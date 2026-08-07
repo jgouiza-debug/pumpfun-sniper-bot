@@ -1,0 +1,40 @@
+{
+  "name": "pumpfun-token-screening-pipeline",
+  "version": "1.0.0",
+  "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && vite build",
+    "start": "ts-node src/index.ts",
+    "server": "tsc && node dist/server.js",
+    "ui": "vite",
+    "dev": "ts-node src/server.ts",
+    "test": "ts-node src/tests/run.ts",
+    "replay": "ts-node src/replay.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.8.1",
+    "bs58": "^6.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "lucide-react": "^0.479.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/bs58": "^4.0.4",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@types/ws": "^8.5.14",
+    "@vitejs/plugin-react": "^4.3.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.1"
+  }
+}

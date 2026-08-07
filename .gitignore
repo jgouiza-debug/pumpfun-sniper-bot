@@ -1,0 +1,16 @@
+node_modules/
+dist/
+
+# Contains a Solana private key in plaintext. Never commit.
+.photon-wallet.json
+.env
+
+# Generated run reports
+reports/
+
+# Live-trading mutex (transient)
+.real-mode.lock
+
+# Per-machine feature flag state (toggled via /api/flags)
+flags.json
+meme-coin-finder-app/
