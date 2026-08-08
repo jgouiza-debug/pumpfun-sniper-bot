@@ -44,6 +44,46 @@ export function App() {
   const [walletError, setWalletError] = useState<string>('');
   const [lastReport, setLastReport] = useState<any>(null);
 
+  // Feature Flags State
+  const [featureFlags, setFeatureFlags] = useState<Record<string, boolean>>({
+    allInSizing: true,
+    devSellStop: true,
+    honestPaper: true,
+    playbookRouting: true,
+    killSwitch: true,
+    dynamicPriorityFee: false,
+    localTxBuild: false,
+    honeypotChecks: true,
+    enforceTradeEconomics: false,
+  });
+
+  const fetchFlags = async (port: number) => {
+    try {
+      const res = await fetch(`http://localhost:${port}/api/flags`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.flags) setFeatureFlags(data.flags);
+      }
+    } catch { /* offline on this port */ }
+  };
+
+  const handleToggleFlag = async (flagKey: string, newValue: boolean) => {
+    setFeatureFlags(prev => ({ ...prev, [flagKey]: newValue }));
+    try {
+      const res = await fetch(`http://localhost:${selectedPort}/api/flags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flag: flagKey, value: newValue }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.flags) setFeatureFlags(data.flags);
+      }
+    } catch (err) {
+      console.error('Failed to toggle flag:', err);
+    }
+  };
+
   const wallet = botStatus?.wallet;
   const run = botStatus?.run;
 
@@ -209,6 +249,7 @@ export function App() {
       if (pollTimer) clearInterval(pollTimer);
       setStreamLive(false);
     };
+    fetchFlags(selectedPort);
   }, [selectedPort]);
 
   // Auto-scroll terminal log
@@ -676,35 +717,75 @@ export function App() {
       {/* Parameters & Keys Modal */}
       {showConfigModal && (
         <div className="modal-overlay">
-          <div className="modal-card">
-            <div className="modal-title">System Parameters — Port {selectedPort}</div>
+          <div className="modal-card" style={{ maxWidth: '580px', width: '92%' }}>
+            <div className="modal-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>System Parameters &amp; Feature Flags — Port {selectedPort}</span>
+              <span className={`status-badge ${featureFlags.allInSizing ? 'positive' : ''}`}>
+                {featureFlags.allInSizing ? '⚡ ALL-IN ACTIVE' : 'FIXED SIZING'}
+              </span>
+            </div>
+
+            {/* All-In Budget Sizing Hero Banner */}
+            <div style={{
+              background: featureFlags.allInSizing ? 'rgba(67, 138, 78, 0.12)' : 'rgba(255,255,255,0.03)',
+              border: `1px solid ${featureFlags.allInSizing ? 'var(--accent-olive)' : 'var(--border-hairline)'}`,
+              padding: '12px 14px',
+              marginBottom: '14px',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: '12px'
+            }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '13px' }}>⚡</span>
+                  <span style={{ fontWeight: 700, fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.08em', color: featureFlags.allInSizing ? 'var(--accent-olive)' : 'var(--ink-primary)' }}>
+                    All-In Wallet Budget Trade Sizing
+                  </span>
+                </div>
+                <div style={{ fontSize: '8.5px', color: 'var(--ink-secondary)', marginTop: '4px', fontFamily: 'var(--font-mono)', lineHeight: '1.3' }}>
+                  {featureFlags.allInSizing
+                    ? 'Every trade entry deploys 100% of available Photon wallet SOL balance (~99.5%+). Budget limits, conviction skipping, and breakeven cost ceilings are disabled.'
+                    : 'Trades spend the fixed Position Allocation Size (SOL) configured below.'}
+                </div>
+              </div>
+              <button
+                type="button"
+                className={featureFlags.allInSizing ? 'btn-terminal' : 'btn-terminal-outline'}
+                style={{ whiteSpace: 'nowrap', padding: '6px 12px', flexShrink: 0 }}
+                onClick={() => handleToggleFlag('allInSizing', !featureFlags.allInSizing)}
+              >
+                {featureFlags.allInSizing ? 'ALL-IN ON' : 'ENABLE ALL-IN'}
+              </button>
+            </div>
 
             <form onSubmit={handleSaveConfig}>
-              <div className="form-group">
-                <label className="form-label">Execution Environment Mode</label>
-                <select
-                  className="form-select"
-                  value={configForm.tradingMode}
-                  onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, tradingMode: e.target.value as 'paper' | 'real' })}
-                >
-                  <option value="paper">Paper Simulation (Risk-Free Testbed)</option>
-                  <option value="real">Real Photon Mainnet Wallet Execution</option>
-                </select>
-              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                <div className="form-group">
+                  <label className="form-label">Execution Environment Mode</label>
+                  <select
+                    className="form-select"
+                    value={configForm.tradingMode}
+                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, tradingMode: e.target.value as 'paper' | 'real' })}
+                  >
+                    <option value="paper">Paper Simulation (Risk-Free Testbed)</option>
+                    <option value="real">Real Photon Mainnet Wallet Execution</option>
+                  </select>
+                </div>
 
-              <div className="form-group">
-                <label className="form-label">Filter Profile</label>
-                <input
-                  className="form-input"
-                  value="STRICT (High Safety, Score ≥ 62) — locked"
-                  disabled
-                  readOnly
-                />
-                <div className="form-help">This bot only trades the strict profile. The server rejects any other value.</div>
+                <div className="form-group">
+                  <label className="form-label">Filter Profile</label>
+                  <input
+                    className="form-input"
+                    value="STRICT (High Safety, Score ≥ 62)"
+                    disabled
+                    readOnly
+                  />
+                </div>
               </div>
 
               {/* Helius Dedicated RPC API Key Input */}
-              <div className="form-group">
+              <div className="form-group" style={{ marginTop: '6px' }}>
                 <label className="form-label">Helius Dedicated RPC Key</label>
                 <input
                   type="text"
@@ -717,7 +798,7 @@ export function App() {
               </div>
 
               {/* Photon Wallet Link — real on-chain execution */}
-              <div className="form-group" style={{ border: '1px solid rgba(255,255,255,0.14)', borderRadius: 10, padding: 14 }}>
+              <div className="form-group" style={{ border: '1px solid rgba(255,255,255,0.14)', padding: 12, marginTop: '6px' }}>
                 <label className="form-label">
                   Photon Wallet {wallet?.linked ? '— LINKED' : '— not linked'}
                 </label>
@@ -727,21 +808,14 @@ export function App() {
                     <div style={{ fontFamily: 'monospace', fontSize: '0.8rem', wordBreak: 'break-all', color: '#00e676' }}>
                       {wallet.address}
                     </div>
-                    <div style={{ display: 'flex', gap: 16, fontSize: '0.85rem', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: 14, fontSize: '0.85rem', flexWrap: 'wrap' }}>
                       <span><strong>{wallet.solBalance}</strong> SOL</span>
                       <span style={{ color: '#94a3b8' }}>${wallet.usdBalance}</span>
-                      <span style={{ color: '#94a3b8' }}>{wallet.deployableSol} deployable</span>
+                      <span style={{ color: '#00e676' }}>{wallet.deployableSol} deployable</span>
                       <span style={{ color: wallet.rpcHealthy ? '#00e676' : '#ff1744' }}>
                         RPC {wallet.rpcHealthy ? 'OK' : 'DOWN'}
                       </span>
-                      <span style={{ color: '#64748b' }}>via {wallet.source}</span>
                     </div>
-
-                    {wallet.blockers.length > 0 && (
-                      <div style={{ color: '#fbbf24', fontSize: '0.8rem' }}>
-                        ⚠️ {wallet.blockers.join(' ')}
-                      </div>
-                    )}
 
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={refreshWallet}>
@@ -772,60 +846,120 @@ export function App() {
                     <button type="button" className="btn-terminal" onClick={linkWallet} disabled={!walletKeyInput.trim()}>
                       LINK WALLET
                     </button>
-                    <div className="form-help">
-                      Signs locally and never leaves this machine. Prefer setting <code>PHOTON_PRIVATE_KEY</code> in
-                      your environment — then it loads at startup and never touches the browser at all.
-                    </div>
                   </div>
                 )}
-
-                {walletError && (
-                  <div style={{ color: '#ff1744', fontSize: '0.8rem', marginTop: 8 }}>{walletError}</div>
-                )}
               </div>
 
-              <div className="form-group">
-                <label className="form-label">Position Allocation Size (SOL)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  className="form-input"
-                  value={configForm.buyAmountSol}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, buyAmountSol: Number(e.target.value) })}
-                />
+              {/* Strategy Parameters Grid */}
+              <div style={{ marginTop: '10px' }}>
+                <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                  Strategy Parameters
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                  <div className="form-group">
+                    <label className="form-label">
+                      Position Size (SOL) {featureFlags.allInSizing && <span style={{ color: 'var(--accent-olive)' }}>(ALL-IN ACTIVE)</span>}
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      className="form-input"
+                      disabled={!!featureFlags.allInSizing}
+                      value={configForm.buyAmountSol}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, buyAmountSol: Number(e.target.value) })}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Take Profit Target (%)</label>
+                    <input
+                      type="number"
+                      className="form-input"
+                      value={configForm.takeProfitPct}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Stop Loss Target (%)</label>
+                    <input
+                      type="number"
+                      className="form-input"
+                      value={configForm.stopLossPct}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, stopLossPct: Number(e.target.value) })}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Max Concurrent Positions</label>
+                    <input
+                      type="number"
+                      className="form-input"
+                      value={configForm.maxActivePositions}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxActivePositions: Number(e.target.value) })}
+                    />
+                  </div>
+                </div>
               </div>
 
-              <div className="form-group">
-                <label className="form-label">Take Profit 1 Target (%)</label>
-                <input
-                  type="number"
-                  className="form-input"
-                  value={configForm.takeProfitPct}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
-                />
+              {/* Feature Flags Matrix */}
+              <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid var(--border-hairline)' }}>
+                <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                  Engine Feature Flags &amp; Guards
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🛑 Dev Sell Stop</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Exit on creator / cluster sells</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.devSellStop} onChange={e => handleToggleFlag('devSellStop', e.target.checked)} />
+                  </div>
+
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🧪 Honest Paper</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Real curve fills &amp; fee drag</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.honestPaper} onChange={e => handleToggleFlag('honestPaper', e.target.checked)} />
+                  </div>
+
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🎯 Playbook Router</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Measured curve routing</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.playbookRouting} onChange={e => handleToggleFlag('playbookRouting', e.target.checked)} />
+                  </div>
+
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>⚡ Kill Switch</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Auto-pause on hourly loss</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.killSwitch} onChange={e => handleToggleFlag('killSwitch', e.target.checked)} />
+                  </div>
+
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>⛽ Dynamic Priority Fee</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>P75 network fee scaling</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.dynamicPriorityFee} onChange={e => handleToggleFlag('dynamicPriorityFee', e.target.checked)} />
+                  </div>
+
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🔒 Honeypot Audit</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Freeze &amp; transfer hook check</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.honeypotChecks} onChange={e => handleToggleFlag('honeypotChecks', e.target.checked)} />
+                  </div>
+                </div>
               </div>
 
-              <div className="form-group">
-                <label className="form-label">Soft Support Limit (%)</label>
-                <input
-                  type="number"
-                  className="form-input"
-                  value={configForm.stopLossPct}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, stopLossPct: Number(e.target.value) })}
-                />
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">Max Concurrent Positions</label>
-                <input
-                  type="number"
-                  className="form-input"
-                  value={configForm.maxActivePositions}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxActivePositions: Number(e.target.value) })}
-                />
-              </div>
-
-              <div style={{ display: 'flex', gap: '8px', marginTop: '16px' }}>
+              <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
                 <button
                   type="button"
                   className="btn-terminal-outline"
