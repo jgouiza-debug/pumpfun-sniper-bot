@@ -1304,10 +1304,6 @@ export class SniperEngine {
           this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
           return;
         }
-        if (!isFullConviction(sizeMultiplier)) {
-          this.log('info', `⏭️ [ALL-IN SKIPPED] Skipping half-unit / borderline signal (sizeMultiplier=${sizeMultiplier}) for $${filterResult.tokenSymbol}.`, filterResult.mint);
-          return;
-        }
       }
 
       this.log('info', `🎯 [TRIGGER] $${filterResult.tokenSymbol} — ${describeRoute(decision)}`, filterResult.mint);
@@ -1323,10 +1319,6 @@ export class SniperEngine {
       if (featureFlags.get('allInSizing')) {
         if (blockAllInEntry(this.activePositions.length, this.buysInFlight)) {
           this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
-          return;
-        }
-        if (!isFullConviction(sizeMultiplier)) {
-          this.log('info', `⏭️ [ALL-IN SKIPPED] Skipping half-unit / borderline signal (sizeMultiplier=${sizeMultiplier}) for $${filterResult.tokenSymbol}.`, filterResult.mint);
           return;
         }
       }
@@ -1356,17 +1348,15 @@ export class SniperEngine {
       }
     }
 
-    if (unitSizeSol < 0.005) {
-      this.log('warn', `⚠️ Insufficient balance (${unitSizeSol.toFixed(4)} SOL computed). Need at least 0.005 SOL to snipe.`);
+    if (unitSizeSol <= 0.0001) {
+      this.log('warn', `⚠️ Insufficient balance (${unitSizeSol.toFixed(4)} SOL computed).`);
       return;
     }
 
-    // Trade economics gate (flag enforceTradeEconomics): fixed costs — priority
-    // fee x2, ATA rent, signatures — do not shrink with position size, so at
-    // small size they dominate. 0.05 SOL needs +11.1% just to break even. A
-    // strategy cannot out-trade its own cost stack; refuse rather than bleed.
+    // Trade economics gate: when allInSizing is active, deploy all budget without
+    // capping or refusing entries due to breakeven cost percentage.
     const be = breakevenPct(unitSizeSol, this.config.priorityFeeSol);
-    if (featureFlags.get('enforceTradeEconomics')) {
+    if (featureFlags.get('enforceTradeEconomics') && !featureFlags.get('allInSizing')) {
       const maxBe = this.config.maxBreakevenPct ?? 6;
       if (be > maxBe) {
         this.log('warn', `⚠️ Skipping $${filterResult.tokenSymbol}: round-trip cost ${be}% of a ${unitSizeSol} SOL position exceeds the ${maxBe}% limit. Increase buyAmountSol or lower priorityFeeSol.`, filterResult.mint);

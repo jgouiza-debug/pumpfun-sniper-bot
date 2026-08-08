@@ -43,7 +43,7 @@ export class WalletService {
   private rpcHealthy = false;
 
   /** SOL held back so exits always have gas, even when fully deployed. */
-  private gasFloatSol = 0.05;
+  private gasFloatSol = 0.005;
 
   private balanceTtlMs = 8000;
   private inflightBalance: Promise<number> | null = null;

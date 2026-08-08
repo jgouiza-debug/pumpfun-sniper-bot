@@ -642,8 +642,8 @@ console.log('\n-- All-In Trade Sizing --');
     assert.strictEqual(isFullConviction(0.5), false);
   });
 
-  test('allInSizing flag default is false', () => {
-    assert.strictEqual(featureFlags.all().allInSizing, false);
+  test('allInSizing flag default is true', () => {
+    assert.strictEqual(featureFlags.all().allInSizing, true);
   });
 }
 

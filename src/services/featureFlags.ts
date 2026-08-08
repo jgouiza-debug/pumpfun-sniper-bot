@@ -77,7 +77,7 @@ const DEFAULTS: FeatureFlagSet = {
   playbookRouting: false,
   honeypotChecks: false,
   devSellStop: false,
-  allInSizing: false,
+  allInSizing: true,
 };
 
 const FLAGS_PATH = path.resolve(process.cwd(), 'flags.json');
