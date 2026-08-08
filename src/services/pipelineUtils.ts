@@ -108,3 +108,56 @@ export function clampPriorityFeeSol(
   // 0.0025000000000000005) never leak into fee fields.
   return Number(clamped.toFixed(9));
 }
+
+/**
+ * Computes entry size in SOL based on allInSizing flag, tradingMode, and wallet/bankroll state.
+ */
+export function computeEntrySizeSol(params: {
+  allIn: boolean;
+  tradingMode: 'paper' | 'real';
+  buyAmountSol: number;
+  sizeMultiplier: number;
+  availableTradeSol: number;
+  bankrollUsd: number;
+  solPriceUsd: number;
+  openExposureSol: number;
+}): number {
+  const {
+    allIn,
+    tradingMode,
+    buyAmountSol,
+    sizeMultiplier,
+    availableTradeSol,
+    bankrollUsd,
+    solPriceUsd,
+    openExposureSol,
+  } = params;
+
+  if (!allIn) {
+    return buyAmountSol * sizeMultiplier;
+  }
+
+  if (tradingMode === 'real') {
+    return Math.max(0, availableTradeSol);
+  }
+
+  // Paper mode all-in: full bankroll converted to SOL minus active open position SOL exposure
+  const solPrice = solPriceUsd > 0 ? solPriceUsd : 200;
+  const totalBankrollSol = bankrollUsd / solPrice;
+  return Math.max(0, totalBankrollSol - openExposureSol);
+}
+
+/**
+ * Returns true if an all-in entry should be blocked because a position is open or in-flight.
+ */
+export function blockAllInEntry(openCount: number, buysInFlight: number): boolean {
+  return openCount > 0 || buysInFlight > 0;
+}
+
+/**
+ * Returns true if a signal is full conviction (sizeMultiplier >= 1).
+ * Borderline / half-unit signals (sizeMultiplier < 1) return false.
+ */
+export function isFullConviction(sizeMultiplier: number): boolean {
+  return sizeMultiplier >= 1;
+}

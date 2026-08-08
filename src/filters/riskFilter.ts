@@ -248,6 +248,23 @@ export class RiskFilter {
     const pressure = launch.buyPressurePct ?? 0;
     if (pressure >= 60) demandScore += 6;
     if (pressure >= 75) demandScore += 4;
+
+    // A completed bonding curve IS measured demand: ~85 SOL of net buying had
+    // to happen for the migration to exist at all. At the migration moment no
+    // indexer has volume/buyer data yet (DexScreener lags minutes), so without
+    // this credit a clean graduation scores demand=0 and dies at the score
+    // gate — observed 2026-08-05: "Thesis", gate0 clean, $12k liq, scored 52
+    // vs the 62 floor purely for lack of not-yet-indexed data. The credit only
+    // applies when indexed demand data is genuinely absent; measured numbers
+    // always take precedence, and concentration rugs are still killed by
+    // Gate 0 regardless of score.
+    if ((launch.bondingProgress ?? 0) >= 90 && vol === 0 && buyers <= 1) {
+      // Credit exactly the volume tiers the completed curve factually proves
+      // (~85 SOL >> the $2k tier): 8 + 4. Buyer-count tiers stay ungranted —
+      // the curve does not reveal how many wallets did the buying.
+      demandScore += 12;
+      notes.push('Demand credited from completed bonding curve (~85 SOL net buying), pre-indexing');
+    }
     demandScore = Math.min(30, demandScore);
 
     // Narrative: only what is actually observable (socials/website on the DEX

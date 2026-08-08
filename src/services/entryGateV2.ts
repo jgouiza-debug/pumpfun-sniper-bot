@@ -128,8 +128,13 @@ export class EntryGateV2 {
 
     const marketCapSol = isFinite(Number(payload?.marketCapSol)) ? Number(payload.marketCapSol) : null;
     if (marketCapSol === null) {
-      unverified.push('marketCapSol');
-    } else {
+      if (!isMigration) unverified.push('marketCapSol');
+    } else if (!isMigration) {
+      // These bands describe a CREATE-moment token (fresh curves sit around
+      // 30-40 SOL MC). A graduation is ~400+ SOL MC by construction — the
+      // curve completes there — so applying the create band to migrations
+      // rejected 100% of them ("410.9 SOL > max 120", observed 2026-08-05).
+      // Migration MC limits belong to the router's Play 3 config instead.
       if (marketCapSol < c.minMarketCapSol) reasons.push(`Market cap ${marketCapSol.toFixed(1)} SOL < min ${c.minMarketCapSol}`);
       if (marketCapSol > c.maxMarketCapSol) reasons.push(`Market cap ${marketCapSol.toFixed(1)} SOL > max ${c.maxMarketCapSol} (already pumped at detection)`);
     }

@@ -129,3 +129,12 @@ Fixed unconditionally this round:
     maxActivePositions 99999→5, maxBreakevenPct 15→6, strict LP-lock floor 50%.
 11. **API binds loopback only** — it previously listened on all interfaces
     while holding a signing key, despite a comment claiming otherwise.
+
+# All-In Trade Sizing — 2026-08-08
+
+- **`allInSizing`** — Spends the entire deployable balance (`availableTradeSol` = `solBalance - 0.05` SOL gas float) on every entry.
+  - **Single position cap**: Forces a maximum of 1 active or in-flight position at any time so concurrent signals cannot double-spend the wallet.
+  - **Full-conviction only**: Skips borderline half-unit signals (`sizeMultiplier < 1`, e.g. score 50–64 in normal tier) entirely rather than sizing down.
+  - **Economics floor**: Requires deployable SOL ≥ ~0.135 SOL to satisfy the 6% breakeven cost ceiling. Below that threshold, `enforceTradeEconomics` refuses entries to protect a damaged wallet from fee bleed.
+  - **Kill switch integration**: Dynamic loss limits (`killSwitch`) remain active to stop trading if rolling hourly losses exceed threshold.
+  - **Toggle**: `POST /api/flags {"flag":"allInSizing","value":true}`.

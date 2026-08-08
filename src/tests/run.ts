@@ -13,6 +13,9 @@ import {
   detectMigration,
   percentile,
   realizedPnlInWindowUsd,
+  computeEntrySizeSol,
+  blockAllInEntry,
+  isFullConviction,
 } from '../services/pipelineUtils';
 import { EntryGateV2 } from '../services/entryGateV2';
 import { RugCheckReport } from '../types';
@@ -470,6 +473,177 @@ console.log('\n-- Liquidity floor: unsatisfiable on a bonding curve --');
     const thinPool = { ...launch, liquidityUsd: 5000 };
     const r = rf.evaluateToken(rug, thinPool); // no override => post-migration rule
     assert.strictEqual(r.isSafe, false);
+  });
+}
+
+console.log('\n-- Migration demand credit (owner report: clean graduations died at the score gate) --');
+{
+  const { RiskFilter } = require('../filters/riskFilter');
+  const rf = new RiskFilter(); rf.setLeniencyMode('strict');
+  const cleanRug: any = { mint: 'M', score: 5, isInferred: false,
+    token: { mintAuthority: null, freezeAuthority: null, supply: 1e9, decimals: 6 },
+    fileMeta: { top10Pct: 18, maxSingleHolderPct: 6, insiderPct: 1, holderSampleSize: 40 } };
+  // "Thesis"-shaped: clean holders, real liquidity, migration moment => no
+  // indexed volume/buyers yet.
+  const migrationLaunch: any = { mint: 'M', bondingProgress: 90, liquidityUsd: 12022,
+    marketCapUsd: 25483, volume5mUsd: 0, top10Pct: 18, devHoldingsPct: 4, bundledSupplyPct: 2, washScore: 0 };
+
+  test('OLD BUG reproduced: without the credit, a clean graduation scores below 62', () => {
+    const r = rf.evaluateToken(cleanRug, { ...migrationLaunch, bondingProgress: 35 });
+    assert.ok(r.score < 62, `expected sub-62, got ${r.score}`);
+  });
+  test('fixed: with curve-demand credit a clean graduation clears the router half-unit band', () => {
+    // Under playbookRouting the router owns the score decision: Gate 0 clean +
+    // score >= 55 is eligible at half unit. The monolithic 62 bar was
+    // calibrated for fabricated-input scores and is no longer the arbiter.
+    const r = rf.evaluateToken(cleanRug, migrationLaunch);
+    assert.strictEqual(r.gate0!.allPassed, true, r.reasons.join('; '));
+    assert.ok(r.score >= 55, `expected >=55 (router half-unit floor), got ${r.score} (${JSON.stringify(r.scoreBreakdown)})`);
+  });
+  test('credit never overrides measured demand (indexed volume present -> no credit)', () => {
+    const withVol = rf.evaluateToken(cleanRug, { ...migrationLaunch, volume5mUsd: 3000, buyPressurePct: 70 });
+    const bd = withVol.scoreBreakdown!;
+    assert.ok(!(bd.notes || []).some((n: string) => n.includes('completed bonding curve')));
+  });
+  test('credit cannot rescue a concentration rug (Gate 0 still rules)', () => {
+    const rugRug = { ...cleanRug, fileMeta: { ...cleanRug.fileMeta, top10Pct: 79, maxSingleHolderPct: 79 } };
+    const r = rf.evaluateToken(rugRug, { ...migrationLaunch, top10Pct: 79, devHoldingsPct: 79 });
+    assert.strictEqual(r.isSafe, false);
+  });
+}
+
+console.log('\n-- Gate V2: create-window MC band must not judge migrations --');
+{
+  const { EntryGateV2 } = require('../services/entryGateV2');
+  const g = new EntryGateV2();
+  const rug: any = { mint: 'M', score: 5, isInferred: false,
+    token: { mintAuthority: null, freezeAuthority: null, supply: 1e9, decimals: 6 },
+    fileMeta: { top10Pct: 18, maxSingleHolderPct: 6, insiderPct: 1, holderSampleSize: 40 } };
+
+  test('OLD BUG reproduced: a ~410 SOL graduation MC fails the create band', () => {
+    const r = g.evaluate({ txType: 'create', marketCapSol: 410.9, vSolInBondingCurve: 32, initialBuy: 10_000_000, solAmount: 1 }, rug, false);
+    assert.ok(r.reasons.some((x: string) => x.includes('already pumped')));
+  });
+  test('fixed: the same MC on a real migration is not judged by the create band', () => {
+    const r = g.evaluate({ txType: 'migrate', marketCapSol: 410.9 }, rug, true);
+    assert.ok(!r.reasons.some((x: string) => x.includes('already pumped')), r.reasons.join('; '));
+  });
+}
+
+console.log('\n-- NORMAL risk tier (owner-selected looser profile) --');
+{
+  const { routePlay, playbookConfigFor, PLAYBOOK_DEFAULTS, PLAYBOOK_NORMAL } = require('../services/playbookRouter');
+
+  test('normal tier widens bands but keeps Play 1 disabled', () => {
+    const n = playbookConfigFor('normal');
+    assert.strictEqual(n.minScoreHalfUnit, 50);
+    assert.strictEqual(n.play3MaxSecondsSinceMigration, 180);
+    assert.strictEqual(n.enablePlay1, false, 'block-0 stays banned at every tier');
+  });
+
+  test('a 3-minute-old migration is refused strict but eligible normal', () => {
+    const input = { isMigrationEvent: true, secondsSinceMigration: 150, ageSeconds: 0,
+      score: 72, marketCapUsd: 69000, liquidityUsd: 6287, solPriceUsd: 74 };
+    assert.strictEqual(routePlay(input, PLAYBOOK_DEFAULTS).eligible, false);
+    assert.strictEqual(routePlay(input, PLAYBOOK_NORMAL).eligible, true,
+      routePlay(input, PLAYBOOK_NORMAL).reasons.join('; '));
+  });
+
+  test('score 52 clears normal half-unit band, not strict', () => {
+    const input = { isMigrationEvent: true, secondsSinceMigration: 20, ageSeconds: 0,
+      score: 52, marketCapUsd: 69000, liquidityUsd: 6287, solPriceUsd: 74 };
+    assert.strictEqual(routePlay(input, PLAYBOOK_DEFAULTS).eligible, false);
+    const n = routePlay(input, PLAYBOOK_NORMAL);
+    assert.strictEqual(n.eligible, true, n.reasons.join('; '));
+    assert.strictEqual(n.sizeMultiplier, 0.5, 'borderline score buys HALF units');
+  });
+}
+
+console.log('\n-- All-In Trade Sizing --');
+{
+  const { featureFlags } = require('../services/featureFlags');
+  const { breakevenPct } = require('../services/paperSimulator');
+
+  test('flag OFF preserves legacy sizing (buyAmountSol * sizeMultiplier)', () => {
+    const size = computeEntrySizeSol({
+      allIn: false,
+      tradingMode: 'real',
+      buyAmountSol: 0.15,
+      sizeMultiplier: 0.5,
+      availableTradeSol: 0.106,
+      bankrollUsd: 100,
+      solPriceUsd: 200,
+      openExposureSol: 0,
+    });
+    assert.strictEqual(size, 0.075);
+  });
+
+  test('flag ON real mode returns full availableTradeSol, ignoring buyAmountSol & multiplier', () => {
+    const size = computeEntrySizeSol({
+      allIn: true,
+      tradingMode: 'real',
+      buyAmountSol: 0.15,
+      sizeMultiplier: 0.5,
+      availableTradeSol: 0.106,
+      bankrollUsd: 100,
+      solPriceUsd: 200,
+      openExposureSol: 0,
+    });
+    assert.strictEqual(size, 0.106);
+  });
+
+  test('flag ON real mode with 0 availableTradeSol returns 0', () => {
+    const size = computeEntrySizeSol({
+      allIn: true,
+      tradingMode: 'real',
+      buyAmountSol: 0.15,
+      sizeMultiplier: 1,
+      availableTradeSol: 0,
+      bankrollUsd: 100,
+      solPriceUsd: 200,
+      openExposureSol: 0,
+    });
+    assert.strictEqual(size, 0);
+  });
+
+  test('flag ON paper mode subtracts active position exposure from converted bankroll', () => {
+    const size = computeEntrySizeSol({
+      allIn: true,
+      tradingMode: 'paper',
+      buyAmountSol: 0.15,
+      sizeMultiplier: 1,
+      availableTradeSol: 0,
+      bankrollUsd: 100,
+      solPriceUsd: 200, // 100/200 = 0.5 SOL
+      openExposureSol: 0.2,
+    });
+    assert.strictEqual(size, 0.3);
+  });
+
+  test('breakeven percent floors for sizing', () => {
+    const be015 = breakevenPct(0.15, 0.001);
+    const be0135 = breakevenPct(0.135, 0.001);
+    const be005 = breakevenPct(0.05, 0.001);
+    assert.ok(be015 < 6, `expected <6%, got ${be015}%`);
+    assert.ok(be0135 <= 6.1, `expected <=6.1%, got ${be0135}%`);
+    assert.ok(be005 > 10, `expected >10%, got ${be005}%`);
+  });
+
+  test('blockAllInEntry returns true if position open or in-flight', () => {
+    assert.strictEqual(blockAllInEntry(0, 0), false);
+    assert.strictEqual(blockAllInEntry(1, 0), true);
+    assert.strictEqual(blockAllInEntry(0, 1), true);
+    assert.strictEqual(blockAllInEntry(2, 1), true);
+  });
+
+  test('isFullConviction requires sizeMultiplier >= 1', () => {
+    assert.strictEqual(isFullConviction(1), true);
+    assert.strictEqual(isFullConviction(1.5), true);
+    assert.strictEqual(isFullConviction(0.5), false);
+  });
+
+  test('allInSizing flag default is false', () => {
+    assert.strictEqual(featureFlags.all().allInSizing, false);
   });
 }
 

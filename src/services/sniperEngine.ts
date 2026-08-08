@@ -27,9 +27,9 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, blockAllInEntry, isFullConviction } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
-import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS } from './playbookRouter';
+import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
 import { inspectMintSafety } from './honeypotDetector';
 import { devSellMonitor } from './devSellMonitor';
@@ -140,6 +140,8 @@ export class SniperEngine {
 
   // Guards against overlapping monitor ticks when a batch fetch runs long.
   private monitorTickInFlight = false;
+  // Tracks in-flight buy attempts for allInSizing position limiting.
+  private buysInFlight = 0;
 
   private priorityFeeService: PriorityFeeService;
   // One kill-switch trip per pause: reset when the bot is (re)started.
@@ -273,15 +275,18 @@ export class SniperEngine {
       this.log('warn', `⏸️ Trading mode changed ${prevMode.toUpperCase()} -> ${newConfig.tradingMode.toUpperCase()} mid-run. Bot stopped — press START to arm the new mode with full preflight.`);
     }
 
-    // STRICT is the only supported profile. Whatever a client sends, the
-    // filter runs strict — a stale UI or an old saved payload cannot loosen it.
-    if (this.config.leniencyMode !== 'strict') {
-      if (newConfig.leniencyMode && newConfig.leniencyMode !== 'strict') {
-        this.log('warn', `🎛️ Ignoring request for ${newConfig.leniencyMode.toUpperCase()} mode — this bot is locked to STRICT.`);
-      }
-      this.config.leniencyMode = 'strict';
+    // Risk tiers. STRICT and NORMAL are supported; NORMAL is the owner's
+    // "take a bit of risk" profile (wider concentration caps, wider score
+    // bands and windows). LENIENT stays locked out: 65% top-10 / 40% single
+    // holder admits the exact rug shapes the last soaks measured — that is not
+    // risk appetite, it is the donation tier. The lock used to force STRICT
+    // because fabricated inputs made every looser tier suicidal; inputs are
+    // real now.
+    if (this.config.leniencyMode === 'lenient') {
+      this.log('warn', '🎛️ LENIENT requested — coercing to NORMAL. Lenient caps (top10 65%, single holder 40%) admit the measured rug profile outright.');
+      this.config.leniencyMode = 'normal';
     }
-    this.riskFilter.setLeniencyMode('strict');
+    this.applyRiskTier(this.config.leniencyMode);
 
     if (newConfig.heliusApiKey) {
       const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${this.config.heliusApiKey}`;
@@ -993,7 +998,7 @@ export class SniperEngine {
     const minLiquidityUsdOverride = onCurve
       ? MIN_CURVE_LIQUIDITY_SOL * this.config.solPriceUsd
       : (useRealData && (isMigration || launchData.hasLiveMarketData))
-        ? PLAYBOOK_DEFAULTS.minLiquiditySol * this.config.solPriceUsd
+        ? this.activePlaybook().minLiquiditySol * this.config.solPriceUsd
         : undefined;
 
     const filterResult = this.riskFilter.evaluateToken(report, launchData, { minLiquidityUsdOverride });
@@ -1009,8 +1014,28 @@ export class SniperEngine {
     const runV2 = useV2 || featureFlags.get('shadowGateV2');
     const v2 = runV2 ? entryGateV2.evaluate(payload, report, isMigration) : null;
 
-    const activeIsSafe = useV2 && v2 ? v2.isSafe : filterResult.isSafe;
-    const activeReasons = useV2 && v2 ? v2.reasons : filterResult.reasons;
+    let activeIsSafe = useV2 && v2 ? v2.isSafe : filterResult.isSafe;
+    let activeReasons = useV2 && v2 ? v2.reasons : filterResult.reasons;
+
+    // Under playbookRouting, Gate 0 owns SAFETY and the router owns STRATEGY.
+    // The monolithic strict-62 score bar was calibrated when fabricated inputs
+    // scored every token 95; on real data a clean migration-moment token
+    // scores ~55-60 (its volume/socials simply aren't indexed yet) and the 62
+    // bar rejected 100% of otherwise-clean graduations — the measured reason
+    // the bot "never tries anything". The router applies the playbook's own
+    // bands instead: 55 = half-unit eligibility, 71 = full unit. Hard safety
+    // (authorities, concentration, liquidity, honeypot) is unchanged.
+    if (!useV2 && featureFlags.get('playbookRouting')
+        && honeypotBlocked.length === 0
+        && filterResult.gate0?.allPassed
+        && !activeIsSafe) {
+      const halfUnitFloor = this.activePlaybook().minScoreHalfUnit;
+      if (filterResult.score >= halfUnitFloor) {
+        activeIsSafe = true;
+      } else {
+        activeReasons = [`Score ${filterResult.score} below router half-unit floor (${halfUnitFloor})`];
+      }
+    }
     latencyTimeline.stamp(mint, 't4DecisionMs');
 
     latencyTimeline.annotate(mint, {
@@ -1170,7 +1195,8 @@ export class SniperEngine {
     // Unique-buyer counts require the paid trade feed, so demand is judged by
     // how fast the curve is filling plus net buy pressure. This is weaker: it
     // cannot tell one whale from twenty buyers.
-    if (!stats || stats.progressVelocity5m < 2 || stats.buyPressurePct < 60) return;
+    const play2 = this.activePlaybook();
+    if (!stats || stats.progressVelocity5m < play2.play2MinVelocity5m || stats.buyPressurePct < play2.play2MinBuyPressurePct) return;
 
     tokenWatchlist.markTriggered(token.mint);
     this.log('info', `📈 [MID-CURVE CANDIDATE] $${token.symbol ?? '?'} at ${token.progressPct.toFixed(0)}% | +${stats.progressVelocity5m}%/5m | ${stats.buyPressurePct}% net buying`, token.mint);
@@ -1254,7 +1280,7 @@ export class SniperEngine {
         buys5m: launchData.buys5m,
         isBoosted: launchData.isBoosted,
         solPriceUsd: this.config.solPriceUsd,
-      }, PLAYBOOK_DEFAULTS);
+      }, this.activePlaybook());
 
       latencyTimeline.annotate(filterResult.mint, {
         gateV2: {
@@ -1272,6 +1298,18 @@ export class SniperEngine {
 
       selectedPlay = decision.play === 'NONE' ? 'PLAY_2' : decision.play;
       sizeMultiplier = decision.sizeMultiplier;
+
+      if (featureFlags.get('allInSizing')) {
+        if (blockAllInEntry(this.activePositions.length, this.buysInFlight)) {
+          this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
+          return;
+        }
+        if (!isFullConviction(sizeMultiplier)) {
+          this.log('info', `⏭️ [ALL-IN SKIPPED] Skipping half-unit / borderline signal (sizeMultiplier=${sizeMultiplier}) for $${filterResult.tokenSymbol}.`, filterResult.mint);
+          return;
+        }
+      }
+
       this.log('info', `🎯 [TRIGGER] $${filterResult.tokenSymbol} — ${describeRoute(decision)}`, filterResult.mint);
     } else {
       if (isMigration || progress >= 70) {
@@ -1281,20 +1319,46 @@ export class SniperEngine {
       } else if (filterResult.liquidityUsd >= 2000) {
         selectedPlay = 'PLAY_5';
       }
+
+      if (featureFlags.get('allInSizing')) {
+        if (blockAllInEntry(this.activePositions.length, this.buysInFlight)) {
+          this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
+          return;
+        }
+        if (!isFullConviction(sizeMultiplier)) {
+          this.log('info', `⏭️ [ALL-IN SKIPPED] Skipping half-unit / borderline signal (sizeMultiplier=${sizeMultiplier}) for $${filterResult.tokenSymbol}.`, filterResult.mint);
+          return;
+        }
+      }
     }
 
     if (this.config.activePlaybook !== 'ALL' && this.config.activePlaybook !== selectedPlay) return;
 
-    let unitSizeSol = this.config.buyAmountSol * sizeMultiplier;
+    const openExposureSol = this.activePositions.reduce(
+      (acc, p) => acc + (p.investedSol || (p.investedUsd / (this.config.solPriceUsd || 200))),
+      0
+    );
 
-    if (this.config.tradingMode === 'real' && this.availableTradeSol > 0) {
+    let unitSizeSol = computeEntrySizeSol({
+      allIn: featureFlags.get('allInSizing'),
+      tradingMode: this.config.tradingMode,
+      buyAmountSol: this.config.buyAmountSol,
+      sizeMultiplier,
+      availableTradeSol: this.availableTradeSol,
+      bankrollUsd: this.currentBankrollUsd,
+      solPriceUsd: this.config.solPriceUsd,
+      openExposureSol,
+    });
+
+    if (this.config.tradingMode === 'real' && !featureFlags.get('allInSizing') && this.availableTradeSol > 0) {
       if (unitSizeSol > this.availableTradeSol) {
         unitSizeSol = this.availableTradeSol;
       }
-      if (unitSizeSol < 0.005) {
-        this.log('warn', `⚠️ Insufficient wallet balance (${this.liveWalletSolBalance} SOL available). Need at least 0.01 SOL to snipe.`);
-        return;
-      }
+    }
+
+    if (unitSizeSol < 0.005) {
+      this.log('warn', `⚠️ Insufficient balance (${unitSizeSol.toFixed(4)} SOL computed). Need at least 0.005 SOL to snipe.`);
+      return;
     }
 
     // Trade economics gate (flag enforceTradeEconomics): fixed costs — priority
@@ -1310,7 +1374,12 @@ export class SniperEngine {
       }
     }
 
-    await this.executeBuy(filterResult, selectedPlay, unitSizeSol, be, launchData);
+    this.buysInFlight++;
+    try {
+      await this.executeBuy(filterResult, selectedPlay, unitSizeSol, be, launchData);
+    } finally {
+      this.buysInFlight--;
+    }
   }
 
   private async executeBuy(
@@ -1362,8 +1431,14 @@ export class SniperEngine {
     }
 
     if (this.config.tradingMode === 'real') {
+      if (featureFlags.get('allInSizing')) {
+        this.availableTradeSol = 0;
+      }
       const result = await this.executeRealMainnetTrade('buy', filterResult.mint, solAmount);
       if (!result) {
+        if (featureFlags.get('allInSizing')) {
+          void this.syncLiveWalletBalance();
+        }
         latencyTimeline.annotate(filterResult.mint, { decision: 'buy_failed' });
         this.log('error', `❌ Photon real buy failed for $${filterResult.tokenSymbol}. Skipping position creation.`);
         return;
@@ -1581,7 +1656,7 @@ export class SniperEngine {
       return {};
     }
 
-    const result = await this.executeRealMainnetTrade('sell', pos.mint, 0, `${pct}%`);
+    const result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`);
     if (!result) return null;
 
     if (result.fill && result.fill.tokenDelta < 0) {
@@ -1623,6 +1698,25 @@ export class SniperEngine {
       this.log('error', `🛑 KILL SWITCH TRIPPED: ${hourPnl.toFixed(2)} USD realized in the last hour (limit -$${limit}). Bot paused; open positions retained.`);
       this.toggleBot(false);
     }
+  }
+
+  /** Router/gate thresholds for the current risk tier. */
+  private activePlaybook(): PlaybookConfig {
+    return playbookConfigFor(this.config.leniencyMode);
+  }
+
+  /**
+   * Applies one risk tier to every gate coherently: Gate 0 concentration caps
+   * (RiskFilter), the real-data gate (EntryGateV2) and — via activePlaybook()
+   * — the router bands and Play 2 triggers. One knob, not five.
+   */
+  private applyRiskTier(mode: LeniencyMode): void {
+    this.riskFilter.setLeniencyMode(mode);
+    entryGateV2.updateConfig(mode === 'strict'
+      ? { maxTop10Pct: 30, maxSingleHolderPct: 12, maxDevInitialBuyPct: 6, maxInsiderPct: 35, minDevInitialBuySol: 0.1 }
+      : { maxTop10Pct: 45, maxSingleHolderPct: 20, maxDevInitialBuyPct: 10, maxInsiderPct: 45, minDevInitialBuySol: 0.05 });
+    // Deliberately NOT loosened at any tier: requireVerifiedConcentration
+    // (unknown is not safe) and maxDevInitialBuySol (the mayhem ban).
   }
 
   /** Immediate manual stop for the API: pause entries, keep positions. */

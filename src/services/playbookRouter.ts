@@ -59,22 +59,26 @@ export interface PhaseInput {
   pairAgeSeconds?: number;
 }
 
-export function classifyPhase(input: PhaseInput): { phase: Phase; progressPct: number | null } {
+export function classifyPhase(
+  input: PhaseInput,
+  /** MIGRATION->POST_MIGRATION boundary. Risk tiers widen it (strict 90s, normal 180s). */
+  migrationWindowS = 90
+): { phase: Phase; progressPct: number | null } {
   const progressPct = bondingProgressPct(input.vSolInBondingCurve);
 
   if (input.isMigrationEvent) {
     const since = input.secondsSinceMigration ?? 0;
-    return { phase: since <= 90 ? 'MIGRATION' : 'POST_MIGRATION', progressPct };
+    return { phase: since <= migrationWindowS ? 'MIGRATION' : 'POST_MIGRATION', progressPct };
   }
 
   // A live DEX pair means it already graduated, whatever the stream said.
   if (input.hasDexPair) {
     const pairAge = input.pairAgeSeconds;
     // Age unknown is NOT age zero. Defaulting to 0 routed pools of unknown
-    // age into the MIGRATION phase's 90-second snipe window as if freshly
-    // graduated. Unknown age gets the conservative classification.
+    // age into the MIGRATION phase's snipe window as if freshly graduated.
+    // Unknown age gets the conservative classification.
     if (pairAge === undefined) return { phase: 'POST_MIGRATION', progressPct };
-    if (pairAge <= 90) return { phase: 'MIGRATION', progressPct };
+    if (pairAge <= migrationWindowS) return { phase: 'MIGRATION', progressPct };
     if (pairAge <= 86_400) return { phase: 'POST_MIGRATION', progressPct };
     return { phase: 'MATURE', progressPct };
   }
@@ -148,6 +152,10 @@ export interface PlaybookConfig {
    */
   play4MinLiquiditySol: number;
   minLiquiditySol: number;
+  /** Play 2 trigger: minimum curve fill over the trailing 5m (percentage points). */
+  play2MinVelocity5m: number;
+  /** Play 2 trigger: minimum net buy pressure (% of curve flow that is buys). */
+  play2MinBuyPressurePct: number;
 }
 
 export const PLAYBOOK_DEFAULTS: PlaybookConfig = {
@@ -164,10 +172,36 @@ export const PLAYBOOK_DEFAULTS: PlaybookConfig = {
   play4MinLiquiditySol: 55,
   /** The playbook's "≈30+ SOL" for any Phase 4+ entry. */
   minLiquiditySol: 30,
+  play2MinVelocity5m: 2,
+  play2MinBuyPressurePct: 60,
 };
 
+/**
+ * Owner-selected NORMAL risk tier (leniencyMode 'normal' + playbookRouting).
+ * Wider score bands and windows, shallower floors. What it deliberately does
+ * NOT loosen: unknown-data handling (unverified still rejects) and the mayhem
+ * dev-owns-the-curve ban — those aren't risk appetite, they're anti-donation.
+ */
+export const PLAYBOOK_NORMAL: PlaybookConfig = {
+  ...PLAYBOOK_DEFAULTS,
+  minScoreFullUnit: 65,
+  minScoreHalfUnit: 50,
+  play3MaxMarketCapUsd: 400_000,
+  // 90s is the textbook discovery window; 3 min accepts a worse entry price
+  // in exchange for roughly doubling eligible graduations.
+  play3MaxSecondsSinceMigration: 180,
+  play4MinLiquiditySol: 40,
+  minLiquiditySol: 25,
+  play2MinVelocity5m: 1,
+  play2MinBuyPressurePct: 55,
+};
+
+export function playbookConfigFor(mode: 'strict' | 'normal' | 'lenient'): PlaybookConfig {
+  return mode === 'strict' ? PLAYBOOK_DEFAULTS : PLAYBOOK_NORMAL;
+}
+
 export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_DEFAULTS): RouteDecision {
-  const { phase, progressPct } = classifyPhase(input);
+  const { phase, progressPct } = classifyPhase(input, config.play3MaxSecondsSinceMigration);
   const reasons: string[] = [];
   const base = { phase, progressPct };
   // Fall back to a conservative SOL price rather than 0, which would make every
