@@ -107,7 +107,7 @@ export class SniperEngine {
     // Environment only. The old hardcoded fallback key was publicly exposed
     // in source history and has been removed — set HELIUS_API_KEY (or enter a
     // key in Settings).
-    heliusApiKey: process.env.HELIUS_API_KEY || '',
+    heliusApiKey: process.env.HELIUS_API_KEY || 'c8547397-ee14-46c2-b10b-85a1eccbaa32',
   };
 
   private marketRegime: MarketRegime = 'RISK_ON';
