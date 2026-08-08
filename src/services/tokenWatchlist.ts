@@ -77,15 +77,23 @@ export class TokenWatchlist {
     return [...this.tokens.values()];
   }
 
-  /** @returns true when the token was newly added (caller should subscribe). */
-  public add(payload: any, nowMs = Date.now()): boolean {
+  /**
+   * @returns added=true when the token was newly enrolled (caller should
+   * subscribe), and the evicted mint when enrolling displaced one — the caller
+   * MUST unsubscribe the victim or its trade/curve subscription leaks forever.
+   */
+  public add(payload: any, nowMs = Date.now()): { added: boolean; evicted?: string } {
     const mint = payload?.mint;
-    if (!mint || this.tokens.has(mint)) return false;
+    if (!mint || this.tokens.has(mint)) return { added: false };
+    let evicted: string | undefined;
     if (this.tokens.size >= this.maxSize) {
       // Evict the least active rather than refusing — a stalled curve is worth
       // less than a fresh candidate.
       const victim = [...this.tokens.values()].sort((a, b) => a.lastTradeAt - b.lastTradeAt)[0];
-      if (victim) this.tokens.delete(victim.mint);
+      if (victim) {
+        this.tokens.delete(victim.mint);
+        evicted = victim.mint;
+      }
     }
 
     const vSol = Number(payload.vSolInBondingCurve) || 0;
@@ -105,7 +113,7 @@ export class TokenWatchlist {
       trades: [],
       triggered: false,
     });
-    return true;
+    return { added: true, evicted };
   }
 
   /**
@@ -193,12 +201,13 @@ export class TokenWatchlist {
     const cutoff = nowMs - FIVE_MIN_MS;
     const recent = token.trades.filter(t => t.at >= cutoff);
     const buyers = new Set<string>();
-    let buys = 0, sells = 0, volume = 0;
+    let buys = 0, sells = 0, volume = 0, buyVol = 0, sellVol = 0;
     for (const t of recent) {
       volume += t.solAmount;
-      if (t.isBuy) { buys++; buyers.add(t.buyer); } else sells++;
+      if (t.isBuy) { buys++; buyers.add(t.buyer); buyVol += t.solAmount; }
+      else { sells++; sellVol += t.solAmount; }
     }
-    const total = buys + sells;
+    const totalVol = buyVol + sellVol;
 
     // Progress five minutes ago, inferred by unwinding net SOL flow.
     const netSol = recent.reduce((acc, t) => acc + (t.isBuy ? t.solAmount : -t.solAmount), 0);
@@ -208,7 +217,10 @@ export class TokenWatchlist {
       uniqueBuyers5m: buyers.size,
       buys5m: buys,
       sells5m: sells,
-      buyPressurePct: total > 0 ? Number(((buys / total) * 100).toFixed(1)) : 0,
+      // Notional-weighted, not event-counted: by count, twenty 0.01-SOL sells
+      // against one 5-SOL buy read as 4.8% "buy pressure" — economically it is
+      // 96%. SOL flow is also what "buy/sell ratio 1.5" actually means.
+      buyPressurePct: totalVol > 0 ? Number(((buyVol / totalVol) * 100).toFixed(1)) : 0,
       volume5mSol: Number(volume.toFixed(4)),
       progressVelocity5m: Number((token.progressPct - priorProgress).toFixed(2)),
     };

@@ -5,6 +5,9 @@ dist/
 .photon-wallet.json
 .env
 
+# Local launcher — embeds the operator's Helius API key. Never commit.
+.claude/run-server.cmd
+
 # Generated run reports
 reports/
 

@@ -29,6 +29,8 @@ export interface PumpTokenLaunch {
   devHoldingsPct?: number;
   washScore?: number;
   uniqueBuyers5m?: number;
+  /** Curve progress gained over the trailing 5 min (pp) — free-tier demand signal. */
+  progressVelocity5m?: number;
   priceUsd?: number;
   buys5m?: number;
   sells5m?: number;

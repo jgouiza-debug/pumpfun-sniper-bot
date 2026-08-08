@@ -332,9 +332,17 @@ app.get('/api/report/last', (req, res) => {
 // IPv6 loopback (::1) first, so an IPv4-only bind leaves the browser connecting
 // to a port nothing is listening on — which surfaces as "backend offline".
 function startListening(retriesLeft = 5): void {
-  const server = app.listen(PORT, () => {
-    console.log(`📡 Sniper Bot API listening on http://localhost:${PORT}`);
+  // `app.listen(PORT)` with no host binds 0.0.0.0 — the opposite of the
+  // comment above. Bind IPv4 loopback as the primary listener, plus a
+  // best-effort IPv6 loopback listener so `localhost` resolving to ::1 on
+  // Windows still reaches the API. Nothing on the LAN can.
+  const server = app.listen(PORT, '127.0.0.1', () => {
+    console.log(`📡 Sniper Bot API listening on http://localhost:${PORT} (loopback only)`);
   });
+  try {
+    const v6 = app.listen(PORT, '::1');
+    v6.on('error', () => { /* IPv6 loopback unavailable or in use — IPv4 covers it */ });
+  } catch { /* same */ }
 
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE' && retriesLeft > 0) {

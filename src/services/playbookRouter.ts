@@ -69,7 +69,11 @@ export function classifyPhase(input: PhaseInput): { phase: Phase; progressPct: n
 
   // A live DEX pair means it already graduated, whatever the stream said.
   if (input.hasDexPair) {
-    const pairAge = input.pairAgeSeconds ?? 0;
+    const pairAge = input.pairAgeSeconds;
+    // Age unknown is NOT age zero. Defaulting to 0 routed pools of unknown
+    // age into the MIGRATION phase's 90-second snipe window as if freshly
+    // graduated. Unknown age gets the conservative classification.
+    if (pairAge === undefined) return { phase: 'POST_MIGRATION', progressPct };
     if (pairAge <= 90) return { phase: 'MIGRATION', progressPct };
     if (pairAge <= 86_400) return { phase: 'POST_MIGRATION', progressPct };
     return { phase: 'MATURE', progressPct };
@@ -93,6 +97,15 @@ export interface RouteInput extends PhaseInput {
   uniqueBuyers5m?: number;
   buyPressurePct?: number;
   volume5mUsd?: number;
+  /**
+   * Curve progress gained over the trailing 5 minutes (percentage points).
+   * The free-tier demand signal: Helius account updates reveal curve position
+   * but not trader identity, so unique-buyer counts are structurally
+   * unavailable (they read 0-1). Without this fallback Play 2 can never fire.
+   */
+  progressVelocity5m?: number;
+  /** DexScreener 5m buy count — the post-migration fallback for unique buyers. */
+  buys5m?: number;
   holderCount?: number;
   isBoosted?: boolean;
   /** Live SOL price, used to convert the SOL-denominated liquidity floors. */
@@ -180,7 +193,16 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
     case 'MID_CURVE': {
       if (!config.enablePlay2) { reasons.push('Play 2 disabled'); return { ...base, play: 'PLAY_2', eligible: false, sizeMultiplier: 0, reasons }; }
       if (input.ageSeconds < 600) reasons.push('Age under 10 min — instant-pump curves are usually bundled momentum');
-      if ((input.uniqueBuyers5m ?? 0) < 20) reasons.push(`Unique 5m buyers ${input.uniqueBuyers5m ?? 0} < 20`);
+      // Demand check. Unique buyers when the trade feed provides them (values
+      // >1 mean real attribution); otherwise curve velocity — the documented
+      // free-tier fallback. Velocity is weaker (cannot tell one whale from
+      // twenty buyers), so the score gate below stays at full-unit strictness.
+      const buyers2 = input.uniqueBuyers5m ?? 0;
+      if (buyers2 > 1) {
+        if (buyers2 < 20) reasons.push(`Unique 5m buyers ${buyers2} < 20`);
+      } else if ((input.progressVelocity5m ?? 0) < 2) {
+        reasons.push(`No buyer attribution and curve velocity ${(input.progressVelocity5m ?? 0).toFixed(1)}%/5m < 2%`);
+      }
       if ((input.buyPressurePct ?? 0) < 60) reasons.push(`Buy pressure ${(input.buyPressurePct ?? 0).toFixed(0)}% < 60% (buy/sell ratio under 1.5)`);
       const ok2 = reasons.length === 0 && scoreTier === 1;
       if (scoreTier !== 1 && reasons.length === 0) reasons.push(`Play 2 requires score >= ${config.minScoreFullUnit}`);
@@ -217,7 +239,14 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
       if (input.liquidityUsd < minLiq4Usd) {
         reasons.push(`Liquidity $${Math.round(input.liquidityUsd).toLocaleString()} < ${config.play4MinLiquiditySol} SOL ($${Math.round(minLiq4Usd).toLocaleString()})`);
       }
-      if ((input.uniqueBuyers5m ?? 0) < 25) reasons.push(`Unique 5m buyers ${input.uniqueBuyers5m ?? 0} < 25`);
+      // Post-migration demand: real unique buyers when attributed, otherwise
+      // DexScreener's 5m buy count (txns, not wallets — weaker but measured).
+      const buyers4 = input.uniqueBuyers5m ?? 0;
+      if (buyers4 > 1) {
+        if (buyers4 < 25) reasons.push(`Unique 5m buyers ${buyers4} < 25`);
+      } else if ((input.buys5m ?? 0) < 25) {
+        reasons.push(`5m buys ${input.buys5m ?? 0} < 25 (no unique-buyer feed)`);
+      }
       const ok4 = reasons.length === 0 && scoreTier > 0;
       return { ...base, play: 'PLAY_4', eligible: ok4, sizeMultiplier: ok4 ? scoreTier : 0, reasons };
     }

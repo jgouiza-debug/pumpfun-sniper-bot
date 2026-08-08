@@ -21,7 +21,8 @@ export interface DexScreenerData {
   turnover5m: number;
   socialCount: number;
   isBoosted: boolean;
-  pairAgeSeconds: number;
+  /** Undefined when DexScreener did not report pairCreatedAt — unknown, not "brand new". */
+  pairAgeSeconds?: number;
   hasPair: boolean;
 }
 
@@ -101,7 +102,7 @@ export class DexScreenerService {
       turnover5m: 0,
       socialCount: 0,
       isBoosted: false,
-      pairAgeSeconds: 0,
+      pairAgeSeconds: undefined,
       hasPair: false,
     };
   }
@@ -170,6 +171,17 @@ export class DexScreenerService {
       }
 
       const grouped = await this.fetchBatch(chunk);
+      if (!grouped) {
+        // Transport failure — the API said nothing about these mints. Serve
+        // stale cache instead of overwriting good data with zeros: a single
+        // transient error here used to feed price 0 / hasPair false into the
+        // exit logic of EVERY open position at once.
+        for (const mint of chunk) {
+          const cached = this.cache.get(mint);
+          out.set(mint, cached ? cached.data : this.empty(mint));
+        }
+        continue;
+      }
       for (const mint of chunk) {
         const data = grouped.get(mint) ?? this.empty(mint);
         this.cache.set(mint, { data, fetchedAt: Date.now() });
@@ -180,7 +192,8 @@ export class DexScreenerService {
     return out;
   }
 
-  private static async fetchBatch(mints: string[]): Promise<Map<string, DexScreenerData>> {
+  /** @returns null on transport failure (callers keep stale data); a map on success. */
+  private static async fetchBatch(mints: string[]): Promise<Map<string, DexScreenerData> | null> {
     const grouped = new Map<string, DexScreenerData>();
 
     try {
@@ -215,6 +228,7 @@ export class DexScreenerService {
       }
     } catch (error: any) {
       // Quiet by design — this runs on a loop; callers fall back to cache.
+      return null;
     }
 
     return grouped;
@@ -261,8 +275,11 @@ export class DexScreenerService {
         (Array.isArray(info.socials) ? info.socials.length : 0) +
         (Array.isArray(info.websites) && info.websites.length > 0 ? 1 : 0);
 
+      // Missing pairCreatedAt means age UNKNOWN. Defaulting it to 0 told the
+      // playbook router this was a seconds-old pool and routed tokens of
+      // unknown age straight into Play 3's "buy within 90s" window.
       const pairCreatedAt = Number(bestPair.pairCreatedAt || 0);
-      const pairAgeSeconds = pairCreatedAt > 0 ? Math.floor((Date.now() - pairCreatedAt) / 1000) : 0;
+      const pairAgeSeconds = pairCreatedAt > 0 ? Math.floor((Date.now() - pairCreatedAt) / 1000) : undefined;
 
       return {
         mint,

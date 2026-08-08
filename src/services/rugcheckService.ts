@@ -1,5 +1,6 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
 import { RugCheckReport, RugCheckTopHolder } from "../types";
+import { bondingCurvePda } from "./curveWatcher";
 
 export interface RugCheckServiceOptions {
   baseUrl?: string;
@@ -96,10 +97,43 @@ export class RugCheckService {
     const holders: RugCheckTopHolder[] = Array.isArray(report.topHolders) ? report.topHolders : [];
 
     // Strip pool-owned balances; they are liquidity, not holder concentration.
-    const realHolders = holders.filter((h) => {
+    //
+    // CRITICAL: the pump.fun bonding curve's token account is owned by a
+    // per-mint PDA (seeds ["bonding-curve", mint]), NOT by the program address
+    // in POOL_OWNERS. Matching only the static list left the curve counted as
+    // a ~93% "holder", which failed every top10/maxSingleHolder gate and
+    // rejected 100% of fresh launches on concentration alone.
+    let curvePdaAddr = '';
+    try { curvePdaAddr = bondingCurvePda(mint).toBase58(); } catch { /* invalid mint string */ }
+
+    // The report's OWN market list names the pool accounts for this specific
+    // token: after migration the AMM pool's token account is owned by the
+    // per-pool market pubkey (verified live 2026-08-07 on a pump_fun_amm
+    // report), which no static address list can anticipate. Without this,
+    // every migrated token showed its own pool as a 20-80% "holder" and
+    // failed the concentration gates.
+    const marketAccounts = new Set<string>();
+    for (const m of (report.markets ?? []) as any[]) {
+      for (const key of ['pubkey', 'liquidityA', 'liquidityB', 'liquidityAAccount', 'liquidityBAccount', 'mintLP']) {
+        const v = m?.[key];
+        if (typeof v === 'string' && v.length > 30) marketAccounts.add(v);
+      }
+      const lpMint = m?.lp?.lpMint;
+      if (typeof lpMint === 'string' && lpMint.length > 30) marketAccounts.add(lpMint);
+    }
+
+    // RugCheck also marks pool accounts explicitly on some reports.
+    const isPool = (h: RugCheckTopHolder & { isPool?: boolean; pool?: boolean }) => {
       const owner = h.owner || h.address || '';
-      return !POOL_OWNERS.has(owner) && !POOL_OWNERS.has(h.address || '');
-    });
+      const addr = h.address || '';
+      return POOL_OWNERS.has(owner)
+        || POOL_OWNERS.has(addr)
+        || (curvePdaAddr !== '' && (owner === curvePdaAddr || addr === curvePdaAddr))
+        || marketAccounts.has(owner)
+        || marketAccounts.has(addr)
+        || Boolean((h as any).isPool || (h as any).pool);
+    };
+    const realHolders = holders.filter((h) => !isPool(h));
 
     // Aggregate by OWNER before ranking. RugCheck lists token ACCOUNTS, and one
     // owner can hold several, so summing rows double-counts them. Observed

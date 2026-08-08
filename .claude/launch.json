@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "sniper-server",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeExecutable": "C:\\Users\\Maxim\\pumpfun-sniper-bot-master\\.claude\\run-server.cmd",
+      "runtimeArgs": [],
       "port": 3001
     },
     {

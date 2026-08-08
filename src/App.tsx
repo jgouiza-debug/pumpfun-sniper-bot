@@ -33,7 +33,8 @@ export function App() {
     tradingMode: 'paper',
     leniencyMode: 'strict',
     privateKey: '',
-    heliusApiKey: 'dfc72823-152b-468b-936e-57935ae27b08',
+    // No baked-in key: the server supplies its configured key via /api/bot/status.
+    heliusApiKey: '',
   });
 
   // Photon wallet linking state. The key only ever lives in this input until

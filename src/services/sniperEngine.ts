@@ -63,6 +63,14 @@ export interface InternalPosition extends Position {
   pool?: PoolSnapshot;
   /** Simulated costs paid so far (paper mode with honestPaper). */
   simulatedFeesSol?: number;
+  /**
+   * Live price derived from the bonding-curve account (vSol/vTokens), kept
+   * fresh by CurveWatcher. Pre-migration tokens have no DexScreener pair, so
+   * without this the position had NO working price — and therefore no
+   * stop-loss or take-profit — until the 30-minute time stop.
+   */
+  lastCurvePriceUsd?: number;
+  lastCurvePriceAt?: number;
 }
 
 export class SniperEngine {
@@ -71,14 +79,20 @@ export class SniperEngine {
     tradingMode: 'paper',
     leniencyMode: 'strict',  // the only supported profile — see updateConfig
     activePlaybook: 'ALL',
-    buyAmountSol: 0.05,      // strict default ~$10 @ $200/SOL
+    // 0.05 SOL carries an 11.1% round-trip cost (fees are fixed, size is not)
+    // — structurally unprofitable at any win rate a sniper can realistically
+    // sustain. 0.3 SOL brings breakeven under ~4.2%.
+    buyAmountSol: 0.3,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
     stopLossPct: 35,
     useTrailingStop: true,
     trailingStopPct: 20,
     maxHoldSeconds: 1800,
-    maxActivePositions: 99999, // Unlimited active positions
+    // Concurrency IS the exposure limit: every position is buyAmountSol at
+    // risk on a 60-80%-rug asset class. 99999 ("unlimited") let the bot
+    // spread the whole wallet across garbage simultaneously.
+    maxActivePositions: 5,
     priorityFeeSol: 0.001,
     maxPriorityFeeSol: 0.005,
     maxSlippagePct: 15,
@@ -86,12 +100,14 @@ export class SniperEngine {
     solPriceUsd: 200,
     bankrollUsd: 100,
     maxHourlyLossUsd: 25,
-    maxBreakevenPct: 15,
+    // 15 made the economics gate decorative (0.05 SOL @ 11.1% passed). 6 is
+    // the audit's number: refuse any trade that needs >6% just to break even.
+    maxBreakevenPct: 6,
     privateKey: '',
-    // Prefer the environment; the literal fallback keeps existing setups
-    // working but this key is exposed in source history — ROTATE it and set
-    // HELIUS_API_KEY instead.
-    heliusApiKey: process.env.HELIUS_API_KEY || 'dfc72823-152b-468b-936e-57935ae27b08',
+    // Environment only. The old hardcoded fallback key was publicly exposed
+    // in source history and has been removed — set HELIUS_API_KEY (or enter a
+    // key in Settings).
+    heliusApiKey: process.env.HELIUS_API_KEY || '',
   };
 
   private marketRegime: MarketRegime = 'RISK_ON';
@@ -151,7 +167,10 @@ export class SniperEngine {
       rateLimitMs: 200,
     });
 
-    const apiKey = this.config.heliusApiKey || 'dfc72823-152b-468b-936e-57935ae27b08';
+    const apiKey = this.config.heliusApiKey;
+    if (!apiKey) {
+      this.log('error', '❌ No Helius API key configured — RPC calls will fail. Set the HELIUS_API_KEY environment variable or enter a key in Settings.');
+    }
     const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
 
     this.solanaConnection = new Connection(rpcUrl, 'confirmed');
@@ -231,9 +250,11 @@ export class SniperEngine {
 
   // Returns the recommended SOL buy size for a given leniency mode
   private defaultBuySolForMode(mode: LeniencyMode): number {
-    if (mode === 'strict')  return 0.05;  // ~$10 @ $200/SOL
-    if (mode === 'normal')  return 0.075; // ~$15 @ $200/SOL
-    return 0.1;                           // lenient ~$20 @ $200/SOL
+    // All ≥0.3 SOL: below that, fixed fees push round-trip breakeven past the
+    // 6% economics gate and every entry is refused (correctly).
+    if (mode === 'strict')  return 0.3;
+    if (mode === 'normal')  return 0.35;
+    return 0.4;
   }
 
   public updateConfig(newConfig: Partial<BotConfig>): void {
@@ -870,7 +891,11 @@ export class SniperEngine {
       launchData.uniqueBuyers5m = payload.__watchlistStats.uniqueBuyers5m;
       launchData.buyPressurePct = payload.__watchlistStats.buyPressurePct;
       launchData.volume5mUsd = payload.__watchlistStats.volume5mSol * this.config.solPriceUsd;
+      // Curve fill velocity — the demand signal that actually exists on the
+      // free tier. Without it Play 2's buyer gate is unsatisfiable.
+      launchData.progressVelocity5m = payload.__watchlistStats.progressVelocity5m;
     }
+
 
     // Replace the fabricated liquidity/market-cap placeholders with the curve's
     // REAL numbers. On a bonding curve the exit liquidity is exactly the real
@@ -924,6 +949,17 @@ export class SniperEngine {
       launchData.isBoosted = dexData.isBoosted;
       launchData.pairAgeSeconds = dexData.pairAgeSeconds;
     }
+
+    // A genuine migration moves the curve's ~79 SOL (85 raised minus the
+    // graduation fee) into the new pool, plus the matching token side — both
+    // sides worth ~158 SOL, known a priori from the program. DexScreener takes
+    // minutes to index a fresh pool (measured tonight: liquidity read 0 even
+    // with hasPair true), so waiting for the indexer made Play 3's 90-second
+    // window structurally unreachable. Only assert when the indexer has no
+    // real reading — never overwrite a measured number with an assumption.
+    if (featureFlags.get('playbookRouting') && isMigration && !((dexData?.liquidityUsd ?? 0) > 0)) {
+      launchData.liquidityUsd = Math.max(launchData.liquidityUsd ?? 0, 2 * 79 * this.config.solPriceUsd);
+    }
     latencyTimeline.stamp(mint, 't3FiltersDoneMs');
 
     // Sell-path safety. Replaces the hardcoded sellSimPassed/notHoneypot stubs
@@ -949,9 +985,16 @@ export class SniperEngine {
     const onCurve = useRealData
       && (launchData.vSolInBondingCurve ?? 0) > 0
       && !launchData.hasLiveMarketData;
+    // Off-curve under routing, the floor is ALSO SOL-denominated (the
+    // playbook's "≈30+ SOL"): the strict $8,000 USD floor equals ~111 SOL at
+    // SOL=$72 — tonight's data shows it rejecting 11/11 real graduations,
+    // exactly the failure mode the curve override fixed one phase earlier.
+    // The router still applies its stricter play-specific floors after this.
     const minLiquidityUsdOverride = onCurve
       ? MIN_CURVE_LIQUIDITY_SOL * this.config.solPriceUsd
-      : undefined;
+      : (useRealData && (isMigration || launchData.hasLiveMarketData))
+        ? PLAYBOOK_DEFAULTS.minLiquiditySol * this.config.solPriceUsd
+        : undefined;
 
     const filterResult = this.riskFilter.evaluateToken(report, launchData, { minLiquidityUsdOverride });
     if (honeypotBlocked.length > 0) {
@@ -1079,6 +1122,18 @@ export class SniperEngine {
    * drives the curve-drain structural stop for open positions.
    */
   private async handleCurveUpdate(u: CurveUpdate): Promise<void> {
+    // Keep held positions priced off the live curve. This is what gives an
+    // on-curve position a real chart: DexScreener has nothing pre-migration.
+    const held = this.activePositions.find(p => p.mint === u.mint);
+    if (held && u.vSolInBondingCurve > 0 && u.vTokensInBondingCurve > 0) {
+      held.pool = {
+        vSolInBondingCurve: u.vSolInBondingCurve,
+        vTokensInBondingCurve: u.vTokensInBondingCurve,
+      };
+      held.lastCurvePriceUsd = (u.vSolInBondingCurve / u.vTokensInBondingCurve) * this.config.solPriceUsd;
+      held.lastCurvePriceAt = u.at;
+    }
+
     // --- Structural stop for anything we currently hold ---
     if (featureFlags.get('devSellStop')) {
       const pos = this.activePositions.find(p => p.mint === u.mint);
@@ -1137,7 +1192,11 @@ export class SniperEngine {
   private enrollInWatchlist(payload: any): void {
     if (!featureFlags.get('playbookRouting')) return;
     if (payload.txType === 'migrate' || tokenWatchlist.has(payload.mint)) return;
-    if (!tokenWatchlist.add(payload)) return;
+    const enrolled = tokenWatchlist.add(payload);
+    if (!enrolled.added) return;
+    // The watchlist evicted a token to make room — release its curve
+    // subscription too, or the slot (and the Helius credits) leak.
+    if (enrolled.evicted) this.curveWatcher.unwatch(enrolled.evicted);
 
     // Curve progress comes from Helius accountSubscribe on the bonding-curve
     // PDA. PumpPortal's subscribeTokenTrade is NOT used: it requires an API key
@@ -1191,6 +1250,8 @@ export class SniperEngine {
         uniqueBuyers5m: launchData.uniqueBuyers5m,
         buyPressurePct: launchData.buyPressurePct,
         volume5mUsd: filterResult.volume5mUsd,
+        progressVelocity5m: launchData.progressVelocity5m,
+        buys5m: launchData.buys5m,
         isBoosted: launchData.isBoosted,
         solPriceUsd: this.config.solPriceUsd,
       }, PLAYBOOK_DEFAULTS);
@@ -1362,11 +1423,19 @@ export class SniperEngine {
     if (featureFlags.get('devSellStop')) {
       const creator = (launchData?.creator as string) || undefined;
       devSellMonitor.track(filterResult.mint, creator);
-      // Watch this position's curve so a sharp drain triggers the structural
-      // stop. Identity-level dev-sell attribution needs the paid trade feed;
-      // the drain itself is detectable for free.
+    }
+
+    // Watch this position's curve while it is still pre-migration: the curve
+    // account is the ONLY live price source (exit ladder) and also powers the
+    // drain structural stop. A held position outranks any screening candidate
+    // for one of the 40 subscription slots.
+    if ((featureFlags.get('devSellStop') || featureFlags.get('playbookRouting')) && pool.vSolInBondingCurve) {
       this.curveWatcher.start();
-      this.curveWatcher.watch(filterResult.mint);
+      if (!this.curveWatcher.isWatching(filterResult.mint) && !this.curveWatcher.watch(filterResult.mint)) {
+        const evicted = this.curveWatcher.evictOldest();
+        if (evicted) tokenWatchlist.remove(evicted);
+        this.curveWatcher.watch(filterResult.mint);
+      }
     }
 
     reportService.recordPositionOpened();
@@ -1570,7 +1639,18 @@ export class SniperEngine {
       let currentMarketCap = dexData.hasPair && dexData.marketCapUsd > 0 ? dexData.marketCapUsd : pos.buyPriceUsd * 1000000000;
 
       const timeElapsedSec = Math.floor((Date.now() - pos.entryTime) / 1000);
-      if (!dexData.hasPair) {
+
+      // Pre-migration: no DexScreener pair exists, but the bonding curve
+      // account IS the market — CurveWatcher streams its reserves. A fresh
+      // curve price (<30s) lets the full exit ladder (stop-loss, take-profit,
+      // trailing stop) protect on-curve positions that previously could only
+      // ever time out.
+      const curvePriceFresh =
+        (pos.lastCurvePriceUsd ?? 0) > 0 &&
+        pos.lastCurvePriceAt !== undefined &&
+        Date.now() - pos.lastCurvePriceAt < 30_000;
+
+      if (!dexData.hasPair && !curvePriceFresh) {
         if (this.config.tradingMode === 'real') {
           // Real money: never act on an invented price — no stop-loss or
           // take-profit off a random walk. But a token that never indexes on
@@ -1607,9 +1687,11 @@ export class SniperEngine {
       // mint 243zZgun...pump ($SMISKI) carries 2B supply, which makes the
       // derived price 2x wrong and corrupts P&L and every exit trigger on that
       // position. DexScreener publishes the real per-token price already.
-      const currentPriceUsd = (featureFlags.get('playbookRouting') && dexData.hasPair && dexData.priceUsd > 0)
-        ? dexData.priceUsd
-        : currentMarketCap / 1000000000;
+      const currentPriceUsd = (!dexData.hasPair && curvePriceFresh)
+        ? pos.lastCurvePriceUsd!
+        : (featureFlags.get('playbookRouting') && dexData.hasPair && dexData.priceUsd > 0)
+          ? dexData.priceUsd
+          : currentMarketCap / 1000000000;
       pos.currentPriceUsd = currentPriceUsd;
 
       if (!pos.priceTicks) pos.priceTicks = [];
@@ -1709,6 +1791,10 @@ export class SniperEngine {
 
     this.activePositions = this.activePositions.filter(p => p.id !== pos.id);
     devSellMonitor.untrack(pos.mint);
+    // Free the curve subscription slot unless the screening watchlist still
+    // has a claim on this mint.
+    if (!tokenWatchlist.has(pos.mint)) this.curveWatcher.unwatch(pos.mint);
+    this.curvePeakSol.delete(pos.mint);
 
     const sellPriceUsd = tokensSold > 0 ? proceedsUsd / tokensSold : pos.currentPriceUsd;
     const finalPnlPct = pos.investedUsd > 0

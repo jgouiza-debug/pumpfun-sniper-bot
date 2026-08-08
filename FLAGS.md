@@ -88,3 +88,44 @@ real metadata and every token displayed as `$PUMP`. Fixed unconditionally.
 - `HELIUS_API_KEY` env var overrides the key baked into source. **Rotate the
   baked-in key** — it is exposed in source history.
 - `jitoTipSol` in config remains unwired (no Jito bundle path exists yet).
+
+# Second audit — 2026-08-07
+
+The first audit's fixes were correct but **never enabled**: no `flags.json`
+existed, so the bot still ran 100% legacy behavior. `flags.json` now ships with
+the paper-safe set ON (honestPaper, playbookRouting, enforceTradeEconomics,
+shadowGateV2, strictMigrationDetect, killSwitch, concurrentExits,
+honeypotChecks, devSellStop, dynamicPriorityFee). `entryGateV2` and
+`localTxBuild` remain OFF pending shadow evidence.
+
+Fixed unconditionally this round:
+
+1. **RugCheck pool filter matched program IDs, not the per-mint bonding-curve
+   PDA** — the curve counted as a ~93% "holder", so concentration gates
+   rejected every fresh launch. Now computes `bondingCurvePda(mint)`.
+2. **Play 2 and Play 4 were dead code on the free data tier**: the router
+   demanded unique-buyer counts only the paid trade feed provides. Now falls
+   back to curve fill velocity (Play 2) and DexScreener 5m buys (Play 4).
+3. **35 free score points** (demand base 20 + narrative constant 15) meant a
+   zero-data token scored 65 and out-scored badly-measured ones. All points
+   are now earned from measured signals; velocity substitutes for buyers.
+4. **On-curve positions had no working price** (no DexScreener pair
+   pre-migration) — no stop-loss or take-profit until the 30-min time stop.
+   CurveWatcher now feeds live curve prices into the exit ladder, and every
+   on-curve position gets a curve subscription (not just with devSellStop).
+5. **A failed DexScreener batch call cached zeros over good prices** for every
+   open position at once. Transport failures now serve stale data.
+6. **Unknown pair age was treated as 0 seconds** — tokens of unknown age were
+   routed into Play 3's 90-second migration window. Unknown now classifies as
+   POST_MIGRATION.
+7. **Migration liquidity is asserted, not polled**: a graduation moves ~79 SOL
+   by construction; waiting for the indexer made Play 3 unreachable inside its
+   own window.
+8. **Buy pressure is notional-weighted** (SOL flow), not event-counted —
+   twenty dust sells no longer outvote one 5-SOL buy.
+9. **Watchlist eviction leaked curve subscriptions**; eviction now reports the
+   victim and the engine unsubscribes it. Positions release their slot on close.
+10. **Defaults**: buyAmountSol 0.05→0.3 SOL (breakeven 11.1%→~4.2%),
+    maxActivePositions 99999→5, maxBreakevenPct 15→6, strict LP-lock floor 50%.
+11. **API binds loopback only** — it previously listened on all interfaces
+    while holding a signing key, despite a comment claiming otherwise.

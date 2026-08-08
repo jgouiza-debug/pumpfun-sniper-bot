@@ -431,10 +431,13 @@ console.log('\n-- Liquidity floor: unsatisfiable on a bonding curve --');
   const rug: any = { mint:'M', score:1, isInferred:false,
     token:{ mintAuthority:null, freezeAuthority:null, supply:1e9, decimals:6 },
     fileMeta:{ top10Pct:15, maxSingleHolderPct:5, insiderPct:0, holderSampleSize:30 } };
-  // A token at 45% of its curve — the Play 2 sweet spot.
+  // A token at 45% of its curve — the Play 2 sweet spot. Demand is MEASURED
+  // (curve velocity + notional buy pressure): since the 2026-08-07 scoring fix
+  // there are no free demand points, so a "healthy" token must show demand.
   const curveSol = 0.45 * GRAD_SOL;
   const launch: any = { mint:'M', liquidityUsd: curveSol * SOL_USD, marketCapUsd: 30000,
-    top10Pct:15, devHoldingsPct:4, bundledSupplyPct:2, washScore:0 };
+    top10Pct:15, devHoldingsPct:4, bundledSupplyPct:2, washScore:0,
+    volume5mUsd: 600, progressVelocity5m: 4, buyPressurePct: 75, socialCount: 1 };
 
   test('OLD BUG reproduced: $8k floor rejects a healthy mid-curve token', () => {
     const rf = new RiskFilter(); rf.setLeniencyMode('strict');

@@ -50,6 +50,10 @@ export class RiskFilter {
     if (mode === 'strict') {
       this.config.minLiquidityUsd = 8000;
       this.config.minScoreToTrade = 62;
+      // Was 0 (constructor default), making the LP-lock gate `lockedPct >= 0`
+      // — literally always true. Post-migration pump.fun burns LP, so a real
+      // pool reports ~100; demanding a majority locked/burned costs nothing.
+      this.config.minLpLockedPct = 50;
       this.config.maxSingleHolderPct = 12;
       this.config.maxTop10Pct = 30;
       this.config.maxBundledSupplyPct = 25;
@@ -221,14 +225,38 @@ export class RiskFilter {
       else deployerScore = 10;
     }
 
-    let demandScore = 20;
-    if (launch.volume5mUsd && launch.volume5mUsd >= 500) demandScore += 5;
-    if (launch.uniqueBuyers5m && launch.uniqueBuyers5m >= 10) demandScore += 5;
+    // Demand must be EARNED from measured signals — the old version granted a
+    // free base of 20 plus a constant narrative 15, so a token with zero data
+    // scored 65 and out-scored tokens whose measured data was merely mediocre.
+    // Ignorance can never outrank measurement.
+    let demandScore = 0;
+    const vol = launch.volume5mUsd ?? 0;
+    if (vol >= 500) demandScore += 8;
+    if (vol >= 2000) demandScore += 4;
 
-    let narrativeScore = 15;
+    const buyers = launch.uniqueBuyers5m ?? 0;
+    if (buyers > 1) {
+      // Real buyer attribution (trade feed). The most wash-resistant signal.
+      if (buyers >= 10) demandScore += 10;
+      if (buyers >= 25) demandScore += 6;
+    } else if (launch.progressVelocity5m !== undefined) {
+      // Free-tier fallback: curve fill velocity (percentage points / 5m).
+      if (launch.progressVelocity5m >= 2) demandScore += 10;
+      if (launch.progressVelocity5m >= 4) demandScore += 6;
+    }
+
+    const pressure = launch.buyPressurePct ?? 0;
+    if (pressure >= 60) demandScore += 6;
+    if (pressure >= 75) demandScore += 4;
+    demandScore = Math.min(30, demandScore);
+
+    // Narrative: only what is actually observable (socials/website on the DEX
+    // listing). No constant credit.
+    let narrativeScore = Math.min(15, (launch.socialCount ?? 0) * 5);
 
     let penalties = 0;
     if ((launch.washScore || 0) > 60) penalties += 5;
+    if (launch.isBoosted) penalties += 10; // paid visibility correlates with negative returns
 
     const totalScore = Math.max(0, Math.min(100, distributionScore + deployerScore + demandScore + narrativeScore - penalties));
 
