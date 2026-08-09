@@ -1,5 +1,77 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { BotConfig, BotInstanceInfo, BotStatusResponse, FilterResult, LeniencyMode, Position } from './types';
+import { BotConfig, BotInstanceInfo, BotStatusResponse, FilterResult, LeniencyMode, Position, TradeHistoryRecord } from './types';
+
+// A txid proves execution only when it's a real signature — paper fills carry
+// a sim_ prefix and never touched the chain.
+const isOnChainTxid = (txid?: string): boolean => Boolean(txid && !txid.startsWith('sim_'));
+
+// The console wipes completely on this cycle, so a fast screening stream stays
+// readable instead of scrolling into a wall of text.
+const LOG_WIPE_INTERVAL_MS = 5_000;
+
+// Below this share, an exit did not close the position — it left a remainder.
+const FULL_EXIT_THRESHOLD = 0.95;
+
+const qty = (n?: number): string => {
+  if (!n || !isFinite(n)) return '—';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toFixed(n < 10 ? 2 : 0);
+};
+
+/**
+ * What this exit actually did on-chain. A "sell everything" that only moved a
+ * sliver used to render identically to a clean close — which is exactly how a
+ * 4.5% fill got reported as a closed position at -96.8%.
+ */
+function ExitFillBadge({ trade }: { trade: TradeHistoryRecord }) {
+  const fraction = trade.fractionSold;
+  if (fraction === undefined) {
+    return <span style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>{qty(trade.tokensSold)}</span>;
+  }
+  const pct = fraction * 100;
+  const partial = fraction < FULL_EXIT_THRESHOLD;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>
+        {qty(trade.tokensSold)} ({pct < 10 ? pct.toFixed(1) : Math.round(pct)}%)
+      </span>
+      {partial && (
+        <span
+          className="status-badge"
+          style={{ color: '#fbbf24', borderColor: '#fbbf24' }}
+          title={`Only ${pct.toFixed(1)}% of the position was sold. The rest was still held after this order.`}
+        >
+          PARTIAL FILL
+        </span>
+      )}
+    </div>
+  );
+}
+
+function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean }) {
+  if (!isOnChainTxid(txid)) {
+    return (
+      <span className="status-badge" title="Paper fill — this trade was simulated and never sent to the chain">
+        SIMULATED
+      </span>
+    );
+  }
+  return (
+    <a
+      href={`https://solscan.io/tx/${txid}`}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="status-badge"
+      style={{ color: verified ? '#00e676' : '#fbbf24', borderColor: verified ? '#00e676' : '#fbbf24', textDecoration: 'none' }}
+      title={verified
+        ? 'Confirmed on-chain — quantities read back from the actual fill. Click to view on Solscan.'
+        : 'Submitted and confirmed on-chain — fill details are estimated. Click to view on Solscan.'}
+    >
+      {verified ? 'ON-CHAIN ✓' : 'ON-CHAIN ↗'}
+    </a>
+  );
+}
 
 export function App() {
   // Multi-Instance State
@@ -86,6 +158,7 @@ export function App() {
 
   const wallet = botStatus?.wallet;
   const run = botStatus?.run;
+  const sizing = botStatus?.sizing;
 
   // Runtime clock: derived from the server's run start timestamp but ticked
   // locally every second, so it counts smoothly even between status frames.
@@ -189,8 +262,23 @@ export function App() {
   // True while the SSE stream is delivering — drives the LIVE indicator.
   const [streamLive, setStreamLive] = useState<boolean>(false);
 
-  // Real-time status: the server pushes over SSE (~1/s). If the stream can't
-  // be established (old server build, transient outage) fall back to polling.
+  // Console wipe cycle. `logClearedAt` is the cutoff every rendered line must
+  // beat; `wipeTick` just drives the countdown display.
+  const [logClearedAt, setLogClearedAt] = useState<number>(() => Date.now());
+  const [wipeTick, setWipeTick] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const now = Date.now();
+      setWipeTick(now);
+      setLogClearedAt(prev => (now - prev >= LOG_WIPE_INTERVAL_MS ? now : prev));
+    }, 500);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Real-time status: the server pushes over SSE the moment anything changes
+  // (order submitted, fill confirmed, price moved), coalesced to at most one
+  // frame per 100ms. If the stream can't be established (old server build,
+  // transient outage) fall back to polling.
   useEffect(() => {
     let closed = false;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -214,7 +302,9 @@ export function App() {
         } catch { /* offline on this port */ }
       };
       fetchStatus();
-      pollTimer = setInterval(fetchStatus, 1500);
+      // Polling is the degraded path; keep it tight enough that a fill is still
+      // visible within a fraction of a second when SSE is unavailable.
+      pollTimer = setInterval(fetchStatus, 600);
     };
 
     // EventSource auto-reconnects through transient drops on its own. Only
@@ -257,20 +347,107 @@ export function App() {
     terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [botStatus?.logs]);
 
+  // Auto-open Photon & Solscan pages when a real trade occurs
+  const autoOpenedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (botStatus?.tradingMode === 'real') {
+      botStatus.activePositions?.forEach(pos => {
+        const key = `${pos.mint}_${pos.buyTxid || 'nobuy'}`;
+        if (pos.mint && !autoOpenedRef.current.has(key)) {
+          autoOpenedRef.current.add(key);
+          window.open(`https://photon-sol.tinyastro.io/en/lp/${pos.mint}`, '_blank');
+          if (pos.buyTxid && !pos.buyTxid.startsWith('sim_')) {
+            window.open(`https://solscan.io/tx/${pos.buyTxid}`, '_blank');
+          }
+        }
+      });
+      botStatus.tradeHistory?.forEach(t => {
+        const key = `trade_${t.id}_${t.sellTxid || 'nosell'}`;
+        if (t.sellTxid && !t.sellTxid.startsWith('sim_') && !autoOpenedRef.current.has(key)) {
+          autoOpenedRef.current.add(key);
+          window.open(`https://solscan.io/tx/${t.sellTxid}`, '_blank');
+        }
+      });
+    }
+  }, [botStatus?.activePositions, botStatus?.tradeHistory, botStatus?.tradingMode]);
+
   // Toggle Bot Power ON / OFF
   const toggleBotPower = async () => {
+    const targetState = !botStatus?.isBotActive;
     try {
-      const res = await fetch(`http://localhost:${selectedPort}/api/bot/toggle`, {
+      const res = await fetch('/api/bot/toggle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: !botStatus?.isBotActive })
+        body: JSON.stringify({ active: targetState })
       });
       const data = await res.json();
       if (data.success && botStatus) {
         setBotStatus({ ...botStatus, isBotActive: data.isBotActive });
       }
     } catch (err) {
-      console.error("Toggle bot error:", err);
+      try {
+        const res = await fetch(`http://localhost:${selectedPort}/api/bot/toggle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active: targetState })
+        });
+        const data = await res.json();
+        if (data.success && botStatus) {
+          setBotStatus({ ...botStatus, isBotActive: data.isBotActive });
+        }
+      } catch (e) {
+        console.error("Toggle bot error:", e);
+      }
+    }
+  };
+
+  // Emergency Cease / Stop Bot
+  const handleEmergencyStop = async () => {
+    try {
+      await fetch('/api/bot/kill', { method: 'POST' }).catch(() => {});
+      await fetch('/api/bot/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: false })
+      }).catch(() => {});
+      if (botStatus) {
+        setBotStatus({ ...botStatus, isBotActive: false });
+      }
+    } catch (err) {
+      console.error("Emergency stop error:", err);
+    }
+  };
+
+  // Close & Kill Dev Server Process Completely
+  const handleShutdownServer = async () => {
+    if (!window.confirm("Are you sure you want to CLOSE and KILL the dev server process?")) return;
+    try {
+      await fetch('/api/server/shutdown', { method: 'POST' });
+    } catch (err) {
+      // Ignored - process exits
+    }
+    alert("Dev server process has been shut down.");
+  };
+
+  // Clear Execution Receipts & Trade History
+  const handleClearHistory = async () => {
+    if (!window.confirm("Are you sure you want to clear all execution receipts and closed trade history?")) return;
+    try {
+      const res = await fetch('/api/bot/clear-history', { method: 'POST' });
+      const data = await res.json();
+      if (data.success && botStatus) {
+        setBotStatus({ ...botStatus, tradeHistory: [] });
+      }
+    } catch (err) {
+      try {
+        const res = await fetch(`http://localhost:${selectedPort}/api/bot/clear-history`, { method: 'POST' });
+        const data = await res.json();
+        if (data.success && botStatus) {
+          setBotStatus({ ...botStatus, tradeHistory: [] });
+        }
+      } catch (e) {
+        console.error("Clear receipts error:", e);
+      }
     }
   };
 
@@ -329,7 +506,15 @@ export function App() {
   const isBotActive = botStatus?.isBotActive || false;
   const currentLeniency = botStatus?.config?.leniencyMode || 'strict';
   const activePositions = botStatus?.activePositions || [];
+  const tradeHistory: TradeHistoryRecord[] = botStatus?.tradeHistory || [];
   const logs = botStatus?.logs || [];
+
+  // Only lines produced since the last wipe are rendered. The server keeps a
+  // longer buffer and re-sends it on every frame, so filtering by the wipe
+  // timestamp is what actually clears the view — clearing local state alone
+  // would be undone by the next status push a fraction of a second later.
+  const visibleLogs = logs.filter(l => l.timestamp >= logClearedAt);
+  const secondsToWipe = Math.max(0, Math.ceil((logClearedAt + LOG_WIPE_INTERVAL_MS - wipeTick) / 1000));
   const stats = botStatus?.stats || { totalTrades: 0, winCount: 0, lossCount: 0, winRatePct: 0, totalNetPnlUsd: 0, totalNetPnlSol: 0 };
 
   return (
@@ -364,20 +549,39 @@ export function App() {
           </button>
         </div>
 
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
           <button className="btn-terminal-outline" onClick={() => setShowConfigModal(true)}>
             SETTINGS
           </button>
 
+          <button className="btn-terminal-outline" onClick={handleClearHistory} style={{ borderColor: 'var(--ink-secondary)' }}>
+            🗑️ CLEAR RECEIPTS
+          </button>
+
           <button 
             className="btn-terminal" 
-            onClick={toggleBotPower}
+            onClick={isBotActive ? handleEmergencyStop : toggleBotPower}
             style={{
-              background: isBotActive ? 'var(--accent-olive)' : 'var(--ink-primary)',
-              borderColor: isBotActive ? 'var(--accent-olive)' : 'var(--ink-primary)'
+              background: isBotActive ? '#d32f2f' : 'var(--accent-olive)',
+              borderColor: isBotActive ? '#d32f2f' : 'var(--accent-olive)',
+              color: '#ffffff',
+              fontWeight: 700
             }}
           >
-            {isBotActive ? 'CEASE BOT' : 'START BOT'}
+            {isBotActive ? '⏹ CEASE / STOP BOT' : '▶ START BOT'}
+          </button>
+
+          <button 
+            className="btn-terminal" 
+            onClick={handleShutdownServer}
+            style={{
+              background: '#8b0000',
+              borderColor: '#ff1744',
+              color: '#ffffff',
+              fontWeight: 700
+            }}
+          >
+            💀 KILL DEV SERVER
           </button>
         </div>
       </header>
@@ -492,6 +696,39 @@ export function App() {
               : 'PAPER MODE ONLY'}
           </div>
         </div>
+
+        {/* Next order size — recomputed from the live balance every frame, by
+            the same maths the buy path uses. */}
+        <div className="stat-card" style={{ border: sizing?.allInEnabled ? '1px solid rgba(251,191,36,0.4)' : undefined }}>
+          <div className="stat-label">
+            Next Entry Size
+            {sizing?.allInEnabled && (
+              <span style={{ float: 'right', fontSize: '9px', color: '#fbbf24' }}>ALL-IN</span>
+            )}
+          </div>
+          <div className="stat-value-mono" style={{ color: sizing?.allInEnabled ? '#fbbf24' : undefined }}>
+            {sizing ? `${sizing.nextBuySol} SOL` : '—'}
+          </div>
+          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+            {sizing
+              ? sizing.allInEnabled
+                ? `≈ $${sizing.nextBuyUsd} · ${sizing.deployableSol} SOL DEPLOYABLE LESS FEES`
+                : `≈ $${sizing.nextBuyUsd} × ${sizing.tradesAffordable} TRADE${sizing.tradesAffordable === 1 ? '' : 'S'} FROM ${sizing.deployableSol} SOL`
+              : 'AWAITING STATUS'}
+          </div>
+          {/* Fee drag is the number that decides whether small stakes can work
+              at all — show it next to the stake, not buried in a report. */}
+          {sizing && sizing.breakevenPct > 0 && (
+            <div style={{
+              fontSize: '10px',
+              marginTop: '3px',
+              fontFamily: 'var(--font-mono)',
+              color: sizing.breakevenPct > 10 ? '#ef4444' : sizing.breakevenPct > 6 ? '#fbbf24' : '#00e676',
+            }}>
+              NEEDS +{sizing.breakevenPct}% TO BREAK EVEN
+            </div>
+          )}
+        </div>
       </section>
 
       {/* Main Single-Screen Split Grid (Zero Forced Page Scrolling) */}
@@ -583,6 +820,7 @@ export function App() {
                     <th>Asset</th>
                     <th>Playbook</th>
                     <th className="num-col">Capital (SOL)</th>
+                    <th className="num-col">Tokens Held</th>
                     <th className="num-col">Entry Price</th>
                     <th className="num-col">Current Price</th>
                     <th className="num-col">Unrealized PNL</th>
@@ -603,20 +841,37 @@ export function App() {
                         </span>
                       </td>
                       <td className="num-col">{pos.investedSol} SOL (${pos.investedUsd})</td>
+                      <td className="num-col" title={`${pos.tokensHeld} tokens still held on-chain`}>
+                        {qty(pos.tokensHeld)}
+                      </td>
                       <td className="num-col">${pos.buyPriceUsd.toFixed(6)}</td>
                       <td className="num-col">${pos.currentPriceUsd.toFixed(6)}</td>
                       <td className={`num-col ${pos.pnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
                         {pos.pnlUsd >= 0 ? '+' : ''}${pos.pnlUsd.toFixed(2)} ({pos.pnlPct >= 0 ? '+' : ''}{pos.pnlPct}%)
                       </td>
                       <td>
-                        {pos.principalRecovered ? (
-                          <span className="status-badge positive">RECOVERED</span>
-                        ) : (
-                          <span className="status-badge">ACTIVE</span>
-                        )}
+                        <div style={{ display: 'inline-flex', flexDirection: 'column', gap: '3px' }}>
+                          {pos.principalRecovered ? (
+                            <span className="status-badge positive">RECOVERED</span>
+                          ) : (
+                            <span className="status-badge">ACTIVE</span>
+                          )}
+                          <TxProofBadge txid={pos.buyTxid} verified={pos.fillVerified} />
+                        </div>
                       </td>
                       <td style={{ textAlign: 'right' }}>
                         <div style={{ display: 'inline-flex', gap: '4px' }}>
+                          {isOnChainTxid(pos.buyTxid) && (
+                            <a
+                              href={`https://solscan.io/tx/${pos.buyTxid}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn-terminal-outline"
+                              style={{ padding: '2px 6px', fontSize: '9px' }}
+                            >
+                              SOLSCAN
+                            </a>
+                          )}
                           <a
                             href={`https://photon-sol.tinyastro.io/en/lp/${pos.mint}`}
                             target="_blank"
@@ -637,20 +892,90 @@ export function App() {
               </table>
             )}
           </div>
+
+          {/* Execution receipts — permanent record of every closed leg. The
+              Execution column is the ground truth the 10-second log feed can't
+              give: a real fill links to its Solscan tx, a paper fill says so. */}
+          <div className="section-header" style={{ marginTop: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div className="section-title">Execution Receipts — Closed Trades</div>
+              <div className="section-count">
+                {tradeHistory.filter(t => isOnChainTxid(t.sellTxid)).length} ON-CHAIN / {tradeHistory.length} TOTAL
+              </div>
+            </div>
+            {tradeHistory.length > 0 && (
+              <button 
+                className="btn-terminal-outline" 
+                onClick={handleClearHistory}
+                style={{ fontSize: '10px', padding: '2px 8px', color: '#ff1744', borderColor: '#ff1744' }}
+              >
+                🗑️ CLEAR RECEIPTS
+              </button>
+            )}
+          </div>
+          <div className="matrix-container flex-matrix">
+            {tradeHistory.length === 0 ? (
+              <div className="empty-state">
+                No closed trades yet. Real fills appear here with an ON-CHAIN ✓ link to their Solscan
+                transaction; paper fills are labeled SIMULATED.
+              </div>
+            ) : (
+              <table className="matrix-table">
+                <thead>
+                  <tr>
+                    <th>Closed</th>
+                    <th>Asset</th>
+                    <th className="num-col">P&amp;L</th>
+                    <th className="num-col">Sold</th>
+                    <th>Execution</th>
+                    <th>Exit Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tradeHistory.slice(0, 12).map((t, i) => (
+                    <tr key={`${t.id}_${t.exitTime}_${i}`}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>
+                        {new Date(t.exitTime).toLocaleTimeString()}
+                      </td>
+                      <td>
+                        <span className="cell-symbol">${t.tokenSymbol}</span>
+                      </td>
+                      <td className={`num-col ${t.pnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
+                        {t.pnlUsd >= 0 ? '+' : ''}${t.pnlUsd.toFixed(2)} ({t.pnlPct >= 0 ? '+' : ''}{t.pnlPct}%)
+                      </td>
+                      <td className="num-col">
+                        <ExitFillBadge trade={t} />
+                      </td>
+                      <td>
+                        <TxProofBadge txid={t.sellTxid} verified={t.fillVerified} />
+                      </td>
+                      <td style={{ fontSize: '10px', color: 'var(--ink-muted)', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.exitReason}>
+                        {t.exitReason}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
         </div>
 
         {/* Right Column: System Logs Console Feed (Full Height Auto-Scroll) */}
         <div className="viewport-column">
           <div className="section-header">
             <div className="section-title">System Logs & Event Stream — Port {selectedPort}</div>
-            <div className="section-count">REALTIME AUDIT FEED</div>
+            <div className="section-count">
+              {visibleLogs.length} LINE{visibleLogs.length === 1 ? '' : 'S'} · WIPES IN {secondsToWipe}s
+            </div>
           </div>
 
           <div className="console-container">
-            {logs.filter(l => l.level !== 'gate0' && (Date.now() - l.timestamp) <= 10000).length === 0 ? (
-              <div style={{ color: 'var(--ink-muted)' }}>Console initialized on Port {selectedPort}. Awaiting system events...</div>
+            {visibleLogs.length === 0 ? (
+              <div style={{ color: 'var(--ink-muted)' }}>
+                Console cleared. Screening activity appears here as it happens.
+              </div>
             ) : (
-              logs.filter(l => l.level !== 'gate0' && (Date.now() - l.timestamp) <= 10000).map(log => (
+              visibleLogs.map(log => (
                 <div key={log.id} className="log-line">
                   <span className="log-time">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
                   <span className={`log-level-${log.level}`}>

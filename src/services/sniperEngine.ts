@@ -27,7 +27,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, blockAllInEntry, isFullConviction } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, blockAllInEntry, isFullConviction, maxAffordableBuySol, sellAmountParam } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -56,6 +56,38 @@ export interface PriceTick {
   priceUsd: number;
 }
 
+/**
+ * Exit-check cadence. Every tick is one batched DexScreener request (up to 30
+ * mints), so 1s costs ~60 req/min against a 240/min bucket that reserves 60 for
+ * screening — comfortably inside it, and it halves the worst-case lag between a
+ * stop-loss level being breached and the sell going out.
+ */
+const POSITION_MONITOR_INTERVAL_MS = 1000;
+
+/**
+ * How long a log line stays in the API feed. The console wipes on a 5s cycle,
+ * so anything older is never rendered — and since SSE ships the whole status
+ * object on every change (up to 10x/sec), holding more just inflates every
+ * frame with verbose screening chatter nobody will see.
+ */
+const LOG_RETENTION_MS = 12_000;
+
+/**
+ * Minimum RugCheck holder rows before a concentration reading counts as a
+ * measurement. Calibrated on 46 recorded graduations (2026-08-09): genuine
+ * distributions arrive with 19 rows and hundreds of total holders, while the
+ * garbage readings that let rugs through had 0-1 rows.
+ */
+const MIN_HOLDER_SAMPLE = 5;
+const MIN_TOTAL_HOLDERS = 10;
+
+/**
+ * Ceiling on RugCheck's own aggregate risk score. Across those same 46
+ * graduations every cleanly distributed token scored 1; everything RugCheck
+ * flagged danger-level scored 2011+. Matches EntryGateV2's existing default.
+ */
+const MAX_RUGCHECK_SCORE = 1000;
+
 export interface InternalPosition extends Position {
   priceTicks?: PriceTick[];
   realizedPnlUsd: number;
@@ -71,6 +103,10 @@ export interface InternalPosition extends Position {
    */
   lastCurvePriceUsd?: number;
   lastCurvePriceAt?: number;
+  /** Consecutive failed real sell attempts; drives the fee-burn backoff. */
+  sellFailCount?: number;
+  /** Epoch ms before which no automatic sell retry may be attempted. */
+  sellRetryAfterMs?: number;
 }
 
 export class SniperEngine {
@@ -93,9 +129,9 @@ export class SniperEngine {
     // risk on a 60-80%-rug asset class. 99999 ("unlimited") let the bot
     // spread the whole wallet across garbage simultaneously.
     maxActivePositions: 5,
-    priorityFeeSol: 0.001,
+    priorityFeeSol: 0.003,
     maxPriorityFeeSol: 0.005,
-    maxSlippagePct: 15,
+    maxSlippagePct: 25,
     jitoTipSol: 0.001,   // NOT wired to anything — reserved for a future Jito bundle path
     solPriceUsd: 200,
     bankrollUsd: 100,
@@ -104,10 +140,11 @@ export class SniperEngine {
     // the audit's number: refuse any trade that needs >6% just to break even.
     maxBreakevenPct: 6,
     privateKey: '',
-    // Environment only. The old hardcoded fallback key was publicly exposed
-    // in source history and has been removed — set HELIUS_API_KEY (or enter a
-    // key in Settings).
-    heliusApiKey: process.env.HELIUS_API_KEY || 'c8547397-ee14-46c2-b10b-85a1eccbaa32',
+    // Environment only — never a literal. The comment here used to claim the
+    // hardcoded fallback had been removed while the key was still sitting in
+    // the expression below it. Set HELIUS_API_KEY in .env (loaded natively via
+    // --env-file-if-exists) or paste a key into Settings.
+    heliusApiKey: process.env.HELIUS_API_KEY || '',
   };
 
   private marketRegime: MarketRegime = 'RISK_ON';
@@ -146,6 +183,8 @@ export class SniperEngine {
   private priorityFeeService: PriorityFeeService;
   // One kill-switch trip per pause: reset when the bot is (re)started.
   private killSwitchTripped = false;
+  /** SSE/UI subscribers notified the moment state changes. See onChange(). */
+  private changeListeners = new Set<() => void>();
   // Migration event arrival times, so Play 3's 90-second window is measured
   // from the real graduation rather than guessed.
   private migrationSeenAt = new Map<string, number>();
@@ -188,6 +227,12 @@ export class SniperEngine {
     }
 
     this.log('info', `⚡ Smart Sniper Engine Initialized (${this.config.leniencyMode.toUpperCase()} Mode Active)`);
+
+    // Fail loudly rather than limping along with an unusable RPC URL: without a
+    // key every balance read, fill inspection and submission silently errors.
+    if (!this.config.heliusApiKey) {
+      this.log('error', '❌ No HELIUS_API_KEY set. Add it to .env (or paste a key in Settings) — the RPC cannot be reached without one.');
+    }
 
     if (this.wallet.isLinked()) {
       this.log('info', `🔗 Photon wallet auto-linked from ${this.wallet.getStatus(this.config.solPriceUsd).source.toUpperCase()}: ${this.wallet.getAddress()}`);
@@ -503,11 +548,13 @@ export class SniperEngine {
   public getStatus(): BotStatusResponse {
     const now = Date.now();
 
-    // Drop logs older than 10s. Find the cutoff and splice once rather than
-    // rebuilding the array — entries are already in timestamp order.
-    if (this.logs.length > 0 && now - this.logs[0].timestamp > 10000) {
+    // Age out old logs. Find the cutoff and splice once rather than rebuilding
+    // the array — entries are already in timestamp order. The window was 10s,
+    // which was shorter than a single confirmation wait: the "submitted" line
+    // for a trade could expire before its "confirmed" line ever arrived.
+    if (this.logs.length > 0 && now - this.logs[0].timestamp > LOG_RETENTION_MS) {
       let cut = 0;
-      while (cut < this.logs.length && now - this.logs[cut].timestamp > 10000) cut++;
+      while (cut < this.logs.length && now - this.logs[cut].timestamp > LOG_RETENTION_MS) cut++;
       this.logs.splice(0, cut);
     }
 
@@ -534,6 +581,51 @@ export class SniperEngine {
       wallet: this.getWalletStatus(),
       run: this.getLiveRunSummary(),
       stats: this.computeStats(),
+      sizing: this.getSizingPreview(),
+    };
+  }
+
+  /**
+   * What the next entry would actually stake, through the same maths the buy
+   * path uses — so the dashboard figure and the real order can never disagree.
+   */
+  private getSizingPreview(): BotStatusResponse['sizing'] {
+    const allInEnabled = featureFlags.get('allInSizing');
+    const deployableSol = this.config.tradingMode === 'real'
+      ? this.wallet.getDeployableSol()
+      : Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
+
+    const sizingPriorityFeeSol = featureFlags.get('dynamicPriorityFee')
+      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
+      : this.config.priorityFeeSol;
+
+    let nextBuySol: number;
+    if (!allInEnabled) {
+      nextBuySol = this.config.buyAmountSol;
+    } else if (this.config.tradingMode === 'real') {
+      nextBuySol = maxAffordableBuySol(deployableSol, this.config.maxSlippagePct, sizingPriorityFeeSol);
+    } else {
+      nextBuySol = deployableSol;
+    }
+
+    // How many entries of this size the budget actually funds. Each one costs
+    // the stake plus its priority fee plus base fees and ATA rent, so dividing
+    // the balance by the stake alone overstates it by roughly a trade.
+    const perTradeCostSol = nextBuySol + sizingPriorityFeeSol + 0.0025;
+    const affordable = nextBuySol > 0 && perTradeCostSol > 0
+      ? Math.floor(deployableSol / perTradeCostSol)
+      : 0;
+    const concurrencyCap = this.config.maxActivePositions >= 99999
+      ? affordable
+      : Math.min(affordable, this.config.maxActivePositions);
+
+    return {
+      allInEnabled,
+      deployableSol,
+      nextBuySol: Number(nextBuySol.toFixed(4)),
+      nextBuyUsd: Number((nextBuySol * this.config.solPriceUsd).toFixed(2)),
+      tradesAffordable: allInEnabled ? Math.min(1, affordable) : Math.max(0, concurrencyCap),
+      breakevenPct: nextBuySol > 0 ? breakevenPct(Number(nextBuySol.toFixed(6)), sizingPriorityFeeSol) : 0,
     };
   }
 
@@ -625,7 +717,9 @@ export class SniperEngine {
           action,
           mint,
           denominatedInSol: action === 'buy' ? 'true' : 'false',
-          amount: action === 'buy' ? solAmount : (amountPct || '100%'),
+          // Sells are a PERCENTAGE of holdings and the '%' must survive — see
+          // sellAmountParam. Without it PumpPortal sells that many raw tokens.
+          amount: action === 'buy' ? solAmount : sellAmountParam(amountPct),
           slippage: this.config.maxSlippagePct,
           priorityFee: priorityFeeSol,
           // 'auto' routes bonding-curve and migrated (Raydium / pump-AMM) tokens
@@ -667,7 +761,15 @@ export class SniperEngine {
 
         // A signature is not a fill. Confirm before mutating any state.
         const confirmed = await this.confirmTransaction(txid);
-        if (!confirmed) {
+        if (confirmed === 'failed') {
+          // Definitive on-chain rejection: everything rolled back, only the fee
+          // was spent. There is nothing to track — opening a position here
+          // would invent tokens the wallet never bought.
+          this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain — no tokens moved, only the fee was burned. Inspect: https://solscan.io/tx/${txid}`, mint);
+          void this.syncLiveWalletBalance();
+          return null;
+        }
+        if (confirmed === 'timeout') {
           if (action === 'sell') {
             this.log('warn', `⚠️ Sell ${txid.slice(0, 8)}... not confirmed in time. Holdings left untouched.`, mint);
             return null;
@@ -692,6 +794,15 @@ export class SniperEngine {
         }
 
         this.log('snipe', `✅ [${action.toUpperCase()} CONFIRMED] TxID: ${txid} | Photon: https://photon-sol.tinyastro.io/en/lp/${mint} | Solscan: https://solscan.io/tx/${txid}`, mint);
+
+        try {
+          const { exec } = require('child_process');
+          exec(`cmd /c start "" "https://photon-sol.tinyastro.io/en/lp/${mint}"`);
+          if (txid && !txid.startsWith('sim_')) {
+            exec(`cmd /c start "" "https://solscan.io/tx/${txid}"`);
+          }
+        } catch { /* ignore browser spawn errors */ }
+
         void this.syncLiveWalletBalance();
         return { txid, fill };
       }
@@ -701,22 +812,31 @@ export class SniperEngine {
     return null;
   }
 
-  private async confirmTransaction(txid: string, timeoutMs = 30000): Promise<boolean> {
+  /**
+   * 'failed' is a definitive on-chain rejection — the tx executed and was
+   * rolled back, so no tokens moved (only the fee burned). 'timeout' means we
+   * simply don't know yet; funds may have moved. Callers must treat the two
+   * differently: a failed buy must never open a position.
+   */
+  private async confirmTransaction(txid: string, timeoutMs = 30000): Promise<'confirmed' | 'failed' | 'timeout'> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
         const status = await this.solanaConnection.getSignatureStatus(txid);
         const value = status?.value;
         if (value) {
-          if (value.err) return false;
-          if (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized') return true;
+          if (value.err) {
+            this.log('warn', `❌ Tx ${txid.slice(0, 8)}... failed on-chain: ${JSON.stringify(value.err)}`);
+            return 'failed';
+          }
+          if (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized') return 'confirmed';
         }
       } catch {
         // RPC hiccup — keep polling until the deadline.
       }
       await new Promise(res => setTimeout(res, 1500));
     }
-    return false;
+    return 'timeout';
   }
 
   private safeSendWs(payload: object): boolean {
@@ -826,6 +946,13 @@ export class SniperEngine {
       payload,
     });
     latencyTimeline.stamp(mint, 't2ParsedMs');
+
+    // Screening chatter, level `gate0` so the UI can style it apart from trade
+    // events. One line on arrival and one verdict line per token — at the
+    // observed ~0.6 tokens/sec that is a readable few lines per refresh cycle.
+    this.log('gate0',
+      `🔍 ${isMigration ? 'MIGRATION' : 'new'} ${payload.symbol ? '$' + payload.symbol : mint.slice(0, 6) + '…'} — querying RugCheck${isMigration ? ' (waiting for holders)' : ''}`,
+      mint);
     if (featureFlags.get('timelineSlotSampling')) {
       void this.solanaConnection.getSlot('processed')
         .then(s => latencyTimeline.annotate(mint, { slotAtArrival: s }))
@@ -861,9 +988,13 @@ export class SniperEngine {
       liquidityUsd: useRealData ? 0 : (isMigration ? 12000 : 3500),
       uniqueBuyers5m: useRealData ? undefined : 25,
       washScore: useRealData ? 0 : 10,
-      bundledSupplyPct: useRealData ? 0 : 5,
-      devHoldingsPct: useRealData ? 0 : 1,
-      top10Pct: useRealData ? 0 : 12,
+      // UNDEFINED, not 0. These are only filled in below from measured RugCheck
+      // holder data. A 0 here reads as "0% concentration — perfectly
+      // distributed" to both Gate 0 and the score, which is how unverified
+      // tokens scored 50/100 on no data at all and were bought.
+      bundledSupplyPct: useRealData ? undefined : 5,
+      devHoldingsPct: useRealData ? undefined : 1,
+      top10Pct: useRealData ? undefined : 12,
       // Fixed (audit bug B1): PumpPortal sends no `timestamp`, and the old
       // `|| 120` fallback aged every fresh token to 120s, defeating the
       // skip-DexScreener-under-45s branch below on 100% of creates.
@@ -880,8 +1011,17 @@ export class SniperEngine {
     // (previously sequential, paying both round-trips back to back). The
     // entry-path DexScreener call keeps a 60-token reserve in the rate bucket
     // so screening can never starve the exit monitor.
+    // Candidates we could actually trade get the patient RugCheck read: a
+    // migration, or a watchlist token re-screened because it walked into the
+    // mid-curve window. Everything else is a fresh create the playbook refuses
+    // on phase alone, so spending seconds waiting on its holder list would be
+    // latency for a token we were never going to buy.
+    const isTradeableCandidate = useRealData && (isMigration || Boolean(payload.__watchlistStats));
+
     const [report, dexData] = await Promise.all([
-      this.rugCheckService.getReport(mint),
+      isTradeableCandidate
+        ? this.rugCheckService.getReportWithHolders(mint)
+        : this.rugCheckService.getReport(mint),
       wantDexLookup ? DexScreenerService.getTokenMarketData(mint, 60) : Promise.resolve(null),
     ]);
 
@@ -924,7 +1064,22 @@ export class SniperEngine {
       // Only ever overwrite with a REAL reading — never relax a value to a
       // friendlier one when the data is missing.
       const meta: any = report?.fileMeta;
-      if (report && !report.isInferred && meta && meta.holderSampleSize > 0) {
+      // `concentrationAnomaly` means the holder percentages summed past 100, so
+      // the reading is not measuring what it claims. Leave the fields unset and
+      // let the gate refuse on "unverified" rather than trust a broken number.
+      // A sample of one holder is not a distribution. $TNOS was bought
+      // 2026-08-09 on holderSampleSize=1 / totalHolders=0 reporting a lovely
+      // "top10 = 2.01%"; by the time it settled, one wallet held 79.32% and
+      // RugCheck flagged three danger-level risks. Requiring a meaningful
+      // sample is the difference between measuring concentration and reading a
+      // single row and calling it a distribution.
+      const holderDataUsable = Boolean(
+        report && !report.isInferred && meta
+        && meta.holderSampleSize >= MIN_HOLDER_SAMPLE
+        && meta.totalHolders >= MIN_TOTAL_HOLDERS
+        && !meta.concentrationAnomaly
+      );
+      if (holderDataUsable) {
         if (typeof meta.top10Pct === 'number') launchData.top10Pct = meta.top10Pct;
         if (typeof meta.maxSingleHolderPct === 'number') {
           // No dedicated dev-holdings feed at this stage; the largest single
@@ -932,7 +1087,14 @@ export class SniperEngine {
           // conservative than the hardcoded 1%.
           launchData.devHoldingsPct = Math.max(launchData.devHoldingsPct ?? 0, meta.maxSingleHolderPct);
         }
-        if (typeof meta.insiderPct === 'number' && meta.insiderPct > 0) {
+        // Zero insiders is a MEASURED result — the best one available — not
+        // missing data. Gating this on `> 0` left bundledSupplyPct undefined on
+        // every clean token, so the verified-concentration rule refused exactly
+        // the tokens whose distribution was flawless. Measured 2026-08-09:
+        // $Drage (top10 19.2%, 19 owners) and TOADHOUSE (24.5%) were both
+        // refused as "unverified" while genuine rugs at 79% and 89.7% were
+        // refused for the same reason — the gate could not tell them apart.
+        if (typeof meta.insiderPct === 'number') {
           launchData.bundledSupplyPct = Math.max(launchData.bundledSupplyPct ?? 0, meta.insiderPct);
         }
       }
@@ -1001,7 +1163,15 @@ export class SniperEngine {
         ? this.activePlaybook().minLiquiditySol * this.config.solPriceUsd
         : undefined;
 
-    const filterResult = this.riskFilter.evaluateToken(report, launchData, { minLiquidityUsdOverride });
+    const filterResult = this.riskFilter.evaluateToken(report, launchData, {
+      minLiquidityUsdOverride,
+      // On the real-data path, concentration we could not measure must reject
+      // rather than pass. Legacy (flag off) still supplies its placeholders.
+      requireVerifiedConcentration: useRealData,
+      // RugCheck's verdict as an independent second opinion, not just its raw
+      // holder rows. Legacy keeps its old behaviour of ignoring the score.
+      maxRugcheckScore: useRealData ? MAX_RUGCHECK_SCORE : undefined,
+    });
     if (honeypotBlocked.length > 0) {
       filterResult.isSafe = false;
       filterResult.reasons = [...honeypotBlocked, ...(filterResult.reasons || [])];
@@ -1064,6 +1234,14 @@ export class SniperEngine {
     reportService.recordScreened(activeIsSafe, activeReasons?.[0]);
 
     if (!activeIsSafe) {
+      // Fresh creates fail here constantly and by design — logging all of them
+      // would bury the feed. But a migration or a matured watchlist token was a
+      // real trade candidate, so say out loud why it was refused.
+      if (isTradeableCandidate) {
+        this.log('warn', `⛔ [REFUSED] $${filterResult.tokenSymbol} (score ${filterResult.score}) — ${activeReasons?.[0] ?? 'failed Gate 0'}`, mint);
+      } else {
+        this.log('gate0', `✗ $${filterResult.tokenSymbol} (score ${filterResult.score}) — ${activeReasons?.[0] ?? 'failed Gate 0'}`, mint);
+      }
       // A create that fails today's gate can still mature into a Play 2 setup,
       // so keep watching its curve instead of discarding it.
       if (payload.txType !== 'migrate' && !payload.__watchlistStats) this.enrollInWatchlist(payload);
@@ -1157,6 +1335,9 @@ export class SniperEngine {
       };
       held.lastCurvePriceUsd = (u.vSolInBondingCurve / u.vTokensInBondingCurve) * this.config.solPriceUsd;
       held.lastCurvePriceAt = u.at;
+      // Curve updates arrive over the Helius websocket, so an on-curve position
+      // can repaint the instant its price moves rather than on the next tick.
+      this.emitChange();
     }
 
     // --- Structural stop for anything we currently hold ---
@@ -1304,6 +1485,23 @@ export class SniperEngine {
           this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
           return;
         }
+        // NOT gated on full conviction. FLAGS.md described all-in as
+        // "full-conviction only" (score >= 71), and enforcing that made Play 3
+        // unreachable by construction: at the migration moment DexScreener has
+        // not indexed the pool, so demand and narrative points cannot be
+        // earned, and a PERFECT graduation — 15% top-10, 1% dev, completed
+        // curve — tops out at exactly 62. Measured, not estimated: see the
+        // "Play 3 score ceiling" test. The same token scores 82 once indexed,
+        // minutes after the window has closed.
+        //
+        // The playbook already accounts for this: 55 is the half-unit floor
+        // Play 3 is designed to trade on. Safety lives in the router's
+        // eligibility check (phase, liquidity, market cap, demand) and in
+        // Gate 0's verified-concentration requirement — which is what actually
+        // stops the unmeasured tokens, and stops them at a score of 42.
+        if (!isFullConviction(sizeMultiplier)) {
+          this.log('info', `📊 [HALF-CONVICTION] $${filterResult.tokenSymbol} scored ${score} (${sizeMultiplier}u) — eligible on the router's half-unit floor. All-in deploys the full balance.`, filterResult.mint);
+        }
       }
 
       this.log('info', `🎯 [TRIGGER] $${filterResult.tokenSymbol} — ${describeRoute(decision)}`, filterResult.mint);
@@ -1331,6 +1529,20 @@ export class SniperEngine {
       0
     );
 
+    // All-in sizes against the wallet as it is RIGHT NOW. The background sync
+    // only runs every 10s, and "all in" means the position IS the balance — a
+    // stale figure either leaves cash idle or overdrafts the transfer.
+    if (this.config.tradingMode === 'real' && featureFlags.get('allInSizing')) {
+      await this.wallet.refreshBalance(true);
+      this.availableTradeSol = this.wallet.getDeployableSol();
+    }
+
+    // Size against the worst-case priority fee: with dynamicPriorityFee the
+    // actual fee is resolved later and may exceed the static config value.
+    const sizingPriorityFeeSol = featureFlags.get('dynamicPriorityFee')
+      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
+      : this.config.priorityFeeSol;
+
     let unitSizeSol = computeEntrySizeSol({
       allIn: featureFlags.get('allInSizing'),
       tradingMode: this.config.tradingMode,
@@ -1340,11 +1552,18 @@ export class SniperEngine {
       bankrollUsd: this.currentBankrollUsd,
       solPriceUsd: this.config.solPriceUsd,
       openExposureSol,
+      maxSlippagePct: this.config.maxSlippagePct,
+      priorityFeeSol: sizingPriorityFeeSol,
     });
 
     if (this.config.tradingMode === 'real' && !featureFlags.get('allInSizing') && this.availableTradeSol > 0) {
-      if (unitSizeSol > this.availableTradeSol) {
-        unitSizeSol = this.availableTradeSol;
+      const maxAffordable = maxAffordableBuySol(
+        this.availableTradeSol,
+        this.config.maxSlippagePct,
+        sizingPriorityFeeSol
+      );
+      if (unitSizeSol > maxAffordable) {
+        unitSizeSol = maxAffordable;
       }
     }
 
@@ -1535,12 +1754,14 @@ export class SniperEngine {
             await this.updateAndCheckPositionExit(pos, quotes.get(pos.mint));
           }
         }
+        // Repaint with the prices this tick just resolved.
+        this.emitChange();
       } catch {
         // Never let one bad tick kill the monitor.
       } finally {
         this.monitorTickInFlight = false;
       }
-    }, 2000);
+    }, POSITION_MONITOR_INTERVAL_MS);
   }
 
   private recordPartialSell(
@@ -1594,6 +1815,7 @@ export class SniperEngine {
       pnlUsd: partialPnlUsd,
       pnlSol: partialPnlSol,
       tokensSold,
+      fractionSold,
       buyTxid: pos.buyTxid,
       sellTxid: actual?.txid,
       fillVerified: Boolean(actual && pos.fillVerified),
@@ -1646,8 +1868,23 @@ export class SniperEngine {
       return {};
     }
 
+    // Fee-burn guard. Measured 2026-08-09: a position whose sell kept failing
+    // on-chain was retried every ~2s exit tick — 35 failed txs and 0.035 SOL
+    // of fees in under a minute. Every failed attempt still pays the full fee,
+    // so retries back off exponentially (5s doubling, capped at 10 min).
+    const now = Date.now();
+    if (pos.sellRetryAfterMs && now < pos.sellRetryAfterMs) return null;
+
     const result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`);
-    if (!result) return null;
+    if (!result) {
+      pos.sellFailCount = (pos.sellFailCount ?? 0) + 1;
+      const delayMs = Math.min(10 * 60_000, 5_000 * Math.pow(2, pos.sellFailCount - 1));
+      pos.sellRetryAfterMs = now + delayMs;
+      this.log('warn', `⏳ Sell failed ${pos.sellFailCount}x in a row for $${pos.tokenSymbol} — backing off ${Math.round(delayMs / 1000)}s before the next attempt (each failed tx burns the fee). LIQUIDATE retries immediately.`, pos.mint);
+      return null;
+    }
+    pos.sellFailCount = 0;
+    pos.sellRetryAfterMs = undefined;
 
     if (result.fill && result.fill.tokenDelta < 0) {
       return {
@@ -1861,9 +2098,26 @@ export class SniperEngine {
       return;
     }
 
+    // "Sold everything" must mean the tokens actually left the wallet. When the
+    // chain says otherwise, book only what really sold and keep the position
+    // open — closing it here strands a real bag behind a closed trade and
+    // prices the whole cost basis against a sliver of proceeds (measured
+    // 2026-08-09: 100 of 2206 $GREEN sold, reported as a closed -96.8%).
+    if (sale.actual && pos.tokensHeld > 0) {
+      const soldFraction = sale.actual.tokensSold / pos.tokensHeld;
+      if (soldFraction < 0.95) {
+        this.log('error',
+          `❌ [PARTIAL EXIT] $${pos.tokenSymbol}: exit filled only ${Math.round(sale.actual.tokensSold).toLocaleString()} of ${Math.round(pos.tokensHeld).toLocaleString()} tokens (${(soldFraction * 100).toFixed(1)}%). Position stays OPEN with the remainder — it was NOT closed.`,
+          pos.mint);
+        this.recordPartialSell(pos, soldFraction, `${reason} [partial fill — ${(soldFraction * 100).toFixed(1)}% only]`, sale.actual);
+        return;
+      }
+    }
+
     const exitTime = Date.now();
     const holdTimeSeconds = Math.floor((exitTime - pos.entryTime) / 1000);
     const tokensSold = sale.actual ? sale.actual.tokensSold : pos.tokensHeld;
+    const fractionSold = pos.tokensHeld > 0 ? Math.min(1, tokensSold / pos.tokensHeld) : 1;
 
     // Proceeds: on-chain SOL received when we have the fill, quote estimate otherwise.
     const proceedsUsd = sale.actual
@@ -1902,6 +2156,7 @@ export class SniperEngine {
       pnlUsd: finalPnlUsd,
       pnlSol: Number((finalPnlUsd / this.config.solPriceUsd).toFixed(4)),
       tokensSold,
+      fractionSold,
       buyTxid: pos.buyTxid,
       sellTxid: sale.actual?.txid ?? sale.txid,
       fillVerified: Boolean(sale.actual && pos.fillVerified),
@@ -1939,6 +2194,8 @@ export class SniperEngine {
     const pos = this.activePositions.find(p => p.id === positionId);
     if (!pos) return false;
 
+    // A human clicking LIQUIDATE overrides the automatic-retry backoff.
+    pos.sellRetryAfterMs = undefined;
     await this.executeSell(pos, 'Manual User Force Sell Override');
     return true;
   }
@@ -1984,6 +2241,31 @@ export class SniperEngine {
     if (this.logs.length > 300) this.logs.splice(0, this.logs.length - 300);
 
     console.log(`[${new Date().toLocaleTimeString()}] [${level.toUpperCase()}] ${message}`);
+    this.emitChange();
+  }
+
+  // ---------------- CHANGE NOTIFICATION ----------------
+
+  /**
+   * Subscribe to "something happened worth pushing" — order submitted, fill
+   * confirmed, position opened or closed, price moved.
+   *
+   * Without this the SSE endpoint could only re-send state on a fixed timer, so
+   * a buy or sell surfaced up to a full second after it happened. Listeners are
+   * expected to coalesce; this fires on every log line.
+   *
+   * @returns an unsubscribe function.
+   */
+  public onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => { this.changeListeners.delete(listener); };
+  }
+
+  private emitChange(): void {
+    for (const listener of this.changeListeners) {
+      // A broken listener (dead SSE socket) must never break the engine.
+      try { listener(); } catch { /* ignore */ }
+    }
   }
 }
 

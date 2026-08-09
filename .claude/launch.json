@@ -2,22 +2,16 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "sniper-server",
-      "runtimeExecutable": ".claude\\run-server.cmd",
-      "runtimeArgs": [],
+      "name": "api",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
       "port": 3001
     },
     {
-      "name": "meme-coin-finder",
+      "name": "ui",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "meme-coin-finder-app", "run", "dev"],
-      "port": 3000
-    },
-    {
-      "name": "sniper-ui",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["vite", "--port", "5273", "--strictPort"],
-      "port": 5273
+      "runtimeArgs": ["run", "ui"],
+      "port": 3010
     }
   ]
 }

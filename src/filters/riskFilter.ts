@@ -94,9 +94,15 @@ export class RiskFilter {
   public evaluateGate0(
     report: RugCheckReport | null,
     launch: Partial<PumpTokenLaunch>,
-    opts?: { minLiquidityUsdOverride?: number }
+    opts?: { minLiquidityUsdOverride?: number; requireVerifiedConcentration?: boolean; maxRugcheckScore?: number }
   ): Gate0Result {
     const failedReasons: string[] = [];
+    // Unknown is not safe. Callers on the real-data path pass `undefined` for
+    // concentration they could not measure; the old `|| 0` read that as "0% —
+    // perfectly distributed" and waved it through. Measured 2026-08-09 on
+    // $GREEN: RugCheck returned an inferred (empty) report, top10/dev/bundled
+    // all read 0, Gate 0 passed clean, and the unverified token was bought.
+    const requireVerified = opts?.requireVerifiedConcentration ?? false;
 
     const tokenInfo = report?.token;
     const mintAuthorityRevoked = !tokenInfo?.mintAuthority;
@@ -124,26 +130,41 @@ export class RiskFilter {
 
     const sellSimPassed = true;
 
-    const bundledSupplyPct = launch.bundledSupplyPct || 0;
-    const bundledSupplyPctClean = bundledSupplyPct <= this.config.maxBundledSupplyPct;
-    if (!bundledSupplyPctClean) {
+    const bundledKnown = typeof launch.bundledSupplyPct === 'number';
+    const bundledSupplyPct = launch.bundledSupplyPct ?? 0;
+    const bundledSupplyPctClean = bundledKnown
+      ? bundledSupplyPct <= this.config.maxBundledSupplyPct
+      : !requireVerified;
+    if (bundledKnown && bundledSupplyPct > this.config.maxBundledSupplyPct) {
       failedReasons.push(`Bundled supply (${bundledSupplyPct}%) >= limit of ${this.config.maxBundledSupplyPct}%`);
+    } else if (!bundledKnown && requireVerified) {
+      failedReasons.push('Bundled supply unverified — no holder data (unknown is not safe)');
     }
 
     const insiderPctClean = true;
     const sniperHoldingsPctClean = true;
 
-    const top10Pct = launch.top10Pct || 0;
-    const top10PctClean = top10Pct <= this.config.maxTop10Pct;
-    if (!top10PctClean) {
+    const top10Known = typeof launch.top10Pct === 'number';
+    const top10Pct = launch.top10Pct ?? 0;
+    const top10PctClean = top10Known
+      ? top10Pct <= this.config.maxTop10Pct
+      : !requireVerified;
+    if (top10Known && top10Pct > this.config.maxTop10Pct) {
       failedReasons.push(`Top 10 holders (${top10Pct}%) >= limit of ${this.config.maxTop10Pct}%`);
+    } else if (!top10Known && requireVerified) {
+      failedReasons.push('Top 10 holder concentration unverified — RugCheck has no holder data (unknown is not safe)');
     }
 
     const maxSingleHolderPctClean = true;
-    const devHoldingsPct = launch.devHoldingsPct || 0;
-    const devHoldingsPctClean = devHoldingsPct <= this.config.maxDevHoldingsPct;
-    if (!devHoldingsPctClean) {
+    const devKnown = typeof launch.devHoldingsPct === 'number';
+    const devHoldingsPct = launch.devHoldingsPct ?? 0;
+    const devHoldingsPctClean = devKnown
+      ? devHoldingsPct <= this.config.maxDevHoldingsPct
+      : !requireVerified;
+    if (devKnown && devHoldingsPct > this.config.maxDevHoldingsPct) {
       failedReasons.push(`Dev holdings (${devHoldingsPct}%) >= limit of ${this.config.maxDevHoldingsPct}%`);
+    } else if (!devKnown && requireVerified) {
+      failedReasons.push('Dev holdings unverified — no holder data (unknown is not safe)');
     }
 
     const devPriorRugRateClean = true;
@@ -163,6 +184,22 @@ export class RiskFilter {
       failedReasons.push(`Liquidity ($${liquidityUsd.toLocaleString()}) < min required ($${minLiquidityUsd.toLocaleString()})`);
     }
 
+    // RugCheck's own aggregate risk score — an independent read on the same
+    // token, and empirically the sharpest single signal available. Measured
+    // across 46 recorded graduations 2026-08-09: every well-distributed token
+    // scored 1, while everything RugCheck flagged danger-level scored 2011 or
+    // above. $TNOS scored 13001 and was bought anyway, because Gate 0 never
+    // looked at this field at all.
+    const maxRugcheckScore = opts?.maxRugcheckScore;
+    let rugcheckScoreClean = true;
+    if (typeof maxRugcheckScore === 'number' && report && !report.isInferred) {
+      const rcScore = Number(report.score ?? 0);
+      rugcheckScoreClean = rcScore <= maxRugcheckScore;
+      if (!rugcheckScoreClean) {
+        failedReasons.push(`RugCheck risk score ${rcScore.toLocaleString()} > max ${maxRugcheckScore.toLocaleString()}`);
+      }
+    }
+
     const washScoreClean = (launch.washScore || 0) <= this.config.maxWashScore;
     const buyPressureClean = true;
     const notHoneypot = true;
@@ -180,6 +217,7 @@ export class RiskFilter {
       devHoldingsPctClean &&
       liquidityMinClean &&
       washScoreClean &&
+      rugcheckScoreClean &&
       marketRegimeValid;
 
     return {
@@ -201,6 +239,7 @@ export class RiskFilter {
       buyPressureClean,
       notHoneypot,
       notDumping,
+      rugcheckScoreClean,
       marketRegimeValid,
       allPassed,
       failedReasons,
@@ -291,7 +330,7 @@ export class RiskFilter {
   public evaluateToken(
     report: RugCheckReport | null,
     launch: Partial<PumpTokenLaunch>,
-    opts?: { minLiquidityUsdOverride?: number }
+    opts?: { minLiquidityUsdOverride?: number; requireVerifiedConcentration?: boolean; maxRugcheckScore?: number }
   ): FilterResult {
     const mint = launch.mint || report?.mint || 'Unknown';
     const gate0 = this.evaluateGate0(report, launch, opts);

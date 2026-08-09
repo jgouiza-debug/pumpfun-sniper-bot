@@ -89,6 +89,39 @@ export class RugCheckService {
     }
   }
 
+  /** True when this report carries a real, usable holder distribution. */
+  public static hasHolderData(report: RugCheckReport | null): boolean {
+    const meta = report?.fileMeta as any;
+    return Boolean(
+      report && !report.isInferred && meta && meta.holderSampleSize > 0 && typeof meta.top10Pct === 'number'
+    );
+  }
+
+  /**
+   * Report with the holder list actually populated, retried briefly.
+   *
+   * RugCheck indexes a mint's holders a beat after the event that made it
+   * interesting. Measured 2026-08-09 on a live run: 0 of 200 candidates had
+   * holder data at the moment they were screened, yet querying the same mints
+   * moments later returned full distributions (including one 93.3% single
+   * holder — exactly the rug shape the gate exists to catch).
+   *
+   * So for candidates we would actually trade, wait for the data instead of
+   * judging without it. Bounded: a few short attempts, well inside Play 3's
+   * 90s window. If the data never lands, the caller still gets an
+   * unverified report and refuses the trade — waiting is not the same as
+   * assuming.
+   */
+  public async getReportWithHolders(mint: string, attempts = 3, delayMs = 1200): Promise<RugCheckReport> {
+    let report = await this.getReport(mint);
+    for (let attempt = 1; attempt < attempts; attempt++) {
+      if (RugCheckService.hasHolderData(report)) break;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      report = await this.getReport(mint);
+    }
+    return report;
+  }
+
   /**
    * Derives concentration metrics from the real holder list and folds them into
    * fileMeta so the risk filter reads measured values instead of defaults.

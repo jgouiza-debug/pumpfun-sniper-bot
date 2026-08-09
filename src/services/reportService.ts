@@ -330,7 +330,11 @@ export class ReportService {
       .sort((a, b) => a.exitTime - b.exitTime)
       .map((t, i) => {
         const proceeds = Number((t.pnlUsd + t.investedUsd + (t.feeDragUsd || 0)).toFixed(2));
-        const solscan = t.sellTxid ? ` [tx](https://solscan.io/tx/${t.sellTxid})` : '';
+        // sim_ txids are paper fills that never touched the chain — a Solscan
+        // link for one is a dead link that reads as a missing real trade.
+        const solscan = t.sellTxid
+          ? (t.sellTxid.startsWith('sim_') ? ' (simulated — not on-chain)' : ` [tx](https://solscan.io/tx/${t.sellTxid})`)
+          : '';
         return `| ${i + 1} | $${t.tokenSymbol} | ${clock(t.entryTime)} | ${qty(t.tokensSold)} | ${clock(t.exitTime)} | $${t.investedUsd.toFixed(2)} | $${proceeds.toFixed(2)} | ${money(t.pnlUsd)} (${pct(t.pnlPct)}) | ${t.fillVerified ? '✅ on-chain' : '≈ estimate'} | ${(t.exitReason || '').replace(/\|/g, '/').slice(0, 60)}${solscan} |`;
       })
       .join('\n') || '| — | — | — | — | — | — | — | — | — | no closed trades |';

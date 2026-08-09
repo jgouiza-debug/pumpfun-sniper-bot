@@ -400,8 +400,11 @@ html, body {
   color: var(--ink-secondary);
 }
 
+/* Routine screening chatter: deliberately dim. It is the highest-volume line
+   in the feed, so it must recede and let snipe/sell/error lines carry colour. */
 .log-level-gate0 {
-  color: var(--accent-oxblood);
+  color: var(--ink-muted);
+  opacity: 0.75;
 }
 
 /* Modal Overlay & Form */

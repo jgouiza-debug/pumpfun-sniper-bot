@@ -130,6 +130,8 @@ export interface Gate0Result {
   buyPressureClean?: boolean;
   notHoneypot?: boolean;
   notDumping?: boolean;
+  /** RugCheck's own aggregate risk score is within the configured ceiling. */
+  rugcheckScoreClean?: boolean;
   marketRegimeValid: boolean;
   allPassed: boolean;
   failedReasons: string[];
@@ -260,6 +262,12 @@ export interface TradeHistoryRecord {
   feeDragUsd: number;
   /** Token quantity this leg sold. */
   tokensSold?: number;
+  /**
+   * Share of the position this leg actually closed, 0-1, measured from the
+   * on-chain fill where available. Anything below ~0.95 is a PARTIAL exit: the
+   * position is still open and holding the remainder.
+   */
+  fractionSold?: number;
   buyTxid?: string;
   sellTxid?: string;
   /**
@@ -391,6 +399,19 @@ export interface BotStatusResponse {
     winRatePct: number;
     totalNetPnlUsd: number;
     totalNetPnlSol: number;
+  };
+  /** What the next entry would actually stake, recomputed from the live balance. */
+  sizing: {
+    allInEnabled: boolean;
+    /** Wallet balance minus the gas float. */
+    deployableSol: number;
+    /** Deployable minus slippage/fee headroom — the real order size. */
+    nextBuySol: number;
+    nextBuyUsd: number;
+    /** How many entries of this size the deployable balance funds, fees included. */
+    tradesAffordable: number;
+    /** Round-trip cost as a % of the position — what a trade must beat to profit. */
+    breakevenPct: number;
   };
 }
 

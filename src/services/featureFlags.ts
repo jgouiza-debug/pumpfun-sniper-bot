@@ -62,7 +62,12 @@ export interface FeatureFlagSet {
   allInSizing: boolean;
 }
 
-const DEFAULTS: FeatureFlagSet = {
+/**
+ * Shipped defaults, before env overrides or flags.json are applied. Exported so
+ * tests can assert what the code ships with rather than whatever the operator
+ * has since toggled at runtime.
+ */
+export const DEFAULTS: FeatureFlagSet = {
   entryGateV2: false,
   shadowGateV2: false,
   strictMigrationDetect: false,

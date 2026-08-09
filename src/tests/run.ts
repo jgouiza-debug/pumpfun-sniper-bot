@@ -16,6 +16,7 @@ import {
   computeEntrySizeSol,
   blockAllInEntry,
   isFullConviction,
+  maxAffordableBuySol,
 } from '../services/pipelineUtils';
 import { EntryGateV2 } from '../services/entryGateV2';
 import { RugCheckReport } from '../types';
@@ -574,11 +575,13 @@ console.log('\n-- All-In Trade Sizing --');
       bankrollUsd: 100,
       solPriceUsd: 200,
       openExposureSol: 0,
+      maxSlippagePct: 15,
+      priorityFeeSol: 0.001,
     });
     assert.strictEqual(size, 0.075);
   });
 
-  test('flag ON real mode returns full availableTradeSol, ignoring buyAmountSol & multiplier', () => {
+  test('flag ON real mode reserves slippage + fees headroom out of availableTradeSol', () => {
     const size = computeEntrySizeSol({
       allIn: true,
       tradingMode: 'real',
@@ -588,8 +591,30 @@ console.log('\n-- All-In Trade Sizing --');
       bankrollUsd: 100,
       solPriceUsd: 200,
       openExposureSol: 0,
+      maxSlippagePct: 15,
+      priorityFeeSol: 0.001,
     });
-    assert.strictEqual(size, 0.106);
+    // The tx reserves size × (1 + slippage + protocol fees) plus the priority
+    // fee and fixed overhead; all of it must fit inside the available balance.
+    assert.ok(size > 0, 'expected a positive size');
+    assert.ok(size < 0.106, 'expected headroom to be reserved');
+    assert.ok(size * 1.165 + 0.001 + 0.0025 <= 0.106 + 1e-9, `size ${size} overdrafts the balance`);
+  });
+
+  test('REGRESSION 2026-08-09: 0.1327 SOL all-in buy must fit its own on-chain transfer', () => {
+    // Measured failure: buy sized to the full 0.1327 SOL deployable balance;
+    // the tx transfer wanted exactly 132700000 × 1.15 = 152605000 lamports and
+    // died with "Transfer: insufficient lamports 134695720, need 152605000".
+    const size = maxAffordableBuySol(0.1327, 15, 0.001);
+    const lamportsNeeded = size * 1.15; // slippage-buffered transfer
+    const balanceAfterFeeAndRent = 0.1327 - 0.001005 - 0.00203928;
+    assert.ok(lamportsNeeded <= balanceAfterFeeAndRent, `transfer ${lamportsNeeded} still exceeds ${balanceAfterFeeAndRent}`);
+    assert.ok(size > 0.1, `expected a usable size, got ${size}`);
+  });
+
+  test('maxAffordableBuySol returns 0 when balance cannot cover fixed costs', () => {
+    assert.strictEqual(maxAffordableBuySol(0.003, 15, 0.001), 0);
+    assert.strictEqual(maxAffordableBuySol(0, 15, 0.001), 0);
   });
 
   test('flag ON real mode with 0 availableTradeSol returns 0', () => {
@@ -602,6 +627,8 @@ console.log('\n-- All-In Trade Sizing --');
       bankrollUsd: 100,
       solPriceUsd: 200,
       openExposureSol: 0,
+      maxSlippagePct: 15,
+      priorityFeeSol: 0.001,
     });
     assert.strictEqual(size, 0);
   });
@@ -616,6 +643,8 @@ console.log('\n-- All-In Trade Sizing --');
       bankrollUsd: 100,
       solPriceUsd: 200, // 100/200 = 0.5 SOL
       openExposureSol: 0.2,
+      maxSlippagePct: 15,
+      priorityFeeSol: 0.001,
     });
     assert.strictEqual(size, 0.3);
   });
@@ -642,8 +671,333 @@ console.log('\n-- All-In Trade Sizing --');
     assert.strictEqual(isFullConviction(0.5), false);
   });
 
-  test('allInSizing flag default is true', () => {
-    assert.strictEqual(featureFlags.all().allInSizing, true);
+  test('allInSizing ships enabled by default', () => {
+    // Assert the shipped default, NOT featureFlags.all() — that reflects
+    // flags.json, so the suite used to fail purely because the operator had
+    // switched all-in off at runtime (which is a supported thing to do).
+    const { DEFAULTS } = require('../services/featureFlags');
+    assert.strictEqual(DEFAULTS.allInSizing, true);
+  });
+
+  test('turning allInSizing off restores fixed-size entries', () => {
+    const size = computeEntrySizeSol({
+      allIn: false,
+      tradingMode: 'real',
+      buyAmountSol: 0.0395,   // the $3-per-trade stake
+      sizeMultiplier: 1,
+      availableTradeSol: 0.092,
+      bankrollUsd: 7.38,
+      solPriceUsd: 76,
+      openExposureSol: 0,
+      maxSlippagePct: 15,
+      priorityFeeSol: 0.0005,
+    });
+    assert.strictEqual(size, 0.0395, 'fixed sizing must use buyAmountSol exactly');
+  });
+}
+
+console.log('\n-- Sell order sizing (2026-08-09 $GREEN partial-exit incident) --');
+{
+  const { sellAmountParam } = require('../services/pipelineUtils');
+
+  test('OLD BUG reproduced: stripping the % turns "sell 100%" into "sell 100 tokens"', () => {
+    const amountPct: string | undefined = '100%';
+    const legacy = String(amountPct || '100').replace('%', '');
+    assert.strictEqual(legacy, '100');
+    assert.ok(!legacy.includes('%'), 'legacy value carried no percent marker — PumpPortal read it as a token count');
+  });
+
+  test('fixed: a full exit keeps its percent marker', () => {
+    assert.strictEqual(sellAmountParam('100%'), '100%');
+    assert.strictEqual(sellAmountParam(100), '100%');
+    assert.strictEqual(sellAmountParam(undefined), '100%');
+  });
+
+  test('partial exits stay percentages too', () => {
+    assert.strictEqual(sellAmountParam('50%'), '50%');
+    assert.strictEqual(sellAmountParam(25), '25%');
+  });
+
+  test('malformed or out-of-range input falls back to a full exit, never a token count', () => {
+    assert.strictEqual(sellAmountParam(''), '100%');
+    assert.strictEqual(sellAmountParam('abc'), '100%');
+    assert.strictEqual(sellAmountParam(0), '100%');
+    assert.strictEqual(sellAmountParam(-5), '100%');
+    assert.strictEqual(sellAmountParam(150), '100%');
+  });
+}
+
+console.log('\n-- Gate 0: unknown concentration is not safe (2026-08-09 $GREEN rug buy) --');
+{
+  const { RiskFilter } = require('../filters/riskFilter');
+
+  // The exact shape RugCheck returned for $GREEN: inferred, no holder list.
+  const inferredReport = {
+    mint: 'CK3CHsrbCgJox2g8MrAsfmRz4Per56QmBWAw9tVMpump',
+    score: 0,
+    token: { mintAuthority: null, freezeAuthority: null, supply: 1000000000, decimals: 6 },
+    fileMeta: { unverified: true },
+    isInferred: true,
+    markets: [],
+  };
+  // Migration-moment launch data with concentration genuinely unmeasured.
+  const unmeasured = {
+    mint: 'CK3CHsrbCgJox2g8MrAsfmRz4Per56QmBWAw9tVMpump',
+    symbol: 'GREEN',
+    liquidityUsd: 11984,
+    marketCapUsd: 2118,
+    bondingProgress: 90,
+    volume5mUsd: 0,
+    washScore: 0,
+    top10Pct: undefined,
+    devHoldingsPct: undefined,
+    bundledSupplyPct: undefined,
+  };
+
+  test('OLD BUG reproduced: concentration read as 0% passes every cap', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const asZero = { ...unmeasured, top10Pct: 0, devHoldingsPct: 0, bundledSupplyPct: 0 };
+    const gate = rf.evaluateGate0(inferredReport, asZero, { minLiquidityUsdOverride: 2275 });
+    assert.strictEqual(gate.allPassed, true, 'the old zero-filled path let an unverified token through');
+  });
+
+  test('OLD BUG reproduced: zero-filled concentration also scored maximum distribution points', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const asZero = { ...unmeasured, top10Pct: 0, devHoldingsPct: 0, bundledSupplyPct: 0 };
+    const s = rf.computeScoreBreakdown(inferredReport, asZero);
+    assert.strictEqual(s.distributionScore, 30, 'unknown scored the top distribution tier');
+    assert.strictEqual(s.deployerScore, 20, 'unknown scored the top deployer tier');
+    assert.ok(s.totalScore >= 55, `unknown data scored ${s.totalScore}, clearing the 55 half-unit floor`);
+  });
+
+  test('fixed: unverified concentration fails Gate 0 under requireVerifiedConcentration', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const gate = rf.evaluateGate0(inferredReport, unmeasured, {
+      minLiquidityUsdOverride: 2275,
+      requireVerifiedConcentration: true,
+    });
+    assert.strictEqual(gate.allPassed, false);
+    assert.ok(
+      gate.failedReasons.some((r: string) => /unverified/i.test(r)),
+      `expected an "unverified" rejection, got: ${JSON.stringify(gate.failedReasons)}`
+    );
+  });
+
+  test('fixed: unverified concentration scores below the half-unit floor', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const s = rf.computeScoreBreakdown(inferredReport, unmeasured);
+    assert.ok(s.totalScore < 55, `expected < 55 (router half-unit floor), got ${s.totalScore}`);
+  });
+
+  test('measured concentration still passes when genuinely clean', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const measured = { ...unmeasured, top10Pct: 18, devHoldingsPct: 2, bundledSupplyPct: 4 };
+    const gate = rf.evaluateGate0(inferredReport, measured, {
+      minLiquidityUsdOverride: 2275,
+      requireVerifiedConcentration: true,
+    });
+    assert.strictEqual(gate.allPassed, true, JSON.stringify(gate.failedReasons));
+  });
+
+  test('measured concentration over the cap still rejects', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const concentrated = { ...unmeasured, top10Pct: 62, devHoldingsPct: 20, bundledSupplyPct: 40 };
+    const gate = rf.evaluateGate0(inferredReport, concentrated, {
+      minLiquidityUsdOverride: 2275,
+      requireVerifiedConcentration: true,
+    });
+    assert.strictEqual(gate.allPassed, false);
+    assert.ok(gate.failedReasons.some((r: string) => /Top 10 holders/.test(r)));
+  });
+
+  test('Play 3 score ceiling: a PERFECT migration cannot reach full conviction pre-indexing', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    // Pristine holder distribution, tiny dev position, completed curve — but no
+    // DexScreener pair yet, which is the norm inside Play 3's 90s window.
+    const perfect = {
+      mint: 'X'.repeat(43),
+      top10Pct: 15,
+      devHoldingsPct: 1,
+      bundledSupplyPct: 2,
+      liquidityUsd: 11984,
+      marketCapUsd: 60000,
+      bondingProgress: 90,
+      volume5mUsd: 0,
+      socialCount: 0,
+      washScore: 0,
+    };
+    const s = rf.computeScoreBreakdown(null, perfect as any);
+    assert.strictEqual(s.totalScore, 62, `expected the measured 62 ceiling, got ${s.totalScore}`);
+    assert.ok(s.totalScore >= 55, 'must clear the half-unit floor Play 3 trades on');
+    assert.ok(s.totalScore < 71,
+      'REGRESSION GUARD: full conviction is unreachable here, so all-in sizing must NOT require it');
+  });
+
+  test('the same token reaches full conviction once demand is indexed', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const indexed = {
+      mint: 'X'.repeat(43),
+      top10Pct: 15,
+      devHoldingsPct: 1,
+      bundledSupplyPct: 2,
+      liquidityUsd: 11984,
+      marketCapUsd: 60000,
+      bondingProgress: 90,
+      volume5mUsd: 3000,
+      buyPressurePct: 80,
+      buys5m: 40,
+      socialCount: 2,
+      washScore: 0,
+    };
+    const s = rf.computeScoreBreakdown(null, indexed as any);
+    assert.ok(s.totalScore >= 71, `expected full conviction once indexed, got ${s.totalScore}`);
+  });
+
+  test('an UNVERIFIED token still scores far below the half-unit floor', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    // $GREEN's shape: no holder data, credited only the completed-curve demand.
+    const unknown = {
+      mint: 'Y'.repeat(43),
+      top10Pct: undefined,
+      devHoldingsPct: undefined,
+      bundledSupplyPct: undefined,
+      liquidityUsd: 11984,
+      marketCapUsd: 2118,
+      bondingProgress: 90,
+      volume5mUsd: 0,
+      socialCount: 0,
+      washScore: 0,
+    };
+    const s = rf.computeScoreBreakdown(null, unknown as any);
+    assert.strictEqual(s.totalScore, 42, `expected 42 for a no-data token, got ${s.totalScore}`);
+    assert.ok(s.totalScore < 55,
+      'a token with no holder data must not clear the floor even with the curve credit');
+  });
+
+  test('REGRESSION: zero insiders is measured data, not missing data', () => {
+    // How the engine folds RugCheck holder data into launchData. Mirrors the
+    // real block in processIncomingToken.
+    const foldHolderData = (meta: any) => {
+      const launch: any = { top10Pct: undefined, devHoldingsPct: undefined, bundledSupplyPct: undefined };
+      const usable = Boolean(meta && meta.holderSampleSize > 0 && !meta.concentrationAnomaly);
+      if (usable) {
+        if (typeof meta.top10Pct === 'number') launch.top10Pct = meta.top10Pct;
+        if (typeof meta.maxSingleHolderPct === 'number') {
+          launch.devHoldingsPct = Math.max(launch.devHoldingsPct ?? 0, meta.maxSingleHolderPct);
+        }
+        if (typeof meta.insiderPct === 'number') {
+          launch.bundledSupplyPct = Math.max(launch.bundledSupplyPct ?? 0, meta.insiderPct);
+        }
+      }
+      return launch;
+    };
+
+    // $Drage, measured live 2026-08-09: a genuinely clean graduation.
+    const drage = { holderSampleSize: 19, top10Pct: 19.24, maxSingleHolderPct: 4.1, insiderPct: 0 };
+    const folded = foldHolderData(drage);
+    assert.strictEqual(folded.bundledSupplyPct, 0,
+      'insiderPct 0 must be recorded as a measured 0, not left undefined');
+
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const gate = rf.evaluateGate0(
+      { isInferred: false, token: { mintAuthority: null, freezeAuthority: null }, markets: [] } as any,
+      { ...folded, liquidityUsd: 11984, washScore: 0 } as any,
+      { minLiquidityUsdOverride: 2275, requireVerifiedConcentration: true }
+    );
+    assert.strictEqual(gate.allPassed, true,
+      `a clean measured graduation must pass: ${JSON.stringify(gate.failedReasons)}`);
+  });
+
+  test('REGRESSION: the concentrated tokens from the same run are still refused', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    // $TWH (79%) and GROUCH (89.65%), both measured live 2026-08-09.
+    for (const [name, top10] of [['$TWH', 79], ['GROUCH', 89.65]] as Array<[string, number]>) {
+      const gate = rf.evaluateGate0(
+        { isInferred: false, token: { mintAuthority: null, freezeAuthority: null }, markets: [] } as any,
+        { top10Pct: top10, devHoldingsPct: top10, bundledSupplyPct: 0, liquidityUsd: 11984, washScore: 0 } as any,
+        { minLiquidityUsdOverride: 2275, requireVerifiedConcentration: true }
+      );
+      assert.strictEqual(gate.allPassed, false, `${name} at ${top10}% top-10 must be refused`);
+    }
+  });
+
+  test('REGRESSION: an untrustworthy reading (sums past 100%) counts as unverified', () => {
+    const meta = { holderSampleSize: 12, top10Pct: 100, maxSingleHolderPct: 60, insiderPct: 5, concentrationAnomaly: true };
+    const usable = Boolean(meta.holderSampleSize > 0 && !meta.concentrationAnomaly);
+    assert.strictEqual(usable, false, 'an anomalous reading must not be treated as measured');
+  });
+
+  test('REGRESSION $TNOS: a one-row holder sample is not a distribution', () => {
+    const MIN_HOLDER_SAMPLE = 5;
+    const MIN_TOTAL_HOLDERS = 10;
+    const usable = (meta: any) => Boolean(
+      meta && meta.holderSampleSize >= MIN_HOLDER_SAMPLE
+      && meta.totalHolders >= MIN_TOTAL_HOLDERS
+      && !meta.concentrationAnomaly
+    );
+
+    // Exactly what RugCheck returned for $TNOS at the moment it was bought.
+    const tnosAtScreening = { holderSampleSize: 1, totalHolders: 0, top10Pct: 2.01, maxSingleHolderPct: 2.01, insiderPct: 0 };
+    assert.strictEqual(usable(tnosAtScreening), false,
+      'a 1-row sample reporting 2.01% must not count as measured — the token settled at 79.32% in one wallet');
+
+    // A genuine distribution from the same run ($Drage) must still be usable.
+    const drage = { holderSampleSize: 19, totalHolders: 255, top10Pct: 19.24, maxSingleHolderPct: 2.26, insiderPct: 0 };
+    assert.strictEqual(usable(drage), true, 'a real 19-row / 255-holder distribution must stay usable');
+  });
+
+  test('REGRESSION $TNOS: RugCheck risk score is enforced by Gate 0', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const clean = { top10Pct: 2.01, devHoldingsPct: 2.01, bundledSupplyPct: 0, liquidityUsd: 12003, washScore: 0 };
+
+    // $TNOS scored 13001 — Gate 0 never looked, so it was bought.
+    const flagged = rf.evaluateGate0(
+      { isInferred: false, score: 13001, token: { mintAuthority: null, freezeAuthority: null }, markets: [] } as any,
+      clean as any,
+      { minLiquidityUsdOverride: 2275, requireVerifiedConcentration: true, maxRugcheckScore: 1000 }
+    );
+    assert.strictEqual(flagged.allPassed, false, 'a 13001 RugCheck score must fail Gate 0');
+    assert.ok(flagged.failedReasons.some((r: string) => /RugCheck risk score/.test(r)),
+      `expected a RugCheck score rejection, got ${JSON.stringify(flagged.failedReasons)}`);
+
+    // The clean graduations in the same dataset all scored 1.
+    const quiet = rf.evaluateGate0(
+      { isInferred: false, score: 1, token: { mintAuthority: null, freezeAuthority: null }, markets: [] } as any,
+      clean as any,
+      { minLiquidityUsdOverride: 2275, requireVerifiedConcentration: true, maxRugcheckScore: 1000 }
+    );
+    assert.strictEqual(quiet.allPassed, true, JSON.stringify(quiet.failedReasons));
+  });
+
+  test('legacy path (flag off) ignores the RugCheck score, as before', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const gate = rf.evaluateGate0(
+      { isInferred: false, score: 999999, token: { mintAuthority: null, freezeAuthority: null }, markets: [] } as any,
+      { top10Pct: 12, devHoldingsPct: 1, bundledSupplyPct: 5, liquidityUsd: 12003, washScore: 0 } as any,
+      { minLiquidityUsdOverride: 2275 }
+    );
+    assert.strictEqual(gate.allPassed, true, 'no maxRugcheckScore passed -> score not enforced');
+  });
+
+  test('legacy path (flag off) is unchanged — placeholders still evaluated as before', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const legacyLaunch = { ...unmeasured, top10Pct: 12, devHoldingsPct: 1, bundledSupplyPct: 5 };
+    const gate = rf.evaluateGate0(inferredReport, legacyLaunch, { minLiquidityUsdOverride: 2275 });
+    assert.strictEqual(gate.allPassed, true, JSON.stringify(gate.failedReasons));
   });
 }
 

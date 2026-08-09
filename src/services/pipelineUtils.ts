@@ -110,6 +110,31 @@ export function clampPriorityFeeSol(
 }
 
 /**
+ * Largest buy that can actually land on-chain out of `availableSol`.
+ *
+ * A PumpPortal buy transaction reserves amount × (1 + slippage) lamports up
+ * front (measured from a failed all-in buy: the System transfer wanted exactly
+ * 1.15× the amount at 15% slippage), plus ~1.5% protocol fees (pump.fun 1% +
+ * PumpPortal 0.5%), the priority fee, base signature fees and token-account
+ * rent. Sizing a buy to the raw balance therefore guarantees an on-chain
+ * "Transfer: insufficient lamports" failure that still burns the fee.
+ */
+export function maxAffordableBuySol(
+  availableSol: number,
+  maxSlippagePct: number,
+  priorityFeeSol: number
+): number {
+  // Base fees (~0.00001) + ATA rent (~0.00204) + safety pad.
+  const FIXED_OVERHEAD_SOL = 0.0025;
+  const PROTOCOL_FEE_FRACTION = 0.015;
+  const spendable = availableSol - priorityFeeSol - FIXED_OVERHEAD_SOL;
+  if (spendable <= 0) return 0;
+  const size = spendable / (1 + maxSlippagePct / 100 + PROTOCOL_FEE_FRACTION);
+  // Round down to a microlamport-safe 6 decimals — never up, toward overdraft.
+  return Math.max(0, Math.floor(size * 1e6) / 1e6);
+}
+
+/**
  * Computes entry size in SOL based on allInSizing flag, tradingMode, and wallet/bankroll state.
  */
 export function computeEntrySizeSol(params: {
@@ -121,6 +146,8 @@ export function computeEntrySizeSol(params: {
   bankrollUsd: number;
   solPriceUsd: number;
   openExposureSol: number;
+  maxSlippagePct: number;
+  priorityFeeSol: number;
 }): number {
   const {
     allIn,
@@ -131,6 +158,8 @@ export function computeEntrySizeSol(params: {
     bankrollUsd,
     solPriceUsd,
     openExposureSol,
+    maxSlippagePct,
+    priorityFeeSol,
   } = params;
 
   if (!allIn) {
@@ -138,13 +167,29 @@ export function computeEntrySizeSol(params: {
   }
 
   if (tradingMode === 'real') {
-    return Math.max(0, availableTradeSol);
+    return maxAffordableBuySol(availableTradeSol, maxSlippagePct, priorityFeeSol);
   }
 
   // Paper mode all-in: full bankroll converted to SOL minus active open position SOL exposure
   const solPrice = solPriceUsd > 0 ? solPriceUsd : 200;
   const totalBankrollSol = bankrollUsd / solPrice;
   return Math.max(0, totalBankrollSol - openExposureSol);
+}
+
+/**
+ * PumpPortal `amount` for a SELL, as a percentage-of-holdings string.
+ *
+ * PumpPortal reads a trailing '%' as "this share of the wallet balance"; a bare
+ * number is a literal token count. Stripping the '%' therefore turned
+ * "sell 100%" into "sell 100 tokens" — measured 2026-08-09 on $GREEN: the
+ * wallet held 2206.04 tokens, the exit order moved exactly 100.00, and the
+ * engine still booked the position as fully closed at -96.8%.
+ */
+export function sellAmountParam(amountPct?: string | number): string {
+  const raw = String(amountPct ?? '100').trim();
+  const numeric = Number(raw.replace('%', ''));
+  if (!isFinite(numeric) || numeric <= 0) return '100%';
+  return `${Math.min(100, numeric)}%`;
 }
 
 /**

@@ -5,10 +5,10 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc && vite build",
-    "start": "ts-node src/index.ts",
-    "server": "tsc && node dist/server.js",
+    "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
+    "server": "tsc && node --use-system-ca --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
-    "dev": "ts-node src/server.ts",
+    "dev": "node --use-system-ca --env-file-if-exists=.env -r ts-node/register src/server.ts",
     "test": "ts-node src/tests/run.ts",
     "replay": "ts-node src/replay.ts"
   },

@@ -233,6 +233,15 @@ app.post('/api/bot/kill', (req, res) => {
   res.json(sniperEngine.emergencyStop());
 });
 
+// POST shutdown dev server process completely
+app.post('/api/server/shutdown', (req, res) => {
+  res.json({ success: true, message: 'Dev server process is shutting down.' });
+  console.log('🛑 Dev server shutdown requested via UI. Terminating process...');
+  setTimeout(() => {
+    process.exit(0);
+  }, 500);
+});
+
 // GET recent T0-T7 candidate timelines with per-stage durations
 app.get('/api/timelines', (req, res) => {
   const limit = Math.min(200, Number(req.query.limit) || 50);
@@ -248,10 +257,20 @@ app.get('/api/timelines', (req, res) => {
 
 // ---------------- REAL-TIME STREAM ----------------
 
-// Server-Sent Events push of the full bot status. The UI subscribes with
-// EventSource instead of polling; each client gets a snapshot immediately and
-// then one per second. SSE rides plain HTTP, so the loopback-only binding and
-// CORS middleware apply unchanged.
+// Server-Sent Events push of the full bot status. SSE rides plain HTTP, so the
+// loopback-only binding and CORS middleware apply unchanged.
+//
+// Event-driven, not timer-driven: the engine notifies on every state change
+// (order submitted, fill confirmed, position opened/closed, price moved) and
+// the frame goes out immediately. A fixed 1s timer meant a buy or a sell could
+// sit invisible for up to a second after it had already happened.
+//
+// Bursts are coalesced to one frame per SSE_MIN_GAP_MS so a busy screening
+// stream cannot flood the socket, and a slow heartbeat still refreshes
+// time-derived fields (runtime clock, log ageing) when nothing is happening.
+const SSE_MIN_GAP_MS = 100;
+const SSE_HEARTBEAT_MS = 1000;
+
 app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -259,8 +278,12 @@ app.get('/api/stream', (req, res) => {
   res.flushHeaders();
 
   let alive = true;
+  let lastPushAt = 0;
+  let coalesceTimer: NodeJS.Timeout | null = null;
+
   const push = () => {
     if (!alive) return;
+    lastPushAt = Date.now();
     try {
       res.write(`data: ${JSON.stringify(sniperEngine.getStatus())}\n\n`);
     } catch {
@@ -268,12 +291,29 @@ app.get('/api/stream', (req, res) => {
     }
   };
 
-  push(); // snapshot on connect — no blank dashboard while waiting for the first tick
-  const interval = setInterval(push, 1000);
+  /** Push now if we are outside the quiet window, otherwise at the end of it. */
+  const schedulePush = () => {
+    if (!alive || coalesceTimer) return;
+    const sinceLast = Date.now() - lastPushAt;
+    if (sinceLast >= SSE_MIN_GAP_MS) {
+      push();
+      return;
+    }
+    coalesceTimer = setTimeout(() => {
+      coalesceTimer = null;
+      push();
+    }, SSE_MIN_GAP_MS - sinceLast);
+  };
+
+  push(); // snapshot on connect — no blank dashboard while waiting for the first event
+  const unsubscribe = sniperEngine.onChange(schedulePush);
+  const heartbeat = setInterval(push, SSE_HEARTBEAT_MS);
 
   req.on('close', () => {
     alive = false;
-    clearInterval(interval);
+    unsubscribe();
+    clearInterval(heartbeat);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
   });
 });
 
