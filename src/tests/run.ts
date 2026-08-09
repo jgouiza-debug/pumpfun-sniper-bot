@@ -14,8 +14,7 @@ import {
   percentile,
   realizedPnlInWindowUsd,
   computeEntrySizeSol,
-  blockAllInEntry,
-  isFullConviction,
+  affordableStakeSol,
   maxAffordableBuySol,
 } from '../services/pipelineUtils';
 import { EntryGateV2 } from '../services/entryGateV2';
@@ -560,51 +559,31 @@ console.log('\n-- NORMAL risk tier (owner-selected looser profile) --');
   });
 }
 
-console.log('\n-- All-In Trade Sizing --');
+console.log('\n-- Fixed trade sizing (all-in removed 2026-08-09) --');
 {
-  const { featureFlags } = require('../services/featureFlags');
   const { breakevenPct } = require('../services/paperSimulator');
 
-  test('flag OFF preserves legacy sizing (buyAmountSol * sizeMultiplier)', () => {
-    const size = computeEntrySizeSol({
-      allIn: false,
-      tradingMode: 'real',
-      buyAmountSol: 0.15,
-      sizeMultiplier: 0.5,
-      availableTradeSol: 0.106,
-      bankrollUsd: 100,
-      solPriceUsd: 200,
-      openExposureSol: 0,
-      maxSlippagePct: 15,
-      priorityFeeSol: 0.001,
-    });
-    assert.strictEqual(size, 0.075);
+  test('entry size is the configured stake scaled by conviction', () => {
+    assert.strictEqual(computeEntrySizeSol({ buyAmountSol: 0.15, sizeMultiplier: 0.5 }), 0.075);
+    assert.strictEqual(computeEntrySizeSol({ buyAmountSol: 0.0395, sizeMultiplier: 1 }), 0.0395);
   });
 
-  test('flag ON real mode reserves slippage + fees headroom out of availableTradeSol', () => {
-    const size = computeEntrySizeSol({
-      allIn: true,
-      tradingMode: 'real',
-      buyAmountSol: 0.15,
-      sizeMultiplier: 0.5,
-      availableTradeSol: 0.106,
-      bankrollUsd: 100,
-      solPriceUsd: 200,
-      openExposureSol: 0,
-      maxSlippagePct: 15,
-      priorityFeeSol: 0.001,
-    });
-    // The tx reserves size × (1 + slippage + protocol fees) plus the priority
-    // fee and fixed overhead; all of it must fit inside the available balance.
-    assert.ok(size > 0, 'expected a positive size');
-    assert.ok(size < 0.106, 'expected headroom to be reserved');
-    assert.ok(size * 1.165 + 0.001 + 0.0025 <= 0.106 + 1e-9, `size ${size} overdrafts the balance`);
+  test('the stake is used as-is when the balance can fund it', () => {
+    // $3-per-trade stake against a wallet that comfortably covers it.
+    assert.strictEqual(affordableStakeSol(0.0395, 0.092, 15, 0.0005), 0.0395);
   });
 
-  test('REGRESSION 2026-08-09: 0.1327 SOL all-in buy must fit its own on-chain transfer', () => {
-    // Measured failure: buy sized to the full 0.1327 SOL deployable balance;
-    // the tx transfer wanted exactly 132700000 × 1.15 = 152605000 lamports and
-    // died with "Transfer: insufficient lamports 134695720, need 152605000".
+  test('the stake is clamped when the balance cannot fund it', () => {
+    const staked = affordableStakeSol(0.3, 0.0885, 15, 0.001);
+    assert.ok(staked < 0.3, 'an unfundable stake must be reduced');
+    assert.ok(staked * 1.165 + 0.001 + 0.0025 <= 0.0885 + 1e-9,
+      `clamped stake ${staked} still overdrafts the balance`);
+  });
+
+  test('REGRESSION 2026-08-09: a stake must fit its own on-chain transfer', () => {
+    // Measured failure: a buy sized to the full 0.1327 SOL deployable balance.
+    // The transfer wanted exactly 132700000 x 1.15 = 152605000 lamports and died
+    // with "Transfer: insufficient lamports 134695720, need 152605000".
     const size = maxAffordableBuySol(0.1327, 15, 0.001);
     const lamportsNeeded = size * 1.15; // slippage-buffered transfer
     const balanceAfterFeeAndRent = 0.1327 - 0.001005 - 0.00203928;
@@ -617,36 +596,8 @@ console.log('\n-- All-In Trade Sizing --');
     assert.strictEqual(maxAffordableBuySol(0, 15, 0.001), 0);
   });
 
-  test('flag ON real mode with 0 availableTradeSol returns 0', () => {
-    const size = computeEntrySizeSol({
-      allIn: true,
-      tradingMode: 'real',
-      buyAmountSol: 0.15,
-      sizeMultiplier: 1,
-      availableTradeSol: 0,
-      bankrollUsd: 100,
-      solPriceUsd: 200,
-      openExposureSol: 0,
-      maxSlippagePct: 15,
-      priorityFeeSol: 0.001,
-    });
-    assert.strictEqual(size, 0);
-  });
-
-  test('flag ON paper mode subtracts active position exposure from converted bankroll', () => {
-    const size = computeEntrySizeSol({
-      allIn: true,
-      tradingMode: 'paper',
-      buyAmountSol: 0.15,
-      sizeMultiplier: 1,
-      availableTradeSol: 0,
-      bankrollUsd: 100,
-      solPriceUsd: 200, // 100/200 = 0.5 SOL
-      openExposureSol: 0.2,
-      maxSlippagePct: 15,
-      priorityFeeSol: 0.001,
-    });
-    assert.strictEqual(size, 0.3);
+  test('an empty wallet stakes nothing', () => {
+    assert.strictEqual(affordableStakeSol(0.0395, 0, 15, 0.0005), 0);
   });
 
   test('breakeven percent floors for sizing', () => {
@@ -658,41 +609,9 @@ console.log('\n-- All-In Trade Sizing --');
     assert.ok(be005 > 10, `expected >10%, got ${be005}%`);
   });
 
-  test('blockAllInEntry returns true if position open or in-flight', () => {
-    assert.strictEqual(blockAllInEntry(0, 0), false);
-    assert.strictEqual(blockAllInEntry(1, 0), true);
-    assert.strictEqual(blockAllInEntry(0, 1), true);
-    assert.strictEqual(blockAllInEntry(2, 1), true);
-  });
-
-  test('isFullConviction requires sizeMultiplier >= 1', () => {
-    assert.strictEqual(isFullConviction(1), true);
-    assert.strictEqual(isFullConviction(1.5), true);
-    assert.strictEqual(isFullConviction(0.5), false);
-  });
-
-  test('allInSizing ships enabled by default', () => {
-    // Assert the shipped default, NOT featureFlags.all() — that reflects
-    // flags.json, so the suite used to fail purely because the operator had
-    // switched all-in off at runtime (which is a supported thing to do).
+  test('the allInSizing flag no longer exists', () => {
     const { DEFAULTS } = require('../services/featureFlags');
-    assert.strictEqual(DEFAULTS.allInSizing, true);
-  });
-
-  test('turning allInSizing off restores fixed-size entries', () => {
-    const size = computeEntrySizeSol({
-      allIn: false,
-      tradingMode: 'real',
-      buyAmountSol: 0.0395,   // the $3-per-trade stake
-      sizeMultiplier: 1,
-      availableTradeSol: 0.092,
-      bankrollUsd: 7.38,
-      solPriceUsd: 76,
-      openExposureSol: 0,
-      maxSlippagePct: 15,
-      priorityFeeSol: 0.0005,
-    });
-    assert.strictEqual(size, 0.0395, 'fixed sizing must use buyAmountSol exactly');
+    assert.ok(!('allInSizing' in DEFAULTS), 'allInSizing must be gone from the flag set');
   });
 }
 

@@ -118,7 +118,6 @@ export function App() {
 
   // Feature Flags State
   const [featureFlags, setFeatureFlags] = useState<Record<string, boolean>>({
-    allInSizing: true,
     devSellStop: true,
     honestPaper: true,
     playbookRouting: true,
@@ -699,21 +698,14 @@ export function App() {
 
         {/* Next order size — recomputed from the live balance every frame, by
             the same maths the buy path uses. */}
-        <div className="stat-card" style={{ border: sizing?.allInEnabled ? '1px solid rgba(251,191,36,0.4)' : undefined }}>
-          <div className="stat-label">
-            Next Entry Size
-            {sizing?.allInEnabled && (
-              <span style={{ float: 'right', fontSize: '9px', color: '#fbbf24' }}>ALL-IN</span>
-            )}
-          </div>
-          <div className="stat-value-mono" style={{ color: sizing?.allInEnabled ? '#fbbf24' : undefined }}>
+        <div className="stat-card">
+          <div className="stat-label">Next Entry Size</div>
+          <div className="stat-value-mono">
             {sizing ? `${sizing.nextBuySol} SOL` : '—'}
           </div>
           <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {sizing
-              ? sizing.allInEnabled
-                ? `≈ $${sizing.nextBuyUsd} · ${sizing.deployableSol} SOL DEPLOYABLE LESS FEES`
-                : `≈ $${sizing.nextBuyUsd} × ${sizing.tradesAffordable} TRADE${sizing.tradesAffordable === 1 ? '' : 'S'} FROM ${sizing.deployableSol} SOL`
+              ? `≈ $${sizing.nextBuyUsd} × ${sizing.tradesAffordable} TRADE${sizing.tradesAffordable === 1 ? '' : 'S'} FROM ${sizing.deployableSol} SOL`
               : 'AWAITING STATUS'}
           </div>
           {/* Fee drag is the number that decides whether small stakes can work
@@ -1045,43 +1037,11 @@ export function App() {
           <div className="modal-card" style={{ maxWidth: '580px', width: '92%' }}>
             <div className="modal-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span>System Parameters &amp; Feature Flags — Port {selectedPort}</span>
-              <span className={`status-badge ${featureFlags.allInSizing ? 'positive' : ''}`}>
-                {featureFlags.allInSizing ? '⚡ ALL-IN ACTIVE' : 'FIXED SIZING'}
-              </span>
-            </div>
-
-            {/* All-In Budget Sizing Hero Banner */}
-            <div style={{
-              background: featureFlags.allInSizing ? 'rgba(67, 138, 78, 0.12)' : 'rgba(255,255,255,0.03)',
-              border: `1px solid ${featureFlags.allInSizing ? 'var(--accent-olive)' : 'var(--border-hairline)'}`,
-              padding: '12px 14px',
-              marginBottom: '14px',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              gap: '12px'
-            }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span style={{ fontSize: '13px' }}>⚡</span>
-                  <span style={{ fontWeight: 700, fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.08em', color: featureFlags.allInSizing ? 'var(--accent-olive)' : 'var(--ink-primary)' }}>
-                    All-In Wallet Budget Trade Sizing
-                  </span>
-                </div>
-                <div style={{ fontSize: '8.5px', color: 'var(--ink-secondary)', marginTop: '4px', fontFamily: 'var(--font-mono)', lineHeight: '1.3' }}>
-                  {featureFlags.allInSizing
-                    ? 'Every trade entry deploys 100% of available Photon wallet SOL balance (~99.5%+). Budget limits, conviction skipping, and breakeven cost ceilings are disabled.'
-                    : 'Trades spend the fixed Position Allocation Size (SOL) configured below.'}
-                </div>
-              </div>
-              <button
-                type="button"
-                className={featureFlags.allInSizing ? 'btn-terminal' : 'btn-terminal-outline'}
-                style={{ whiteSpace: 'nowrap', padding: '6px 12px', flexShrink: 0 }}
-                onClick={() => handleToggleFlag('allInSizing', !featureFlags.allInSizing)}
-              >
-                {featureFlags.allInSizing ? 'ALL-IN ON' : 'ENABLE ALL-IN'}
-              </button>
+              {sizing && (
+                <span className="status-badge">
+                  {sizing.nextBuySol} SOL × {sizing.tradesAffordable}
+                </span>
+              )}
             </div>
 
             <form onSubmit={handleSaveConfig}>
@@ -1183,14 +1143,11 @@ export function App() {
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                   <div className="form-group">
-                    <label className="form-label">
-                      Position Size (SOL) {featureFlags.allInSizing && <span style={{ color: 'var(--accent-olive)' }}>(ALL-IN ACTIVE)</span>}
-                    </label>
+                    <label className="form-label">Position Size (SOL)</label>
                     <input
                       type="number"
-                      step="0.01"
+                      step="0.001"
                       className="form-input"
-                      disabled={!!featureFlags.allInSizing}
                       value={configForm.buyAmountSol}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, buyAmountSol: Number(e.target.value) })}
                     />

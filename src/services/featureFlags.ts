@@ -55,11 +55,6 @@ export interface FeatureFlagSet {
    * price stops, per the playbook.
    */
   devSellStop: boolean;
-  /**
-   * Each entry spends the full deployable balance (gas float preserved); forces max 1 concurrent position;
-   * full-conviction only (skips half-unit signals).
-   */
-  allInSizing: boolean;
 }
 
 /**
@@ -82,7 +77,6 @@ export const DEFAULTS: FeatureFlagSet = {
   playbookRouting: false,
   honeypotChecks: false,
   devSellStop: false,
-  allInSizing: true,
 };
 
 const FLAGS_PATH = path.resolve(process.cwd(), 'flags.json');

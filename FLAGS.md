@@ -277,7 +277,35 @@ Fixed unconditionally after the first real all-in buy failed on-chain
    no position) from a confirmation timeout (funds may have moved — position
    opens on estimates, as before). Failed buys/sells log the Solscan link.
 
-# All-In Trade Sizing — 2026-08-08
+# All-in sizing REMOVED — 2026-08-09
+
+The `allInSizing` flag and every code path behind it are gone. Position size is
+now the operator's configured `buyAmountSol`, scaled only by the router's
+conviction multiplier and clamped to what the wallet can actually fund
+(`affordableStakeSol`).
+
+Why it was removed rather than left switched off:
+
+- **It could not fund its own transaction.** A buy reserves stake x
+  (1 + slippage) plus protocol fees, priority fee, base fees and ATA rent.
+  Staking the whole deployable balance overdrafts by construction — every
+  all-in order died with "Transfer: insufficient lamports".
+- **It forced one position at a time.** With the balance fully committed there
+  was nothing left for a second entry, so `blockAllInEntry` skipped every
+  concurrent signal. Diversification was impossible by design.
+- **It made a single bad fill a total loss.** One rug took the entire wallet,
+  which is exactly what happened repeatedly.
+- **It fought the economics gate.** `enforceTradeEconomics` had to be bypassed
+  for all-in entries, removing the only guard against fee-dominated trades.
+
+The one genuinely useful piece — sizing against the live balance rather than a
+10-second-old snapshot, and never ordering more than the balance can fund — was
+kept and now applies to every entry.
+
+The section below is retained for historical context only. The flag it
+describes no longer exists.
+
+# All-In Trade Sizing — 2026-08-08 (REMOVED — historical)
 
 - **`allInSizing`** — Spends the entire deployable balance (`availableTradeSol` = `solBalance - 0.05` SOL gas float) on every entry.
   - **Single position cap**: Forces a maximum of 1 active or in-flight position at any time so concurrent signals cannot double-spend the wallet.

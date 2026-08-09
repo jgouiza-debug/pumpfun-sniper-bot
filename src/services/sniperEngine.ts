@@ -27,7 +27,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, blockAllInEntry, isFullConviction, maxAffordableBuySol, sellAmountParam } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -177,8 +177,6 @@ export class SniperEngine {
 
   // Guards against overlapping monitor ticks when a batch fetch runs long.
   private monitorTickInFlight = false;
-  // Tracks in-flight buy attempts for allInSizing position limiting.
-  private buysInFlight = 0;
 
   private priorityFeeService: PriorityFeeService;
   // One kill-switch trip per pause: reset when the bot is (re)started.
@@ -590,7 +588,6 @@ export class SniperEngine {
    * path uses — so the dashboard figure and the real order can never disagree.
    */
   private getSizingPreview(): BotStatusResponse['sizing'] {
-    const allInEnabled = featureFlags.get('allInSizing');
     const deployableSol = this.config.tradingMode === 'real'
       ? this.wallet.getDeployableSol()
       : Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
@@ -599,14 +596,11 @@ export class SniperEngine {
       ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
       : this.config.priorityFeeSol;
 
-    let nextBuySol: number;
-    if (!allInEnabled) {
-      nextBuySol = this.config.buyAmountSol;
-    } else if (this.config.tradingMode === 'real') {
-      nextBuySol = maxAffordableBuySol(deployableSol, this.config.maxSlippagePct, sizingPriorityFeeSol);
-    } else {
-      nextBuySol = deployableSol;
-    }
+    // The configured stake, clamped to what the balance can actually fund —
+    // exactly what the buy path computes.
+    const nextBuySol = this.config.tradingMode === 'real' && deployableSol > 0
+      ? affordableStakeSol(this.config.buyAmountSol, deployableSol, this.config.maxSlippagePct, sizingPriorityFeeSol)
+      : this.config.buyAmountSol;
 
     // How many entries of this size the budget actually funds. Each one costs
     // the stake plus its priority fee plus base fees and ATA rent, so dividing
@@ -620,11 +614,10 @@ export class SniperEngine {
       : Math.min(affordable, this.config.maxActivePositions);
 
     return {
-      allInEnabled,
       deployableSol,
       nextBuySol: Number(nextBuySol.toFixed(4)),
       nextBuyUsd: Number((nextBuySol * this.config.solPriceUsd).toFixed(2)),
-      tradesAffordable: allInEnabled ? Math.min(1, affordable) : Math.max(0, concurrencyCap),
+      tradesAffordable: Math.max(0, concurrencyCap),
       breakevenPct: nextBuySol > 0 ? breakevenPct(Number(nextBuySol.toFixed(6)), sizingPriorityFeeSol) : 0,
     };
   }
@@ -656,7 +649,7 @@ export class SniperEngine {
     return null;
   }
 
-  private async executeRealMainnetTrade(action: 'buy' | 'sell', mint: string, solAmount: number, amountPct?: string): Promise<TradeResult | null> {
+  private async executeRealMainnetTrade(action: 'buy' | 'sell', mint: string, solAmount: number, amountPct?: string, pool?: string): Promise<TradeResult | null> {
     const keypair = this.wallet.getKeypair();
     if (!keypair) {
       this.log('error', '❌ Cannot execute real trade: no Photon wallet linked.');
@@ -722,9 +715,16 @@ export class SniperEngine {
           amount: action === 'buy' ? solAmount : sellAmountParam(amountPct),
           slippage: this.config.maxSlippagePct,
           priorityFee: priorityFeeSol,
-          // 'auto' routes bonding-curve and migrated (Raydium / pump-AMM) tokens
-          // alike. Hardcoding 'pump' silently fails on anything post-migration.
-          pool: 'auto'
+          // Route to the venue the migration payload named, falling back to
+          // 'auto' when we genuinely do not know.
+          //
+          // 'auto' is NOT safe for a token that just graduated: PumpPortal
+          // resolves it against an index that has not caught up yet, sends the
+          // order to the pump.fun bonding curve, and the program rejects it
+          // with BondingCurveComplete (0x1775). Measured 2026-08-09 — two of
+          // four failed buys died exactly this way, both on migrations, which
+          // is the bot's main strategy.
+          pool: pool || 'auto'
         }, {
           responseType: 'arraybuffer',
           timeout: 10000
@@ -961,6 +961,9 @@ export class SniperEngine {
 
     const launchData: Partial<PumpTokenLaunch> = {
       mint,
+      // Destination venue, present on migration payloads. Carried all the way
+      // to the order so a graduated token is never routed at the dead curve.
+      pool: typeof payload.pool === 'string' ? payload.pool : undefined,
       // Do NOT default these. Migration events carry no name/symbol, and a
       // truthy placeholder here shadows the RugCheck metadata fallback in
       // RiskFilter.evaluateToken (`launch.name || report?.tokenMeta?.name`),
@@ -1480,30 +1483,6 @@ export class SniperEngine {
       selectedPlay = decision.play === 'NONE' ? 'PLAY_2' : decision.play;
       sizeMultiplier = decision.sizeMultiplier;
 
-      if (featureFlags.get('allInSizing')) {
-        if (blockAllInEntry(this.activePositions.length, this.buysInFlight)) {
-          this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
-          return;
-        }
-        // NOT gated on full conviction. FLAGS.md described all-in as
-        // "full-conviction only" (score >= 71), and enforcing that made Play 3
-        // unreachable by construction: at the migration moment DexScreener has
-        // not indexed the pool, so demand and narrative points cannot be
-        // earned, and a PERFECT graduation — 15% top-10, 1% dev, completed
-        // curve — tops out at exactly 62. Measured, not estimated: see the
-        // "Play 3 score ceiling" test. The same token scores 82 once indexed,
-        // minutes after the window has closed.
-        //
-        // The playbook already accounts for this: 55 is the half-unit floor
-        // Play 3 is designed to trade on. Safety lives in the router's
-        // eligibility check (phase, liquidity, market cap, demand) and in
-        // Gate 0's verified-concentration requirement — which is what actually
-        // stops the unmeasured tokens, and stops them at a score of 42.
-        if (!isFullConviction(sizeMultiplier)) {
-          this.log('info', `📊 [HALF-CONVICTION] $${filterResult.tokenSymbol} scored ${score} (${sizeMultiplier}u) — eligible on the router's half-unit floor. All-in deploys the full balance.`, filterResult.mint);
-        }
-      }
-
       this.log('info', `🎯 [TRIGGER] $${filterResult.tokenSymbol} — ${describeRoute(decision)}`, filterResult.mint);
     } else {
       if (isMigration || progress >= 70) {
@@ -1513,26 +1492,14 @@ export class SniperEngine {
       } else if (filterResult.liquidityUsd >= 2000) {
         selectedPlay = 'PLAY_5';
       }
-
-      if (featureFlags.get('allInSizing')) {
-        if (blockAllInEntry(this.activePositions.length, this.buysInFlight)) {
-          this.log('info', `⏭️ [ALL-IN BLOCKED] Position or buy in-flight already (${this.activePositions.length} active, ${this.buysInFlight} in-flight). Skipping buy for $${filterResult.tokenSymbol}.`, filterResult.mint);
-          return;
-        }
-      }
     }
 
     if (this.config.activePlaybook !== 'ALL' && this.config.activePlaybook !== selectedPlay) return;
 
-    const openExposureSol = this.activePositions.reduce(
-      (acc, p) => acc + (p.investedSol || (p.investedUsd / (this.config.solPriceUsd || 200))),
-      0
-    );
-
-    // All-in sizes against the wallet as it is RIGHT NOW. The background sync
-    // only runs every 10s, and "all in" means the position IS the balance — a
-    // stale figure either leaves cash idle or overdrafts the transfer.
-    if (this.config.tradingMode === 'real' && featureFlags.get('allInSizing')) {
+    // Read the wallet as it is right now: the background sync only runs every
+    // 10s, and sizing against a stale balance either leaves cash idle or
+    // overdrafts the order.
+    if (this.config.tradingMode === 'real') {
       await this.wallet.refreshBalance(true);
       this.availableTradeSol = this.wallet.getDeployableSol();
     }
@@ -1544,27 +1511,19 @@ export class SniperEngine {
       : this.config.priorityFeeSol;
 
     let unitSizeSol = computeEntrySizeSol({
-      allIn: featureFlags.get('allInSizing'),
-      tradingMode: this.config.tradingMode,
       buyAmountSol: this.config.buyAmountSol,
       sizeMultiplier,
-      availableTradeSol: this.availableTradeSol,
-      bankrollUsd: this.currentBankrollUsd,
-      solPriceUsd: this.config.solPriceUsd,
-      openExposureSol,
-      maxSlippagePct: this.config.maxSlippagePct,
-      priorityFeeSol: sizingPriorityFeeSol,
     });
 
-    if (this.config.tradingMode === 'real' && !featureFlags.get('allInSizing') && this.availableTradeSol > 0) {
-      const maxAffordable = maxAffordableBuySol(
+    // Never order more than the balance can actually fund, fees and the
+    // slippage buffer included.
+    if (this.config.tradingMode === 'real' && this.availableTradeSol > 0) {
+      unitSizeSol = affordableStakeSol(
+        unitSizeSol,
         this.availableTradeSol,
         this.config.maxSlippagePct,
         sizingPriorityFeeSol
       );
-      if (unitSizeSol > maxAffordable) {
-        unitSizeSol = maxAffordable;
-      }
     }
 
     if (unitSizeSol <= 0.0001) {
@@ -1572,10 +1531,8 @@ export class SniperEngine {
       return;
     }
 
-    // Trade economics gate: when allInSizing is active, deploy all budget without
-    // capping or refusing entries due to breakeven cost percentage.
     const be = breakevenPct(unitSizeSol, this.config.priorityFeeSol);
-    if (featureFlags.get('enforceTradeEconomics') && !featureFlags.get('allInSizing')) {
+    if (featureFlags.get('enforceTradeEconomics')) {
       const maxBe = this.config.maxBreakevenPct ?? 6;
       if (be > maxBe) {
         this.log('warn', `⚠️ Skipping $${filterResult.tokenSymbol}: round-trip cost ${be}% of a ${unitSizeSol} SOL position exceeds the ${maxBe}% limit. Increase buyAmountSol or lower priorityFeeSol.`, filterResult.mint);
@@ -1583,12 +1540,7 @@ export class SniperEngine {
       }
     }
 
-    this.buysInFlight++;
-    try {
-      await this.executeBuy(filterResult, selectedPlay, unitSizeSol, be, launchData);
-    } finally {
-      this.buysInFlight--;
-    }
+    await this.executeBuy(filterResult, selectedPlay, unitSizeSol, be, launchData);
   }
 
   private async executeBuy(
@@ -1640,14 +1592,12 @@ export class SniperEngine {
     }
 
     if (this.config.tradingMode === 'real') {
-      if (featureFlags.get('allInSizing')) {
-        this.availableTradeSol = 0;
-      }
-      const result = await this.executeRealMainnetTrade('buy', filterResult.mint, solAmount);
+      // Reserve the stake against concurrent entries until the fill (or the
+      // failure) resolves the real balance.
+      this.availableTradeSol = Math.max(0, this.availableTradeSol - solAmount);
+      const result = await this.executeRealMainnetTrade('buy', filterResult.mint, solAmount, undefined, launchData?.pool);
       if (!result) {
-        if (featureFlags.get('allInSizing')) {
-          void this.syncLiveWalletBalance();
-        }
+        void this.syncLiveWalletBalance();
         latencyTimeline.annotate(filterResult.mint, { decision: 'buy_failed' });
         this.log('error', `❌ Photon real buy failed for $${filterResult.tokenSymbol}. Skipping position creation.`);
         return;
@@ -1677,6 +1627,7 @@ export class SniperEngine {
       tokenName: filterResult.tokenName,
       tokenSymbol: filterResult.tokenSymbol,
       playbook,
+      venue: launchData?.pool,
       buyPriceUsd,
       currentPriceUsd: buyPriceUsd,
       highestPriceUsd: buyPriceUsd,
@@ -1875,7 +1826,8 @@ export class SniperEngine {
     const now = Date.now();
     if (pos.sellRetryAfterMs && now < pos.sellRetryAfterMs) return null;
 
-    const result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`);
+    // Exit on the same venue the entry filled on, for the same reason.
+    const result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`, pos.venue);
     if (!result) {
       pos.sellFailCount = (pos.sellFailCount ?? 0) + 1;
       const delayMs = Math.min(10 * 60_000, 5_000 * Math.pow(2, pos.sellFailCount - 1));

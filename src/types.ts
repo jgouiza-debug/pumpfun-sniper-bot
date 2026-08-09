@@ -1,5 +1,12 @@
 export interface PumpTokenLaunch {
   mint: string;
+  /**
+   * Venue the token actually trades on, straight from the migration payload
+   * (measured: 77x "pump-amm", 1x "raydium-cpmm" over 78 graduations).
+   * Routing a freshly graduated token as "auto" resolves to the bonding curve
+   * before the indexer catches up, and the buy dies with BondingCurveComplete.
+   */
+  pool?: string;
   name: string;
   symbol: string;
   description?: string;
@@ -220,6 +227,12 @@ export interface Position {
   tokenName: string;
   tokenSymbol: string;
   playbook: PlaybookType;
+  /**
+   * Venue this position was filled on ("pump-amm", "raydium-cpmm", ...), so the
+   * exit routes to the same place. Distinct from the engine's internal `pool`
+   * reserves snapshot.
+   */
+  venue?: string;
   buyPriceUsd: number;
   currentPriceUsd: number;
   highestPriceUsd: number;
@@ -402,7 +415,6 @@ export interface BotStatusResponse {
   };
   /** What the next entry would actually stake, recomputed from the live balance. */
   sizing: {
-    allInEnabled: boolean;
     /** Wallet balance minus the gas float. */
     deployableSol: number;
     /** Deployable minus slippage/fee headroom — the real order size. */

@@ -135,45 +135,21 @@ export function maxAffordableBuySol(
 }
 
 /**
- * Computes entry size in SOL based on allInSizing flag, tradingMode, and wallet/bankroll state.
+ * Entry size in SOL: the configured stake, scaled by the router's conviction
+ * multiplier (1 unit or a half unit).
+ *
+ * All-in sizing was removed 2026-08-09. It staked the entire deployable balance
+ * on every entry, which forced a one-position-at-a-time cap, made a single bad
+ * fill a total loss, and repeatedly overdrafted its own transaction because the
+ * order reserves stake x (1+slippage) plus fees. Position size is now the
+ * operator's number and nothing else scales it.
  */
 export function computeEntrySizeSol(params: {
-  allIn: boolean;
-  tradingMode: 'paper' | 'real';
   buyAmountSol: number;
   sizeMultiplier: number;
-  availableTradeSol: number;
-  bankrollUsd: number;
-  solPriceUsd: number;
-  openExposureSol: number;
-  maxSlippagePct: number;
-  priorityFeeSol: number;
 }): number {
-  const {
-    allIn,
-    tradingMode,
-    buyAmountSol,
-    sizeMultiplier,
-    availableTradeSol,
-    bankrollUsd,
-    solPriceUsd,
-    openExposureSol,
-    maxSlippagePct,
-    priorityFeeSol,
-  } = params;
-
-  if (!allIn) {
-    return buyAmountSol * sizeMultiplier;
-  }
-
-  if (tradingMode === 'real') {
-    return maxAffordableBuySol(availableTradeSol, maxSlippagePct, priorityFeeSol);
-  }
-
-  // Paper mode all-in: full bankroll converted to SOL minus active open position SOL exposure
-  const solPrice = solPriceUsd > 0 ? solPriceUsd : 200;
-  const totalBankrollSol = bankrollUsd / solPrice;
-  return Math.max(0, totalBankrollSol - openExposureSol);
+  const { buyAmountSol, sizeMultiplier } = params;
+  return buyAmountSol * sizeMultiplier;
 }
 
 /**
@@ -193,16 +169,17 @@ export function sellAmountParam(amountPct?: string | number): string {
 }
 
 /**
- * Returns true if an all-in entry should be blocked because a position is open or in-flight.
+ * Largest stake that still leaves room for the fees and slippage buffer, given
+ * what the wallet can actually deploy. Kept as the affordability clamp on a
+ * fixed stake — the operator's configured size is used unless the balance
+ * cannot fund it.
  */
-export function blockAllInEntry(openCount: number, buysInFlight: number): boolean {
-  return openCount > 0 || buysInFlight > 0;
-}
-
-/**
- * Returns true if a signal is full conviction (sizeMultiplier >= 1).
- * Borderline / half-unit signals (sizeMultiplier < 1) return false.
- */
-export function isFullConviction(sizeMultiplier: number): boolean {
-  return sizeMultiplier >= 1;
+export function affordableStakeSol(
+  requestedSol: number,
+  availableSol: number,
+  maxSlippagePct: number,
+  priorityFeeSol: number
+): number {
+  const ceiling = maxAffordableBuySol(availableSol, maxSlippagePct, priorityFeeSol);
+  return Math.min(requestedSol, ceiling);
 }
