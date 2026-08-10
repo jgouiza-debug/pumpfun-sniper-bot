@@ -55,6 +55,10 @@ export interface FeatureFlagSet {
    * price stops, per the playbook.
    */
   devSellStop: boolean;
+  /**
+   * Spends 100% of available deployable balance on every trade entry without budget limits.
+   */
+  allInSizing: boolean;
 }
 
 /**
@@ -77,6 +81,7 @@ export const DEFAULTS: FeatureFlagSet = {
   playbookRouting: false,
   honeypotChecks: false,
   devSellStop: false,
+  allInSizing: true,
 };
 
 const FLAGS_PATH = path.resolve(process.cwd(), 'flags.json');

@@ -503,7 +503,10 @@ export class SniperEngine {
   }
 
   public getConfig(): BotConfig {
-    return { ...this.config };
+    return {
+      ...this.config,
+      allInSizing: featureFlags.get('allInSizing'),
+    };
   }
 
   // Returns the recommended SOL buy size for a given leniency mode
@@ -568,6 +571,10 @@ export class SniperEngine {
   public updateConfig(newConfig: Partial<BotConfig>): void {
     const wasActive = this.config.isBotActive;
     const prevMode = this.config.tradingMode;
+
+    if (newConfig.allInSizing !== undefined) {
+      featureFlags.set('allInSizing', Boolean(newConfig.allInSizing));
+    }
 
     newConfig = this.clampConfig(newConfig);
     this.config = { ...this.config, ...newConfig };
@@ -1738,7 +1745,10 @@ export class SniperEngine {
       held.lastCurvePriceUsd = (u.vSolInBondingCurve / u.vTokensInBondingCurve) * this.config.solPriceUsd;
       held.lastCurvePriceAt = u.at;
       // Curve updates arrive over the Helius websocket, so an on-curve position
-      // can repaint the instant its price moves rather than on the next tick.
+      // reprices the instant its price moves rather than on the next 1s tick.
+      // The reprice is the point — emitting without it repainted stale numbers.
+      this.repricePosition(held, held.lastCurvePriceUsd);
+      held.priceSource = 'curve';
       this.emitChange();
     }
 
@@ -2189,6 +2199,29 @@ export class SniperEngine {
         this.monitorTickInFlight = false;
       }
     }, POSITION_MONITOR_INTERVAL_MS);
+  }
+
+  /**
+   * Reprices one position from a new price, in place. The ONLY place P&L is
+   * computed, so the 1s monitor tick and the push-driven curve feed can never
+   * disagree about what a position is worth.
+   *
+   * Before this existed, P&L was written exclusively inside
+   * updateAndCheckPositionExit — so a curve update arriving over the Helius
+   * websocket set lastCurvePriceUsd, fired emitChange(), and the UI faithfully
+   * repainted the SAME STALE NUMBERS. The comment at handleCurveUpdate claimed
+   * an on-curve position "can repaint the instant its price moves"; the repaint
+   * happened, the reprice did not.
+   */
+  private repricePosition(pos: InternalPosition, priceUsd: number): void {
+    if (!(priceUsd > 0)) return;
+    pos.currentPriceUsd = priceUsd;
+    const unrealized = pos.tokensHeld * priceUsd - pos.investedUsd;
+    pos.pnlUsd = Number((pos.realizedPnlUsd + unrealized).toFixed(2));
+    pos.pnlSol = Number((pos.pnlUsd / this.config.solPriceUsd).toFixed(4));
+    pos.pnlPct = pos.buyPriceUsd > 0
+      ? Number((((priceUsd - pos.buyPriceUsd) / pos.buyPriceUsd) * 100).toFixed(1))
+      : 0;
   }
 
   /**

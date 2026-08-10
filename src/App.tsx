@@ -129,6 +129,7 @@ export function App() {
 
   // Feature Flags State
   const [featureFlags, setFeatureFlags] = useState<Record<string, boolean>>({
+    allInSizing: true,
     devSellStop: true,
     honestPaper: true,
     playbookRouting: true,
@@ -468,7 +469,7 @@ export function App() {
       const res = await fetch(`http://localhost:${selectedPort}/api/bot/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(configForm)
+        body: JSON.stringify({ ...configForm, allInSizing: featureFlags.allInSizing })
       });
       const data = await res.json();
       if (data.success) {

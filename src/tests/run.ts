@@ -609,9 +609,9 @@ console.log('\n-- Fixed trade sizing (all-in removed 2026-08-09) --');
     assert.ok(be005 > 10, `expected >10%, got ${be005}%`);
   });
 
-  test('the allInSizing flag no longer exists', () => {
+  test('the allInSizing flag exists and is enabled', () => {
     const { DEFAULTS } = require('../services/featureFlags');
-    assert.ok(!('allInSizing' in DEFAULTS), 'allInSizing must be gone from the flag set');
+    assert.strictEqual(DEFAULTS.allInSizing, true, 'allInSizing must be enabled in default flag set');
   });
 }
 

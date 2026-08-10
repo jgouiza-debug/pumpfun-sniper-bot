@@ -202,6 +202,11 @@ export interface BotConfig {
   activePlaybook: PlaybookType | 'ALL';
   buyAmountSol: number;
   /**
+   * Spends 100% of deployable Photon wallet balance on every entry without budget caps,
+   * conviction skipping, or breakeven ceilings.
+   */
+  allInSizing?: boolean;
+  /**
    * Split the run's deployable balance into `maxActivePositions` equal slots at
    * arm time, and stake one slot per entry, instead of using the fixed
    * `buyAmountSol`. The budget is fixed for the run, so a slot that goes to zero
