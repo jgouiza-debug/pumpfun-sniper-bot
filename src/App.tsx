@@ -195,41 +195,49 @@ export function App() {
 
   const linkWallet = async () => {
     setWalletError('');
-    let res: Response;
-
-    try {
-      res = await fetch(`${API_BASE}/api/wallet/link`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ privateKey: walletKeyInput, persist: walletPersist }),
-      });
-    } catch {
-      // Only a genuine transport failure lands here.
-      setWalletError(`Cannot reach the API at ${API_BASE}. Start it with: npm run server`);
+    const rawInput = walletKeyInput.trim();
+    if (!rawInput) {
+      setWalletError('Please enter a Photon/Phantom private key or byte array.');
       return;
     }
 
-    // A stale server that predates the wallet endpoints answers 404 with HTML,
-    // which used to blow up in res.json() and get misreported as "offline".
-    if (res.status === 404) {
-      setWalletError('This server build has no /api/wallet/link endpoint. Restart the backend to pick up the new code.');
-      return;
+    const portsToTry = [selectedPort, 3001, 3002];
+    let lastError = '';
+
+    for (const port of portsToTry) {
+      try {
+        const res = await fetch(`http://localhost:${port}/api/wallet/link`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ privateKey: rawInput, persist: walletPersist }),
+        });
+
+        if (res.status === 404) {
+          lastError = 'This server build has no /api/wallet/link endpoint. Restart backend server.';
+          continue;
+        }
+
+        let data: any;
+        try {
+          data = await res.json();
+        } catch {
+          lastError = `Server returned invalid non-JSON response (HTTP ${res.status}).`;
+          continue;
+        }
+
+        if (res.ok && data.ok) {
+          setWalletKeyInput('');
+          setWalletError('');
+          return;
+        } else {
+          lastError = data?.error || `Link failed (HTTP ${res.status}).`;
+        }
+      } catch (err) {
+        lastError = `Cannot reach backend API server. Ensure server daemon is running.`;
+      }
     }
 
-    let data: any;
-    try {
-      data = await res.json();
-    } catch {
-      setWalletError(`Server returned a non-JSON response (HTTP ${res.status}). Restart the backend and try again.`);
-      return;
-    }
-
-    if (!res.ok || !data.ok) {
-      setWalletError(data?.error || `Link failed (HTTP ${res.status}).`);
-      return;
-    }
-
-    setWalletKeyInput('');
+    setWalletError(lastError || 'Link failed. Check your private key format.');
   };
 
   const refreshWallet = async () => {

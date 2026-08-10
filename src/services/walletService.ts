@@ -139,17 +139,54 @@ export class WalletService {
    */
   public static parseSecret(secret: string): Keypair | null {
     try {
-      const trimmed = secret.trim();
+      let trimmed = secret.trim();
       if (!trimmed) return null;
 
-      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-        return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(trimmed)));
+      // Strip surrounding double/single quotes if copied with quotes
+      if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+        trimmed = trimmed.slice(1, -1).trim();
       }
 
+      // JSON Array or bracketed numbers: e.g. [123, 45, 67...]
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        try {
+          const arr = JSON.parse(trimmed);
+          if (Array.isArray(arr)) {
+            const bytes = Uint8Array.from(arr);
+            if (bytes.length === 64) return Keypair.fromSecretKey(bytes);
+            if (bytes.length === 32) return Keypair.fromSeed(bytes);
+          }
+        } catch { /* proceed */ }
+      }
+
+      // Comma-separated numbers without brackets: e.g. 123, 45, 67...
+      if (/^\d+(\s*,\s*\d+){31,63}$/.test(trimmed)) {
+        try {
+          const arr = trimmed.split(',').map(n => parseInt(n.trim(), 10));
+          const bytes = Uint8Array.from(arr);
+          if (bytes.length === 64) return Keypair.fromSecretKey(bytes);
+          if (bytes.length === 32) return Keypair.fromSeed(bytes);
+        } catch { /* proceed */ }
+      }
+
+      // 128-char hex string (64 bytes) or 64-char hex string (32 bytes seed)
       if (/^[0-9a-fA-F]{128}$/.test(trimmed)) {
         return Keypair.fromSecretKey(Uint8Array.from(Buffer.from(trimmed, 'hex')));
       }
+      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        return Keypair.fromSeed(Uint8Array.from(Buffer.from(trimmed, 'hex')));
+      }
 
+      // Base64 string
+      if (/^[A-Za-z0-9+/=]{44,88}$/.test(trimmed)) {
+        try {
+          const decodedB64 = Buffer.from(trimmed, 'base64');
+          if (decodedB64.length === 64) return Keypair.fromSecretKey(Uint8Array.from(decodedB64));
+          if (decodedB64.length === 32) return Keypair.fromSeed(Uint8Array.from(decodedB64));
+        } catch { /* proceed */ }
+      }
+
+      // Base58 string (most common for Phantom / Solflare / Photon exports)
       const decoded = bs58.decode(trimmed);
       if (decoded.length === 64) return Keypair.fromSecretKey(decoded);
       if (decoded.length === 32) return Keypair.fromSeed(decoded);
