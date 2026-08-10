@@ -1064,5 +1064,60 @@ console.log('\n-- Exit policy: no price stop-loss --');
   });
 }
 
+// ---------------------------------------------------------------------------
+// Entry economics — the wall that produced the 0-trade 89-minute live run.
+// ---------------------------------------------------------------------------
+console.log('\n-- Entry economics: the half-unit stake must clear the breakeven gate --');
+{
+  const { breakevenPct } = require('../services/paperSimulator');
+  const { affordableStakeSol, computeEntrySizeSol } = require('../services/pipelineUtils');
+  const MAX_BE = 6;
+  const PRIORITY_FEE = 0.003;
+  const SLIPPAGE = 25;
+
+  test('OLD BUG reproduced: buyAmountSol 0.3 sized a half unit that the gate refused', () => {
+    const stake = computeEntrySizeSol({ buyAmountSol: 0.3, sizeMultiplier: 0.5 });
+    assert.strictEqual(stake, 0.15);
+    const be = breakevenPct(stake, PRIORITY_FEE);
+    assert.ok(be > MAX_BE,
+      `0.15 SOL should exceed the ${MAX_BE}% limit (this is why 102 candidates passed and 0 opened), got ${be}%`);
+  });
+
+  test('OLD BUG reproduced: at a 0.2 SOL wallet NO buyAmountSol could clear the gate', () => {
+    // affordableStakeSol clamps to what the balance can fund, so the ceiling is
+    // the ceiling regardless of how large the configured unit is.
+    const deployable = 0.195; // 0.2 wallet - 0.005 gas float
+    for (const unit of [0.3, 0.6, 5, 50]) {
+      const stake = affordableStakeSol(
+        computeEntrySizeSol({ buyAmountSol: unit, sizeMultiplier: 0.5 }),
+        deployable, SLIPPAGE, PRIORITY_FEE);
+      assert.ok(breakevenPct(stake, PRIORITY_FEE) > MAX_BE,
+        `a 0.2 SOL wallet must not be able to clear the gate at any unit size (unit ${unit})`);
+    }
+  });
+
+  test('fixed: buyAmountSol 0.6 sizes a 0.3 SOL half unit that clears the gate', () => {
+    const stake = computeEntrySizeSol({ buyAmountSol: 0.6, sizeMultiplier: 0.5 });
+    assert.strictEqual(stake, 0.3);
+    const be = breakevenPct(stake, PRIORITY_FEE);
+    assert.ok(be <= MAX_BE, `expected <= ${MAX_BE}%, got ${be}%`);
+  });
+
+  test('fixed: ~1.2 SOL funds three concurrent 0.3 SOL stakes', () => {
+    const deployable = 1.2 - 0.005;
+    let remaining = deployable;
+    for (let i = 0; i < 3; i++) {
+      const stake = affordableStakeSol(0.3, remaining, SLIPPAGE, PRIORITY_FEE);
+      assert.ok(Math.abs(stake - 0.3) < 1e-9,
+        `position ${i + 1} should fund a full 0.3 SOL stake, got ${stake}`);
+      remaining -= stake * (1 + SLIPPAGE / 100 + 0.015) + PRIORITY_FEE + 0.0025;
+    }
+  });
+
+  test('a full unit (score >= minScoreFullUnit) is also economic', () => {
+    assert.ok(breakevenPct(computeEntrySizeSol({ buyAmountSol: 0.6, sizeMultiplier: 1 }), PRIORITY_FEE) <= MAX_BE);
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

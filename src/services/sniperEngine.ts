@@ -128,15 +128,21 @@ export class SniperEngine {
     tradingMode: 'paper',
     leniencyMode: 'strict',  // the only supported profile — see updateConfig
     activePlaybook: 'ALL',
-    // 0.05 SOL carries a 19.1% round-trip cost at the shipped 0.003 priority
-    // fee (11.1% at 0.001) — structurally unprofitable at any win rate a
-    // sniper can realistically sustain, because fees are fixed and size is not.
-    // 0.3 SOL brings it to 5.68%.
+    // THIS IS A FULL UNIT, NOT THE PER-TRADE STAKE.
     //
-    // NOTE: the router awards a HALF unit until a candidate scores
-    // minScoreFullUnit, so the stake actually sized is 0.15 SOL => 8.37%, which
-    // exceeds maxBreakevenPct 6 and is refused. See the entry preflight.
-    buyAmountSol: 0.3,
+    // The router awards a HALF unit until a candidate clears minScoreFullUnit
+    // (71 strict), and the maximum score observed across 3,635 real candidates
+    // is 66 — so in practice every entry is sized at half of this number.
+    // 0.6 here means a 0.3 SOL stake, whose round-trip cost is 5.68%, inside
+    // the 6% maxBreakevenPct. The previous 0.3 sized to 0.15 => 8.37%, which
+    // the economics gate refused on every single candidate.
+    //
+    // Fixed costs do not scale down: 0.05 SOL carries a 19.1% round trip at the
+    // shipped 0.003 priority fee. Small size is fatal, not conservative.
+    //
+    // Wallet needed: ~0.39 SOL for one position, ~1.16 SOL for three
+    // concurrent. Checked loudly at arm time by preflightRealMode().
+    buyAmountSol: 0.6,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
     // NO PRICE STOP-LOSS. Removed 2026-08-09, deliberately and permanently.
@@ -406,6 +412,18 @@ export class SniperEngine {
         const blockers = this.wallet.getBlockers(this.minBuySol());
         if (blockers.length > 0) {
           this.log('error', `❌ Cannot start in REAL mode: ${blockers.join(' ')}`);
+          this.config.isBotActive = false;
+          return false;
+        }
+
+        // Economics preflight. Measured 2026-08-08: an 89-minute live run
+        // screened 2,952 tokens, passed 102 and opened ZERO positions, because
+        // every candidate was silently refused by the breakeven gate — a
+        // per-token `warn` that never reaches the run report's funnel. Fail
+        // loudly here instead of looking busy for an hour and trading nothing.
+        const preflight = this.preflightRealMode();
+        if (!preflight.ok) {
+          for (const reason of preflight.reasons) this.log('error', `❌ Cannot start in REAL mode: ${reason}`);
           this.config.isBotActive = false;
           return false;
         }
@@ -1963,6 +1981,50 @@ export class SniperEngine {
       : { maxTop10Pct: 45, maxSingleHolderPct: 20, maxDevInitialBuyPct: 10, maxInsiderPct: 45, minDevInitialBuySol: 0.05 });
     // Deliberately NOT loosened at any tier: requireVerifiedConcentration
     // (unknown is not safe) and maxDevInitialBuySol (the mayhem ban).
+  }
+
+  /**
+   * Can this configuration actually open a position with this wallet?
+   *
+   * Answers, at arm time, the two questions that silently produced a 0-trade
+   * 89-minute live run: is the stake the router will actually size big enough
+   * to clear maxBreakevenPct, and can the balance fund it?
+   *
+   * Sized against a HALF unit deliberately — the router awards a full unit only
+   * above minScoreFullUnit (71 strict), and the highest score observed across
+   * 3,635 real candidates is 66. The half unit is the realistic case, not the
+   * pessimistic one.
+   */
+  public preflightRealMode(): { ok: boolean; reasons: string[]; stakeSol: number; breakevenPct: number; requiredSol: number } {
+    const reasons: string[] = [];
+    const sizingPriorityFeeSol = featureFlags.get('dynamicPriorityFee')
+      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
+      : this.config.priorityFeeSol;
+
+    const halfUnitSol = this.config.buyAmountSol * 0.5;
+    const be = breakevenPct(halfUnitSol, this.config.priorityFeeSol);
+    const maxBe = this.config.maxBreakevenPct ?? 6;
+
+    if (featureFlags.get('enforceTradeEconomics') && be > maxBe) {
+      const neededFull = Math.ceil((2 * (sizingPriorityFeeSol * 2 + 0.00203928 + 0.00001)) / ((maxBe / 100) - 0.03) * 100) / 100;
+      reasons.push(
+        `position size too small. The router sizes a half unit (${halfUnitSol.toFixed(4)} SOL of your ${this.config.buyAmountSol} SOL unit), whose round-trip cost is ${be}% — above the ${maxBe}% limit, so EVERY candidate would be refused. Raise buyAmountSol to about ${neededFull} SOL, or lower priorityFeeSol.`
+      );
+    }
+
+    // What the balance must hold to fund one half-unit order: stake x
+    // (1 + slippage + protocol fees) + priority fee + overhead + the gas float.
+    const requiredPerPosition = halfUnitSol * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
+    const requiredSol = Number((requiredPerPosition + 0.005).toFixed(4));
+    const deployable = this.wallet.getDeployableSol();
+
+    if (deployable > 0 && deployable < requiredPerPosition) {
+      reasons.push(
+        `wallet cannot fund one position. Deployable ${deployable.toFixed(4)} SOL, need ${requiredPerPosition.toFixed(4)} SOL for a ${halfUnitSol.toFixed(4)} SOL stake at ${this.config.maxSlippagePct}% slippage (fund ~${requiredSol} SOL for one position, ~${(requiredPerPosition * this.config.maxActivePositions + 0.005).toFixed(2)} SOL for ${this.config.maxActivePositions} concurrent).`
+      );
+    }
+
+    return { ok: reasons.length === 0, reasons, stakeSol: halfUnitSol, breakevenPct: be, requiredSol };
   }
 
   /** Immediate manual stop for the API: pause entries, keep positions. */

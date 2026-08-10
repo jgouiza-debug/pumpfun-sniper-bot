@@ -98,7 +98,9 @@ export function App() {
     // whatever is in it, so a stale 0.05 here silently reconfigured the bot to a
     // stake whose round-trip breakeven is 19.1% — above maxBreakevenPct, which
     // blocks every entry at any wallet size.
-    buyAmountSol: 0.3,
+    // A FULL unit; the router halves it until a candidate clears the full-unit
+    // score band, so the real per-trade stake is 0.3 SOL.
+    buyAmountSol: 0.6,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
     // No stopLossPct: this bot has no price stop-loss by design.
