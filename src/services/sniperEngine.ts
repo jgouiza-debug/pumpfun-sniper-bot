@@ -830,28 +830,32 @@ export class SniperEngine {
     void this.syncLiveWalletBalance();
     this.walletSyncInterval = setInterval(() => {
       void this.syncLiveWalletBalance();
-    }, 10000);
+    }, 2000);
   }
 
   /**
-   * Recomputes trade stats only when the history has actually changed.
-   * The UI polls status roughly once a second; four full passes over the
-   * history on every poll is work nobody asked for.
+   * Recomputes trade stats in real-time.
+   * Includes both realized P&L from closed history AND live unrealized P&L from open positions.
    */
   private computeStats(): BotStatusResponse['stats'] {
-    if (this.statsCache) return this.statsCache;
+    if (this.statsCache && this.activePositions.length === 0) return this.statsCache;
 
     let winCount = 0;
-    let totalNetPnlUsd = 0;
+    let totalRealizedPnlUsd = 0;
     for (const t of this.tradeHistory) {
       if (t.pnlUsd > 0) winCount++;
-      totalNetPnlUsd += t.pnlUsd;
+      totalRealizedPnlUsd += t.pnlUsd;
     }
 
-    const totalTrades = this.tradeHistory.length;
-    totalNetPnlUsd = Number(totalNetPnlUsd.toFixed(2));
+    const openUnrealizedUsd = this.activePositions.reduce(
+      (acc, p) => acc + (p.pnlUsd || 0),
+      0
+    );
 
-    this.statsCache = {
+    const totalTrades = this.tradeHistory.length;
+    const totalNetPnlUsd = Number((totalRealizedPnlUsd + openUnrealizedUsd).toFixed(2));
+
+    const stats = {
       totalTrades,
       winCount,
       lossCount: totalTrades - winCount,
@@ -859,7 +863,11 @@ export class SniperEngine {
       totalNetPnlUsd,
       totalNetPnlSol: Number((totalNetPnlUsd / (this.config.solPriceUsd || 1)).toFixed(4)),
     };
-    return this.statsCache;
+
+    if (this.activePositions.length === 0) {
+      this.statsCache = stats;
+    }
+    return stats;
   }
 
   public getStatus(): BotStatusResponse {
@@ -2222,6 +2230,7 @@ export class SniperEngine {
     pos.pnlPct = pos.buyPriceUsd > 0
       ? Number((((priceUsd - pos.buyPriceUsd) / pos.buyPriceUsd) * 100).toFixed(1))
       : 0;
+    this.statsCache = null;
   }
 
   /**
