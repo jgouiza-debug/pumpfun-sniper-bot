@@ -561,8 +561,22 @@ export function App() {
         </div>
 
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button
+            className="btn-terminal-outline"
+            onClick={() => handleToggleFlag('allInSizing', !featureFlags.allInSizing)}
+            style={{
+              borderColor: featureFlags.allInSizing ? '#00e676' : 'var(--ink-secondary)',
+              color: featureFlags.allInSizing ? '#00e676' : 'var(--ink-secondary)',
+              fontWeight: 700,
+              background: featureFlags.allInSizing ? 'rgba(0, 230, 118, 0.12)' : 'transparent',
+            }}
+            title="When active, every trade spends 100% of your available Photon wallet SOL balance"
+          >
+            ⚡ ALL-IN MODE: {featureFlags.allInSizing ? 'ON' : 'OFF'}
+          </button>
+
           <button className="btn-terminal-outline" onClick={() => setShowConfigModal(true)}>
-            SETTINGS
+            SETTINGS &amp; FLAGS
           </button>
 
           <button className="btn-terminal-outline" onClick={handleClearHistory} style={{ borderColor: 'var(--ink-secondary)' }}>
@@ -710,17 +724,25 @@ export function App() {
 
         {/* Next order size — recomputed from the live balance every frame, by
             the same maths the buy path uses. */}
-        <div className="stat-card">
+        <div className="stat-card" style={{ border: featureFlags.allInSizing ? '1px solid rgba(0,230,118,0.5)' : undefined }}>
           <div className="stat-label">
-            {botStatus?.config?.walletSplitSizing ? `Slot Size (1 of ${botStatus?.config?.maxActivePositions ?? 3})` : 'Next Entry Size'}
+            {featureFlags.allInSizing
+              ? '⚡ ALL-IN WALLET BUDGET'
+              : botStatus?.config?.walletSplitSizing
+                ? `Slot Size (1 of ${botStatus?.config?.maxActivePositions ?? 3})`
+                : 'Next Entry Size'}
           </div>
-          <div className="stat-value-mono">
-            {sizing ? `${sizing.nextBuySol} SOL` : '—'}
+          <div className="stat-value-mono" style={{ color: featureFlags.allInSizing ? '#00e676' : undefined }}>
+            {featureFlags.allInSizing
+              ? (wallet?.linked ? `${wallet.deployableSol} SOL` : '100% WALLET')
+              : sizing ? `${sizing.nextBuySol} SOL` : '—'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
-            {sizing
-              ? `≈ $${sizing.nextBuyUsd} × ${sizing.tradesAffordable} TRADE${sizing.tradesAffordable === 1 ? '' : 'S'} FROM ${sizing.deployableSol} SOL`
-              : 'AWAITING STATUS'}
+          <div style={{ fontSize: '10px', color: featureFlags.allInSizing ? '#00e676' : 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+            {featureFlags.allInSizing
+              ? 'EVERY ENTRY SPENDS 100% WALLET SOL'
+              : sizing
+                ? `≈ $${sizing.nextBuyUsd} × ${sizing.tradesAffordable} TRADE${sizing.tradesAffordable === 1 ? '' : 'S'} FROM ${sizing.deployableSol} SOL`
+                : 'AWAITING STATUS'}
           </div>
           {/* The whole point of splitting: name what one dead slot actually
               costs, in the currency the owner thinks in. */}
