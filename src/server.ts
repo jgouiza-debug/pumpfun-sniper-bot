@@ -429,6 +429,108 @@ app.get('/api/report/last', (req, res) => {
 // Bind BOTH loopback addresses. On Windows `localhost` usually resolves to the
 // IPv6 loopback (::1) first, so an IPv4-only bind leaves the browser connecting
 // to a port nothing is listening on — which surfaces as "backend offline".
+/**
+ * Opens the dashboard as a DESKTOP APP WINDOW, not a browser tab.
+ *
+ * The previous behaviour shelled out to `start "" <url>`, which hands the URL to
+ * whatever browser the user has open — so the bot appeared as one more tab
+ * alongside their email, with an address bar showing localhost. It looked like a
+ * web page because it was being opened as one.
+ *
+ * Chromium's `--app=` flag gives a frameless standalone window: no address bar,
+ * no tab strip, its own taskbar entry and icon, and its own process. Paired with
+ * a dedicated `--user-data-dir` it does not join the user's existing browser
+ * session, which is both why it gets a separate taskbar identity and why closing
+ * it cannot close their other tabs.
+ *
+ * Edge ships on every supported Windows install, so this path is reliable there;
+ * Chrome and Brave are tried too. If none is found we fall back to the default
+ * browser rather than failing to show a UI at all.
+ *
+ * Closing the window shuts the bot down, which is what makes it behave like an
+ * application instead of a background service. Set SNIPER_NO_WINDOW=1 to keep
+ * the old headless-server behaviour.
+ */
+function launchAppWindow(url: string, server: http.Server): void {
+  if (parseBoolish(process.env.SNIPER_NO_WINDOW)) {
+    console.log('🖥️  SNIPER_NO_WINDOW set — running headless. Open the URL above yourself.');
+    return;
+  }
+
+  const { spawn, exec } = require('child_process') as typeof import('child_process');
+  const os = require('os') as typeof import('os');
+
+  // A per-install profile dir. Without one, Chromium reuses the user's default
+  // profile and may fold the window into an existing session instead of opening
+  // a standalone app window.
+  const profileDir = path.join(os.tmpdir(), 'pumpfun-sniper-app-profile');
+
+  const candidates: string[] = process.platform === 'win32'
+    ? [
+        path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Microsoft\\Edge\\Application\\msedge.exe'),
+        path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Microsoft\\Edge\\Application\\msedge.exe'),
+        path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(process.env['LOCALAPPDATA'] || '', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'BraveSoftware\\Brave-Browser\\Application\\brave.exe'),
+      ]
+    : process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+          '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+        ]
+      : ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/microsoft-edge'];
+
+  const runtime = candidates.find(p => { try { return p && fs.existsSync(p); } catch { return false; } });
+
+  if (!runtime) {
+    console.warn('⚠️ No Chromium-based runtime found — falling back to your default browser.');
+    try {
+      if (process.platform === 'win32') exec(`cmd /c start "" "${url}"`);
+      else if (process.platform === 'darwin') exec(`open "${url}"`);
+      else exec(`xdg-open "${url}"`);
+    } catch { /* best effort */ }
+    return;
+  }
+
+  try {
+    const child = spawn(runtime, [
+      `--app=${url}`,
+      `--user-data-dir=${profileDir}`,
+      '--window-size=1440,920',
+      '--no-first-run',
+      '--no-default-browser-check',
+      // The dashboard is a local trading console; a translate bar or profile
+      // pop-up over it is noise.
+      '--disable-features=Translate,AutofillServerCommunication',
+    ], { detached: false, stdio: 'ignore' });
+
+    child.on('error', () => {
+      console.warn('⚠️ App window failed to start — open ' + url + ' manually.');
+    });
+
+    // Closing the window ends the session. Without this the bot would keep
+    // trading headlessly after the user thinks they shut it down.
+    child.on('exit', () => {
+      console.log('\n🛑 App window closed — shutting the bot down.');
+      try { sniperEngine.toggleBot(false); } catch { /* already stopped */ }
+      server.close(() => process.exit(0));
+      // Never hang on a lingering keep-alive socket.
+      setTimeout(() => process.exit(0), 3000).unref();
+    });
+
+    console.log('🪟 Opened as a desktop app window (close it to stop the bot).');
+  } catch {
+    console.warn('⚠️ Could not open the app window — open ' + url + ' manually.');
+  }
+}
+
+/** Shared truthy-string parse for the env switches this file reads. */
+function parseBoolish(v: string | undefined): boolean {
+  return v !== undefined && ['1', 'true', 'on', 'yes'].includes(v.toLowerCase());
+}
+
 function startListening(retriesLeft = 5): void {
   // `app.listen(PORT)` with no host binds 0.0.0.0 — the opposite of the
   // comment above. Bind IPv4 loopback as the primary listener, plus a
@@ -443,16 +545,7 @@ function startListening(retriesLeft = 5): void {
     console.log(`🔑 Enter your Photon Wallet & Helius API key in UI Settings`);
     console.log(`========================================================\n`);
 
-    try {
-      const { exec } = require('child_process');
-      if (process.platform === 'win32') {
-        exec(`cmd /c start "" "${url}"`);
-      } else if (process.platform === 'darwin') {
-        exec(`open "${url}"`);
-      } else {
-        exec(`xdg-open "${url}"`);
-      }
-    } catch { /* browser auto-launch best effort */ }
+    launchAppWindow(url, server);
   });
   try {
     const v6 = app.listen(PORT, '::1');

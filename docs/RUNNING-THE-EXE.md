@@ -14,17 +14,27 @@ and the compiled UI).
 
 ## Run it
 
-Double-click the exe. It:
+Double-click the exe. It opens as a **desktop app window** — no address bar, no
+tab strip, its own taskbar icon. **Closing the window stops the bot.**
 
-1. starts a local API + UI server on `http://localhost:3001` (loopback only —
-   nothing on your network can reach it),
-2. opens your default browser at that address,
-3. prints a banner with the URL in case the browser does not open.
+Under the hood it still runs a local server on `http://localhost:3001` (loopback
+only — nothing on your network can reach it) and renders the UI in a frameless
+Chromium window via `--app=`. That is what makes it a window rather than a tab.
 
-To use a different port, set `PORT` before launching:
+It looks for Edge first (present on every supported Windows install), then
+Chrome, then Brave. If none is found it falls back to your default browser so
+you still get a UI.
+
+To use a different port:
 
 ```bash
 set PORT=3055 && pumpfun-sniper-bot.exe
+```
+
+To run headless — no window, server only, keeps running until you kill it:
+
+```bash
+set SNIPER_NO_WINDOW=1 && pumpfun-sniper-bot.exe
 ```
 
 ## Supplying your Helius API key
@@ -91,6 +101,11 @@ exe — toggling a flag in the UI writes that file for you.
 
 ## Known limits
 
+- The app window is a frameless Chromium window, not a fully native shell. It
+  needs Edge, Chrome or Brave installed — Edge always is on Windows. A truly
+  self-contained window (custom icon, native menus, no installed-browser
+  dependency) means switching the packaging to Electron or Tauri, which roughly
+  doubles the binary and is a separate piece of work.
 - **Windows x64 only.** `--targets host` builds for the machine doing the build.
 - The binary bundles the compiled UI; `npm run build:exe` runs `vite build` first,
   so the UI is always current with the source at build time.
