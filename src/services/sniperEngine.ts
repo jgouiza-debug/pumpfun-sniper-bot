@@ -27,7 +27,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -107,6 +107,19 @@ export interface InternalPosition extends Position {
   sellFailCount?: number;
   /** Epoch ms before which no automatic sell retry may be attempted. */
   sellRetryAfterMs?: number;
+  /**
+   * True when the last sellPctReal returned null because the backoff was still
+   * running, not because an order failed. Lets the caller stay quiet instead of
+   * logging "SELL FAILED — will retry next tick" once a second for 10 minutes
+   * during which no attempt is made and no retry is scheduled.
+   */
+  sellBlockedByBackoff?: boolean;
+  /**
+   * Set when a structural stop has fired. Survives a failed sell so the exit is
+   * retried (forced) on every subsequent tick — the alert itself latches inside
+   * DevSellMonitor and will never be raised twice.
+   */
+  forceExitReason?: string;
 }
 
 export class SniperEngine {
@@ -115,27 +128,49 @@ export class SniperEngine {
     tradingMode: 'paper',
     leniencyMode: 'strict',  // the only supported profile — see updateConfig
     activePlaybook: 'ALL',
-    // 0.05 SOL carries an 11.1% round-trip cost (fees are fixed, size is not)
-    // — structurally unprofitable at any win rate a sniper can realistically
-    // sustain. 0.3 SOL brings breakeven under ~4.2%.
+    // 0.05 SOL carries a 19.1% round-trip cost at the shipped 0.003 priority
+    // fee (11.1% at 0.001) — structurally unprofitable at any win rate a
+    // sniper can realistically sustain, because fees are fixed and size is not.
+    // 0.3 SOL brings it to 5.68%.
+    //
+    // NOTE: the router awards a HALF unit until a candidate scores
+    // minScoreFullUnit, so the stake actually sized is 0.15 SOL => 8.37%, which
+    // exceeds maxBreakevenPct 6 and is refused. See the entry preflight.
     buyAmountSol: 0.3,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
-    stopLossPct: 35,
+    // NO PRICE STOP-LOSS. Removed 2026-08-09, deliberately and permanently.
+    // The -35% stop it replaces fired on ordinary pump.fun volatility and
+    // turned noise into realized losses; the loss side is now carried by
+    // structural exits (creator sell, curve/pool drain, sell-flow collapse)
+    // plus the time stop. Do not reintroduce a price floor here.
+    //
+    // The trailing stop survives only as a MOONBAG RATCHET: it arms at 3x, not
+    // at the old 1.3x. At 1.3x arm / 20% trail the forced exit sat at 1.04x —
+    // inside the round-trip breakeven (5.68% at 0.3 SOL), so the
+    // "profit-protecting" stop booked losses. At 3x arm / 30% trail the
+    // earliest exit is 2.1x, far above any breakeven.
+    trailingArmMultiple: 3.0,
     useTrailingStop: true,
-    trailingStopPct: 20,
+    trailingStopPct: 30,
     maxHoldSeconds: 1800,
+    poolDrainExitFraction: 0.5,
+    sellFlowExitTicks: 3,
     // Concurrency IS the exposure limit: every position is buyAmountSol at
     // risk on a 60-80%-rug asset class. 99999 ("unlimited") let the bot
-    // spread the whole wallet across garbage simultaneously.
-    maxActivePositions: 5,
+    // spread the whole wallet across garbage simultaneously. 3 rather than 5
+    // because without a price stop each slot can go to zero.
+    maxActivePositions: 3,
     priorityFeeSol: 0.003,
     maxPriorityFeeSol: 0.005,
     maxSlippagePct: 25,
     jitoTipSol: 0.001,   // NOT wired to anything — reserved for a future Jito bundle path
     solPriceUsd: 200,
     bankrollUsd: 100,
-    maxHourlyLossUsd: 25,
+    // Sized to roughly three full-position losses. With no price stop a losing
+    // position can go to zero by design, so a limit tuned for stop-protected
+    // trades would pause the bot on one ordinary hour.
+    maxHourlyLossUsd: 70,
     // 15 made the economics gate decorative (0.05 SOL @ 11.1% passed). 6 is
     // the audit's number: refuse any trade that needs >6% just to break even.
     maxBreakevenPct: 6,
@@ -1317,8 +1352,19 @@ export class SniperEngine {
       return;
     }
     this.log('sell', `🚨 [STRUCTURAL STOP: ${alert.kind}] $${pos.tokenSymbol} — ${alert.detail}. Selling everything now.`, alert.mint);
-    await this.executeSell(pos, `SOLD ALL — structural stop: ${alert.detail}`);
-    devSellMonitor.untrack(alert.mint);
+
+    // Latch the reason on the position, not on the monitor. DevSellMonitor sets
+    // `devSold = true` permanently on the first creator sell, so an alert whose
+    // exit fails can never be raised a second time. With the price stop-loss
+    // gone this is the position's only remaining loss-side exit, so the intent
+    // to leave has to outlive one failed transaction: the exit ladder retries a
+    // forced full exit every tick until the tokens are actually gone.
+    pos.forceExitReason = `structural stop: ${alert.detail}`;
+    await this.executeSell(pos, `SOLD ALL — structural stop: ${alert.detail}`, true);
+
+    // Only stop watching once the position is genuinely closed. Untracking after
+    // a failed sell discards the creator subscription for a bag we still hold.
+    if (!this.activePositions.some(p => p.id === pos.id)) devSellMonitor.untrack(alert.mint);
   }
 
   /** Adds a fresh create to the curve watchlist and subscribes to its trades. */
@@ -1785,16 +1831,33 @@ export class SniperEngine {
     pos.tokensHeld = actual ? Math.max(0, tokensBefore - actual.tokensSold) : tokensBefore * (1 - fractionSold);
     pos.investedUsd = pos.investedUsd * (1 - fractionSold);
     pos.investedSol = pos.investedSol * (1 - fractionSold);
+
+    // Give the surviving bag its own room. `highestPriceUsd` is a monotonic
+    // ratchet that was never lowered, so after a partial the trailing target
+    // stayed pinned to the all-time peak — the remainder was then force-sold on
+    // the next tick a few percent lower, taking the whole position out on one
+    // wick. Re-anchoring makes the stop re-arm from here, which is the entire
+    // point of scaling out.
+    if (pos.tokensHeld > 0 && pos.currentPriceUsd > 0) {
+      pos.highestPriceUsd = pos.currentPriceUsd;
+      pos.trailingStopTargetUsd = undefined;
+    }
   }
 
   /**
    * Runs the on-chain leg of a partial sell.
    * Returns null when the sell did NOT happen (caller must not mutate state);
    * `{}` in paper mode; `{txid, actual?}` for a confirmed real sell.
+   *
+   * `force` bypasses the fee-burn backoff. Structural stops and manual exits
+   * MUST pass it: the backoff reaches 10 minutes after 8 failures, and a
+   * creator dump completes in one or two transactions. Now that there is no
+   * price stop-loss behind them, a muted structural stop is no exit at all.
    */
   private async sellPctReal(
     pos: InternalPosition,
-    pct: number
+    pct: number,
+    force = false
   ): Promise<{ txid?: string; actual?: { proceedsSol: number; tokensSold: number; txid: string } } | null> {
     if (this.config.tradingMode !== 'real') {
       // Paper with honestPaper: walk the same pool the real sell would hit and
@@ -1824,7 +1887,11 @@ export class SniperEngine {
     // of fees in under a minute. Every failed attempt still pays the full fee,
     // so retries back off exponentially (5s doubling, capped at 10 min).
     const now = Date.now();
-    if (pos.sellRetryAfterMs && now < pos.sellRetryAfterMs) return null;
+    if (!force && pos.sellRetryAfterMs && now < pos.sellRetryAfterMs) {
+      pos.sellBlockedByBackoff = true;
+      return null;
+    }
+    pos.sellBlockedByBackoff = false;
 
     // Exit on the same venue the entry filled on, for the same reason.
     const result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`, pos.venue);
@@ -1907,6 +1974,13 @@ export class SniperEngine {
 
   private async updateAndCheckPositionExit(pos: InternalPosition, prefetched?: DexScreenerData): Promise<void> {
     try {
+      // A structural stop that already fired outranks every price and time rule
+      // below, and keeps retrying until the bag is actually gone.
+      if (pos.forceExitReason) {
+        await this.executeSell(pos, `SOLD ALL — ${pos.forceExitReason}`, true);
+        return;
+      }
+
       const dexData = prefetched ?? await DexScreenerService.getTokenMarketData(pos.mint);
 
       let currentMarketCap = dexData.hasPair && dexData.marketCapUsd > 0 ? dexData.marketCapUsd : pos.buyPriceUsd * 1000000000;
@@ -1960,18 +2034,44 @@ export class SniperEngine {
       // mint 243zZgun...pump ($SMISKI) carries 2B supply, which makes the
       // derived price 2x wrong and corrupts P&L and every exit trigger on that
       // position. DexScreener publishes the real per-token price already.
-      const currentPriceUsd = (!dexData.hasPair && curvePriceFresh)
-        ? pos.lastCurvePriceUsd!
+      const priceSource: 'curve' | 'dex' | 'mcap' = (!dexData.hasPair && curvePriceFresh)
+        ? 'curve'
         : (featureFlags.get('playbookRouting') && dexData.hasPair && dexData.priceUsd > 0)
+          ? 'dex'
+          : 'mcap';
+      const currentPriceUsd = priceSource === 'curve'
+        ? pos.lastCurvePriceUsd!
+        : priceSource === 'dex'
           ? dexData.priceUsd
           : currentMarketCap / 1000000000;
+
+      const prevPriceUsd = pos.currentPriceUsd;
       pos.currentPriceUsd = currentPriceUsd;
 
       if (!pos.priceTicks) pos.priceTicks = [];
       pos.priceTicks.push({ timestamp: Date.now(), priceUsd: currentPriceUsd });
       if (pos.priceTicks.length > 60) pos.priceTicks.shift();
 
-      if (currentPriceUsd > pos.highestPriceUsd) {
+      // The three price feeds are not comparable. `mcap/1e9` assumes a 1B supply
+      // (verified 2x wrong on the 2B-supply $SMISKI), and a curve price and a
+      // DexScreener quote for the same token routinely differ across migration.
+      // A peak recorded under one source must never arm a stop measured under
+      // another: re-anchor on any source change so a bogus high cannot strand
+      // the position at 0.7x an invented peak with no recovery path.
+      if (pos.priceSource && pos.priceSource !== priceSource) {
+        pos.highestPriceUsd = currentPriceUsd;
+        pos.trailingStopTargetUsd = undefined;
+        pos.lowBuyPressureTicks = 0;
+      }
+      pos.priceSource = priceSource;
+
+      // Reject an implausible single-tick spike for PEAK purposes only. A >300%
+      // jump in one second is a bad quote, and the peak is permanent once set.
+      if (acceptPeakUpdate({
+        candidatePriceUsd: currentPriceUsd,
+        prevPriceUsd,
+        currentPeakUsd: pos.highestPriceUsd,
+      })) {
         pos.highestPriceUsd = currentPriceUsd;
       }
 
@@ -1981,9 +2081,60 @@ export class SniperEngine {
       pos.pnlSol = Number((pos.pnlUsd / this.config.solPriceUsd).toFixed(4));
       pos.pnlPct = Number((((currentPriceUsd - pos.buyPriceUsd) / pos.buyPriceUsd) * 100).toFixed(1));
 
-      if (this.config.useTrailingStop && pos.highestPriceUsd > pos.buyPriceUsd * 1.3) {
-        pos.trailingStopTargetUsd = pos.highestPriceUsd * (1 - (this.config.trailingStopPct / 100));
+      // STRUCTURAL EXIT — pool drained. The post-migration twin of CURVE_DRAINED
+      // (which only sees the bonding curve). `dexData.liquidityUsd` was already
+      // being fetched on every exit tick and thrown away. Liquidity leaving the
+      // pool is the event that actually makes a bag unsellable, and unlike a
+      // price stop it cannot be triggered by ordinary volatility.
+      if (dexData.hasPair && dexData.liquidityUsd > 0) {
+        const drainFraction = this.config.poolDrainExitFraction ?? 0.5;
+        if (isPoolDrained({
+          peakLiquidityUsd: pos.peakLiquidityUsd ?? 0,
+          currentLiquidityUsd: dexData.liquidityUsd,
+          drainFraction,
+        })) {
+          const pct = Math.round((1 - dexData.liquidityUsd / pos.peakLiquidityUsd!) * 100);
+          this.log('sell', `🚨 [STRUCTURAL STOP: POOL_DRAINED] $${pos.tokenSymbol} — liquidity fell ${pct}% from $${Math.round(pos.peakLiquidityUsd!).toLocaleString()} to $${Math.round(dexData.liquidityUsd).toLocaleString()}. Selling everything now.`, pos.mint);
+          pos.forceExitReason = `structural stop: pool liquidity drained ${pct}% from its peak`;
+          await this.executeSell(pos, `SOLD ALL — structural stop: pool liquidity drained ${pct}%`, true);
+          return;
+        }
+        pos.peakLiquidityUsd = Math.max(pos.peakLiquidityUsd ?? 0, dexData.liquidityUsd);
       }
+
+      // STRUCTURAL EXIT — sell flow. Buy pressure collapsing across consecutive
+      // ticks on a pool that is still trading is the crowd leaving, which is a
+      // different event from the price wobbling. Requires real volume so a dead
+      // pair with no trades cannot trip it.
+      const sellFlowTicks = this.config.sellFlowExitTicks ?? 3;
+      if (dexData.hasPair && dexData.volume5mUsd > 0 && typeof dexData.buyPressurePct === 'number') {
+        if (dexData.buyPressurePct < 25) {
+          pos.lowBuyPressureTicks = (pos.lowBuyPressureTicks ?? 0) + 1;
+          if (pos.lowBuyPressureTicks >= sellFlowTicks) {
+            this.log('sell', `🚨 [STRUCTURAL STOP: SELL_FLOW] $${pos.tokenSymbol} — buy pressure ${dexData.buyPressurePct.toFixed(0)}% for ${pos.lowBuyPressureTicks} consecutive ticks. Selling everything now.`, pos.mint);
+            pos.forceExitReason = `structural stop: buy pressure collapsed to ${dexData.buyPressurePct.toFixed(0)}%`;
+            await this.executeSell(pos, `SOLD ALL — structural stop: buy pressure collapsed to ${dexData.buyPressurePct.toFixed(0)}%`, true);
+            return;
+          }
+        } else {
+          pos.lowBuyPressureTicks = 0;
+        }
+      }
+
+      // Moonbag ratchet. Arms only once the position has genuinely run
+      // (trailingArmMultiple, default 3x). The old 1.3x arm made this the bot's
+      // primary liquidator: it forced an exit at 1.04x — below the 5.68%
+      // round-trip breakeven — and any position peaking between 1.30x and
+      // 1.8824x cleared no profit rung at all before being fully liquidated on
+      // one 20% wick, which on pump.fun is noise.
+      const armedTarget = trailingStopTargetUsd({
+        highestPriceUsd: pos.highestPriceUsd,
+        buyPriceUsd: pos.buyPriceUsd,
+        armMultiple: this.config.trailingArmMultiple ?? 3.0,
+        trailingStopPct: this.config.trailingStopPct,
+        useTrailingStop: this.config.useTrailingStop,
+      });
+      if (armedTarget !== undefined) pos.trailingStopTargetUsd = armedTarget;
 
       const pullbackFromPeakPct = ((pos.highestPriceUsd - currentPriceUsd) / pos.highestPriceUsd) * 100;
       if (pos.pnlPct >= 60 && pullbackFromPeakPct >= 15 && !pos.principalRecovered) {
@@ -2021,15 +2172,35 @@ export class SniperEngine {
         return;
       }
 
+      // Trailing stop: scale out, do not liquidate. The first trigger takes half
+      // and re-anchors (recordPartialSell clears the target), so a single wick
+      // can no longer take the whole position — the old code sold 50% at
+      // 0.85x peak and then force-sold the remainder at 0.80x peak on the very
+      // next tick. Only a second, independently re-armed trigger closes it.
       if (pos.trailingStopTargetUsd && currentPriceUsd <= pos.trailingStopTargetUsd) {
-        await this.executeSell(pos, `SOLD ALL — trailing stop: price fell ${this.config.trailingStopPct}% from its peak of $${pos.highestPriceUsd.toFixed(6)}`);
+        pos.trailingTriggerCount = (pos.trailingTriggerCount ?? 0) + 1;
+        const trailReason = `trailing stop: price fell ${this.config.trailingStopPct}% from its peak of $${pos.highestPriceUsd.toFixed(6)}`;
+
+        if (pos.trailingTriggerCount >= 2) {
+          await this.executeSell(pos, `SOLD ALL — ${trailReason} (second trigger)`);
+          return;
+        }
+
+        const sale = await this.sellPctReal(pos, 50);
+        if (sale === null) return;
+        pos.status = 'PARTIAL_PROFIT';
+        this.recordPartialSell(pos, 0.5, trailReason, sale.actual);
+        this.log('sell', `📉 [SOLD 50%] $${pos.tokenSymbol} — ${trailReason}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%; the stop must re-arm from here.`, pos.mint);
         return;
       }
 
-      if (pos.pnlPct <= -this.config.stopLossPct) {
-        await this.executeSell(pos, `SOLD ALL — stop loss: down ${this.config.stopLossPct}% from entry`);
-        return;
-      }
+      // NO PRICE STOP-LOSS. The `-stopLossPct` block that stood here was deleted
+      // 2026-08-09 at the owner's direction: on this asset class a 35% drawdown
+      // is routine intra-trade noise, and stopping out of it converted recoverable
+      // volatility into realized losses. The loss side is now carried by the
+      // structural exits above (creator sell, curve drain, pool drain, sell-flow
+      // collapse) and the time stop below. A position on an intact pool that
+      // simply bleeds is held to `maxHoldSeconds` — that is the accepted risk.
 
       if (timeElapsedSec >= this.config.maxHoldSeconds) {
         await this.executeSell(pos, `SOLD ALL — max hold time reached (${Math.floor(this.config.maxHoldSeconds / 60)} min)`);
@@ -2041,12 +2212,29 @@ export class SniperEngine {
     }
   }
 
-  public async executeSell(pos: InternalPosition, reason: string): Promise<void> {
+  public async executeSell(pos: InternalPosition, reason: string, force = false): Promise<void> {
+    // One exit at a time per position. The WS handler is `on('message', async
+    // ...)`, so awaiting a ~30s sell confirmation does NOT defer later messages:
+    // a structural alert could re-enter this method while a monitor-tick exit
+    // was still in flight, booking the same position twice and double-crediting
+    // the bankroll, the daily P&L and the kill-switch window.
+    if (pos.exitInFlight) return;
+    pos.exitInFlight = true;
+    try {
+      await this.executeSellInner(pos, reason, force);
+    } finally {
+      pos.exitInFlight = false;
+    }
+  }
+
+  private async executeSellInner(pos: InternalPosition, reason: string, force: boolean): Promise<void> {
     // Sell FIRST. Position state is only touched once we know what happened —
     // a failed real exit keeps the position tracked and retried, never dropped.
-    const sale = await this.sellPctReal(pos, 100);
+    const sale = await this.sellPctReal(pos, 100, force);
     if (sale === null) {
-      this.log('warn', `⚠️ SELL FAILED for $${pos.tokenSymbol} (${reason}) — still holding, will retry next tick.`, pos.mint);
+      if (!pos.sellBlockedByBackoff) {
+        this.log('warn', `⚠️ SELL FAILED for $${pos.tokenSymbol} (${reason}) — still holding, will retry next tick.`, pos.mint);
+      }
       return;
     }
 
@@ -2148,7 +2336,7 @@ export class SniperEngine {
 
     // A human clicking LIQUIDATE overrides the automatic-retry backoff.
     pos.sellRetryAfterMs = undefined;
-    await this.executeSell(pos, 'Manual User Force Sell Override');
+    await this.executeSell(pos, 'Manual User Force Sell Override', true);
     return true;
   }
 

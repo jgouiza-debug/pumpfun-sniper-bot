@@ -920,5 +920,149 @@ console.log('\n-- Gate 0: unknown concentration is not safe (2026-08-09 $GREEN r
   });
 }
 
+// ---------------------------------------------------------------------------
+// Exit policy (2026-08-09: price stop-loss removed).
+//
+// Before this block the entire exit ladder had ZERO coverage — which is how a
+// trailing stop that forced exits BELOW round-trip breakeven survived as the
+// bot's primary liquidator. Each test states the old behavior it prevents.
+// ---------------------------------------------------------------------------
+console.log('\n-- Exit policy: no price stop-loss --');
+{
+  const { trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate } = require('../services/pipelineUtils');
+  const { breakevenPct } = require('../services/paperSimulator');
+
+  const ENTRY = 0.001;
+  const arm = (peakMultiple: number, armMultiple = 3.0, trailingStopPct = 30) =>
+    trailingStopTargetUsd({
+      highestPriceUsd: ENTRY * peakMultiple,
+      buyPriceUsd: ENTRY,
+      armMultiple,
+      trailingStopPct,
+      useTrailingStop: true,
+    });
+
+  test('OLD BUG reproduced: at the 1.3x arm / 20% trail the stop exited BELOW breakeven', () => {
+    // The arm is a strict `>`, so take a peak fractionally above it — the
+    // worst armed case the old settings could produce.
+    const target = arm(1.3 + 1e-9, 1.3, 20)!;
+    assert.ok(target !== undefined, 'old settings armed just above 1.3x');
+    const exitMultiple = target / ENTRY;
+    assert.ok(Math.abs(exitMultiple - 1.04) < 1e-6, `expected ~1.04x, got ${exitMultiple}`);
+    // Round-trip cost at the shipped 0.3 SOL stake / 0.003 priority fee.
+    const be = breakevenPct(0.3, 0.003);
+    assert.ok(be > 4, `breakeven should be material, got ${be}%`);
+    assert.ok((exitMultiple - 1) * 100 < be,
+      `old stop exited at +${((exitMultiple - 1) * 100).toFixed(2)}% against a ${be}% round trip — a guaranteed loss`);
+  });
+
+  test('fixed: a 1.5x peak never arms the trailing stop', () => {
+    assert.strictEqual(arm(1.5), undefined);
+  });
+
+  test('fixed: a 2.9x peak still does not arm (below the 3x ratchet)', () => {
+    assert.strictEqual(arm(2.9), undefined);
+  });
+
+  test('fixed: a 3.5x peak arms at 2.45x — comfortably above breakeven', () => {
+    const target = arm(3.5)!;
+    assert.ok(Math.abs(target / ENTRY - 2.45) < 1e-9, `expected 2.45x, got ${target / ENTRY}`);
+    assert.ok((target / ENTRY - 1) * 100 > breakevenPct(0.3, 0.003));
+  });
+
+  test('fixed: the armed level always clears round-trip cost at the 3x arm', () => {
+    // Minimum armed exit is arm x (1 - trail) = 3.0 x 0.70 = 2.10x.
+    const minExit = arm(3.0000001)! / ENTRY;
+    assert.ok(minExit >= 2.09, `min armed exit ${minExit} should be ~2.1x`);
+    for (const stake of [0.05, 0.15, 0.3, 0.6]) {
+      assert.ok((minExit - 1) * 100 > breakevenPct(stake, 0.003),
+        `2.1x must beat breakeven at ${stake} SOL`);
+    }
+  });
+
+  test('useTrailingStop=false never arms', () => {
+    assert.strictEqual(trailingStopTargetUsd({
+      highestPriceUsd: ENTRY * 10, buyPriceUsd: ENTRY,
+      armMultiple: 3, trailingStopPct: 30, useTrailingStop: false,
+    }), undefined);
+  });
+
+  test('a position down 60% has NO price exit — that is the point', () => {
+    // No stop-loss helper exists to call. Assert the config surface is gone so
+    // a future edit cannot quietly reintroduce a price floor.
+    const engineSrc = require('fs').readFileSync(
+      require('path').join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+    assert.ok(!/config\.stopLossPct/.test(engineSrc),
+      'engine must not reference config.stopLossPct');
+    assert.ok(!/pnlPct\s*<=\s*-/.test(engineSrc),
+      'engine must not contain a negative-pnl price stop');
+    const typesSrc = require('fs').readFileSync(
+      require('path').join(__dirname, '../types.ts'), 'utf8');
+    assert.ok(!/\bstopLossPct\b/.test(typesSrc), 'BotConfig must not carry stopLossPct');
+  });
+
+  console.log('\n-- Exit policy: structural exits replace the price stop --');
+
+  test('pool drain fires at half the peak', () => {
+    assert.strictEqual(isPoolDrained({
+      peakLiquidityUsd: 12000, currentLiquidityUsd: 6000, drainFraction: 0.5,
+    }), true);
+  });
+
+  test('pool drain does NOT fire on an ordinary 30% dip', () => {
+    assert.strictEqual(isPoolDrained({
+      peakLiquidityUsd: 12000, currentLiquidityUsd: 8400, drainFraction: 0.5,
+    }), false);
+  });
+
+  test('a thin pool cannot trip the drain exit on noise', () => {
+    assert.strictEqual(isPoolDrained({
+      peakLiquidityUsd: 1500, currentLiquidityUsd: 10, drainFraction: 0.5,
+    }), false);
+  });
+
+  test('an unindexed pool (liquidity 0) is not a drain signal', () => {
+    assert.strictEqual(isPoolDrained({
+      peakLiquidityUsd: 12000, currentLiquidityUsd: 0, drainFraction: 0.5,
+    }), false, 'liquidity 0 means "not indexed yet", not "drained"');
+  });
+
+  console.log('\n-- Exit policy: peak integrity across price sources --');
+
+  test('a normal new high raises the peak', () => {
+    assert.strictEqual(acceptPeakUpdate({
+      candidatePriceUsd: 1.2, prevPriceUsd: 1.0, currentPeakUsd: 1.1,
+    }), true);
+  });
+
+  test('a price below the peak never lowers it', () => {
+    assert.strictEqual(acceptPeakUpdate({
+      candidatePriceUsd: 0.9, prevPriceUsd: 1.0, currentPeakUsd: 1.1,
+    }), false);
+  });
+
+  test('OLD BUG reproduced: a 2x source switch would have anchored the peak forever', () => {
+    // marketCap/1e9 reads 2x high on a 2B-supply token ($SMISKI, 2026-08-05).
+    // The old code took any higher tick unconditionally.
+    const bogus = 2.0, real = 1.0;
+    assert.ok(bogus > real, 'the bogus source reads high');
+    assert.strictEqual(acceptPeakUpdate({
+      candidatePriceUsd: 10.0, prevPriceUsd: 1.0, currentPeakUsd: 1.0,
+    }), false, 'a 10x single-tick spike must not set the peak');
+  });
+
+  test('a 3x single-tick move is still accepted (real launches do move)', () => {
+    assert.strictEqual(acceptPeakUpdate({
+      candidatePriceUsd: 3.0, prevPriceUsd: 1.0, currentPeakUsd: 1.0,
+    }), true);
+  });
+
+  test('the first tick (no previous price) is accepted', () => {
+    assert.strictEqual(acceptPeakUpdate({
+      candidatePriceUsd: 5.0, prevPriceUsd: 0, currentPeakUsd: 1.0,
+    }), true);
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

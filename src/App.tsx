@@ -93,14 +93,20 @@ export function App() {
 
   // Form config state
   const [configForm, setConfigForm] = useState<Partial<BotConfig>>({
-    buyAmountSol: 0.05,       // strict default ~$10 @ $200/SOL
+    // These mirror the engine defaults and are replaced by the server's real
+    // config on the first status fetch. They must NOT diverge: the form posts
+    // whatever is in it, so a stale 0.05 here silently reconfigured the bot to a
+    // stake whose round-trip breakeven is 19.1% — above maxBreakevenPct, which
+    // blocks every entry at any wallet size.
+    buyAmountSol: 0.3,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
-    stopLossPct: 35,
+    // No stopLossPct: this bot has no price stop-loss by design.
+    trailingArmMultiple: 3.0,
     useTrailingStop: true,
-    trailingStopPct: 20,
+    trailingStopPct: 30,
     maxHoldSeconds: 1800,
-    maxActivePositions: 99999,
+    maxActivePositions: 3,
     activePlaybook: 'ALL',
     tradingMode: 'paper',
     leniencyMode: 'strict',
@@ -1164,13 +1170,19 @@ export function App() {
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Stop Loss Target (%)</label>
+                    <label className="form-label">Trailing Arm (x peak)</label>
                     <input
                       type="number"
+                      step="0.1"
                       className="form-input"
-                      value={configForm.stopLossPct}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, stopLossPct: Number(e.target.value) })}
+                      value={configForm.trailingArmMultiple}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingArmMultiple: Number(e.target.value) })}
                     />
+                    <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginTop: '3px' }}>
+                      No price stop-loss. The trailing stop is a moonbag ratchet — it
+                      arms only above this multiple, then gives back {configForm.trailingStopPct}%.
+                      Losses are cut by structural exits, not by a price floor.
+                    </div>
                   </div>
 
                   <div className="form-group">

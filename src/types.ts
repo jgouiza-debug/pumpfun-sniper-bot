@@ -198,10 +198,22 @@ export interface BotConfig {
   buyAmountSol: number;
   takeProfitPct: number;
   takeProfitRung2Pct: number;
-  stopLossPct: number;
+  /**
+   * Peak multiple a position must reach before the trailing stop arms at all.
+   * There is deliberately NO price stop-loss on this bot: on pump.fun a 20-35%
+   * drawdown is noise, not a trend break, and a stop that fires inside the
+   * entry band converts ordinary volatility into a realized loss. The loss side
+   * is handled by structural exits (creator sell, curve/pool drain, sell-flow
+   * collapse) and the time stop. See exit ladder in sniperEngine.
+   */
+  trailingArmMultiple: number;
   useTrailingStop: boolean;
   trailingStopPct: number;
   maxHoldSeconds: number;
+  /** Exit when pool liquidity falls to this fraction of its observed peak. */
+  poolDrainExitFraction?: number;
+  /** Exit after this many consecutive ticks of collapsed buy pressure. */
+  sellFlowExitTicks?: number;
   maxActivePositions: number;
   priorityFeeSol: number;
   /** Hard ceiling for the dynamic priority fee (flag dynamicPriorityFee). */
@@ -253,6 +265,21 @@ export interface Position {
   buyTxid?: string;
   /** True when cost basis and quantity were corrected from the on-chain fill. */
   fillVerified?: boolean;
+  /**
+   * Which feed produced `currentPriceUsd`. The three sources disagree by up to
+   * 2x (marketCap/1e9 assumes a 1B supply), so a peak set from one source must
+   * never arm a stop measured against another — the peak is re-anchored on any
+   * source change.
+   */
+  priceSource?: 'curve' | 'dex' | 'mcap';
+  /** Highest pool liquidity seen while holding — the POOL_DRAINED baseline. */
+  peakLiquidityUsd?: number;
+  /** Consecutive exit ticks with collapsed buy pressure (SELL_FLOW trigger). */
+  lowBuyPressureTicks?: number;
+  /** Consecutive trailing-stop triggers; the first sells half, the second all. */
+  trailingTriggerCount?: number;
+  /** Guards against two exits running concurrently for the same position. */
+  exitInFlight?: boolean;
 }
 
 export interface TradeHistoryRecord {

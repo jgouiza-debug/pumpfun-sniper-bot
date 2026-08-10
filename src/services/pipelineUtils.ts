@@ -183,3 +183,74 @@ export function affordableStakeSol(
   const ceiling = maxAffordableBuySol(availableSol, maxSlippagePct, priorityFeeSol);
   return Math.min(requestedSol, ceiling);
 }
+
+// ---------------------------------------------------------------------------
+// Exit-policy predicates.
+//
+// This bot has NO price stop-loss (removed 2026-08-09). These helpers hold the
+// thresholds that replaced it, extracted from the engine so the exit ladder is
+// testable at all — before this it had zero coverage, which is how a trailing
+// stop that forced exits BELOW round-trip breakeven survived as the bot's
+// primary liquidator.
+// ---------------------------------------------------------------------------
+
+/**
+ * Trailing-stop level, or undefined while the stop is not armed.
+ *
+ * The stop is a MOONBAG RATCHET, not a loss stop: it arms only once the peak
+ * clears `armMultiple` x entry. The old 1.3x arm with a 20% give-back forced
+ * exits at 1.04x entry — inside the 5.68% round-trip cost of a 0.3 SOL trade,
+ * so it booked losses while claiming to protect profit. At 3.0x / 30% the
+ * earliest possible exit is 2.1x.
+ */
+export function trailingStopTargetUsd(params: {
+  highestPriceUsd: number;
+  buyPriceUsd: number;
+  armMultiple: number;
+  trailingStopPct: number;
+  useTrailingStop: boolean;
+}): number | undefined {
+  const { highestPriceUsd, buyPriceUsd, armMultiple, trailingStopPct, useTrailingStop } = params;
+  if (!useTrailingStop) return undefined;
+  if (!(buyPriceUsd > 0) || !(highestPriceUsd > 0)) return undefined;
+  if (highestPriceUsd <= buyPriceUsd * armMultiple) return undefined;
+  return highestPriceUsd * (1 - trailingStopPct / 100);
+}
+
+/**
+ * Pool-drain structural exit: liquidity leaving is what actually makes a bag
+ * unsellable, and unlike a price stop it cannot be tripped by volatility.
+ * `minPeakUsd` keeps a thin or unindexed pool from tripping it on noise.
+ */
+export function isPoolDrained(params: {
+  peakLiquidityUsd: number;
+  currentLiquidityUsd: number;
+  drainFraction: number;
+  minPeakUsd?: number;
+}): boolean {
+  const { peakLiquidityUsd, currentLiquidityUsd, drainFraction, minPeakUsd = 2000 } = params;
+  if (!(peakLiquidityUsd >= minPeakUsd)) return false;
+  if (!(currentLiquidityUsd > 0)) return false;
+  return currentLiquidityUsd <= peakLiquidityUsd * drainFraction;
+}
+
+/**
+ * Whether a new price may raise the recorded peak.
+ *
+ * `highestPriceUsd` is monotonic and permanent once set, and the price feed
+ * switches between the bonding curve, a DexScreener quote and marketCap/1e9
+ * (which assumes a 1B supply and is 2x wrong for a 2B-supply token). One bad
+ * high tick would otherwise anchor the trailing stop forever with no recovery
+ * path, so an implausible single-tick spike is refused for peak purposes.
+ */
+export function acceptPeakUpdate(params: {
+  candidatePriceUsd: number;
+  prevPriceUsd: number;
+  currentPeakUsd: number;
+  maxTickRatio?: number;
+}): boolean {
+  const { candidatePriceUsd, prevPriceUsd, currentPeakUsd, maxTickRatio = 4 } = params;
+  if (!(candidatePriceUsd > currentPeakUsd)) return false;
+  if (prevPriceUsd > 0 && candidatePriceUsd / prevPriceUsd > maxTickRatio) return false;
+  return true;
+}
