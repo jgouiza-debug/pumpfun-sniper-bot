@@ -1621,5 +1621,134 @@ console.log('\n-- Rug fixtures from recorded live data (audit #38) --');
   });
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3 — reporting metrics that were computed but WRONG (audit #8-#10, #27).
+// ---------------------------------------------------------------------------
+console.log('\n-- Win rate is per position, not per leg (audit #9) --');
+{
+  const { reportService } = require('../services/reportService');
+  const { classifyExitReason } = require('../services/pipelineUtils');
+
+  const leg = (positionId: string, pnlUsd: number, exitCode: string, legIndex = 0) => ({
+    id: `${positionId}_${legIndex}`, positionId, legIndex, exitCode,
+    mint: 'm', tokenName: 'T', tokenSymbol: 'T', playbook: 'PLAY_3',
+    buyPriceUsd: 1, sellPriceUsd: 1, investedSol: 0.3, investedUsd: 60,
+    pnlPct: 0, pnlUsd, pnlSol: 0, entryTime: 1, exitTime: 2, holdTimeSeconds: 1,
+    exitReason: `SOLD 50% — ${pnlUsd >= 0 ? 'PROFIT' : 'LOSS'} ${pnlUsd >= 0 ? '+' : '-'}$${Math.abs(pnlUsd)}: whatever`,
+    feeDragUsd: 0, feesPaidUsd: 1.5,
+  });
+
+  // finish() writes reports/run_<id>.{json,md}. These are test fixtures, not
+  // real runs, so remove them rather than leaving them to be committed and
+  // later mistaken for evidence.
+  const runReport = (legs: any[]) => {
+    reportService.start({ tradingMode: 'paper', leniencyMode: 'strict' } as any, 100, 1, 'W');
+    for (const l of legs) reportService.recordTrade(l as any);
+    const r = reportService.finish(100, 1, 0, 0, 200);
+    if (r?.runId) {
+      const dir = require('path').join(__dirname, '../../reports');
+      for (const ext of ['json', 'md']) {
+        try { require('fs').unlinkSync(require('path').join(dir, `${r.runId}.${ext}`)); } catch { /* fine */ }
+      }
+    }
+    return r;
+  };
+
+  test('OLD BUG reproduced: a winner exits in more legs, inflating a leg-based rate', () => {
+    // One winning position exits in 3 legs, one losing position in 1 leg.
+    const legs = [
+      leg('posWin', 10, 'PULLBACK_PARTIAL', 0),
+      leg('posWin', 12, 'TP1', 1),
+      leg('posWin', 15, 'TRAILING_FULL', 2),
+      leg('posLoss', -40, 'TIME_STOP', 0),
+    ];
+    const legWinRate = legs.filter(l => l.pnlUsd > 0).length / legs.length * 100;
+    assert.strictEqual(Math.round(legWinRate), 75, 'leg-based rate reads 75%');
+    // Truth: 1 win, 1 loss => 50%.
+  });
+
+  test('fixed: the report groups legs into positions', () => {
+    const r = runReport([
+      leg('posWin', 10, 'PULLBACK_PARTIAL', 0),
+      leg('posWin', 12, 'TP1', 1),
+      leg('posWin', 15, 'TRAILING_FULL', 2),
+      leg('posLoss', -40, 'TIME_STOP', 0),
+    ]);
+    assert.strictEqual(r.positionsClosed, 2, 'two positions, not four legs');
+    assert.strictEqual(r.winRatePct, 50, `expected 50%, got ${r.winRatePct}%`);
+    assert.strictEqual(r.winCount, 1);
+    assert.strictEqual(r.lossCount, 1);
+    assert.strictEqual(r.totalTrades, 4, 'legs are still reported for the ledger');
+  });
+
+  test('a position is a WIN on its summed P&L, not on any single leg', () => {
+    // Two profitable partials then a big final loss => the position lost.
+    const r = runReport([
+      leg('p1', 5, 'PULLBACK_PARTIAL', 0),
+      leg('p1', 5, 'TP1', 1),
+      leg('p1', -30, 'TRAILING_FULL', 2),
+    ]);
+    assert.strictEqual(r.positionsClosed, 1);
+    assert.strictEqual(r.winRatePct, 0, 'the summed position is a loss');
+    assert.strictEqual(r.legWinCount, 2, 'but two of its legs were profitable');
+  });
+
+  test('avg P&L per position is reported', () => {
+    const r = runReport([leg('a', 20, 'TP1'), leg('b', -10, 'TIME_STOP')]);
+    assert.strictEqual(r.avgPnlPerPositionUsd, 5);
+  });
+
+  test('#8: fees are reported from feesPaidUsd, not the P&L adjustment', () => {
+    const r = runReport([leg('a', 20, 'TP1'), leg('b', -10, 'TIME_STOP')]);
+    assert.strictEqual(r.totalFeesUsd, 3, 'two legs x $1.50 modelled fees');
+  });
+
+  test('OLD BUG reproduced: summing feeDragUsd on real fills reports $0.00', () => {
+    const legs = [leg('a', 20, 'TP1'), leg('b', -10, 'TIME_STOP')];
+    const oldTotal = legs.reduce((acc, t) => acc + (t.feeDragUsd || 0), 0);
+    assert.strictEqual(oldTotal, 0, 'this is the "Fees paid $0.00" bug');
+  });
+
+  test('#10/#27: exit reasons bucket on the code, not the interpolated string', () => {
+    const r = runReport([
+      leg('a', 5, 'TP1'), leg('b', 7, 'TP1'), leg('c', 9, 'TP1'),
+    ]);
+    const keys = Object.keys(r.byExitReason);
+    assert.strictEqual(keys.length, 1, `three TP1 legs must be ONE bucket, got ${JSON.stringify(keys)}`);
+    assert.strictEqual(keys[0], 'TP1');
+    assert.strictEqual(r.byExitReason.TP1.count, 3);
+  });
+
+  test('OLD BUG reproduced: the raw string fragments into one bucket per trade', () => {
+    const raw = [5, 7, 9].map(v => `SOLD 50% — PROFIT +$${v}: hit take-profit`);
+    const oldKeys = new Set(raw.map(s => s.replace(/\s*\[final leg.*$/i, '').split('(')[0].trim().slice(0, 60)));
+    assert.strictEqual(oldKeys.size, 3, 'the dollar amount sits before any paren, so each is its own bucket');
+  });
+
+  test('legacy records with no exitCode still aggregate after numeral collapsing', () => {
+    const legacy = [5, 7, 9].map(v => ({
+      ...leg('x' + v, v, undefined as any), exitCode: undefined,
+      exitReason: `SOLD 50% — PROFIT +$${v}: hit take-profit`,
+    }));
+    const r = runReport(legacy);
+    assert.strictEqual(Object.keys(r.byExitReason).length, 1,
+      `legacy strings must collapse, got ${JSON.stringify(Object.keys(r.byExitReason))}`);
+  });
+
+  test('classifyExitReason maps the full-exit strings', () => {
+    assert.strictEqual(classifyExitReason('SOLD ALL — structural stop: pool drained 60%'), 'STRUCTURAL');
+    assert.strictEqual(classifyExitReason('SOLD ALL — honeypot: sell simulation reverts'), 'HONEYPOT');
+    assert.strictEqual(classifyExitReason('SOLD ALL — max hold time reached (30 min)'), 'TIME_STOP');
+    assert.strictEqual(classifyExitReason('SOLD ALL — no market data 180s after entry (never indexed)'), 'NO_DATA_STOP');
+    assert.strictEqual(classifyExitReason('Manual User Force Sell Override'), 'MANUAL');
+    assert.strictEqual(classifyExitReason('SOLD ALL — trailing stop: price fell 30%'), 'TRAILING_FULL');
+  });
+
+  test('the no-data stop is classified before the generic time stop', () => {
+    // Both strings contain time-ish words; order matters.
+    assert.strictEqual(classifyExitReason('SOLD ALL — no market data 180s after entry'), 'NO_DATA_STOP');
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

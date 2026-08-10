@@ -215,6 +215,25 @@ export function splitWalletIntoSlots(params: {
   };
 }
 
+/**
+ * Maps a full-exit reason string to a structured ExitCode.
+ *
+ * Only used for the paths that close a whole position; the partial rungs pass
+ * their code explicitly. Bucketing on the raw string is what produced 498
+ * buckets for 10 real reasons, because the string interpolates dollar amounts.
+ */
+export function classifyExitReason(reason: string): import('../types').ExitCode {
+  const r = (reason || '').toLowerCase();
+  if (r.includes('honeypot')) return 'HONEYPOT';
+  if (r.includes('structural stop')) return 'STRUCTURAL';
+  if (r.includes('manual')) return 'MANUAL';
+  if (r.includes('no market data')) return 'NO_DATA_STOP';
+  if (r.includes('time stop') || r.includes('max hold time')) return 'TIME_STOP';
+  if (r.includes('trailing stop')) return 'TRAILING_FULL';
+  if (r.includes('partial fill')) return 'PARTIAL_FILL';
+  return 'UNKNOWN';
+}
+
 // ---------------------------------------------------------------------------
 // Exit-policy predicates.
 //

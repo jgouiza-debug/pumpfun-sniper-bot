@@ -338,8 +338,44 @@ export interface Position {
   exitInFlight?: boolean;
 }
 
+/**
+ * Structured exit trigger. The human `exitReason` string interpolates dollar
+ * amounts, so bucketing on it produced one bucket per trade — the "by exit
+ * reason" table degenerated into a list. Bucket on this instead.
+ */
+export type ExitCode =
+  | 'PULLBACK_PARTIAL'
+  | 'TP1'
+  | 'TP2'
+  | 'TRAILING_PARTIAL'
+  | 'TRAILING_FULL'
+  | 'TIME_STOP'
+  | 'NO_DATA_STOP'
+  | 'STRUCTURAL'
+  | 'HONEYPOT'
+  | 'MANUAL'
+  | 'PARTIAL_FILL'
+  | 'UNKNOWN';
+
 export interface TradeHistoryRecord {
   id: string;
+  /**
+   * The position this leg belongs to. A position sells in up to four legs, and
+   * win rate computed over LEGS is not win rate: a verified run reported 9
+   * positions as "15 closed, 93.3% win rate". Group by this for real numbers.
+   */
+  positionId?: string;
+  /** 0-based index of this leg within its position. */
+  legIndex?: number;
+  /** Machine-readable exit trigger; bucket on this, never on exitReason. */
+  exitCode?: ExitCode;
+  /**
+   * Fees actually paid on this leg, in USD, for REPORTING only. Distinct from
+   * feeDragUsd, which is the P&L adjustment and is 0 when a real fill already
+   * has the costs inside its balance deltas. Without this the report printed
+   * "Fees paid $0.00" — the one line built to expose the cost stack.
+   */
+  feesPaidUsd?: number;
   mint: string;
   tokenName: string;
   tokenSymbol: string;
@@ -420,11 +456,19 @@ export interface RunReport {
   positionsClosed: number;
   positionsStillOpen: number;
 
-  // Trades
+  // Trades. `totalTrades` counts LEGS (the ledger lists legs); win/loss and
+  // winRatePct are per POSITION, which is the only meaningful denominator — a
+  // profitable position exits in more legs than a losing one, so a leg-based
+  // rate is structurally inflated.
   totalTrades: number;
   winCount: number;
   lossCount: number;
   winRatePct: number;
+  /** Leg-level counts, kept for reconciliation against the ledger. */
+  legWinCount?: number;
+  legLossCount?: number;
+  /** Mean realized P&L per closed position. */
+  avgPnlPerPositionUsd?: number;
 
   // P&L
   realizedPnlUsd: number;

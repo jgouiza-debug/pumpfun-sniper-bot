@@ -12,7 +12,8 @@ import {
   PlaybookType,
   Position,
   PumpTokenLaunch,
-  TradeHistoryRecord
+  TradeHistoryRecord,
+  ExitCode
 } from '../types';
 import { RiskFilter } from '../filters/riskFilter';
 import { RugCheckService } from './rugcheckService';
@@ -27,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -130,6 +131,8 @@ export interface InternalPosition extends Position {
   sellPathVerified?: boolean;
   /** A full exit simulated as REVERTING — the token is a honeypot. */
   honeypotConfirmed?: boolean;
+  /** Legs recorded for this position so far; drives TradeHistoryRecord.legIndex. */
+  legCount?: number;
 }
 
 export class SniperEngine {
@@ -2092,11 +2095,26 @@ export class SniperEngine {
     }, POSITION_MONITOR_INTERVAL_MS);
   }
 
+  /**
+   * Modelled fee stack for one leg, in USD, for the report's "Fees paid" line.
+   *
+   * Real fills bury their costs inside the balance deltas, so feeDragUsd is
+   * correctly 0 for P&L — but that made the report print "Fees paid $0.00",
+   * hiding the entire cost stack the economics gate exists to control. This is
+   * the modelled figure: protocol fees on the notional plus the flat costs.
+   */
+  private legFeesUsd(notionalSol: number): number {
+    const protocolSol = Math.max(0, notionalSol) * 0.015;
+    const flatSol = this.config.priorityFeeSol + 0.000005;
+    return Number(((protocolSol + flatSol) * this.config.solPriceUsd).toFixed(4));
+  }
+
   private recordPartialSell(
     pos: InternalPosition,
     fractionSold: number,
     reason: string,
-    actual?: { proceedsSol: number; tokensSold: number; txid: string }
+    actual?: { proceedsSol: number; tokensSold: number; txid: string },
+    exitCode: ExitCode = 'UNKNOWN'
   ): void {
     // With a real fill, everything derives from chain deltas: the fraction is
     // tokens-actually-sold over tokens held, proceeds are SOL-actually-received
@@ -2129,8 +2147,12 @@ export class SniperEngine {
     const sellPriceUsd = tokensSold > 0 ? proceedsUsd / tokensSold : pos.currentPriceUsd;
 
     // Record trade history entry for this partial sell
+    pos.legCount = (pos.legCount ?? 0) + 1;
     const record: TradeHistoryRecord = {
       id: `trade_${Date.now()}_${Math.floor(Math.random()*1000)}`,
+      positionId: pos.id,
+      legIndex: pos.legCount - 1,
+      exitCode,
       mint: pos.mint,
       tokenName: pos.tokenName,
       tokenSymbol: pos.tokenSymbol,
@@ -2153,6 +2175,7 @@ export class SniperEngine {
       exitReason: `SOLD ${Math.round(fractionSold * 100)}% — ${partialPnlUsd >= 0 ? 'PROFIT' : 'LOSS'} ${partialPnlUsd >= 0 ? '+' : '-'}$${Math.abs(partialPnlUsd)}: ${reason}`,
       // With a real fill, all costs are already inside the balance deltas.
       feeDragUsd: actual ? 0 : 0.20,
+      feesPaidUsd: this.legFeesUsd(pos.investedSol * fractionSold),
     };
 
     this.pushTrade(record);
@@ -2682,7 +2705,7 @@ export class SniperEngine {
         pos.pullbackRungTaken = true;
         pos.principalRecovered = true;
         pos.status = 'PARTIAL_PROFIT';
-        this.recordPartialSell(pos, 0.5, `price fell ${pullbackFromPeakPct.toFixed(0)}% from its peak while up ${pos.pnlPct}%`, sale.actual);
+        this.recordPartialSell(pos, 0.5, `price fell ${pullbackFromPeakPct.toFixed(0)}% from its peak while up ${pos.pnlPct}%`, sale.actual, 'PULLBACK_PARTIAL');
         this.log('sell', `📉 [SOLD 50%] $${pos.tokenSymbol} — was up +${pos.pnlPct}%, price dropped ${pullbackFromPeakPct.toFixed(0)}% from peak $${pos.highestPriceUsd.toFixed(6)}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
         return;
       }
@@ -2694,7 +2717,7 @@ export class SniperEngine {
         pos.tp1Taken = true;
         pos.principalRecovered = true;
         pos.status = 'PARTIAL_PROFIT';
-        this.recordPartialSell(pos, 0.5, `hit take-profit target of +${this.config.takeProfitPct}%`, sale.actual);
+        this.recordPartialSell(pos, 0.5, `hit take-profit target of +${this.config.takeProfitPct}%`, sale.actual, 'TP1');
         this.log('sell', `💰 [SOLD 50%] $${pos.tokenSymbol} — hit +${pos.pnlPct}% (target +${this.config.takeProfitPct}%)${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
         return;
       }
@@ -2704,7 +2727,7 @@ export class SniperEngine {
         if (sale === null) return;
 
         pos.moonbagRiding = true;
-        this.recordPartialSell(pos, 0.5, `hit second take-profit target of +${this.config.takeProfitRung2Pct}%`, sale.actual);
+        this.recordPartialSell(pos, 0.5, `hit second take-profit target of +${this.config.takeProfitRung2Pct}%`, sale.actual, 'TP2');
         this.log('sell', `🔥 [SOLD 50%] $${pos.tokenSymbol} — hit +${pos.pnlPct}% (target +${this.config.takeProfitRung2Pct}%)${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding the rest.`, pos.mint);
         return;
       }
@@ -2726,7 +2749,7 @@ export class SniperEngine {
         const sale = await this.sellPctReal(pos, 50);
         if (sale === null) return;
         pos.status = 'PARTIAL_PROFIT';
-        this.recordPartialSell(pos, 0.5, trailReason, sale.actual);
+        this.recordPartialSell(pos, 0.5, trailReason, sale.actual, 'TRAILING_PARTIAL');
         this.log('sell', `📉 [SOLD 50%] $${pos.tokenSymbol} — ${trailReason}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%; the stop must re-arm from here.`, pos.mint);
         return;
       }
@@ -2786,7 +2809,7 @@ export class SniperEngine {
         this.log('error',
           `❌ [PARTIAL EXIT] $${pos.tokenSymbol}: exit filled only ${Math.round(sale.actual.tokensSold).toLocaleString()} of ${Math.round(pos.tokensHeld).toLocaleString()} tokens (${(soldFraction * 100).toFixed(1)}%). Position stays OPEN with the remainder — it was NOT closed.`,
           pos.mint);
-        this.recordPartialSell(pos, soldFraction, `${reason} [partial fill — ${(soldFraction * 100).toFixed(1)}% only]`, sale.actual);
+        this.recordPartialSell(pos, soldFraction, `${reason} [partial fill — ${(soldFraction * 100).toFixed(1)}% only]`, sale.actual, 'PARTIAL_FILL');
         return;
       }
     }
@@ -2819,8 +2842,12 @@ export class SniperEngine {
     // Record only THIS leg's P&L. Any partial sells already wrote their own
     // records, so carrying the cumulative figure here would double-count every
     // partial when the history is summed for stats and the run report.
+    pos.legCount = (pos.legCount ?? 0) + 1;
     const record: TradeHistoryRecord = {
       id: pos.id,
+      positionId: pos.id,
+      legIndex: pos.legCount - 1,
+      exitCode: classifyExitReason(reason),
       mint: pos.mint,
       tokenName: pos.tokenName,
       tokenSymbol: pos.tokenSymbol,
@@ -2844,6 +2871,7 @@ export class SniperEngine {
         ? `${reason} [final leg; position total ${totalPositionPnlUsd >= 0 ? '+' : ''}$${totalPositionPnlUsd}]`
         : reason,
       feeDragUsd,
+      feesPaidUsd: this.legFeesUsd(pos.investedSol),
     };
 
     this.pushTrade(record);

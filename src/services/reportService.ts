@@ -114,8 +114,30 @@ export class ReportService {
     const wins = this.trades.filter(t => t.pnlUsd > 0);
     const losses = this.trades.filter(t => t.pnlUsd <= 0);
     const realizedPnlUsd = Number(this.trades.reduce((acc, t) => acc + t.pnlUsd, 0).toFixed(2));
-    const totalFeesUsd = Number(this.trades.reduce((acc, t) => acc + (t.feeDragUsd || 0), 0).toFixed(2));
+    // Prefer the modelled fee stack. feeDragUsd is 0 whenever a real fill buried
+    // its costs inside the balance deltas, so summing it printed "Fees paid
+    // $0.00" — the one line built to expose the cost stack.
+    const totalFeesUsd = Number(this.trades.reduce(
+      (acc, t) => acc + (t.feesPaidUsd ?? t.feeDragUsd ?? 0), 0).toFixed(2));
     const fillVerifiedLegs = this.trades.filter(t => t.fillVerified).length;
+
+    // Win rate over POSITIONS, not legs. A position exits in up to four legs and
+    // the profitable ones exit in more, so counting legs inflates the rate: a
+    // verified run reported 9 positions as "15 closed, 93.3% win rate".
+    const byPosition = new Map<string, number>();
+    for (const t of this.trades) {
+      const key = t.positionId || t.id;
+      byPosition.set(key, Number(((byPosition.get(key) ?? 0) + t.pnlUsd).toFixed(2)));
+    }
+    const positionPnls = [...byPosition.values()];
+    const positionsClosed = positionPnls.length;
+    const positionWins = positionPnls.filter(p => p > 0).length;
+    const positionWinRatePct = positionsClosed
+      ? Number(((positionWins / positionsClosed) * 100).toFixed(1))
+      : 0;
+    const avgPnlPerPositionUsd = positionsClosed
+      ? Number((positionPnls.reduce((a, b) => a + b, 0) / positionsClosed).toFixed(2))
+      : 0;
 
     const byPlaybook: Record<string, { trades: number; pnlUsd: number; wins: number }> = {};
     const byExitReason: Record<string, { count: number; pnlUsd: number }> = {};
@@ -127,13 +149,20 @@ export class ReportService {
       byPlaybook[pb].pnlUsd = Number((byPlaybook[pb].pnlUsd + t.pnlUsd).toFixed(2));
       if (t.pnlUsd > 0) byPlaybook[pb].wins++;
 
-      // Strip per-leg annotations before bucketing so counts don't fragment
-      // on interpolated amounts ("[final leg; position total +$3]").
-      const reasonKey = (t.exitReason || 'Unknown')
-        .replace(/\s*\[final leg.*$/i, '')
-        .split('(')[0]
-        .trim()
-        .slice(0, 60);
+      // Bucket on the structured code when we have one. The human string
+      // interpolates dollar amounts ("SOLD 50% — PROFIT +$8.2: ..."), and those
+      // sit before any parenthesis and inside the 60-char slice, so stripping
+      // annotations was not enough — every partial leg became its own bucket.
+      // Legacy records without a code fall back to the old normalisation, now
+      // with numerals collapsed so they aggregate instead of fragmenting.
+      const reasonKey = t.exitCode
+        ? t.exitCode
+        : (t.exitReason || 'Unknown')
+            .replace(/\s*\[final leg.*$/i, '')
+            .split('(')[0]
+            .replace(/[-+]?\$?\d[\d,.]*%?/g, 'N')
+            .trim()
+            .slice(0, 60);
       byExitReason[reasonKey] ??= { count: 0, pnlUsd: 0 };
       byExitReason[reasonKey].count++;
       byExitReason[reasonKey].pnlUsd = Number((byExitReason[reasonKey].pnlUsd + t.pnlUsd).toFixed(2));
@@ -164,13 +193,20 @@ export class ReportService {
         .map(([reason, count]) => ({ reason, count })),
 
       positionsOpened: this.positionsOpened,
-      positionsClosed: this.trades.length,
+      // Distinct POSITIONS closed. This used to be this.trades.length, which is
+      // the number of LEGS — so 9 positions were reported as "15 closed".
+      positionsClosed,
       positionsStillOpen: openPositionsCount,
 
+      // totalTrades stays leg-denominated (the ledger lists legs), but the
+      // headline win rate is now per position.
       totalTrades: this.trades.length,
-      winCount: wins.length,
-      lossCount: losses.length,
-      winRatePct: this.trades.length ? Number(((wins.length / this.trades.length) * 100).toFixed(1)) : 0,
+      winCount: positionWins,
+      lossCount: positionsClosed - positionWins,
+      winRatePct: positionWinRatePct,
+      legWinCount: wins.length,
+      legLossCount: losses.length,
+      avgPnlPerPositionUsd,
 
       realizedPnlUsd,
       realizedPnlSol: Number((realizedPnlUsd / (solPriceUsd || 1)).toFixed(4)),
@@ -403,7 +439,9 @@ ${openRows}
 | Fees paid | ${money(-Math.abs(r.totalFeesUsd))} |
 | Bankroll | $${r.startingBankrollUsd.toFixed(2)} → $${r.endingBankrollUsd.toFixed(2)} |
 | ROI | ${pct(r.roiPct)} |
-${r.walletAddress ? `| Wallet SOL | ${r.startingWalletSol} → ${r.endingWalletSol} |\n` : ''}| Win rate | ${r.winRatePct}% (${r.winCount}W / ${r.lossCount}L) |
+${r.walletAddress ? `| Wallet SOL | ${r.startingWalletSol} → ${r.endingWalletSol} |\n` : ''}| Win rate | ${r.winRatePct}% (${r.winCount}W / ${r.lossCount}L across ${r.positionsClosed} position${r.positionsClosed === 1 ? '' : 's'}) |
+| Avg P&L per position | ${(r.avgPnlPerPositionUsd ?? 0) >= 0 ? '+' : ''}$${r.avgPnlPerPositionUsd ?? 0} |
+| Exit legs | ${r.totalTrades} (${r.legWinCount ?? 0}W / ${r.legLossCount ?? 0}L) |
 | Avg hold | ${Math.floor(r.avgHoldSeconds / 60)}m ${r.avgHoldSeconds % 60}s |
 
 ## Screening funnel
