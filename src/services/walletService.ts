@@ -53,14 +53,28 @@ export class WalletService {
 
   constructor(connection: Connection) {
     this.connection = connection;
+    this.rpcHealthy = true;
+    void this.checkRpcHealth();
     this.autoLoad();
     if (this.keypair) this.subscribeToBalance();
+  }
+
+  public async checkRpcHealth(): Promise<boolean> {
+    try {
+      await this.connection.getSlot('confirmed');
+      this.rpcHealthy = true;
+      return true;
+    } catch {
+      this.rpcHealthy = false;
+      return false;
+    }
   }
 
   public setConnection(connection: Connection): void {
     this.unsubscribeBalance();
     this.connection = connection;
     this.lastCheckedAt = 0;
+    void this.checkRpcHealth();
     if (this.keypair) this.subscribeToBalance();
   }
 
@@ -249,7 +263,7 @@ export class WalletService {
     this.source = 'none';
     this.solBalance = 0;
     this.lastCheckedAt = 0;
-    this.rpcHealthy = false;
+    void this.checkRpcHealth();
 
     if (deleteFile) {
       try {
@@ -286,7 +300,7 @@ export class WalletService {
    */
   public async refreshBalance(force = false): Promise<number> {
     if (!this.keypair) {
-      this.rpcHealthy = false;
+      void this.checkRpcHealth();
       return 0;
     }
 
