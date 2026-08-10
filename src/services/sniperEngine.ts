@@ -916,10 +916,13 @@ export class SniperEngine {
         this.safeSendWs({ method: 'subscribeMigration' });
 
         // Re-subscribe to trades for anything already being watched, so a
-        // reconnect does not silently blind the curve tracker.
-        const watched = tokenWatchlist.all().map(t => t.mint);
-        if (watched.length) {
-          this.safeSendWs({ method: 'subscribeTokenTrade', keys: watched });
+        // reconnect does not silently blind the curve tracker. Open positions
+        // are included: they carry real money and their creator/insider stops
+        // read this same stream, so a reconnect must not drop them.
+        const watched = new Set(tokenWatchlist.all().map(t => t.mint));
+        for (const p of this.activePositions) watched.add(p.mint);
+        if (watched.size) {
+          this.safeSendWs({ method: 'subscribeTokenTrade', keys: [...watched] });
         }
       });
 
@@ -1717,11 +1720,27 @@ export class SniperEngine {
 
     this.activePositions.push(position);
 
-    // Watch the creator from the moment we are exposed. Subscribing to this
-    // token's trade stream is what makes the structural stop possible.
+    // Watch the creator from the moment we are exposed.
+    //
+    // This comment used to claim that subscribing to the token's trade stream
+    // "is what makes the structural stop possible" while the code only
+    // registered the creator and never sent the subscription. The dev-sell
+    // handler fires on PumpPortal trade events for tracked mints, and the only
+    // subscribeTokenTrade the engine ever sent was a reconnect replay for
+    // WATCHLIST mints — a held position was never among them. DEV_SOLD,
+    // LINKED_WALLET_SOLD and LARGE_SELL_CLUSTER could therefore never fire for
+    // a position we actually held, independently of the free-tier problem.
+    //
+    // The subscription is sent here now. On an unfunded PumpPortal key it is a
+    // no-op (the endpoint requires a key funded with 0.02 SOL and returns zero
+    // events), so this changes nothing until that key is funded — at which
+    // point the three creator/insider stops start working with no further code
+    // change. Until then the loss side rests on CURVE_DRAINED, POOL_DRAINED,
+    // SELL_FLOW and the time stop.
     if (featureFlags.get('devSellStop')) {
       const creator = (launchData?.creator as string) || undefined;
       devSellMonitor.track(filterResult.mint, creator);
+      this.safeSendWs({ method: 'subscribeTokenTrade', keys: [filterResult.mint] });
     }
 
     // Watch this position's curve while it is still pre-migration: the curve
