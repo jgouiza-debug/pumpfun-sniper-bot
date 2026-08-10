@@ -180,28 +180,46 @@ export class SniperEngine {
     maxHoldSeconds: 1800,
     poolDrainExitFraction: 0.5,
     sellFlowExitTicks: 3,
-    // Concurrency IS the exposure limit: every position is one slot at risk on
-    // a 60-80%-rug asset class. The old "unlimited" sentinel let the bot spread
-    // the whole wallet across garbage simultaneously; it is gone and this is now
-    // clamped to 1..20. 3 rather than 5 because without a price stop each slot
-    // can go to zero.
-    maxActivePositions: 3,
-    priorityFeeSol: 0.003,
+    // ALL-IN, ONE POSITION AT A TIME. Owner decision 2026-08-09 for a 0.2 SOL
+    // wallet: at that size fixed Solana fees are ~0.0081 SOL per round trip
+    // regardless of stake, so splitting into 2 or 3 slots pushes every slot's
+    // breakeven to 8.45% / 11.33% against a 6% limit and NOTHING trades.
+    //
+    // The cost is explicit and accepted: one rug takes the whole deployable
+    // balance. The 1/N survivability property is unaffordable at this size.
+    // Raise this back to 3 when the wallet reaches ~0.55 SOL.
+    maxActivePositions: 1,
+    // 0.001, not 0.003. At a 0.2 SOL wallet the priority fee is paid twice per
+    // round trip against a ~0.15 SOL stake, so 0.003 alone adds 4.0 percentage
+    // points of breakeven and pushes the only viable config (1 slot, 100%
+    // deployment) from 5.67% to 8.37% — above the limit, so nothing trades.
+    //
+    // ACCEPTED TRADE-OFF: a 0.001 priority fee loses races on congested slots,
+    // and migrations are the only entry type this bot produces. Cheaper fills
+    // mean fewer fills. Raise this once the stake is large enough to absorb it.
+    priorityFeeSol: 0.001,
     maxPriorityFeeSol: 0.005,
     maxSlippagePct: 25,
     jitoTipSol: 0.001,   // NOT wired to anything — reserved for a future Jito bundle path
     solPriceUsd: 200,
     bankrollUsd: 100,
-    // Sized to roughly three full-position losses. With no price stop a losing
-    // position can go to zero by design, so a limit tuned for stop-protected
-    // trades would pause the bot on one ordinary hour.
-    maxHourlyLossUsd: 70,
+    // Scaled to the actual wallet. These were 70 / 200, sized for a 1.2 SOL
+    // wallet — at a ~$15 wallet with a ~$11.6 position they could NEVER fire, so
+    // all three breakers were dead weight giving false assurance. A breaker that
+    // cannot trip is worse than no breaker.
+    //
+    // At all-in sizing one full loss is roughly the whole deployable balance, so
+    // these trip after essentially one wipeout rather than after three.
+    maxHourlyLossUsd: 12,
     // Roughly three full-slot losses in a day, and three losers in a row. Both
     // pause NEW ENTRIES only; open positions are always retained.
-    maxDailyLossUsd: 200,
-    maxConsecutiveLosses: 4,
-    // Commit 60% of the wallet per run, not ~100%.
-    maxDeployedFractionPct: 60,
+    maxDailyLossUsd: 16,
+    maxConsecutiveLosses: 2,
+    // 100%, not 60%. At 0.2 SOL a 60% cap leaves 0.117 SOL, which stakes 0.0897
+    // at a 7.51% round trip — above the limit, so nothing trades. There is no
+    // reserve at this size; the reserve IS funding the wallet properly.
+    // Set this back to 60 the moment the balance can carry it.
+    maxDeployedFractionPct: 100,
     // Leave a position that never gets a market rather than holding it blind for
     // the full 30-minute timer. Not a price stop — it never reads a price.
     noDataExitSeconds: 180,

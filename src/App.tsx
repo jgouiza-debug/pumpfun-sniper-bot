@@ -110,7 +110,8 @@ export function App() {
     useTrailingStop: true,
     trailingStopPct: 30,
     maxHoldSeconds: 1800,
-    maxActivePositions: 3,
+    // All-in at the current wallet size — see the engine defaults for why.
+    maxActivePositions: 1,
     activePlaybook: 'ALL',
     tradingMode: 'paper',
     leniencyMode: 'strict',
