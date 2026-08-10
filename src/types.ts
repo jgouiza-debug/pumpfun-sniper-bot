@@ -217,6 +217,24 @@ export interface BotConfig {
   useTrailingStop: boolean;
   trailingStopPct: number;
   maxHoldSeconds: number;
+  /**
+   * Leave a position that has had NO usable market data this many seconds after
+   * entry. Not a price stop — it never reads a price, only whether a market
+   * exists. Covers the fresh-migration window where an unindexed pool leaves the
+   * structural exits blind and the only fallback is maxHoldSeconds.
+   */
+  noDataExitSeconds?: number;
+  /** Give up automatic retries of a forced exit after this many attempts. */
+  maxForceExitAttempts?: number;
+  /**
+   * Ceiling on the fraction of the deployable balance the run may commit across
+   * all slots. Without it, wallet-split sizing deploys ~100% of the wallet.
+   */
+  maxDeployedFractionPct?: number;
+  /** Pause new entries after this many consecutive losing trades. */
+  maxConsecutiveLosses?: number;
+  /** Realized loss (USD) in a rolling 24h that pauses the bot. */
+  maxDailyLossUsd?: number;
   /** Exit when pool liquidity falls to this fraction of its observed peak. */
   poolDrainExitFraction?: number;
   /** Exit after this many consecutive ticks of collapsed buy pressure. */
@@ -263,7 +281,15 @@ export interface Position {
   pnlUsd: number;
   pnlSol: number;
   status: 'OPEN' | 'PARTIAL_PROFIT' | 'CLOSED';
+  /** True once any rung has banked principal. Kept for the UI and reporting. */
   principalRecovered: boolean;
+  /**
+   * Per-rung latches. These used to share `principalRecovered`, which made the
+   * pullback rung and TP1 mutually exclusive — the first to fire consumed the
+   * latch and the position took no further profit until TP2.
+   */
+  pullbackRungTaken?: boolean;
+  tp1Taken?: boolean;
   moonbagRiding: boolean;
   autoSellReason?: string;
   score: number;

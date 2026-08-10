@@ -643,7 +643,7 @@ export function App() {
         <div className="stat-card">
           <div className="stat-label">Active Engagements</div>
           <div className="stat-value-mono">
-            {activePositions.length} / {(botStatus?.config.maxActivePositions || 99999) >= 99999 ? 'UNLIMITED' : botStatus?.config.maxActivePositions}
+            {activePositions.length} / {botStatus?.config.maxActivePositions ?? '—'}
           </div>
           <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}>
             CONCURRENT LIMIT

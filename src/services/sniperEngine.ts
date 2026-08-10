@@ -120,6 +120,12 @@ export interface InternalPosition extends Position {
    * DevSellMonitor and will never be raised twice.
    */
   forceExitReason?: string;
+  /** Forced-exit attempts made so far; bounded by config.maxForceExitAttempts. */
+  forceExitAttempts?: number;
+  /** True once the stranded-position error has been logged, so it logs once. */
+  strandedLogged?: boolean;
+  /** When this position first had ANY usable market data. Drives the no-data exit. */
+  firstMarketDataAt?: number;
 }
 
 export class SniperEngine {
@@ -166,10 +172,11 @@ export class SniperEngine {
     maxHoldSeconds: 1800,
     poolDrainExitFraction: 0.5,
     sellFlowExitTicks: 3,
-    // Concurrency IS the exposure limit: every position is buyAmountSol at
-    // risk on a 60-80%-rug asset class. 99999 ("unlimited") let the bot
-    // spread the whole wallet across garbage simultaneously. 3 rather than 5
-    // because without a price stop each slot can go to zero.
+    // Concurrency IS the exposure limit: every position is one slot at risk on
+    // a 60-80%-rug asset class. The old "unlimited" sentinel let the bot spread
+    // the whole wallet across garbage simultaneously; it is gone and this is now
+    // clamped to 1..20. 3 rather than 5 because without a price stop each slot
+    // can go to zero.
     maxActivePositions: 3,
     priorityFeeSol: 0.003,
     maxPriorityFeeSol: 0.005,
@@ -181,6 +188,16 @@ export class SniperEngine {
     // position can go to zero by design, so a limit tuned for stop-protected
     // trades would pause the bot on one ordinary hour.
     maxHourlyLossUsd: 70,
+    // Roughly three full-slot losses in a day, and three losers in a row. Both
+    // pause NEW ENTRIES only; open positions are always retained.
+    maxDailyLossUsd: 200,
+    maxConsecutiveLosses: 4,
+    // Commit 60% of the wallet per run, not ~100%.
+    maxDeployedFractionPct: 60,
+    // Leave a position that never gets a market rather than holding it blind for
+    // the full 30-minute timer. Not a price stop — it never reads a price.
+    noDataExitSeconds: 180,
+    maxForceExitAttempts: 20,
     // 15 made the economics gate decorative (0.05 SOL @ 11.1% passed). 6 is
     // the audit's number: refuse any trade that needs >6% just to break even.
     maxBreakevenPct: 6,
@@ -215,6 +232,14 @@ export class SniperEngine {
    * fall back to config.buyAmountSol.
    */
   private runSlotStakeSol = 0;
+
+  /**
+   * Mints with an entry in flight — claimed before the first await in
+   * evaluatePlaybookTrigger and released when it settles. Without this the
+   * concurrency cap only counted CONFIRMED positions, which arrive up to 30s
+   * after submission, so the cap was advisory across that whole window.
+   */
+  private entriesInFlight = new Set<string>();
 
   // Stats & Tracking
   private consecutiveLosses = 0;
@@ -314,6 +339,16 @@ export class SniperEngine {
       : Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
   }
 
+  /**
+   * All-in SOL one in-flight entry ties up: the stake plus its slippage buffer,
+   * protocol fees, priority fee and rent. Used to discount the live balance by
+   * what concurrent entries have already claimed but not yet spent on-chain.
+   */
+  private reservedPerEntrySol(): number {
+    const stake = this.runSlotStakeSol > 0 ? this.runSlotStakeSol : this.config.buyAmountSol;
+    return stake * (1 + this.config.maxSlippagePct / 100 + 0.015) + this.sizingPriorityFee() + 0.0025;
+  }
+
   private sizingPriorityFee(): number {
     return featureFlags.get('dynamicPriorityFee')
       ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
@@ -335,16 +370,25 @@ export class SniperEngine {
    * above maxBreakevenPct. Conviction belongs in the decision to enter, not in
    * shaving an already-sized bet.
    */
-  private computeRunBudget(): { deployableSol: number; slots: number; slotBudgetSol: number; stakePerSlotSol: number } {
+  private computeRunBudget(): { deployableSol: number; deployedSol: number; slots: number; slotBudgetSol: number; stakePerSlotSol: number } {
     const deployableSol = this.deployableForSizing();
     const slots = Math.max(1, Math.min(this.config.maxActivePositions, 20));
+
+    // Never commit the whole wallet. Without this ceiling the split deploys
+    // ~100% of the deployable balance across its slots — on an asset class this
+    // repo measures at a 60-80% rug rate, with no price stop-loss underneath it.
+    // The remainder is not idle capital, it is the thing that lets a bad run end
+    // with a wallet.
+    const fraction = Math.min(100, Math.max(1, this.config.maxDeployedFractionPct ?? 60)) / 100;
+    const deployedSol = deployableSol * fraction;
+
     const { slotBudgetSol, stakePerSlotSol } = splitWalletIntoSlots({
-      deployableSol,
+      deployableSol: deployedSol,
       slots,
       maxSlippagePct: this.config.maxSlippagePct,
       priorityFeeSol: this.sizingPriorityFee(),
     });
-    return { deployableSol, slots, slotBudgetSol, stakePerSlotSol };
+    return { deployableSol, deployedSol, slots, slotBudgetSol, stakePerSlotSol };
   }
 
   /**
@@ -398,10 +442,61 @@ export class SniperEngine {
     return 0.4;
   }
 
+  /**
+   * Clamps every risk-bearing numeric field to a sane band.
+   *
+   * `/api/bot/config` passes `req.body` straight through with no validation of
+   * any field, so a single POST could set maxActivePositions to a huge number
+   * and remove the only exposure limit the bot has, or set maxSlippagePct to 100.
+   * Values outside the band are corrected and logged rather than rejected, so a
+   * fat-fingered UI entry degrades safely instead of failing the whole update.
+   */
+  private clampConfig(cfg: Partial<BotConfig>): Partial<BotConfig> {
+    const out: Partial<BotConfig> = { ...cfg };
+    const bands: Array<[keyof BotConfig, number, number]> = [
+      ['maxActivePositions', 1, 20],
+      ['maxSlippagePct', 1, 40],
+      ['priorityFeeSol', 0, 0.05],
+      ['maxPriorityFeeSol', 0, 0.05],
+      ['maxBreakevenPct', 1, 15],
+      ['buyAmountSol', 0.001, 100],
+      ['takeProfitPct', 5, 100_000],
+      ['takeProfitRung2Pct', 5, 1_000_000],
+      ['trailingStopPct', 1, 90],
+      ['trailingArmMultiple', 1.05, 100],
+      ['maxHoldSeconds', 30, 86_400],
+      ['noDataExitSeconds', 15, 86_400],
+      ['maxDeployedFractionPct', 1, 100],
+      ['poolDrainExitFraction', 0.05, 0.95],
+      ['sellFlowExitTicks', 1, 600],
+      ['maxHourlyLossUsd', 0, 1_000_000],
+      ['maxDailyLossUsd', 0, 1_000_000],
+      ['maxConsecutiveLosses', 1, 100],
+      ['maxForceExitAttempts', 1, 1000],
+    ];
+    for (const [key, lo, hi] of bands) {
+      const raw = out[key];
+      if (raw === undefined) continue;
+      const n = Number(raw);
+      if (!isFinite(n)) {
+        this.log('warn', `⚠️ Config ${String(key)} was not a finite number — ignoring.`);
+        delete out[key];
+        continue;
+      }
+      const clamped = Math.min(hi, Math.max(lo, n));
+      if (clamped !== n) {
+        this.log('warn', `⚠️ Config ${String(key)}=${n} is outside the allowed range ${lo}..${hi} — clamped to ${clamped}.`);
+      }
+      (out as any)[key] = clamped;
+    }
+    return out;
+  }
+
   public updateConfig(newConfig: Partial<BotConfig>): void {
     const wasActive = this.config.isBotActive;
     const prevMode = this.config.tradingMode;
 
+    newConfig = this.clampConfig(newConfig);
     this.config = { ...this.config, ...newConfig };
 
     // Changing execution mode mid-run must go through the full start preflight
@@ -513,10 +608,12 @@ export class SniperEngine {
         this.runSlotStakeSol = budget.stakePerSlotSol;
         if (this.runSlotStakeSol > 0) {
           const be = breakevenPct(this.runSlotStakeSol, this.config.priorityFeeSol);
+          const pct = this.config.maxDeployedFractionPct ?? 60;
           this.log('info',
-            `💰 RUN BUDGET: ${budget.deployableSol.toFixed(4)} SOL split into ${budget.slots} slots — ` +
+            `💰 RUN BUDGET: ${budget.deployableSol.toFixed(4)} SOL deployable, committing ${pct}% (${budget.deployedSol.toFixed(4)} SOL) across ${budget.slots} slots — ` +
             `${this.runSlotStakeSol.toFixed(4)} SOL staked per position (${budget.slotBudgetSol.toFixed(4)} SOL all-in per slot, ` +
-            `breakeven ${be}%). A position going to zero costs 1/${budget.slots} of the run.`);
+            `breakeven ${be}%). A position going to zero costs 1/${budget.slots} of the committed budget; ` +
+            `${(budget.deployableSol - budget.deployedSol).toFixed(4)} SOL is held back.`);
         } else {
           this.log('warn', `⚠️ Wallet-split sizing found nothing deployable — entries fall back to the fixed ${this.config.buyAmountSol} SOL stake.`);
         }
@@ -745,9 +842,9 @@ export class SniperEngine {
     const affordable = nextBuySol > 0 && perTradeCostSol > 0
       ? Math.floor(deployableSol / perTradeCostSol)
       : 0;
-    const concurrencyCap = this.config.maxActivePositions >= 99999
-      ? affordable
-      : Math.min(affordable, this.config.maxActivePositions);
+    // No "unlimited" branch: maxActivePositions is clamped to 1..20 and is the
+    // exposure limit, so it always applies.
+    const concurrencyCap = Math.min(affordable, this.config.maxActivePositions);
 
     return {
       deployableSol,
@@ -1578,13 +1675,33 @@ export class SniperEngine {
   }
 
   private async evaluatePlaybookTrigger(filterResult: FilterResult, launchData: Partial<PumpTokenLaunch>, isMigration: boolean): Promise<void> {
-    if (this.config.maxActivePositions < 99999 && this.activePositions.length >= this.config.maxActivePositions) {
-      this.log('warn', `⚠️ Position limit reached (${this.activePositions.length}/${this.config.maxActivePositions}). Skipping buy for $${filterResult.tokenSymbol}.`);
+    // Claim the slot SYNCHRONOUSLY, before the first await.
+    //
+    // A position only joins activePositions after confirmTransaction, which
+    // polls for up to 30s. The websocket handler is `on('message', async ...)`
+    // and is not awaited, so up to 8 candidates run concurrently (measured).
+    // Counting only activePositions therefore made maxActivePositions advisory
+    // across a 30-second window: N candidates could all read "0 open" and all
+    // buy. entriesInFlight closes that window — it is claimed here and released
+    // in the finally below, so the count is exact at every instant.
+    if (this.entriesInFlight.has(filterResult.mint)) return;
+    if (this.activePositions.some(p => p.mint === filterResult.mint)) return;
+
+    const committed = this.activePositions.length + this.entriesInFlight.size;
+    if (committed >= this.config.maxActivePositions) {
+      this.log('warn', `⚠️ Position limit reached (${this.activePositions.length} open + ${this.entriesInFlight.size} in flight / ${this.config.maxActivePositions}). Skipping buy for $${filterResult.tokenSymbol}.`);
       return;
     }
 
-    if (this.activePositions.some(p => p.mint === filterResult.mint)) return;
+    this.entriesInFlight.add(filterResult.mint);
+    try {
+      await this.evaluatePlaybookTriggerInner(filterResult, launchData, isMigration);
+    } finally {
+      this.entriesInFlight.delete(filterResult.mint);
+    }
+  }
 
+  private async evaluatePlaybookTriggerInner(filterResult: FilterResult, launchData: Partial<PumpTokenLaunch>, isMigration: boolean): Promise<void> {
     const score = filterResult.score;
     const progress = filterResult.bondingProgress || 35;
 
@@ -1649,9 +1766,16 @@ export class SniperEngine {
     // Read the wallet as it is right now: the background sync only runs every
     // 10s, and sizing against a stale balance either leaves cash idle or
     // overdrafts the order.
+    //
+    // The on-chain balance does NOT yet reflect entries that are submitted but
+    // unconfirmed, so subtract what concurrent entries have already claimed.
+    // This assignment used to overwrite availableTradeSol wholesale on every
+    // entry, erasing the reservation executeBuy had just made and letting two
+    // concurrent buys each size against the full balance.
     if (this.config.tradingMode === 'real') {
       await this.wallet.refreshBalance(true);
-      this.availableTradeSol = this.wallet.getDeployableSol();
+      const reservedByPeers = Math.max(0, this.entriesInFlight.size - 1) * this.reservedPerEntrySol();
+      this.availableTradeSol = Math.max(0, this.wallet.getDeployableSol() - reservedByPeers);
     }
 
     // Size against the worst-case priority fee: with dynamicPriorityFee the
@@ -1963,6 +2087,12 @@ export class SniperEngine {
     if (pos.tokensHeld > 0 && pos.currentPriceUsd > 0) {
       pos.highestPriceUsd = pos.currentPriceUsd;
       pos.trailingStopTargetUsd = undefined;
+      // Reset the trigger count with the anchor. Without this the counter is
+      // cumulative for the life of the position, so the SECOND trigger ever —
+      // even hours later, after a full re-arm from a new 3x peak — liquidates
+      // 100%. That defeats the re-arm design: each armed cycle should get its
+      // own scale-out, not inherit the previous cycle's count.
+      pos.trailingTriggerCount = 0;
     }
   }
 
@@ -2057,14 +2187,32 @@ export class SniperEngine {
    */
   private checkKillSwitch(): void {
     if (!featureFlags.get('killSwitch') || this.killSwitchTripped || !this.config.isBotActive) return;
-    const limit = this.config.maxHourlyLossUsd ?? 25;
-    if (limit <= 0) return;
 
-    const hourPnl = realizedPnlInWindowUsd(this.tradeHistory, 60 * 60 * 1000);
-    if (hourPnl <= -limit) {
+    const trip = (why: string) => {
       this.killSwitchTripped = true;
-      this.log('error', `🛑 KILL SWITCH TRIPPED: ${hourPnl.toFixed(2)} USD realized in the last hour (limit -$${limit}). Bot paused; open positions retained.`);
+      this.log('error', `🛑 KILL SWITCH TRIPPED: ${why}. Bot paused; open positions retained.`);
       this.toggleBot(false);
+    };
+
+    // 1. Rolling-hour realized loss.
+    const hourLimit = this.config.maxHourlyLossUsd ?? 70;
+    if (hourLimit > 0) {
+      const hourPnl = realizedPnlInWindowUsd(this.tradeHistory, 60 * 60 * 1000);
+      if (hourPnl <= -hourLimit) return trip(`${hourPnl.toFixed(2)} USD realized in the last hour (limit -$${hourLimit})`);
+    }
+
+    // 2. Rolling-24h realized loss. `dailyPnlUsd` was written on every close and
+    // read by nothing — no conditional, no log, not even the status payload.
+    const dayLimit = this.config.maxDailyLossUsd ?? 0;
+    if (dayLimit > 0) {
+      const dayPnl = realizedPnlInWindowUsd(this.tradeHistory, 24 * 60 * 60 * 1000);
+      if (dayPnl <= -dayLimit) return trip(`${dayPnl.toFixed(2)} USD realized in the last 24h (limit -$${dayLimit})`);
+    }
+
+    // 3. Consecutive losses. Same story: incremented, decremented, never read.
+    const lossLimit = this.config.maxConsecutiveLosses ?? 0;
+    if (lossLimit > 0 && this.consecutiveLosses >= lossLimit) {
+      return trip(`${this.consecutiveLosses} consecutive losing trades (limit ${lossLimit})`);
     }
   }
 
@@ -2166,18 +2314,65 @@ export class SniperEngine {
 
   private async updateAndCheckPositionExit(pos: InternalPosition, prefetched?: DexScreenerData): Promise<void> {
     try {
-      // A structural stop that already fired outranks every price and time rule
-      // below, and keeps retrying until the bag is actually gone.
-      if (pos.forceExitReason) {
-        await this.executeSell(pos, `SOLD ALL — ${pos.forceExitReason}`, true);
-        return;
-      }
-
       const dexData = prefetched ?? await DexScreenerService.getTokenMarketData(pos.mint);
 
       let currentMarketCap = dexData.hasPair && dexData.marketCapUsd > 0 ? dexData.marketCapUsd : pos.buyPriceUsd * 1000000000;
 
       const timeElapsedSec = Math.floor((Date.now() - pos.entryTime) / 1000);
+
+      // A structural stop that already fired outranks every other rule and keeps
+      // retrying until the bag is gone.
+      //
+      // This sits AFTER dexData is fetched and BELOW the price update further
+      // down only in the sense that it re-runs each tick — but it deliberately
+      // still short-circuits, because once we have decided to leave, nothing
+      // below can change that decision. What it must NOT do is retry forever:
+      // executeSell passes force=true, which bypasses the 5s..10min fee-burn
+      // backoff, so an unsellable token (honeypot, dead pool) would submit a
+      // full-fee failing transaction every second indefinitely. Precedent: 35
+      // failed txs and 0.035 SOL in under a minute.
+      if (pos.forceExitReason) {
+        pos.forceExitAttempts = (pos.forceExitAttempts ?? 0) + 1;
+        const capExceeded = pos.forceExitAttempts > (this.config.maxForceExitAttempts ?? 20);
+        const agedOut = timeElapsedSec >= this.config.maxHoldSeconds;
+
+        if (capExceeded || agedOut) {
+          if (!pos.strandedLogged) {
+            pos.strandedLogged = true;
+            this.log('error',
+              `🧟 STRANDED: $${pos.tokenSymbol} could not be sold after ${pos.forceExitAttempts} forced attempts (${pos.forceExitReason}). ` +
+              `Halting automatic retries to stop burning fees — the position stays open and LIQUIDATE still works.`, pos.mint);
+          }
+          return;
+        }
+        await this.executeSell(pos, `SOLD ALL — ${pos.forceExitReason}`, true);
+        return;
+      }
+
+      // Fresh-migration blind window. Play 3 — the only play this bot actually
+      // reaches — enters at graduation, when DexScreener has typically not
+      // indexed the new pool yet (measured: 51 of 71 rows had hasLiveMarketData
+      // true with liquidityUsd 0). POOL_DRAINED and SELL_FLOW both require an
+      // indexed pair, and a migrated position gets no curve subscription, so for
+      // those first minutes the ONLY loss-side exit is the 30-minute timer.
+      //
+      // This is the no-price-stop replacement for that hole: if a position has
+      // had NO usable market data at all for noDataExitSeconds, leave. It cannot
+      // fire on volatility because it never looks at a price — only at whether a
+      // market exists.
+      const hasUsableMarket =
+        (dexData.hasPair && (dexData.priceUsd > 0 || dexData.liquidityUsd > 0)) ||
+        (pos.lastCurvePriceUsd ?? 0) > 0;
+      if (hasUsableMarket) {
+        pos.firstMarketDataAt = pos.firstMarketDataAt ?? Date.now();
+      } else if (!pos.firstMarketDataAt) {
+        const blindSec = this.config.noDataExitSeconds ?? 180;
+        if (timeElapsedSec >= blindSec) {
+          this.log('warn', `⏱️ [NO-DATA EXIT] $${pos.tokenSymbol} — no market data ${blindSec}s after entry. Leaving rather than holding blind to the ${Math.floor(this.config.maxHoldSeconds / 60)}-minute timer.`, pos.mint);
+          await this.executeSell(pos, `SOLD ALL — no market data ${blindSec}s after entry (never indexed)`);
+          return;
+        }
+      }
 
       // Pre-migration: no DexScreener pair exists, but the bonding curve
       // account IS the market — CurveWatcher streams its reserves. A fresh
@@ -2329,13 +2524,20 @@ export class SniperEngine {
       if (armedTarget !== undefined) pos.trailingStopTargetUsd = armedTarget;
 
       const pullbackFromPeakPct = ((pos.highestPriceUsd - currentPriceUsd) / pos.highestPriceUsd) * 100;
-      if (pos.pnlPct >= 60 && pullbackFromPeakPct >= 15 && !pos.principalRecovered) {
+      // Each profit rung has its OWN latch. They used to share
+      // `principalRecovered`, which made them mutually exclusive: whichever
+      // fired first consumed the latch, so a token that pulled back at +65% and
+      // then ran to +100% took exactly one 50% sale and nothing more until
+      // +400%. A 2.9x round trip banked one leg near +65% and rode the rest to
+      // the time stop.
+      if (pos.pnlPct >= 60 && pullbackFromPeakPct >= 15 && !pos.pullbackRungTaken) {
         // Sell first, book only what actually happened. Flags are set after a
         // confirmed sell so a failed exit is retried next tick instead of
         // silently recorded as banked profit.
         const sale = await this.sellPctReal(pos, 50);
         if (sale === null) return;
 
+        pos.pullbackRungTaken = true;
         pos.principalRecovered = true;
         pos.status = 'PARTIAL_PROFIT';
         this.recordPartialSell(pos, 0.5, `price fell ${pullbackFromPeakPct.toFixed(0)}% from its peak while up ${pos.pnlPct}%`, sale.actual);
@@ -2343,10 +2545,11 @@ export class SniperEngine {
         return;
       }
 
-      if (pos.pnlPct >= this.config.takeProfitPct && !pos.principalRecovered) {
+      if (pos.pnlPct >= this.config.takeProfitPct && !pos.tp1Taken) {
         const sale = await this.sellPctReal(pos, 50);
         if (sale === null) return;
 
+        pos.tp1Taken = true;
         pos.principalRecovered = true;
         pos.status = 'PARTIAL_PROFIT';
         this.recordPartialSell(pos, 0.5, `hit take-profit target of +${this.config.takeProfitPct}%`, sale.actual);

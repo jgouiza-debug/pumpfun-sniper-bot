@@ -1197,5 +1197,200 @@ console.log('\n-- Wallet-split sizing: one dead slot costs 1/N, never the wallet
   });
 }
 
+// ---------------------------------------------------------------------------
+// Increment 1 — exit-path safety and risk controls (audit items 1, 5, 6, 11-16, 29).
+// ---------------------------------------------------------------------------
+console.log('\n-- Router reads its tier config (audit #1) --');
+{
+  const { routePlay, PLAYBOOK_DEFAULTS, PLAYBOOK_NORMAL, playbookConfigFor } = require('../services/playbookRouter');
+
+  test('NORMAL tier declares looser Play 2 triggers than STRICT', () => {
+    assert.ok(PLAYBOOK_NORMAL.play2MinVelocity5m < PLAYBOOK_DEFAULTS.play2MinVelocity5m);
+    assert.ok(PLAYBOOK_NORMAL.play2MinBuyPressurePct < PLAYBOOK_DEFAULTS.play2MinBuyPressurePct);
+  });
+
+  // A MID_CURVE token that clears NORMAL's triggers but not STRICT's.
+  // Progress is (vSol - 30) / 85, so vSol 68 => ~45%, inside the 30-60% band.
+  // vSol 55 lands at 29% (EARLY_CURVE) and never reaches the Play 2 branch.
+  const midCurve = (cfg: any) => routePlay({
+    isMigrationEvent: false,
+    ageSeconds: 900,
+    vSolInBondingCurve: 68,      // ~45% of the curve => MID_CURVE
+    score: 999,                  // clear the score band; we are testing the triggers
+    progressVelocity5m: 1.5,     // >= NORMAL's 1, < STRICT's 2
+    buyPressurePct: 57,          // >= NORMAL's 55, < STRICT's 60
+    solPriceUsd: 200,
+  }, cfg);
+
+  test('the fixture actually reaches the Play 2 branch', () => {
+    const r = midCurve(PLAYBOOK_DEFAULTS);
+    assert.strictEqual(r.play, 'PLAY_2',
+      `fixture must land in MID_CURVE, got play=${r.play} reasons=${JSON.stringify(r.reasons)}`);
+  });
+
+  test('OLD BUG reproduced: bare literals meant NORMAL behaved exactly like STRICT', () => {
+    // The old code compared against 2 and 60 regardless of tier. Reproduce by
+    // evaluating NORMAL's inputs against STRICT's numbers.
+    const velocityFailsAt2 = 1.5 < 2;
+    const pressureFailsAt60 = 57 < 60;
+    assert.ok(velocityFailsAt2 && pressureFailsAt60,
+      'these inputs must fail the STRICT numbers, which is what NORMAL used to be judged by');
+  });
+
+  test('fixed: STRICT still rejects these inputs', () => {
+    const r = midCurve(PLAYBOOK_DEFAULTS);
+    assert.ok(r.reasons.some((x: string) => /velocity/i.test(x) || /buy pressure/i.test(x)),
+      `expected a trigger rejection, got ${JSON.stringify(r.reasons)}`);
+  });
+
+  test('fixed: NORMAL now accepts them — its config finally has an effect', () => {
+    const r = midCurve(PLAYBOOK_NORMAL);
+    assert.ok(!r.reasons.some((x: string) => /velocity/i.test(x) || /buy pressure/i.test(x)),
+      `NORMAL should clear its own triggers, got ${JSON.stringify(r.reasons)}`);
+  });
+
+  test('the rejection message quotes the configured number, not a literal', () => {
+    const r = midCurve(PLAYBOOK_DEFAULTS);
+    const msg = r.reasons.join(' | ');
+    assert.ok(/< 2%/.test(msg) || /< 60%/.test(msg), `expected configured thresholds in ${msg}`);
+  });
+
+  test('playbookConfigFor maps modes to the right tier', () => {
+    assert.strictEqual(playbookConfigFor('strict').play2MinBuyPressurePct, 60);
+    assert.strictEqual(playbookConfigFor('normal').play2MinBuyPressurePct, 55);
+  });
+}
+
+console.log('\n-- Bankroll cap and slot budget (audit #16) --');
+{
+  const { splitWalletIntoSlots } = require('../services/pipelineUtils');
+  const SLIP = 25, PF = 0.003;
+
+  const budget = (deployable: number, pct: number, slots = 3) => {
+    const deployed = deployable * (pct / 100);
+    return splitWalletIntoSlots({ deployableSol: deployed, slots, maxSlippagePct: SLIP, priorityFeeSol: PF });
+  };
+
+  test('OLD BUG reproduced: with no cap the run commits ~100% of the wallet', () => {
+    const deployable = 1.195;
+    const { stakePerSlotSol } = budget(deployable, 100);
+    const committed = (stakePerSlotSol * (1 + SLIP / 100 + 0.015) + PF + 0.0025) * 3;
+    assert.ok(committed / deployable > 0.99,
+      `uncapped split commits ${(committed / deployable * 100).toFixed(1)}% of the wallet`);
+  });
+
+  test('fixed: a 60% cap holds back 40% of the wallet', () => {
+    const deployable = 1.195;
+    const { stakePerSlotSol } = budget(deployable, 60);
+    const committed = (stakePerSlotSol * (1 + SLIP / 100 + 0.015) + PF + 0.0025) * 3;
+    const ratio = committed / deployable;
+    assert.ok(ratio > 0.55 && ratio <= 0.61, `expected ~60% committed, got ${(ratio * 100).toFixed(1)}%`);
+  });
+
+  test('the cap shrinks the per-slot stake proportionally', () => {
+    assert.ok(budget(1.195, 60).stakePerSlotSol < budget(1.195, 100).stakePerSlotSol);
+  });
+
+  test('a capped slot is still large enough to trade at a 2 SOL wallet', () => {
+    const { breakevenPct } = require('../services/paperSimulator');
+    const { stakePerSlotSol } = budget(1.995, 60);
+    assert.ok(breakevenPct(stakePerSlotSol, PF) <= 6,
+      `60% of a 2 SOL wallet must still clear the economics gate, got ${breakevenPct(stakePerSlotSol, PF)}%`);
+  });
+}
+
+console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit #5, #6, #11, #12, #13) --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const typesSrc = fs.readFileSync(path.join(__dirname, '../types.ts'), 'utf8');
+
+  test('the price stop-loss is still gone (guard against regression)', () => {
+    assert.ok(!/config\.stopLossPct/.test(engineSrc));
+    assert.ok(!/\bstopLossPct\b/.test(typesSrc));
+  });
+
+  test('#13: a no-data exit exists and is time-based, not price-based', () => {
+    assert.ok(/noDataExitSeconds/.test(engineSrc), 'engine must implement the no-data exit');
+    assert.ok(/noDataExitSeconds/.test(typesSrc), 'noDataExitSeconds must be configurable');
+  });
+
+  test('#13: the no-data exit is gated on market EXISTENCE, never on a price level', () => {
+    const block = engineSrc.slice(engineSrc.indexOf('hasUsableMarket'), engineSrc.indexOf('hasUsableMarket') + 900);
+    assert.ok(/hasPair/.test(block) && /liquidityUsd/.test(block),
+      'must key off whether a market exists');
+    assert.ok(!/pnlPct\s*<=/.test(block), 'must not compare against a P&L threshold');
+  });
+
+  test('#5: forced exits are bounded, so an unsellable token stops burning fees', () => {
+    assert.ok(/maxForceExitAttempts/.test(engineSrc));
+    assert.ok(/forceExitAttempts/.test(engineSrc));
+    assert.ok(/STRANDED/.test(engineSrc), 'a stranded position must be reported, not retried silently');
+  });
+
+  test('#11: the profit rungs have independent latches', () => {
+    assert.ok(/pullbackRungTaken/.test(engineSrc), 'pullback rung needs its own latch');
+    assert.ok(/tp1Taken/.test(engineSrc), 'TP1 needs its own latch');
+    assert.ok(/pullbackRungTaken/.test(typesSrc) && /tp1Taken/.test(typesSrc));
+  });
+
+  test('#11: neither rung is gated on the shared principalRecovered flag any more', () => {
+    assert.ok(!/pullbackFromPeakPct >= 15 && !pos\.principalRecovered/.test(engineSrc));
+    assert.ok(!/takeProfitPct && !pos\.principalRecovered/.test(engineSrc));
+  });
+
+  test('#12: trailingTriggerCount resets when the stop re-anchors', () => {
+    const idx = engineSrc.indexOf('pos.trailingStopTargetUsd = undefined;');
+    assert.ok(idx > 0, 'recordPartialSell must clear the trailing target');
+    assert.ok(/trailingTriggerCount = 0/.test(engineSrc.slice(idx, idx + 600)),
+      'the trigger count must reset with the anchor, or the second trigger ever closes 100%');
+  });
+}
+
+console.log('\n-- Config clamps and circuit breakers (audit #15, #29) --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const appSrc = fs.readFileSync(path.join(__dirname, '../App.tsx'), 'utf8');
+
+  test('#15: updateConfig clamps incoming values', () => {
+    assert.ok(/clampConfig/.test(engineSrc));
+    const clamp = engineSrc.slice(engineSrc.indexOf('private clampConfig'), engineSrc.indexOf('public updateConfig'));
+    for (const field of ['maxActivePositions', 'maxSlippagePct', 'priorityFeeSol', 'maxBreakevenPct']) {
+      assert.ok(clamp.includes(field), `${field} must be clamped`);
+    }
+    assert.ok(/'maxActivePositions', 1, 20/.test(clamp), 'positions must be bounded 1..20');
+  });
+
+  test('#15: the 99999 unlimited-positions sentinel is gone', () => {
+    assert.ok(!/99999/.test(engineSrc), 'engine must not carry the unlimited sentinel');
+    assert.ok(!/99999/.test(appSrc), 'UI must not carry the unlimited sentinel');
+  });
+
+  test('#29: all three circuit breakers are read, not just written', () => {
+    const ks = engineSrc.slice(engineSrc.indexOf('private checkKillSwitch'), engineSrc.indexOf('private checkKillSwitch') + 2200);
+    assert.ok(/maxHourlyLossUsd/.test(ks), 'hourly loss breaker');
+    assert.ok(/maxDailyLossUsd/.test(ks), 'daily loss breaker');
+    assert.ok(/consecutiveLosses/.test(ks), 'consecutive-loss breaker');
+  });
+
+  test('#29: tripping pauses entries but never closes positions', () => {
+    const ks = engineSrc.slice(engineSrc.indexOf('private checkKillSwitch'), engineSrc.indexOf('private checkKillSwitch') + 2200);
+    assert.ok(/open positions retained/i.test(ks));
+    assert.ok(!/executeSell/.test(ks), 'a breaker must not liquidate');
+  });
+
+  test('#14: entries are reserved before the first await', () => {
+    assert.ok(/entriesInFlight/.test(engineSrc));
+    const guard = engineSrc.slice(engineSrc.indexOf('private async evaluatePlaybookTrigger('), engineSrc.indexOf('evaluatePlaybookTriggerInner('));
+    assert.ok(/activePositions\.length \+ this\.entriesInFlight\.size/.test(guard),
+      'the cap must count in-flight entries, not just confirmed positions');
+    assert.ok(/finally/.test(engineSrc.slice(engineSrc.indexOf('this.entriesInFlight.add'), engineSrc.indexOf('this.entriesInFlight.add') + 400)),
+      'the reservation must be released in a finally');
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

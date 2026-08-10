@@ -156,6 +156,8 @@ export interface PlaybookConfig {
   play2MinVelocity5m: number;
   /** Play 2 trigger: minimum net buy pressure (% of curve flow that is buys). */
   play2MinBuyPressurePct: number;
+  /** Play 2 trigger: minimum unique 5m buyers, when the feed provides attribution. */
+  play2MinUniqueBuyers5m: number;
 }
 
 export const PLAYBOOK_DEFAULTS: PlaybookConfig = {
@@ -174,6 +176,7 @@ export const PLAYBOOK_DEFAULTS: PlaybookConfig = {
   minLiquiditySol: 30,
   play2MinVelocity5m: 2,
   play2MinBuyPressurePct: 60,
+  play2MinUniqueBuyers5m: 20,
 };
 
 /**
@@ -194,6 +197,7 @@ export const PLAYBOOK_NORMAL: PlaybookConfig = {
   minLiquiditySol: 25,
   play2MinVelocity5m: 1,
   play2MinBuyPressurePct: 55,
+  play2MinUniqueBuyers5m: 15,
 };
 
 export function playbookConfigFor(mode: 'strict' | 'normal' | 'lenient'): PlaybookConfig {
@@ -231,13 +235,20 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
       // >1 mean real attribution); otherwise curve velocity — the documented
       // free-tier fallback. Velocity is weaker (cannot tell one whale from
       // twenty buyers), so the score gate below stays at full-unit strictness.
+      // These read the tier config. They used to be the bare literals 2 and 60,
+      // which meant NORMAL's looser play2MinVelocity5m (1) and
+      // play2MinBuyPressurePct (55) were declared, documented, surfaced — and
+      // silently ignored. Every Play 2 tuning experiment on the NORMAL tier was
+      // therefore a no-op against the STRICT numbers.
       const buyers2 = input.uniqueBuyers5m ?? 0;
       if (buyers2 > 1) {
-        if (buyers2 < 20) reasons.push(`Unique 5m buyers ${buyers2} < 20`);
-      } else if ((input.progressVelocity5m ?? 0) < 2) {
-        reasons.push(`No buyer attribution and curve velocity ${(input.progressVelocity5m ?? 0).toFixed(1)}%/5m < 2%`);
+        if (buyers2 < config.play2MinUniqueBuyers5m) reasons.push(`Unique 5m buyers ${buyers2} < ${config.play2MinUniqueBuyers5m}`);
+      } else if ((input.progressVelocity5m ?? 0) < config.play2MinVelocity5m) {
+        reasons.push(`No buyer attribution and curve velocity ${(input.progressVelocity5m ?? 0).toFixed(1)}%/5m < ${config.play2MinVelocity5m}%`);
       }
-      if ((input.buyPressurePct ?? 0) < 60) reasons.push(`Buy pressure ${(input.buyPressurePct ?? 0).toFixed(0)}% < 60% (buy/sell ratio under 1.5)`);
+      if ((input.buyPressurePct ?? 0) < config.play2MinBuyPressurePct) {
+        reasons.push(`Buy pressure ${(input.buyPressurePct ?? 0).toFixed(0)}% < ${config.play2MinBuyPressurePct}%`);
+      }
       const ok2 = reasons.length === 0 && scoreTier === 1;
       if (scoreTier !== 1 && reasons.length === 0) reasons.push(`Play 2 requires score >= ${config.minScoreFullUnit}`);
       return { ...base, play: 'PLAY_2', eligible: ok2, sizeMultiplier: ok2 ? 1 : 0, reasons };
