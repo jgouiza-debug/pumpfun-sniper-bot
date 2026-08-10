@@ -28,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -160,6 +160,7 @@ export class SniperEngine {
     // real stake is one slot of the run budget. See computeRunBudget().
     buyAmountSol: 0.6,
     walletSplitSizing: true,
+    autoFitSlotsToWallet: true,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
     // NO PRICE STOP-LOSS. Removed 2026-08-09, deliberately and permanently.
@@ -349,10 +350,21 @@ export class SniperEngine {
    * The balance this run is allowed to deploy. Real mode reads the wallet; paper
    * uses the configured bankroll so the testbed stays usable on an unfunded key.
    */
+  /**
+   * The balance this run may deploy — the LINKED PHOTON WALLET, in both modes.
+   *
+   * Paper used to size off `bankrollUsd / solPrice`, a number the operator typed
+   * ($100 => ~1.3 SOL). With a 0.2 SOL wallet that made paper rehearse trades
+   * 6.5x larger than the wallet could ever fund, so paper's fills, fee ratios
+   * and breakeven percentages predicted nothing about real execution — the exact
+   * paper-vs-real gap this codebase already fought once.
+   *
+   * Falls back to the configured bankroll ONLY when no wallet is linked, so the
+   * testbed still runs on a machine with no key.
+   */
   private deployableForSizing(): number {
-    return this.config.tradingMode === 'real'
-      ? this.wallet.getDeployableSol()
-      : Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
+    if (this.wallet.isLinked()) return this.wallet.getDeployableSol();
+    return Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
   }
 
   /**
@@ -386,9 +398,13 @@ export class SniperEngine {
    * above maxBreakevenPct. Conviction belongs in the decision to enter, not in
    * shaving an already-sized bet.
    */
-  private computeRunBudget(): { deployableSol: number; deployedSol: number; slots: number; slotBudgetSol: number; stakePerSlotSol: number } {
+  private computeRunBudget(): {
+    deployableSol: number; deployedSol: number; slots: number;
+    slotBudgetSol: number; stakePerSlotSol: number;
+    requestedSlots: number; slotsReducedForEconomics: boolean;
+  } {
     const deployableSol = this.deployableForSizing();
-    const slots = Math.max(1, Math.min(this.config.maxActivePositions, 20));
+    const requestedSlots = Math.max(1, Math.min(this.config.maxActivePositions, 20));
 
     // Never commit the whole wallet. Without this ceiling the split deploys
     // ~100% of the deployable balance across its slots — on an asset class this
@@ -397,14 +413,37 @@ export class SniperEngine {
     // with a wallet.
     const fraction = Math.min(100, Math.max(1, this.config.maxDeployedFractionPct ?? 60)) / 100;
     const deployedSol = deployableSol * fraction;
+    const priorityFeeSol = this.sizingPriorityFee();
+
+    // Fit the slot count to what the wallet can fund ECONOMICALLY. Fixed fees
+    // dominate at small size, so dividing a small balance into more slots makes
+    // every slot fail the breakeven gate and the bot trades nothing at all.
+    // Measured on 0.2 SOL: 1 slot = 5.67%, 2 = 8.45%, 3 = 11.33% against a 6%
+    // limit. Diversification you cannot afford is not diversification.
+    let slots = requestedSlots;
+    let slotsReducedForEconomics = false;
+    if ((this.config.autoFitSlotsToWallet ?? true) && featureFlags.get('enforceTradeEconomics')) {
+      const fit = fitSlotsToWallet({
+        deployableSol: deployedSol,
+        maxSlots: requestedSlots,
+        maxSlippagePct: this.config.maxSlippagePct,
+        priorityFeeSol,
+        maxBreakevenPct: this.config.maxBreakevenPct ?? 6,
+        breakevenOf: breakevenPct,
+      });
+      if (fit.slots > 0 && fit.slots < requestedSlots) {
+        slots = fit.slots;
+        slotsReducedForEconomics = true;
+      }
+    }
 
     const { slotBudgetSol, stakePerSlotSol } = splitWalletIntoSlots({
       deployableSol: deployedSol,
       slots,
       maxSlippagePct: this.config.maxSlippagePct,
-      priorityFeeSol: this.sizingPriorityFee(),
+      priorityFeeSol,
     });
-    return { deployableSol, deployedSol, slots, slotBudgetSol, stakePerSlotSol };
+    return { deployableSol, deployedSol, slots, slotBudgetSol, stakePerSlotSol, requestedSlots, slotsReducedForEconomics };
   }
 
   /**
@@ -625,11 +664,21 @@ export class SniperEngine {
         if (this.runSlotStakeSol > 0) {
           const be = breakevenPct(this.runSlotStakeSol, this.config.priorityFeeSol);
           const pct = this.config.maxDeployedFractionPct ?? 60;
+          const src = this.wallet.isLinked() ? 'Photon wallet' : 'configured bankroll (NO WALLET LINKED)';
           this.log('info',
-            `💰 RUN BUDGET: ${budget.deployableSol.toFixed(4)} SOL deployable, committing ${pct}% (${budget.deployedSol.toFixed(4)} SOL) across ${budget.slots} slots — ` +
+            `💰 RUN BUDGET from ${src}: ${budget.deployableSol.toFixed(4)} SOL deployable, committing ${pct}% (${budget.deployedSol.toFixed(4)} SOL) across ${budget.slots} slot${budget.slots === 1 ? '' : 's'} — ` +
             `${this.runSlotStakeSol.toFixed(4)} SOL staked per position (${budget.slotBudgetSol.toFixed(4)} SOL all-in per slot, ` +
             `breakeven ${be}%). A position going to zero costs 1/${budget.slots} of the committed budget; ` +
             `${(budget.deployableSol - budget.deployedSol).toFixed(4)} SOL is held back.`);
+
+          if (budget.slotsReducedForEconomics) {
+            this.log('warn',
+              `⚠️ CONCENTRATION CHANGED: you asked for ${budget.requestedSlots} slots, but ${budget.deployedSol.toFixed(4)} SOL split ${budget.requestedSlots} ways ` +
+              `is too small to clear the ${this.config.maxBreakevenPct ?? 6}% round-trip limit — every trade would be refused. ` +
+              `Running ${budget.slots} slot${budget.slots === 1 ? '' : 's'} instead. ` +
+              `A single dead position now costs ${Math.round(100 / budget.slots)}% of the committed budget, not ${Math.round(100 / budget.requestedSlots)}%. ` +
+              `Fund more SOL to get the diversification back.`);
+          }
         } else {
           this.log('warn', `⚠️ Wallet-split sizing found nothing deployable — entries fall back to the fixed ${this.config.buyAmountSol} SOL stake.`);
         }
@@ -840,13 +889,18 @@ export class SniperEngine {
     // the bot is armed that is the snapshot taken at arm time, so the dashboard
     // shows what the next order will REALLY stake rather than what a fresh
     // split would produce from a balance that has since moved.
+    const budget = this.computeRunBudget();
+    const budgetSlots = budget.slots;
+    const budgetRequestedSlots = budget.requestedSlots;
+    const budgetReduced = budget.slotsReducedForEconomics;
+
     let nextBuySol: number;
     if (this.config.walletSplitSizing) {
       nextBuySol = this.config.isBotActive && this.runSlotStakeSol > 0
         ? this.runSlotStakeSol
-        : this.computeRunBudget().stakePerSlotSol;
+        : budget.stakePerSlotSol;
     } else {
-      nextBuySol = this.config.tradingMode === 'real' && deployableSol > 0
+      nextBuySol = deployableSol > 0
         ? affordableStakeSol(this.config.buyAmountSol, deployableSol, this.config.maxSlippagePct, sizingPriorityFeeSol)
         : this.config.buyAmountSol;
     }
@@ -862,12 +916,36 @@ export class SniperEngine {
     // exposure limit, so it always applies.
     const concurrencyCap = Math.min(affordable, this.config.maxActivePositions);
 
+    // "Affordable" is not the same as "tradeable". The balance can fund N orders
+    // while every one of them would be refused by the economics gate — which is
+    // exactly the 0.2 SOL case, and exactly how a bot screens 2,952 tokens and
+    // buys nothing while the dashboard claims 3 trades are affordable.
+    const be = nextBuySol > 0 ? breakevenPct(Number(nextBuySol.toFixed(6)), sizingPriorityFeeSol) : 0;
+    const maxBe = this.config.maxBreakevenPct ?? 6;
+    const enforced = featureFlags.get('enforceTradeEconomics');
+    const economicsOk = nextBuySol > 0 && (!enforced || be <= maxBe);
+
+    let blockedReason: string | undefined;
+    if (nextBuySol <= 0) {
+      blockedReason = `Balance ${deployableSol.toFixed(4)} SOL cannot fund a single order.`;
+    } else if (!economicsOk) {
+      blockedReason =
+        `${deployableSol.toFixed(4)} SOL across ${budgetSlots} slot${budgetSlots === 1 ? '' : 's'} stakes ` +
+        `${nextBuySol.toFixed(4)} SOL — a ${be}% round trip against the ${maxBe}% limit. Every trade would be refused.`;
+    }
+
     return {
       deployableSol,
       nextBuySol: Number(nextBuySol.toFixed(4)),
       nextBuyUsd: Number((nextBuySol * this.config.solPriceUsd).toFixed(2)),
-      tradesAffordable: Math.max(0, concurrencyCap),
-      breakevenPct: nextBuySol > 0 ? breakevenPct(Number(nextBuySol.toFixed(6)), sizingPriorityFeeSol) : 0,
+      // Report 0 tradeable when nothing would actually be bought.
+      tradesAffordable: economicsOk ? Math.max(0, concurrencyCap) : 0,
+      breakevenPct: be,
+      economicsOk,
+      blockedReason,
+      slots: budgetSlots,
+      requestedSlots: budgetRequestedSlots,
+      slotsReducedForEconomics: budgetReduced,
     };
   }
 
@@ -2384,12 +2462,41 @@ export class SniperEngine {
       if (this.config.walletSplitSizing) {
         // Per slot the wallet must hold the stake plus its own buffer; scale up
         // by the slot count for the whole run, plus the gas float.
-        const neededWallet = minEconomicStake * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
+        const perSlotWallet = minEconomicStake * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
+        const fraction = Math.min(100, Math.max(1, this.config.maxDeployedFractionPct ?? 60)) / 100;
+
         reasons.push(
-          `each slot is too small to trade economically. ${deployable.toFixed(4)} SOL split ${budget.slots} ways stakes ` +
-          `${stakeSol.toFixed(4)} SOL per position, a ${be}% round trip — above the ${maxBe}% limit, so EVERY candidate would be refused. ` +
-          `Fund ~${(neededWallet * budget.slots + 0.005).toFixed(2)} SOL for ${budget.slots} slots, or lower maxActivePositions.`
+          `each slot is too small to trade economically. ${deployable.toFixed(4)} SOL deployable, committing ` +
+          `${Math.round(fraction * 100)}% split ${budget.slots} way${budget.slots === 1 ? '' : 's'}, stakes ` +
+          `${stakeSol.toFixed(4)} SOL per position — a ${be}% round trip against the ${maxBe}% limit, so EVERY candidate would be refused.`
         );
+
+        // Name the concrete ways out, computed rather than hand-waved.
+        const needFullWallet = (perSlotWallet * budget.slots) / fraction + 0.005;
+        const fixes: string[] = [`fund ~${needFullWallet.toFixed(2)} SOL to keep ${budget.slots} slot${budget.slots === 1 ? '' : 's'} at the current ${Math.round(fraction * 100)}% cap`];
+
+        // Would raising the deployed fraction to 100% rescue it at this size?
+        const at100 = fitSlotsToWallet({
+          deployableSol: deployable, maxSlots: this.config.maxActivePositions,
+          maxSlippagePct: this.config.maxSlippagePct, priorityFeeSol: sizingPriorityFeeSol,
+          maxBreakevenPct: maxBe, breakevenOf: breakevenPct,
+        });
+        if (at100.slots > 0) {
+          fixes.push(`or raise maxDeployedFractionPct to 100 (${at100.slots} slot${at100.slots === 1 ? '' : 's'} of ${at100.stakePerSlotSol.toFixed(4)} SOL at ${at100.breakevenPct}%)`);
+        }
+
+        // Would a cheaper priority fee rescue it?
+        if (sizingPriorityFeeSol > 0.001) {
+          const cheaper = fitSlotsToWallet({
+            deployableSol: deployable, maxSlots: this.config.maxActivePositions,
+            maxSlippagePct: this.config.maxSlippagePct, priorityFeeSol: 0.001,
+            maxBreakevenPct: maxBe, breakevenOf: breakevenPct,
+          });
+          if (cheaper.slots > 0) {
+            fixes.push(`or drop priorityFeeSol to 0.001 at 100% deployment (${cheaper.slots} slot${cheaper.slots === 1 ? '' : 's'} of ${cheaper.stakePerSlotSol.toFixed(4)} SOL at ${cheaper.breakevenPct}%) — cheaper fills lose migration races`);
+          }
+        }
+        reasons.push(`Options: ${fixes.join('; ')}.`);
       } else {
         reasons.push(
           `position size too small. The router sizes a half unit (${stakeSol.toFixed(4)} SOL of your ${this.config.buyAmountSol} SOL unit), ` +

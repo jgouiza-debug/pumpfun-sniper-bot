@@ -724,7 +724,20 @@ export function App() {
               costs, in the currency the owner thinks in. */}
           {sizing && botStatus?.config?.walletSplitSizing && sizing.nextBuySol > 0 && (
             <div style={{ fontSize: '10px', marginTop: '3px', fontFamily: 'var(--font-mono)', color: 'var(--ink-muted)' }}>
-              MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (botStatus?.config?.maxActivePositions || 3))}% OF RUN)
+              MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (sizing.slots || botStatus?.config?.maxActivePositions || 3))}% OF RUN)
+            </div>
+          )}
+          {/* The balance can fund N orders while every one of them would be
+              refused by the economics gate. Say so here rather than letting the
+              bot look armed and buy nothing. */}
+          {sizing && sizing.economicsOk === false && sizing.blockedReason && (
+            <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(239,68,68,0.08)' }}>
+              ⛔ NO TRADES POSSIBLE — {sizing.blockedReason}
+            </div>
+          )}
+          {sizing && sizing.slotsReducedForEconomics && (
+            <div style={{ fontSize: '9.5px', marginTop: '4px', fontFamily: 'var(--font-mono)', color: '#fbbf24' }}>
+              ⚠️ {sizing.requestedSlots} SLOTS REQUESTED → {sizing.slots} FUNDABLE. ONE DEAD POSITION NOW COSTS {Math.round(100 / (sizing.slots || 1))}% OF THE RUN.
             </div>
           )}
           {/* Fee drag is the number that decides whether small stakes can work

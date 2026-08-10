@@ -208,6 +208,14 @@ export interface BotConfig {
    * costs 1/N and does not shrink the others.
    */
   walletSplitSizing: boolean;
+  /**
+   * Reduce the slot count when the wallet cannot fund `maxActivePositions`
+   * slots that each clear `maxBreakevenPct`. Fixed fees dominate at small size,
+   * so splitting a small balance further makes every slot uneconomic and the
+   * bot refuses every trade. Turning this OFF means an underfunded wallet
+   * simply never trades rather than trading with less diversification.
+   */
+  autoFitSlotsToWallet?: boolean;
   takeProfitPct: number;
   takeProfitRung2Pct: number;
   /**
@@ -551,6 +559,20 @@ export interface BotStatusResponse {
     tradesAffordable: number;
     /** Round-trip cost as a % of the position — what a trade must beat to profit. */
     breakevenPct: number;
+    /**
+     * False when this stake would be refused by the economics gate, i.e. the
+     * bot would screen forever and buy nothing. `tradesAffordable` counts what
+     * the BALANCE funds; this says whether any of them would actually be taken.
+     */
+    economicsOk?: boolean;
+    /** Why no trade can be placed at this balance, if that is the case. */
+    blockedReason?: string;
+    /** Slots actually in use this run, after fitting to the wallet. */
+    slots?: number;
+    /** Slots requested via maxActivePositions, before economic fitting. */
+    requestedSlots?: number;
+    /** True when the balance forced fewer slots than requested. */
+    slotsReducedForEconomics?: boolean;
   };
 }
 

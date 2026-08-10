@@ -1750,5 +1750,116 @@ console.log('\n-- Win rate is per position, not per leg (audit #9) --');
   });
 }
 
+// ---------------------------------------------------------------------------
+// Sizing is driven by the linked Photon wallet, and fits the slot count to it.
+// ---------------------------------------------------------------------------
+console.log('\n-- Slot count fits the wallet (0.2 SOL reality check) --');
+{
+  const { fitSlotsToWallet, splitWalletIntoSlots } = require('../services/pipelineUtils');
+  const { breakevenPct } = require('../services/paperSimulator');
+  const SLIP = 25, MAXBE = 6;
+
+  const fit = (deployable: number, maxSlots: number, pf: number) => fitSlotsToWallet({
+    deployableSol: deployable, maxSlots, maxSlippagePct: SLIP,
+    priorityFeeSol: pf, maxBreakevenPct: MAXBE, breakevenOf: breakevenPct,
+  });
+
+  // The real wallet: 0.2 SOL minus the 0.005 gas float.
+  const WALLET_02 = 0.195;
+
+  test('THE PROBLEM: 0.2 SOL split 3 ways is uneconomic at any priority fee', () => {
+    for (const pf of [0.003, 0.001]) {
+      const s = splitWalletIntoSlots({ deployableSol: WALLET_02, slots: 3, maxSlippagePct: SLIP, priorityFeeSol: pf }).stakePerSlotSol;
+      assert.ok(breakevenPct(s, pf) > MAXBE,
+        `3 slots at pf ${pf} should exceed ${MAXBE}%, got ${breakevenPct(s, pf)}%`);
+    }
+  });
+
+  test('THE PROBLEM: at the 0.003 priority fee, 0.2 SOL cannot trade at ALL', () => {
+    assert.strictEqual(fit(WALLET_02, 3, 0.003).slots, 0,
+      'no slot count clears the gate at pf 0.003 — this is why the bot took zero trades');
+  });
+
+  test('fixed: at pf 0.001 the wallet supports exactly ONE slot', () => {
+    const f = fit(WALLET_02, 3, 0.001);
+    assert.strictEqual(f.slots, 1, `expected 1 slot, got ${f.slots}`);
+    assert.ok(Math.abs(f.stakePerSlotSol - 0.1514) < 0.001, `stake ${f.stakePerSlotSol}`);
+    assert.ok(f.breakevenPct <= MAXBE, `breakeven ${f.breakevenPct}%`);
+  });
+
+  test('the fitter prefers MORE slots when the wallet can afford them', () => {
+    // A 2 SOL wallet can fund all three.
+    const f = fit(1.995, 3, 0.003);
+    assert.strictEqual(f.slots, 3, `a 2 SOL wallet should keep 3 slots, got ${f.slots}`);
+  });
+
+  test('it steps down one slot at a time, not straight to 1', () => {
+    // Find a balance where 3 fails but 2 clears.
+    const f = fit(0.85, 3, 0.001);
+    assert.ok(f.slots >= 1 && f.slots <= 3);
+    if (f.slots > 0) {
+      assert.ok(f.breakevenPct <= MAXBE, `chosen config must clear the gate, got ${f.breakevenPct}%`);
+    }
+  });
+
+  test('it never returns a slot count whose stake fails the gate', () => {
+    for (const bal of [0.05, 0.1, 0.195, 0.4, 0.85, 1.2, 2.0, 5.0]) {
+      for (const pf of [0.001, 0.003]) {
+        const f = fit(bal, 3, pf);
+        if (f.slots > 0) {
+          assert.ok(f.breakevenPct <= MAXBE,
+            `balance ${bal} pf ${pf}: returned ${f.slots} slots at ${f.breakevenPct}%, above the limit`);
+        }
+      }
+    }
+  });
+
+  test('a wallet too small for even one slot returns 0, so the caller refuses to arm', () => {
+    assert.strictEqual(fit(0.02, 3, 0.003).slots, 0);
+    assert.strictEqual(fit(0, 3, 0.001).slots, 0);
+  });
+
+  test('never returns more slots than requested', () => {
+    assert.ok(fit(50, 3, 0.001).slots <= 3);
+    assert.ok(fit(50, 1, 0.001).slots <= 1);
+  });
+}
+
+console.log('\n-- Sizing reads the linked Photon wallet in BOTH modes --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+
+  test('OLD BUG reproduced: paper sized off the typed bankroll, not the wallet', () => {
+    // $100 bankroll / $76.78 per SOL = ~1.30 SOL, against a real wallet of 0.2.
+    const fictional = 100 / 76.78;
+    assert.ok(fictional / 0.2 > 6,
+      'paper rehearsed trades 6.5x larger than the wallet could ever fund');
+  });
+
+  test('fixed: deployableForSizing prefers the linked wallet regardless of mode', () => {
+    const fn = engineSrc.slice(engineSrc.indexOf('private deployableForSizing'), engineSrc.indexOf('private deployableForSizing') + 400);
+    assert.ok(/this\.wallet\.isLinked\(\)/.test(fn), 'must key off wallet linkage, not tradingMode');
+    assert.ok(!/tradingMode === 'real'\s*$/m.test(fn.split('\n')[0]), 'must not branch on mode');
+  });
+
+  test('the bankroll fallback survives for an unlinked machine', () => {
+    const fn = engineSrc.slice(engineSrc.indexOf('private deployableForSizing'), engineSrc.indexOf('private deployableForSizing') + 400);
+    assert.ok(/currentBankrollUsd/.test(fn), 'must still work with no wallet linked');
+  });
+
+  test('a reduced slot count is surfaced as a concentration change, not silently', () => {
+    assert.ok(/CONCENTRATION CHANGED/.test(engineSrc));
+    assert.ok(/slotsReducedForEconomics/.test(engineSrc));
+  });
+
+  test('autoFitSlotsToWallet can be turned off', () => {
+    assert.ok(/autoFitSlotsToWallet/.test(engineSrc));
+    const typesSrc = fs.readFileSync(path.join(__dirname, '../types.ts'), 'utf8');
+    assert.ok(/autoFitSlotsToWallet/.test(typesSrc), 'must be configurable');
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

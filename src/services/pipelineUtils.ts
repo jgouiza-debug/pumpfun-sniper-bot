@@ -216,6 +216,40 @@ export function splitWalletIntoSlots(params: {
 }
 
 /**
+ * Largest number of slots the wallet can actually fund ECONOMICALLY.
+ *
+ * Splitting into N slots divides the stake by N, and round-trip cost is
+ * dominated by FIXED fees at small size — so past a point, adding a slot makes
+ * every slot uneconomic and the bot refuses all of them. Measured on a 0.2 SOL
+ * wallet: 1 slot is 5.67% round-trip, 2 slots is 8.45%, 3 slots is 11.33%,
+ * against a 6% limit. Blindly using maxActivePositions there produces a bot
+ * that screens forever and never trades.
+ *
+ * Returns 0 when even a single slot cannot clear the limit — the caller must
+ * then refuse to arm rather than place a structurally losing trade.
+ */
+export function fitSlotsToWallet(params: {
+  deployableSol: number;
+  maxSlots: number;
+  maxSlippagePct: number;
+  priorityFeeSol: number;
+  maxBreakevenPct: number;
+  breakevenOf: (stakeSol: number, priorityFeeSol: number) => number;
+}): { slots: number; stakePerSlotSol: number; breakevenPct: number } {
+  const { deployableSol, maxSlots, maxSlippagePct, priorityFeeSol, maxBreakevenPct, breakevenOf } = params;
+  // Prefer MORE slots (better diversification); step down only as economics force it.
+  for (let n = Math.max(1, Math.floor(maxSlots)); n >= 1; n--) {
+    const { stakePerSlotSol } = splitWalletIntoSlots({
+      deployableSol, slots: n, maxSlippagePct, priorityFeeSol,
+    });
+    if (stakePerSlotSol <= 0) continue;
+    const be = breakevenOf(stakePerSlotSol, priorityFeeSol);
+    if (be <= maxBreakevenPct) return { slots: n, stakePerSlotSol, breakevenPct: be };
+  }
+  return { slots: 0, stakePerSlotSol: 0, breakevenPct: 0 };
+}
+
+/**
  * Maps a full-exit reason string to a structured ExitCode.
  *
  * Only used for the paths that close a whole position; the partial rungs pass
