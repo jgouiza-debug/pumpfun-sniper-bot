@@ -531,7 +531,7 @@ export class SniperEngine {
     const out: Partial<BotConfig> = { ...cfg };
     const bands: Array<[keyof BotConfig, number, number]> = [
       ['maxActivePositions', 1, 20],
-      ['maxSlippagePct', 1, 40],
+      ['maxSlippagePct', 1, 100],
       ['priorityFeeSol', 0, 0.05],
       ['maxPriorityFeeSol', 0, 0.05],
       ['maxBreakevenPct', 1, 15],
@@ -735,6 +735,7 @@ export class SniperEngine {
       this.log('warn', '⏸️ SMART SNIPER BOT PAUSED. Automatic buying disabled.');
       this.finishRun();
     }
+    this.emitChange();
     return this.config.isBotActive;
   }
 
@@ -1009,15 +1010,25 @@ export class SniperEngine {
     return null;
   }
 
-  private async executeRealMainnetTrade(action: 'buy' | 'sell', mint: string, solAmount: number, amountPct?: string, pool?: string): Promise<TradeResult | null> {
+  private async executeRealMainnetTrade(
+    action: 'buy' | 'sell',
+    mint: string,
+    solAmount: number,
+    amountPct?: string,
+    pool?: string,
+    slippageOverride?: number,
+    retryCount = 0
+  ): Promise<TradeResult | null> {
     const keypair = this.wallet.getKeypair();
     if (!keypair) {
       this.log('error', '❌ Cannot execute real trade: no Photon wallet linked.');
       return null;
     }
 
+    const effectiveSlippage = Math.max(1, Math.min(100, slippageOverride ?? (this.config.maxSlippagePct || 25)));
+
     try {
-      this.log('info', `📡 Building ${action.toUpperCase()} for ${mint.slice(0,6)}... from ${keypair.publicKey.toBase58().slice(0,6)}...`);
+      this.log('info', `📡 Building ${action.toUpperCase()} for ${mint.slice(0,6)}... (${effectiveSlippage}% slippage) from ${keypair.publicKey.toBase58().slice(0,6)}...`);
 
       // Dynamic priority fee (flag dynamicPriorityFee): p75 of recent fees,
       // floored at the static config value, capped by maxPriorityFeeSol and
@@ -1050,7 +1061,7 @@ export class SniperEngine {
             user: keypair.publicKey,
             mint,
             solAmount,
-            slippagePct: this.config.maxSlippagePct,
+            slippagePct: effectiveSlippage,
             priorityFeeSol,
           });
           if (built) {
@@ -1073,7 +1084,7 @@ export class SniperEngine {
           // Sells are a PERCENTAGE of holdings and the '%' must survive — see
           // sellAmountParam. Without it PumpPortal sells that many raw tokens.
           amount: action === 'buy' ? solAmount : sellAmountParam(amountPct),
-          slippage: this.config.maxSlippagePct,
+          slippage: effectiveSlippage,
           priorityFee: priorityFeeSol,
           // Route to the venue the migration payload named, falling back to
           // 'auto' when we genuinely do not know.
@@ -1114,13 +1125,24 @@ export class SniperEngine {
           const cmpBytes = remoteTxBytes;
           void localTxBuilder.shadowCompare(
             cmpBytes,
-            { user: keypair.publicKey, mint, solAmount, slippagePct: this.config.maxSlippagePct, priorityFeeSol },
+            { user: keypair.publicKey, mint, solAmount, slippagePct: effectiveSlippage, priorityFeeSol },
             (level, msg) => this.log(level, msg, mint)
           );
         }
 
         // A signature is not a fill. Confirm before mutating any state.
         const confirmed = await this.confirmTransaction(txid);
+        if (confirmed === 'slippage_failed' || (confirmed === 'failed' && action === 'sell')) {
+          this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain due to Slippage (6004). Inspect: https://solscan.io/tx/${txid}`, mint);
+          if (retryCount < 2) {
+            const nextSlippage = Math.min(100, Math.round(effectiveSlippage * 1.5 + 5));
+            this.log('warn', `⚡ [AUTO-RETRY 6004 SLIPPAGE FIX] Retrying ${action.toUpperCase()} for ${mint.slice(0,6)} with escalated ${nextSlippage}% slippage...`, mint);
+            void this.syncLiveWalletBalance();
+            return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, nextSlippage, retryCount + 1);
+          }
+          void this.syncLiveWalletBalance();
+          return null;
+        }
         if (confirmed === 'failed') {
           // Definitive on-chain rejection: everything rolled back, only the fee
           // was spent. There is nothing to track — opening a position here
@@ -1178,7 +1200,7 @@ export class SniperEngine {
    * simply don't know yet; funds may have moved. Callers must treat the two
    * differently: a failed buy must never open a position.
    */
-  private async confirmTransaction(txid: string, timeoutMs = 30000): Promise<'confirmed' | 'failed' | 'timeout'> {
+  private async confirmTransaction(txid: string, timeoutMs = 30000): Promise<'confirmed' | 'failed' | 'slippage_failed' | 'timeout'> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
@@ -1186,7 +1208,13 @@ export class SniperEngine {
         const value = status?.value;
         if (value) {
           if (value.err) {
-            this.log('warn', `❌ Tx ${txid.slice(0, 8)}... failed on-chain: ${JSON.stringify(value.err)}`);
+            const errStr = JSON.stringify(value.err);
+            const isSlippage = errStr.includes('6004') || errStr.includes('ExceededSlippage') || errStr.includes('SlippageExceeded');
+            if (isSlippage) {
+              this.log('warn', `⚠️ Tx ${txid.slice(0, 8)}... failed on-chain: 6004 ExceededSlippage`);
+              return 'slippage_failed';
+            }
+            this.log('warn', `❌ Tx ${txid.slice(0, 8)}... failed on-chain: ${errStr}`);
             return 'failed';
           }
           if (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized') return 'confirmed';

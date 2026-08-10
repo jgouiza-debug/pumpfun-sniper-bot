@@ -17,3 +17,4 @@ reports/
 # Per-machine feature flag state (toggled via /api/flags)
 flags.json
 meme-coin-finder-app/
+.vercel

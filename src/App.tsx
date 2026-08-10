@@ -385,47 +385,39 @@ export function App() {
   // Toggle Bot Power ON / OFF
   const toggleBotPower = async () => {
     const targetState = !botStatus?.isBotActive;
-    try {
-      const res = await fetch('/api/bot/toggle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: targetState })
-      });
-      const data = await res.json();
-      if (data.success && botStatus) {
-        setBotStatus({ ...botStatus, isBotActive: data.isBotActive });
-      }
-    } catch (err) {
+    if (botStatus) setBotStatus(prev => prev ? { ...prev, isBotActive: targetState } : null);
+
+    const portsToTry = [selectedPort, 3001, 3002];
+    for (const port of portsToTry) {
       try {
-        const res = await fetch(`http://localhost:${selectedPort}/api/bot/toggle`, {
+        const res = await fetch(`http://localhost:${port}/api/bot/toggle`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ active: targetState })
         });
         const data = await res.json();
         if (data.success && botStatus) {
-          setBotStatus({ ...botStatus, isBotActive: data.isBotActive });
+          setBotStatus(prev => prev ? { ...prev, isBotActive: data.isBotActive } : null);
+          break;
         }
-      } catch (e) {
-        console.error("Toggle bot error:", e);
-      }
+      } catch (e) { /* try next */ }
     }
   };
 
   // Emergency Cease / Stop Bot
   const handleEmergencyStop = async () => {
-    try {
-      await fetch('/api/bot/kill', { method: 'POST' }).catch(() => {});
-      await fetch('/api/bot/toggle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: false })
-      }).catch(() => {});
-      if (botStatus) {
-        setBotStatus({ ...botStatus, isBotActive: false });
-      }
-    } catch (err) {
-      console.error("Emergency stop error:", err);
+    if (botStatus) setBotStatus(prev => prev ? { ...prev, isBotActive: false } : null);
+
+    const portsToTry = [selectedPort, 3001, 3002];
+    for (const port of portsToTry) {
+      try {
+        await fetch(`http://localhost:${port}/api/bot/kill`, { method: 'POST' }).catch(() => {});
+        await fetch(`http://localhost:${port}/api/bot/toggle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active: false })
+        }).catch(() => {});
+      } catch (err) { /* try next */ }
     }
   };
 
