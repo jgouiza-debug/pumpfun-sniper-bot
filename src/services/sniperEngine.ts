@@ -28,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -2490,28 +2490,45 @@ export class SniperEngine {
         );
 
         // Name the concrete ways out, computed rather than hand-waved.
-        const needFullWallet = (perSlotWallet * budget.slots) / fraction + 0.005;
-        const fixes: string[] = [`fund ~${needFullWallet.toFixed(2)} SOL to keep ${budget.slots} slot${budget.slots === 1 ? '' : 's'} at the current ${Math.round(fraction * 100)}% cap`];
-
-        // Would raising the deployed fraction to 100% rescue it at this size?
-        const at100 = fitSlotsToWallet({
-          deployableSol: deployable, maxSlots: this.config.maxActivePositions,
+        //
+        // The first question is whether ANY slot count works at this balance.
+        // Reporting only "fund X to keep N slots" is misleading when even one
+        // slot fails — it implies the slot count is the problem when the wallet
+        // is. Check the best case (1 slot, everything deployed) first.
+        const fixes: string[] = [];
+        const bestCase = fitSlotsToWallet({
+          deployableSol: deployable, maxSlots: 1,
           maxSlippagePct: this.config.maxSlippagePct, priorityFeeSol: sizingPriorityFeeSol,
           maxBreakevenPct: maxBe, breakevenOf: breakevenPct,
         });
-        if (at100.slots > 0) {
-          fixes.push(`or raise maxDeployedFractionPct to 100 (${at100.slots} slot${at100.slots === 1 ? '' : 's'} of ${at100.stakePerSlotSol.toFixed(4)} SOL at ${at100.breakevenPct}%)`);
-        }
 
-        // Would a cheaper priority fee rescue it?
-        if (sizingPriorityFeeSol > 0.001) {
-          const cheaper = fitSlotsToWallet({
-            deployableSol: deployable, maxSlots: this.config.maxActivePositions,
-            maxSlippagePct: this.config.maxSlippagePct, priorityFeeSol: 0.001,
-            maxBreakevenPct: maxBe, breakevenOf: breakevenPct,
+        if (bestCase.slots === 0) {
+          // Nothing works at this balance. Say so, and give the real number.
+          const minWallet = minWalletForSlots({
+            slots: 1, maxSlippagePct: this.config.maxSlippagePct,
+            priorityFeeSol: sizingPriorityFeeSol, maxBreakevenPct: maxBe,
           });
-          if (cheaper.slots > 0) {
-            fixes.push(`or drop priorityFeeSol to 0.001 at 100% deployment (${cheaper.slots} slot${cheaper.slots === 1 ? '' : 's'} of ${cheaper.stakePerSlotSol.toFixed(4)} SOL at ${cheaper.breakevenPct}%) — cheaper fills lose migration races`);
+          reasons.push(
+            `NO configuration can trade at this balance — not even 1 slot with 100% deployed. ` +
+            `This is wallet size, not settings: fixed Solana costs are ~${(sizingPriorityFeeSol * 2 + 0.00203928 + 0.00001).toFixed(4)} SOL per round trip ` +
+            `no matter how small the stake, so below a certain size fees alone exceed the ${maxBe}% limit.`
+          );
+          fixes.push(`fund at least ~${minWallet.toFixed(2)} SOL for a single position at the current ${sizingPriorityFeeSol} priority fee`);
+          const cheapWallet = minWalletForSlots({
+            slots: 1, maxSlippagePct: this.config.maxSlippagePct,
+            priorityFeeSol: 0.001, maxBreakevenPct: maxBe,
+          });
+          if (cheapWallet < minWallet) {
+            fixes.push(`or ~${cheapWallet.toFixed(2)} SOL if you also drop priorityFeeSol to 0.001 (cheaper fills lose migration races)`);
+          }
+          fixes.push(`raising maxBreakevenPct instead would let it trade, but every trade would then need >${be}% just to break even — that is how a wallet bleeds out with no rug involved`);
+        } else {
+          // One slot works; the requested slot count is the thing to change.
+          const needFullWallet = (perSlotWallet * budget.slots) / fraction + 0.005;
+          fixes.push(`set maxActivePositions to ${bestCase.slots} — ${bestCase.stakePerSlotSol.toFixed(4)} SOL at ${bestCase.breakevenPct}%, which clears the limit today`);
+          fixes.push(`or fund ~${needFullWallet.toFixed(2)} SOL to keep ${budget.slots} slot${budget.slots === 1 ? '' : 's'} at the current ${Math.round(fraction * 100)}% cap`);
+          if (fraction < 1) {
+            fixes.push(`or raise maxDeployedFractionPct to 100`);
           }
         }
         reasons.push(`Options: ${fixes.join('; ')}.`);

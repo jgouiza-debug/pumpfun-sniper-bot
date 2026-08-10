@@ -250,6 +250,38 @@ export function fitSlotsToWallet(params: {
 }
 
 /**
+ * Smallest wallet balance that can fund `slots` economic positions.
+ *
+ * Inverts the breakeven identity. Round-trip cost is
+ *   (stake * 0.03 + fixed) / stake, fixed = 2*priorityFee + 2*networkFee + ataRent
+ * so the smallest viable stake is fixed / (limit - 0.03); below that no stake
+ * can clear the limit at any balance. Each slot then needs its stake plus the
+ * slippage/fee buffer, and the wallet needs the gas float on top.
+ *
+ * Returns Infinity when the limit is at or below the 3% variable cost — no
+ * wallet size can help, because the variable component alone exceeds it.
+ */
+export function minWalletForSlots(params: {
+  slots: number;
+  maxSlippagePct: number;
+  priorityFeeSol: number;
+  maxBreakevenPct: number;
+  gasFloatSol?: number;
+}): number {
+  const { slots, maxSlippagePct, priorityFeeSol, maxBreakevenPct, gasFloatSol = 0.005 } = params;
+  const VARIABLE = 0.03;          // 1.5% protocol fee on each of two legs
+  const NETWORK = 0.000005 * 2;
+  const ATA_RENT = 0.00203928;
+  const limit = maxBreakevenPct / 100;
+  if (limit <= VARIABLE) return Infinity;
+
+  const fixed = priorityFeeSol * 2 + NETWORK + ATA_RENT;
+  const minStake = fixed / (limit - VARIABLE);
+  const perSlot = minStake * (1 + maxSlippagePct / 100 + 0.015) + priorityFeeSol + 0.0025;
+  return Number((perSlot * Math.max(1, slots) + gasFloatSol).toFixed(4));
+}
+
+/**
  * Maps a full-exit reason string to a structured ExitCode.
  *
  * Only used for the paths that close a whole position; the partial rungs pass

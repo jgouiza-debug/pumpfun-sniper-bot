@@ -1861,5 +1861,64 @@ console.log('\n-- Sizing reads the linked Photon wallet in BOTH modes --');
   });
 }
 
+console.log('\n-- Minimum viable wallet is computed, not guessed --');
+{
+  const { minWalletForSlots, fitSlotsToWallet } = require('../services/pipelineUtils');
+  const { breakevenPct } = require('../services/paperSimulator');
+  const SLIP = 25, MAXBE = 6;
+
+  const minFor = (slots: number, pf: number) => minWalletForSlots({
+    slots, maxSlippagePct: SLIP, priorityFeeSol: pf, maxBreakevenPct: MAXBE,
+  });
+
+  test('the returned minimum actually clears the gate', () => {
+    for (const pf of [0.001, 0.003]) {
+      for (const slots of [1, 2, 3]) {
+        const w = minFor(slots, pf);
+        const f = fitSlotsToWallet({
+          deployableSol: w - 0.005, maxSlots: slots, maxSlippagePct: SLIP,
+          priorityFeeSol: pf, maxBreakevenPct: MAXBE, breakevenOf: breakevenPct,
+        });
+        assert.strictEqual(f.slots, slots,
+          `minWalletForSlots(${slots}, pf ${pf}) = ${w} should fund exactly ${slots} slots, got ${f.slots}`);
+      }
+    }
+  });
+
+  test('a hair under the minimum does NOT clear it', () => {
+    const w = minFor(1, 0.001);
+    const f = fitSlotsToWallet({
+      deployableSol: (w - 0.005) * 0.97, maxSlots: 1, maxSlippagePct: SLIP,
+      priorityFeeSol: 0.001, maxBreakevenPct: MAXBE, breakevenOf: breakevenPct,
+    });
+    assert.strictEqual(f.slots, 0, 'the minimum must be tight, not padded');
+  });
+
+  test('THE CURRENT WALLET: 0.1 SOL is below the floor at any slot count', () => {
+    assert.ok(minFor(1, 0.001) > 0.1,
+      `1 slot needs ${minFor(1, 0.001)} SOL, more than the 0.1 SOL wallet`);
+  });
+
+  test('0.2 SOL clears it for one slot, which is why that was the earlier floor', () => {
+    assert.ok(minFor(1, 0.001) <= 0.2, `needs ${minFor(1, 0.001)} SOL`);
+  });
+
+  test('more slots costs proportionally more wallet', () => {
+    const one = minFor(1, 0.001);
+    const three = minFor(3, 0.001);
+    assert.ok(three > one * 2.5 && three < one * 3.5, `1 slot ${one}, 3 slots ${three}`);
+  });
+
+  test('a cheaper priority fee lowers the floor', () => {
+    assert.ok(minFor(1, 0.001) < minFor(1, 0.003));
+  });
+
+  test('a breakeven limit at or below the 3% variable cost is unreachable at any size', () => {
+    assert.strictEqual(minWalletForSlots({
+      slots: 1, maxSlippagePct: SLIP, priorityFeeSol: 0.001, maxBreakevenPct: 3,
+    }), Infinity, 'no wallet can beat a limit the variable fee alone exceeds');
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
