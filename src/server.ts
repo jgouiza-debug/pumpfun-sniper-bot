@@ -30,6 +30,46 @@ process.on('unhandledRejection', (reason: any) => {
 });
 
 
+/**
+ * Load a .env sitting NEXT TO the executable.
+ *
+ * `npm run dev` gets this from node's --env-file-if-exists flag, but a pkg-built
+ * exe is launched by double-click with no flags — so without this an end user
+ * has no file-based way to supply a key. The .env is deliberately NOT bundled
+ * into the binary (see the note in package.json "pkg"), because that would bake
+ * the builder's own Helius key into every copy handed out.
+ *
+ * Precedence: a real environment variable always wins over the file, and the
+ * key entered in the UI wins over both (it is applied at runtime).
+ */
+function loadEnvBesideExecutable(): void {
+  // process.execPath is the exe itself when packaged; cwd otherwise.
+  const isPackaged = Boolean((process as any).pkg);
+  const baseDir = isPackaged ? path.dirname(process.execPath) : process.cwd();
+  const envPath = path.join(baseDir, '.env');
+  try {
+    if (!fs.existsSync(envPath)) return;
+    for (const rawLine of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      let value = line.slice(eq + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      // Never clobber a variable the user set in their shell.
+      if (process.env[key] === undefined) process.env[key] = value;
+    }
+    console.log(`🔑 Loaded settings from ${envPath}`);
+  } catch {
+    // A malformed .env must not stop the bot from starting — the UI can still
+    // supply the key.
+  }
+}
+loadEnvBesideExecutable();
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -39,10 +79,28 @@ const PORT = Number(process.env.PORT) || 3001;
 // Serve the built UI from this same process, so http://localhost:3001 is the
 // whole app — no separate vite window to keep alive. `npm run build` refreshes
 // dist/; `npm run ui` still gives the hot-reload dev server on 3010.
-const DIST_DIR = path.resolve(process.cwd(), 'dist');
-if (fs.existsSync(path.join(DIST_DIR, 'index.html'))) {
-  app.use(express.static(DIST_DIR));
-  console.log('🖥️  Serving UI from dist/ — open http://localhost:' + PORT);
+const candidateDirs = [
+  path.resolve(process.cwd(), 'dist'),
+  path.resolve(__dirname, 'dist'),
+  path.resolve(__dirname, '../dist'),
+  path.resolve(__dirname, '../../dist')
+];
+
+let validDistDir: string | null = null;
+for (const dir of candidateDirs) {
+  if (fs.existsSync(path.join(dir, 'index.html'))) {
+    validDistDir = dir;
+    break;
+  }
+}
+
+if (validDistDir) {
+  app.use(express.static(validDistDir));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next();
+    res.sendFile(path.join(validDistDir!, 'index.html'));
+  });
+  console.log(`🖥️  Serving UI from ${validDistDir} — open http://localhost:${PORT}`);
 } else {
   console.warn('⚠️ dist/ not found — run `npm run build` to serve the UI from this port.');
 }
@@ -377,7 +435,24 @@ function startListening(retriesLeft = 5): void {
   // best-effort IPv6 loopback listener so `localhost` resolving to ::1 on
   // Windows still reaches the API. Nothing on the LAN can.
   const server = app.listen(PORT, '127.0.0.1', () => {
-    console.log(`📡 Sniper Bot API listening on http://localhost:${PORT} (loopback only)`);
+    const url = `http://localhost:${PORT}`;
+    console.log(`\n========================================================`);
+    console.log(`🚀 PUMPFUN SNIPER BOT ONLINE — LOCALHOST ACTIVE`);
+    console.log(`========================================================`);
+    console.log(`🖥️  UI Server listening at ${url}`);
+    console.log(`🔑 Enter your Photon Wallet & Helius API key in UI Settings`);
+    console.log(`========================================================\n`);
+
+    try {
+      const { exec } = require('child_process');
+      if (process.platform === 'win32') {
+        exec(`cmd /c start "" "${url}"`);
+      } else if (process.platform === 'darwin') {
+        exec(`open "${url}"`);
+      } else {
+        exec(`xdg-open "${url}"`);
+      }
+    } catch { /* browser auto-launch best effort */ }
   });
   try {
     const v6 = app.listen(PORT, '::1');

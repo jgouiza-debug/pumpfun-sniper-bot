@@ -84,7 +84,61 @@ export const DEFAULTS: FeatureFlagSet = {
   allInSizing: true,
 };
 
-const FLAGS_PATH = path.resolve(process.cwd(), 'flags.json');
+/**
+ * What a PACKAGED build runs when no flags.json is supplied.
+ *
+ * DEFAULTS above is "legacy behaviour, everything off" — correct for the audit
+ * rollout on a dev machine that always had a flags.json, and actively dangerous
+ * for a distributed binary that does not. Measured 2026-08-10 by running the
+ * built exe from a clean directory: it reported `Enabled: allInSizing` — i.e.
+ * all-in position sizing ON with the honeypot check, dev-sell stop, economics
+ * gate, kill switch and honest-paper accounting all OFF. That is the single
+ * worst combination this codebase can produce, and it is what anyone handed the
+ * exe would have run.
+ *
+ * These are the flags the project actually operates with.
+ */
+export const PACKAGED_DEFAULTS: FeatureFlagSet = {
+  ...DEFAULTS,
+  shadowGateV2: true,
+  strictMigrationDetect: true,
+  killSwitch: true,
+  honestPaper: true,
+  enforceTradeEconomics: true,
+  playbookRouting: true,
+  honeypotChecks: true,
+  devSellStop: true,
+  allInSizing: false,
+};
+
+/** True when running from a pkg-built single-file executable. */
+const IS_PACKAGED = Boolean((process as any).pkg);
+
+/**
+ * Where to look for flags.json, most specific first:
+ *   1. beside the executable — how an end user overrides the shipped set
+ *   2. the working directory — the dev-machine path
+ *   3. inside the binary — the set this build shipped with
+ */
+function flagsSearchPaths(): string[] {
+  const paths: string[] = [];
+  if (IS_PACKAGED) paths.push(path.join(path.dirname(process.execPath), 'flags.json'));
+  paths.push(path.resolve(process.cwd(), 'flags.json'));
+  paths.push(path.resolve(__dirname, '../../flags.json'));
+  return paths;
+}
+
+/** First existing flags.json, or the cwd path when none exists (for writes). */
+function resolveFlagsPath(): string {
+  for (const p of flagsSearchPaths()) {
+    try { if (fs.existsSync(p)) return p; } catch { /* keep looking */ }
+  }
+  return IS_PACKAGED
+    ? path.join(path.dirname(process.execPath), 'flags.json')
+    : path.resolve(process.cwd(), 'flags.json');
+}
+
+const FLAGS_PATH = resolveFlagsPath();
 
 function envName(key: string): string {
   return 'FLAG_' + key.replace(/([A-Z])/g, '_$1').toUpperCase();
@@ -105,7 +159,9 @@ class FeatureFlags {
   }
 
   private load(): FeatureFlagSet {
-    const merged: FeatureFlagSet = { ...DEFAULTS };
+    // A packaged binary with no flags.json must not fall back to
+    // everything-off; see PACKAGED_DEFAULTS.
+    const merged: FeatureFlagSet = IS_PACKAGED ? { ...PACKAGED_DEFAULTS } : { ...DEFAULTS };
 
     try {
       if (fs.existsSync(FLAGS_PATH)) {

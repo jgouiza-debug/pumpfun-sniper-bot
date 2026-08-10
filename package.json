@@ -6,7 +6,7 @@
   "bin": "dist/server.js",
   "scripts": {
     "build": "vite build && tsc",
-    "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets node18-win-x64 --output dist-exe/pumpfun-sniper-bot.exe",
+    "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets host --output dist-exe/pumpfun-sniper-bot.exe",
     "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
     "server": "tsc && node --use-system-ca --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
@@ -16,9 +16,10 @@
   },
   "pkg": {
     "scripts": "dist/**/*.js",
+    "//assets": "NEVER add .env here. pkg embeds assets INSIDE the binary, so bundling .env would bake the builder's HELIUS_API_KEY into every copy of an exe meant to be handed to other people. The key is entered in the UI, read from the environment, or read from a .env placed NEXT TO the exe at runtime.",
+    "//flags": "flags.json is deliberately NOT bundled. Bundling it ships whatever the build machine happened to have toggled, so a local experiment leaks into every distributed copy (measured: it shipped allInSizing ON). With no bundled file the binary uses PACKAGED_DEFAULTS, which is explicit and asserted by tests; a user drops their own flags.json beside the exe to override.",
     "assets": [
-      "dist/**/*",
-      ".env"
+      "dist/**/*"
     ],
     "targets": [
       "node18-win-x64"

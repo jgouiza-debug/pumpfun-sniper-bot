@@ -1920,5 +1920,51 @@ console.log('\n-- Minimum viable wallet is computed, not guessed --');
   });
 }
 
+console.log('\n-- A packaged exe must not ship with every safety flag off --');
+{
+  const { DEFAULTS, PACKAGED_DEFAULTS } = require('../services/featureFlags');
+
+  // Measured 2026-08-10: the built exe run from a clean directory reported
+  // "Enabled: allInSizing" — all-in sizing ON with every guard OFF.
+  const GUARDS = ['honeypotChecks', 'devSellStop', 'enforceTradeEconomics',
+                  'killSwitch', 'honestPaper', 'playbookRouting'];
+
+  test('OLD BUG reproduced: the dev DEFAULTS have every guard off', () => {
+    for (const g of GUARDS) {
+      assert.strictEqual(DEFAULTS[g], false,
+        `${g} is off in DEFAULTS — correct for the audit rollout, fatal for a shipped binary`);
+    }
+  });
+
+  test('OLD BUG reproduced: DEFAULTS also turn all-in sizing ON', () => {
+    assert.strictEqual(DEFAULTS.allInSizing, true,
+      'all-in sizing with no guards is the worst combination this codebase can produce');
+  });
+
+  for (const g of GUARDS) {
+    test(`fixed: a packaged build enables ${g}`, () => {
+      assert.strictEqual(PACKAGED_DEFAULTS[g], true, `${g} must be on in a shipped binary`);
+    });
+  }
+
+  test('fixed: a packaged build does NOT default to all-in sizing', () => {
+    assert.strictEqual(PACKAGED_DEFAULTS.allInSizing, false);
+  });
+
+  test('PACKAGED_DEFAULTS covers every declared flag', () => {
+    for (const k of Object.keys(DEFAULTS)) {
+      assert.ok(k in PACKAGED_DEFAULTS, `${k} missing from PACKAGED_DEFAULTS`);
+      assert.strictEqual(typeof PACKAGED_DEFAULTS[k], 'boolean');
+    }
+  });
+
+  test('experimental flags stay off even when packaged', () => {
+    // These change execution paths and need shadow validation first.
+    for (const k of ['localTxBuild', 'entryGateV2', 'dynamicPriorityFee']) {
+      assert.strictEqual(PACKAGED_DEFAULTS[k], false, `${k} must not auto-enable in a shipped build`);
+    }
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
