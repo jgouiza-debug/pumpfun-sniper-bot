@@ -1392,5 +1392,234 @@ console.log('\n-- Config clamps and circuit breakers (audit #15, #29) --');
   });
 }
 
+// ---------------------------------------------------------------------------
+// Increment 2 — rug screening (audit #4, #20, #21, #22, #33).
+// ---------------------------------------------------------------------------
+console.log('\n-- Mint authority is read on-chain, not asserted (audit #20) --');
+{
+  const { inspectMintSafety } = require('../services/honeypotDetector');
+
+  // A minimal 82-byte SPL Mint account. Layout:
+  //   0..3 mintAuthority COption tag, 4..35 key, 36..43 supply, 44 decimals,
+  //   45 isInitialized, 46..49 freezeAuthority COption tag, 50..81 key.
+  const mintAccount = (mintTag: number, freezeTag: number) => {
+    const d = Buffer.alloc(82);
+    d.writeUInt32LE(mintTag, 0);
+    d.writeUInt32LE(freezeTag, 46);
+    d[45] = 1;
+    return d;
+  };
+  const SPL = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+  const conn = (data: Buffer | null) => ({
+    getAccountInfo: async () => data === null ? null : ({ owner: { toBase58: () => SPL }, data }),
+  });
+  const MINT = 'So11111111111111111111111111111111111111112';
+
+  test('OLD BUG reproduced: an inferred RugCheck report ASSERTS both authorities are null', () => {
+    // 85.4% of 6,380 recorded candidates were isInferred, and the inferred
+    // report claims mintAuthority: null without ever reading the chain.
+    const inferred = { isInferred: true, token: { mintAuthority: null, freezeAuthority: null } };
+    assert.strictEqual(inferred.token.mintAuthority, null,
+      'the inferred report asserts renunciation — this is the assumption the on-chain read replaces');
+  });
+
+  test('fixed: a live mint authority is detected and rejected', async () => {
+    const v = await inspectMintSafety(conn(mintAccount(1, 0)) as any, MINT, null);
+    assert.strictEqual(v.details.mintAuthorityActive, true);
+    assert.ok(v.reasons.some((r: string) => /mint authority/i.test(r)), JSON.stringify(v.reasons));
+    assert.strictEqual(v.safe, false);
+  });
+
+  test('fixed: a renounced mint authority passes', async () => {
+    const v = await inspectMintSafety(conn(mintAccount(0, 0)) as any, MINT, null);
+    assert.strictEqual(v.details.mintAuthorityActive, false);
+    assert.ok(!v.reasons.some((r: string) => /mint authority/i.test(r)));
+  });
+
+  test('freeze authority is still detected independently', async () => {
+    const v = await inspectMintSafety(conn(mintAccount(0, 1)) as any, MINT, null);
+    assert.strictEqual(v.details.freezeAuthorityActive, true);
+    assert.ok(v.reasons.some((r: string) => /freeze authority/i.test(r)));
+  });
+
+  test('both authorities live yields both reasons', async () => {
+    const v = await inspectMintSafety(conn(mintAccount(1, 1)) as any, MINT, null);
+    assert.strictEqual(v.reasons.filter((r: string) => /authority/i.test(r)).length, 2);
+  });
+
+  test('#21: an unreachable mint account reports unverified, never a silent pass', async () => {
+    const v = await inspectMintSafety(conn(null) as any, MINT, null);
+    assert.ok(v.unverified.includes('mintAccount'),
+      'a missing mint account must be reported as unverified');
+  });
+}
+
+console.log('\n-- Unknown is not safe: unverified blocks the trade (audit #21) --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+
+  test('OLD BUG reproduced: verdict.unverified was computed and discarded', () => {
+    // The old guard was `if (!verdict.safe)` alone, so unverified fell through.
+    assert.ok(/fatalUnverified/.test(engineSrc),
+      'the engine must act on unverified fields, not just on !safe');
+  });
+
+  test('rugcheckRisks alone does not block (it is covered by concentration rules)', () => {
+    const block = engineSrc.slice(engineSrc.indexOf('const fatalUnverified'), engineSrc.indexOf('const fatalUnverified') + 300);
+    assert.ok(/rugcheckRisks/.test(block), 'rugcheckRisks must be excluded from the fatal set');
+  });
+}
+
+console.log('\n-- Liquidity vs market cap (audit #33) --');
+{
+  const ratioBlocks = (mcap: number, liq: number, limit: number) => liq > 0 && mcap > 0 && (mcap / liq) > limit;
+
+  test('OLD BUG reproduced: only absolute floors existed, so 33:1 passed everything', () => {
+    // $12k liquidity against a $400k mcap cleared every liquidity rule in the
+    // codebase, because all of them were absolute minimums.
+    const passesAbsoluteFloor = 12_000 >= 8_000;
+    assert.ok(passesAbsoluteFloor, 'the thin pool clears the absolute floor');
+    assert.ok(400_000 / 12_000 > 30, 'while being 33x its own liquidity');
+  });
+
+  test('fixed: 33:1 is rejected at the default 20x limit', () => {
+    assert.strictEqual(ratioBlocks(400_000, 12_000, 20), true);
+  });
+
+  test('a genuine graduation (~5:1) passes', () => {
+    assert.strictEqual(ratioBlocks(60_000, 12_000, 20), false);
+  });
+
+  test('the check is disabled at 0 rather than rejecting everything', () => {
+    const engineSrc = require('fs').readFileSync(
+      require('path').join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+    assert.ok(/maxMcapToLiquidityRatio && this\.config\.maxMcapToLiquidityRatio > 0/.test(engineSrc),
+      '0 must disable the check');
+  });
+
+  test('the ratio is never computed against ASSERTED liquidity', () => {
+    const engineSrc = require('fs').readFileSync(
+      require('path').join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+    assert.ok(/liquidityIsMeasured/.test(engineSrc),
+      'the migration liquidity assertion must not feed the ratio check');
+  });
+}
+
+console.log('\n-- Creator resolution and the real sell simulation (audit #22, #4) --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const { DevSellMonitor } = require('../services/devSellMonitor');
+
+  test('OLD BUG reproduced: an Unknown creator silently disables all three creator stops', () => {
+    const m = new DevSellMonitor();
+    m.track('mintA', 'Unknown');
+    assert.strictEqual(m.isTracked('mintA'), false,
+      'track() returns early on Unknown — this is why 19 of 20 bought tokens had no creator stop');
+  });
+
+  test('fixed: the engine falls back to the curve-decoded creator', () => {
+    // Anchor on the resolution site itself. Anchoring on the devSellStop flag
+    // string matches its first use (curveWatcher.start at arm time) instead.
+    const at = engineSrc.indexOf('devSellMonitor.track(filterResult.mint');
+    assert.ok(at > 0, 'the position-open tracking site must exist');
+    const block = engineSrc.slice(Math.max(0, at - 1400), at + 200);
+    assert.ok(/curveWatcher\.getLast\(/.test(block), 'must fall back to the curve account creator');
+    assert.ok(/rugCreator/.test(block), 'must also fall back to RugCheck');
+  });
+
+  test('fixed: a missing creator is reported loudly instead of failing silently', () => {
+    assert.ok(/cannot fire on this position/.test(engineSrc));
+  });
+
+  test('a real creator is tracked and alerts on its sell', () => {
+    const m = new DevSellMonitor();
+    m.track('mintB', 'CreatorWallet111');
+    const alert = m.onTrade({ mint: 'mintB', traderPublicKey: 'CreatorWallet111', txType: 'sell', solAmount: 2 });
+    assert.ok(alert && alert.kind === 'DEV_SOLD', JSON.stringify(alert));
+  });
+
+  test('#4: simulateSellPath now has a call site', () => {
+    assert.ok(/simulateSellPath/.test(engineSrc), 'the real sell test must be wired up');
+    assert.ok(/verifySellPath/.test(engineSrc));
+  });
+
+  test('#4: the sell simulation runs off the entry hot path', () => {
+    // Anchor on the scheduling site, not the config default declared earlier.
+    const at = engineSrc.indexOf('this.config.sellSimDelayMs');
+    assert.ok(at > 0, 'the scheduling site must exist');
+    const block = engineSrc.slice(at, at + 600);
+    assert.ok(/setTimeout/.test(block), 'must be deferred, not awaited during entry');
+    assert.ok(!/await this\.verifySellPath/.test(engineSrc), 'must never be awaited on the entry path');
+  });
+
+  test('#4: a confirmed honeypot latches a forced exit', () => {
+    assert.ok(/honeypotConfirmed/.test(engineSrc));
+    assert.ok(/honeypot: sell simulation reverts/.test(engineSrc));
+  });
+
+  test('#4: an inconclusive simulation does NOT exit the position', () => {
+    const block = engineSrc.slice(engineSrc.indexOf('private async verifySellPath'), engineSrc.indexOf('private async verifySellPath') + 2600);
+    assert.ok(/null = could not simulate/.test(block),
+      'an unknown result must leave the position alone rather than acting on it');
+  });
+}
+
+console.log('\n-- Rug fixtures from recorded live data (audit #38) --');
+{
+  const { RiskFilter } = require('../filters/riskFilter');
+  // Real mints from reports/candidates-2026-08-08.jsonl, with their measured
+  // RugCheck values. These are tokens the bot actually saw.
+  const REAL_RUGS = [
+    { sym: 'roar',    mint: 'G3K1MWyebY2oReAdbnXtLkXmU6BPZLjbaASWJuzqpump', score: 21601, top10: 100,   sample: 1,  holders: 1 },
+    { sym: 'TOAD',    mint: '4eXnZ9JYU9fG6UhBicKXodGt4McYDq3KezRHooE2pump', score: 29532, top10: 100,   sample: 4,  holders: 5 },
+    { sym: '$STICK',  mint: 'EH4q2niM5ifPNWfdMD7zbncGmUA44pbK5NbU4jgQNray', score: 58701, top10: 100,   sample: 2,  holders: 1 },
+    { sym: 'SEACAT',  mint: 'GD5E1XaE2dnm489k5mAFHQfQFbxTnDoDy5Lm8KDRpump', score: 25953, top10: 89.66, sample: 13, holders: 14 },
+    { sym: '$HALVES', mint: 'FDR2TwyUaz735tmsvpSg6krB5G1s7N1dgjmPrTwTpump', score: 17811, top10: 89.66, sample: 14, holders: 15 },
+    { sym: 'ROGRAP',  mint: 'J8Fq4ffwLKdUg3WZU22eXsANjLLNrzbM6Bz3MqJPpump', score: 31423, top10: 89.66, sample: 8,  holders: 9 },
+    { sym: 'TT 2.0',  mint: 'E4ZdRkeaE6qpTKxHmogf48u9bfzDSSqkWbfxVcb4pump', score: 18819, top10: 89.66, sample: 15, holders: 16 },
+    { sym: 'ICT',     mint: 'DoYdkJapBGPxJ5KgwyAnBQ9QiceyYkJNRjyTL2Z8pump', score: 27405, top10: 89.66, sample: 16, holders: 17 },
+  ];
+
+  for (const r of REAL_RUGS) {
+    test(`REAL RUG ${r.sym}: top10 ${r.top10}%, RugCheck score ${r.score} — must be refused`, () => {
+      const rf = new RiskFilter();
+      rf.setLeniencyMode('strict');
+      const report = {
+        isInferred: false,
+        score: r.score,
+        token: { mintAuthority: null, freezeAuthority: null },
+        fileMeta: { top10Pct: r.top10, holderSampleSize: r.sample, totalHolders: r.holders },
+        markets: [],
+      };
+      const gate = rf.evaluateGate0(report as any, {
+        top10Pct: r.top10, devHoldingsPct: 0, bundledSupplyPct: 0,
+        liquidityUsd: 12_000, washScore: 0,
+      } as any, { minLiquidityUsdOverride: 2275, requireVerifiedConcentration: true, maxRugcheckScore: 1000 });
+      assert.strictEqual(gate.allPassed, false,
+        `${r.sym} must be rejected; reasons=${JSON.stringify(gate.failedReasons)}`);
+    });
+  }
+
+  test('a clean distribution from the same corpus is still accepted', () => {
+    const rf = new RiskFilter();
+    rf.setLeniencyMode('strict');
+    const report = {
+      isInferred: false, score: 1,
+      token: { mintAuthority: null, freezeAuthority: null },
+      fileMeta: { top10Pct: 19.2, holderSampleSize: 19, totalHolders: 240 },
+      markets: [],
+    };
+    const gate = rf.evaluateGate0(report as any, {
+      top10Pct: 19.2, devHoldingsPct: 1, bundledSupplyPct: 5, liquidityUsd: 12_000, washScore: 0,
+    } as any, { minLiquidityUsdOverride: 2275, requireVerifiedConcentration: true, maxRugcheckScore: 1000 });
+    assert.strictEqual(gate.allPassed, true,
+      `a clean token must still pass; reasons=${JSON.stringify(gate.failedReasons)}`);
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

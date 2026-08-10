@@ -31,7 +31,7 @@ import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntr
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
-import { inspectMintSafety } from './honeypotDetector';
+import { inspectMintSafety, simulateSellPath } from './honeypotDetector';
 import { devSellMonitor } from './devSellMonitor';
 import { CurveWatcher, CurveUpdate } from './curveWatcher';
 
@@ -126,6 +126,10 @@ export interface InternalPosition extends Position {
   strandedLogged?: boolean;
   /** When this position first had ANY usable market data. Drives the no-data exit. */
   firstMarketDataAt?: number;
+  /** A full exit simulated cleanly after the fill. */
+  sellPathVerified?: boolean;
+  /** A full exit simulated as REVERTING — the token is a honeypot. */
+  honeypotConfirmed?: boolean;
 }
 
 export class SniperEngine {
@@ -198,6 +202,15 @@ export class SniperEngine {
     // the full 30-minute timer. Not a price stop — it never reads a price.
     noDataExitSeconds: 180,
     maxForceExitAttempts: 20,
+    // Rug screening. A genuine graduation sits near 5:1; 20:1 rejects the thin
+    // pools while leaving normal graduations alone. Tune from recorded data —
+    // every rejection is logged with its measured ratio.
+    maxMcapToLiquidityRatio: 20,
+    sellSimDelayMs: 4000,
+    minHolderSample: MIN_HOLDER_SAMPLE,
+    minTotalHolders: MIN_TOTAL_HOLDERS,
+    maxRugcheckScore: MAX_RUGCHECK_SCORE,
+    minLpBurnedOrLockedPct: 90,
     // 15 made the economics gate decorative (0.05 SOL @ 11.1% passed). 6 is
     // the audit's number: refuse any trade that needs >6% just to break even.
     maxBreakevenPct: 6,
@@ -1380,6 +1393,20 @@ export class SniperEngine {
         latencyTimeline.annotate(mint, { decision: 'rejected' });
         this.log('warn', `🍯 [SELL-PATH RISK] $${payload.symbol ?? mint.slice(0, 6)} — ${verdict.reasons[0]}`, mint);
       }
+
+      // Unknown is not safe. `unverified` was computed and thrown away, so an
+      // unreachable RPC returned {safe:true} and the token sailed through with
+      // its mint and freeze authorities never actually read — the exact
+      // fail-open the rest of the pipeline is built to refuse. Only the mint
+      // account itself is fatal; a missing RugCheck risks array is common and
+      // is already covered by the concentration rules.
+      const fatalUnverified = verdict.unverified.filter(u => u !== 'rugcheckRisks');
+      if (fatalUnverified.length > 0) {
+        const why = `Sell-path safety unverifiable (${fatalUnverified.join(', ')}) — unknown is not safe`;
+        honeypotBlocked = [...honeypotBlocked, why];
+        latencyTimeline.annotate(mint, { decision: 'rejected' });
+        this.log('warn', `🍯 [UNVERIFIED] $${payload.symbol ?? mint.slice(0, 6)} — ${why}`, mint);
+      }
     }
 
     // Phase-aware liquidity floor. A token still on its bonding curve cannot
@@ -1402,6 +1429,32 @@ export class SniperEngine {
         ? this.activePlaybook().minLiquiditySol * this.config.solPriceUsd
         : undefined;
 
+    // Liquidity depth vs market cap. Previously ABSENT: every liquidity rule in
+    // the codebase was an absolute floor, so a $12k-liquidity / $400k-mcap token
+    // (33:1) passed everything. A thin pool against a large notional is what
+    // makes a price trivially manipulable and an exit impossible at the quoted
+    // price. A genuine pump.fun graduation is ~5:1.
+    //
+    // Only applied when BOTH numbers are real: the migration liquidity assertion
+    // below fabricates ~$12,044, and a ratio computed against a constant is
+    // theatre.
+    const mcapRatioBlocked: string[] = [];
+    if (this.config.maxMcapToLiquidityRatio && this.config.maxMcapToLiquidityRatio > 0) {
+      const liq = launchData.liquidityUsd ?? 0;
+      const mcap = launchData.marketCapUsd ?? 0;
+      const liquidityIsMeasured = Boolean(dexData?.hasPair && (dexData?.liquidityUsd ?? 0) > 0);
+      if (liquidityIsMeasured && liq > 0 && mcap > 0) {
+        const ratio = mcap / liq;
+        if (ratio > this.config.maxMcapToLiquidityRatio) {
+          mcapRatioBlocked.push(
+            `Market cap $${Math.round(mcap).toLocaleString()} is ${ratio.toFixed(1)}x the $${Math.round(liq).toLocaleString()} pool ` +
+            `(limit ${this.config.maxMcapToLiquidityRatio}x) — too thin to exit at the quoted price`
+          );
+          this.log('warn', `💧 [THIN POOL] $${payload.symbol ?? mint.slice(0, 6)} — mcap/liquidity ${ratio.toFixed(1)}x > ${this.config.maxMcapToLiquidityRatio}x`, mint);
+        }
+      }
+    }
+
     const filterResult = this.riskFilter.evaluateToken(report, launchData, {
       minLiquidityUsdOverride,
       // On the real-data path, concentration we could not measure must reject
@@ -1411,9 +1464,9 @@ export class SniperEngine {
       // holder rows. Legacy keeps its old behaviour of ignoring the score.
       maxRugcheckScore: useRealData ? MAX_RUGCHECK_SCORE : undefined,
     });
-    if (honeypotBlocked.length > 0) {
+    if (honeypotBlocked.length > 0 || mcapRatioBlocked.length > 0) {
       filterResult.isSafe = false;
-      filterResult.reasons = [...honeypotBlocked, ...(filterResult.reasons || [])];
+      filterResult.reasons = [...honeypotBlocked, ...mcapRatioBlocked, ...(filterResult.reasons || [])];
     }
 
     // Gate V2 (real data only): entryGateV2 trades on it; shadowGateV2 runs it
@@ -1947,9 +2000,30 @@ export class SniperEngine {
     // change. Until then the loss side rests on CURVE_DRAINED, POOL_DRAINED,
     // SELL_FLOW and the time stop.
     if (featureFlags.get('devSellStop')) {
-      const creator = (launchData?.creator as string) || undefined;
-      devSellMonitor.track(filterResult.mint, creator);
-      this.safeSendWs({ method: 'subscribeTokenTrade', keys: [filterResult.mint] });
+      // Resolve the creator from every source we have, in order of reliability.
+      //
+      // Measured: all 178 migrate payloads carry only {signature, mint, txType,
+      // pool} — no creator — so 19 of 20 bought tokens had creator 'Unknown'
+      // and devSellMonitor.track() returned immediately at its own guard. The
+      // three creator stops were therefore dead for a reason INDEPENDENT of the
+      // unfunded PumpPortal trade feed, and funding that key would not have
+      // fixed them.
+      //
+      // CurveWatcher already decodes the creator out of the bonding-curve
+      // account (curveWatcher.ts:61), and RugCheck reports carry it too. Both
+      // are already in memory; neither costs an RPC.
+      const creator =
+        (launchData?.creator as string | undefined) ||
+        this.curveWatcher.getLast(filterResult.mint)?.creator ||
+        (launchData?.rugCreator as string | undefined) ||
+        undefined;
+
+      if (creator && creator !== 'Unknown') {
+        devSellMonitor.track(filterResult.mint, creator);
+        this.safeSendWs({ method: 'subscribeTokenTrade', keys: [filterResult.mint] });
+      } else {
+        this.log('warn', `⚠️ No creator address for $${filterResult.tokenSymbol} — DEV_SOLD, LINKED_WALLET_SOLD and LARGE_SELL_CLUSTER cannot fire on this position.`, filterResult.mint);
+      }
     }
 
     // Watch this position's curve while it is still pre-migration: the curve
@@ -1963,6 +2037,17 @@ export class SniperEngine {
         if (evicted) tokenWatchlist.remove(evicted);
         this.curveWatcher.watch(filterResult.mint);
       }
+    }
+
+    // Real honeypot test, a few seconds after the fill so the tokens exist.
+    // Deliberately not awaited: it must not delay anything on the entry path.
+    if (featureFlags.get('honeypotChecks') && this.config.tradingMode === 'real') {
+      const delayMs = this.config.sellSimDelayMs ?? 4000;
+      setTimeout(() => {
+        if (this.activePositions.some(p => p.id === position.id)) {
+          void this.verifySellPath(position).catch(() => { /* never let this throw into the timer */ });
+        }
+      }, delayMs).unref?.();
     }
 
     reportService.recordPositionOpened();
@@ -2303,6 +2388,63 @@ export class SniperEngine {
     }
 
     return { ok: reasons.length === 0, reasons, stakeSol, breakevenPct: be, requiredSol };
+  }
+
+  /**
+   * The only REAL honeypot test in the codebase: build the sell we would
+   * actually send and ask the RPC to run it without submitting.
+   *
+   * `simulateSellPath` has existed, correct and unused, with zero call sites —
+   * while the pre-buy gate carried `sellSimPassed = true` as a hardcoded
+   * constant. A honeypot is a blocked SELL, which no buy-side check can catch,
+   * so until now the entire blocked-sell scam class was undetectable.
+   *
+   * Runs a few seconds AFTER the fill (it needs the tokens to exist) and off the
+   * hot path, so it costs the entry nothing. A failure latches a forced exit —
+   * which will itself fail if the token truly cannot be sold, and is then capped
+   * by maxForceExitAttempts and reported as STRANDED rather than burning fees
+   * forever.
+   */
+  private async verifySellPath(pos: InternalPosition): Promise<void> {
+    if (!featureFlags.get('honeypotChecks')) return;
+    if (this.config.tradingMode !== 'real') return;
+
+    const keypair = this.wallet.getKeypair();
+    if (!keypair) return;
+
+    const result = await simulateSellPath(
+      this.solanaConnection,
+      async () => {
+        try {
+          const response = await axios.post('https://pumpportal.fun/api/trade-local', {
+            publicKey: keypair.publicKey.toBase58(),
+            action: 'sell',
+            mint: pos.mint,
+            denominatedInSol: 'false',
+            amount: sellAmountParam('100%'),
+            slippage: this.config.maxSlippagePct,
+            priorityFee: this.config.priorityFeeSol,
+            pool: pos.venue || 'auto',
+          }, { responseType: 'arraybuffer', timeout: 8000 });
+          if (response.status !== 200) return null;
+          return VersionedTransaction.deserialize(new Uint8Array(response.data));
+        } catch {
+          return null;
+        }
+      },
+      (msg: string) => this.log('warn', `🍯 [SELL SIM] $${pos.tokenSymbol}: ${msg}`, pos.mint)
+    );
+
+    if (result === false) {
+      this.log('error', `🍯 [HONEYPOT CONFIRMED] $${pos.tokenSymbol} — a full sell SIMULATES AS REVERTING. Exiting immediately; if the sell truly cannot land this position will be marked STRANDED.`, pos.mint);
+      pos.forceExitReason = 'honeypot: sell simulation reverts';
+      pos.honeypotConfirmed = true;
+    } else if (result === true) {
+      pos.sellPathVerified = true;
+      this.log('info', `✅ [SELL PATH OK] $${pos.tokenSymbol} — a full exit simulates cleanly.`, pos.mint);
+    }
+    // null = could not simulate; leave the position alone rather than acting on
+    // an unknown. The structural exits and the time stop still apply.
   }
 
   /** Immediate manual stop for the API: pause entries, keep positions. */

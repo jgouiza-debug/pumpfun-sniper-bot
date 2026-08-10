@@ -16,6 +16,11 @@ export interface PumpTokenLaunch {
   telegram?: string;
   website?: string;
   creator: string;
+  /**
+   * Creator as reported by RugCheck. A fallback for migration payloads, which
+   * carry no creator field at all — measured across all 178 recorded migrations.
+   */
+  rugCreator?: string;
   timestamp: number;
   initialBuy?: number;
   marketCapSol?: number;
@@ -235,6 +240,24 @@ export interface BotConfig {
   maxConsecutiveLosses?: number;
   /** Realized loss (USD) in a rolling 24h that pauses the bot. */
   maxDailyLossUsd?: number;
+  // --- Rug screening (every check on/off + threshold, no hardcoded numbers) ---
+  /**
+   * Reject when market cap exceeds this multiple of pool liquidity. A genuine
+   * pump.fun graduation is ~5:1; a thin pool under a large notional is trivially
+   * manipulable and cannot be exited at the quoted price. 0 disables.
+   * Only applied when liquidity is MEASURED, never against an asserted number.
+   */
+  maxMcapToLiquidityRatio?: number;
+  /** Milliseconds after a fill before the real sell simulation runs. */
+  sellSimDelayMs?: number;
+  /** Minimum RugCheck holder rows before concentration counts as measured. */
+  minHolderSample?: number;
+  /** Minimum total holders before concentration counts as measured. */
+  minTotalHolders?: number;
+  /** Reject above this RugCheck aggregate risk score. */
+  maxRugcheckScore?: number;
+  /** Reject when LP burned+locked is below this percentage. 0 disables. */
+  minLpBurnedOrLockedPct?: number;
   /** Exit when pool liquidity falls to this fraction of its observed peak. */
   poolDrainExitFraction?: number;
   /** Exit after this many consecutive ticks of collapsed buy pressure. */

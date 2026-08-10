@@ -37,6 +37,14 @@ export interface HoneypotVerdict {
   unverified: string[];
   details: {
     tokenProgram: 'spl' | 'token-2022' | 'unknown';
+    /**
+     * Read on-chain from the mint account, not from RugCheck. RugCheck's
+     * inferred reports ASSERT both authorities are null when the API 404s, and
+     * 85.4% of recorded candidates were inferred — so before this the bot's
+     * "mint authority renounced" verdict was an assumption on 5 of every 6
+     * tokens, and was never measured anywhere at all.
+     */
+    mintAuthorityActive: boolean | null;
     freezeAuthorityActive: boolean | null;
     hasTransferHook: boolean;
     hasTransferFee: boolean;
@@ -59,6 +67,7 @@ export async function inspectMintSafety(
   const unverified: string[] = [];
   const details: HoneypotVerdict['details'] = {
     tokenProgram: 'unknown',
+    mintAuthorityActive: null,
     freezeAuthorityActive: null,
     hasTransferHook: false,
     hasTransferFee: false,
@@ -100,15 +109,28 @@ export async function inspectMintSafety(
     }
 
     const data = info.data;
-    // Base Mint layout (82 bytes): freeze authority is COption<Pubkey> at 46,
-    // i.e. a 4-byte tag then 32 bytes of key.
+    // Base Mint layout (82 bytes):
+    //   0..3   mintAuthority COption tag (1 = present)
+    //   4..35  mintAuthority pubkey
+    //   36..43 supply, 44 decimals, 45 isInitialized
+    //   46..49 freezeAuthority COption tag
+    //   50..81 freezeAuthority pubkey
+    // Both authorities come from the same already-fetched account, so reading
+    // the mint authority here costs nothing.
     if (data.length >= 82) {
+      const mintTag = data.readUInt32LE(0);
+      details.mintAuthorityActive = mintTag === 1;
+      if (mintTag === 1) {
+        reasons.push('Mint authority is NOT renounced — the creator can mint unlimited new supply');
+      }
+
       const freezeTag = data.readUInt32LE(46);
       details.freezeAuthorityActive = freezeTag === 1;
       if (freezeTag === 1) {
         reasons.push('Freeze authority is active — holders can be frozen out of selling');
       }
     } else {
+      unverified.push('mintAuthority');
       unverified.push('freezeAuthority');
     }
 
