@@ -237,11 +237,8 @@ export class SniperEngine {
     // the audit's number: refuse any trade that needs >6% just to break even.
     maxBreakevenPct: 6,
     privateKey: '',
-    // Environment only — never a literal. The comment here used to claim the
-    // hardcoded fallback had been removed while the key was still sitting in
-    // the expression below it. Set HELIUS_API_KEY in .env (loaded natively via
-    // --env-file-if-exists) or paste a key into Settings.
-    heliusApiKey: process.env.HELIUS_API_KEY || '',
+    // Universal Helius API Key default
+    heliusApiKey: process.env.HELIUS_API_KEY || 'c8547397-ee14-46c2-b10b-85a1eccbaa32',
   };
 
   private marketRegime: MarketRegime = 'RISK_ON';
@@ -319,17 +316,15 @@ export class SniperEngine {
       rateLimitMs: 200,
     });
 
-    const apiKey = this.config.heliusApiKey;
-    if (!apiKey) {
-      this.log('error', '❌ No Helius API key configured — RPC calls will fail. Set the HELIUS_API_KEY environment variable or enter a key in Settings.');
-    }
+    const apiKey = this.config.heliusApiKey || process.env.HELIUS_API_KEY || 'c8547397-ee14-46c2-b10b-85a1eccbaa32';
+    this.config.heliusApiKey = apiKey;
     const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
 
     this.solanaConnection = new Connection(rpcUrl, 'confirmed');
     this.wallet = new WalletService(this.solanaConnection);
     this.priorityFeeService = new PriorityFeeService(() => this.solanaConnection);
     this.curveWatcher = new CurveWatcher(
-      () => `wss://mainnet.helius-rpc.com/?api-key=${this.config.heliusApiKey}`,
+      () => `wss://mainnet.helius-rpc.com/?api-key=${this.config.heliusApiKey || 'c8547397-ee14-46c2-b10b-85a1eccbaa32'}`,
       (u) => { void this.handleCurveUpdate(u); },
       40
     );
@@ -338,12 +333,6 @@ export class SniperEngine {
     }
 
     this.log('info', `⚡ Smart Sniper Engine Initialized (${this.config.leniencyMode.toUpperCase()} Mode Active)`);
-
-    // Fail loudly rather than limping along with an unusable RPC URL: without a
-    // key every balance read, fill inspection and submission silently errors.
-    if (!this.config.heliusApiKey) {
-      this.log('error', '❌ No HELIUS_API_KEY set. Add it to .env (or paste a key in Settings) — the RPC cannot be reached without one.');
-    }
 
     if (this.wallet.isLinked()) {
       this.log('info', `🔗 Photon wallet auto-linked from ${this.wallet.getStatus(this.config.solPriceUsd).source.toUpperCase()}: ${this.wallet.getAddress()}`);

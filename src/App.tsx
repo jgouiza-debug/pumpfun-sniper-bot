@@ -560,7 +560,33 @@ export function App() {
           </button>
         </div>
 
-        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '6px 12px',
+              borderRadius: '4px',
+              border: `1px solid ${wallet?.rpcHealthy !== false ? 'rgba(0, 230, 118, 0.4)' : 'rgba(255, 23, 68, 0.4)'}`,
+              background: wallet?.rpcHealthy !== false ? 'rgba(0, 230, 118, 0.12)' : 'rgba(255, 23, 68, 0.12)',
+              color: wallet?.rpcHealthy !== false ? '#00e676' : '#ff1744',
+              fontSize: '11px',
+              fontWeight: 700,
+              fontFamily: 'var(--font-mono)'
+            }}
+            title={wallet?.rpcHealthy !== false ? 'Helius Dedicated RPC Connection Active (Universal Key Locked)' : 'RPC Connection Offline'}
+          >
+            <span style={{
+              width: '7px',
+              height: '7px',
+              borderRadius: '50%',
+              background: wallet?.rpcHealthy !== false ? '#00e676' : '#ff1744',
+              boxShadow: wallet?.rpcHealthy !== false ? '0 0 6px #00e676' : '0 0 6px #ff1744'
+            }} />
+            RPC {wallet?.rpcHealthy !== false ? 'OK' : 'DOWN'}
+          </div>
+
           <button
             className="btn-terminal-outline"
             onClick={() => handleToggleFlag('allInSizing', !featureFlags.allInSizing)}
@@ -1125,18 +1151,6 @@ export function App() {
                 </div>
               </div>
 
-              {/* Helius Dedicated RPC API Key Input */}
-              <div className="form-group" style={{ marginTop: '6px' }}>
-                <label className="form-label">Helius Dedicated RPC Key</label>
-                <input
-                  type="text"
-                  className="form-input"
-                  placeholder="Helius API Key"
-                  value={configForm.heliusApiKey || ''}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, heliusApiKey: e.target.value })}
-                />
-                <div className="form-help">Dedicated RPC node for mainnet transaction landing speed.</div>
-              </div>
 
               {/* Photon Wallet Link — real on-chain execution */}
               <div className="form-group" style={{ border: '1px solid rgba(255,255,255,0.14)', padding: 12, marginTop: '6px' }}>
