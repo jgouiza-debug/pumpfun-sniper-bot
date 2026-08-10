@@ -101,6 +101,8 @@ export function App() {
     // A FULL unit; the router halves it until a candidate clears the full-unit
     // score band, so the real per-trade stake is 0.3 SOL.
     buyAmountSol: 0.6,
+    // On by default: the stake is one slot of the run budget, not this number.
+    walletSplitSizing: true,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
     // No stopLossPct: this bot has no price stop-loss by design.
@@ -707,7 +709,9 @@ export function App() {
         {/* Next order size — recomputed from the live balance every frame, by
             the same maths the buy path uses. */}
         <div className="stat-card">
-          <div className="stat-label">Next Entry Size</div>
+          <div className="stat-label">
+            {botStatus?.config?.walletSplitSizing ? `Slot Size (1 of ${botStatus?.config?.maxActivePositions ?? 3})` : 'Next Entry Size'}
+          </div>
           <div className="stat-value-mono">
             {sizing ? `${sizing.nextBuySol} SOL` : '—'}
           </div>
@@ -716,6 +720,13 @@ export function App() {
               ? `≈ $${sizing.nextBuyUsd} × ${sizing.tradesAffordable} TRADE${sizing.tradesAffordable === 1 ? '' : 'S'} FROM ${sizing.deployableSol} SOL`
               : 'AWAITING STATUS'}
           </div>
+          {/* The whole point of splitting: name what one dead slot actually
+              costs, in the currency the owner thinks in. */}
+          {sizing && botStatus?.config?.walletSplitSizing && sizing.nextBuySol > 0 && (
+            <div style={{ fontSize: '10px', marginTop: '3px', fontFamily: 'var(--font-mono)', color: 'var(--ink-muted)' }}>
+              MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (botStatus?.config?.maxActivePositions || 3))}% OF RUN)
+            </div>
+          )}
           {/* Fee drag is the number that decides whether small stakes can work
               at all — show it next to the stake, not buried in a report. */}
           {sizing && sizing.breakevenPct > 0 && (
@@ -1196,6 +1207,24 @@ export function App() {
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxActivePositions: Number(e.target.value) })}
                     />
                   </div>
+                </div>
+
+                {/* Wallet-split sizing: the run budget is carved into equal
+                    slots at START, so one dead trade costs 1/N of the run. */}
+                <div style={{ marginTop: '8px', padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+                  <div>
+                    <div style={{ fontSize: '8.5px', fontWeight: 700 }}>💰 Split Wallet Across Slots</div>
+                    <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>
+                      At START, divide the deployable balance into {configForm.maxActivePositions ?? 3} equal
+                      slots and stake one per trade. Fixed for the run, so a position going to zero costs
+                      1/{configForm.maxActivePositions ?? 3} and never shrinks the others. Overrides Position Size.
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={!!configForm.walletSplitSizing}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, walletSplitSizing: e.target.checked })}
+                  />
                 </div>
               </div>
 

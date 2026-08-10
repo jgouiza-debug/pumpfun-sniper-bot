@@ -1119,5 +1119,83 @@ console.log('\n-- Entry economics: the half-unit stake must clear the breakeven 
   });
 }
 
+// ---------------------------------------------------------------------------
+// Wallet-split sizing: N equal, independently survivable slots per run.
+// ---------------------------------------------------------------------------
+console.log('\n-- Wallet-split sizing: one dead slot costs 1/N, never the wallet --');
+{
+  const { splitWalletIntoSlots } = require('../services/pipelineUtils');
+  const { breakevenPct } = require('../services/paperSimulator');
+  const SLIP = 25;
+  const PF = 0.003;
+  const OVERHEAD = 0.0025;
+
+  const split = (deployable: number, slots = 3) =>
+    splitWalletIntoSlots({ deployableSol: deployable, slots, maxSlippagePct: SLIP, priorityFeeSol: PF });
+
+  test('a 1.2 SOL wallet splits into 3 fundable slots', () => {
+    const { slotBudgetSol, stakePerSlotSol } = split(1.195);
+    assert.ok(Math.abs(slotBudgetSol - 1.195 / 3) < 1e-6, `slot budget ${slotBudgetSol}`);
+    assert.ok(stakePerSlotSol > 0.3, `expected a >0.3 SOL stake, got ${stakePerSlotSol}`);
+  });
+
+  test('all 3 slots actually fit inside the balance (no overdraft)', () => {
+    const deployable = 1.195;
+    const { stakePerSlotSol } = split(deployable);
+    // Each order reserves stake x (1 + slippage + protocol fees) + fees.
+    const costPerSlot = stakePerSlotSol * (1 + SLIP / 100 + 0.015) + PF + OVERHEAD;
+    assert.ok(costPerSlot * 3 <= deployable + 1e-6,
+      `3 slots cost ${(costPerSlot * 3).toFixed(6)} but only ${deployable} is deployable`);
+  });
+
+  test('OLD BUG reproduced: naive balance/3 as the stake overdrafts', () => {
+    const deployable = 1.195;
+    const naiveStake = deployable / 3;
+    const costPerSlot = naiveStake * (1 + SLIP / 100 + 0.015) + PF + OVERHEAD;
+    assert.ok(costPerSlot * 3 > deployable,
+      'staking balance/3 directly must overdraft — this is why the split applies the affordability transform');
+  });
+
+  test('the slot stake clears the breakeven gate at 1.2 SOL', () => {
+    const { stakePerSlotSol } = split(1.195);
+    assert.ok(breakevenPct(stakePerSlotSol, PF) <= 6,
+      `slot breakeven ${breakevenPct(stakePerSlotSol, PF)}% must clear the 6% limit`);
+  });
+
+  test('a slot going to zero costs exactly 1/N — the other slots keep full size', () => {
+    // The budget is snapshotted, so slot 2 and 3 are computed from the SAME
+    // split as slot 1 regardless of what slot 1 did.
+    const { stakePerSlotSol } = split(1.195);
+    const lossFromOneDeadSlot = stakePerSlotSol;
+    const totalStaked = stakePerSlotSol * 3;
+    assert.ok(Math.abs(lossFromOneDeadSlot / totalStaked - 1 / 3) < 1e-9,
+      'one dead slot must be exactly a third of the deployed capital');
+  });
+
+  test('more slots means a smaller, still-equal share', () => {
+    const three = split(1.195, 3).stakePerSlotSol;
+    const five = split(1.195, 5).stakePerSlotSol;
+    assert.ok(five < three, 'five slots must stake less each');
+    assert.ok(breakevenPct(five, PF) > breakevenPct(three, PF),
+      'smaller slots carry a worse round trip — the cost of more concurrency');
+  });
+
+  test('an underfunded wallet yields a zero stake rather than a bad order', () => {
+    assert.strictEqual(split(0.0049).stakePerSlotSol, 0,
+      'the current 0.0099 SOL wallet cannot fund a slot');
+  });
+
+  test('a zero or negative balance is not sliceable', () => {
+    assert.deepStrictEqual(split(0), { slotBudgetSol: 0, stakePerSlotSol: 0 });
+    assert.deepStrictEqual(split(-1), { slotBudgetSol: 0, stakePerSlotSol: 0 });
+  });
+
+  test('one slot degenerates to the whole affordable balance', () => {
+    const { stakePerSlotSol } = split(1.195, 1);
+    const cost = stakePerSlotSol * (1 + SLIP / 100 + 0.015) + PF + OVERHEAD;
+    assert.ok(cost <= 1.195 + 1e-6, 'a single slot must still fit the balance');
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

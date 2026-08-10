@@ -27,7 +27,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -142,7 +142,11 @@ export class SniperEngine {
     //
     // Wallet needed: ~0.39 SOL for one position, ~1.16 SOL for three
     // concurrent. Checked loudly at arm time by preflightRealMode().
+    //
+    // With walletSplitSizing on (the default) this is only a FALLBACK — the
+    // real stake is one slot of the run budget. See computeRunBudget().
     buyAmountSol: 0.6,
+    walletSplitSizing: true,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
     // NO PRICE STOP-LOSS. Removed 2026-08-09, deliberately and permanently.
@@ -203,6 +207,14 @@ export class SniperEngine {
   // Real Wallet Balance State
   private liveWalletSolBalance = 0;
   private availableTradeSol = 0;
+
+  /**
+   * Stake per position for THIS run, fixed when the bot was armed by splitting
+   * the deployable balance into `maxActivePositions` slots. 0 means the run was
+   * armed without wallet-split sizing (or with nothing to deploy) and entries
+   * fall back to config.buyAmountSol.
+   */
+  private runSlotStakeSol = 0;
 
   // Stats & Tracking
   private consecutiveLosses = 0;
@@ -290,6 +302,49 @@ export class SniperEngine {
 
   private minBuySol(): number {
     return Math.max(0.005, Math.min(this.config.buyAmountSol, 0.01));
+  }
+
+  /**
+   * The balance this run is allowed to deploy. Real mode reads the wallet; paper
+   * uses the configured bankroll so the testbed stays usable on an unfunded key.
+   */
+  private deployableForSizing(): number {
+    return this.config.tradingMode === 'real'
+      ? this.wallet.getDeployableSol()
+      : Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
+  }
+
+  private sizingPriorityFee(): number {
+    return featureFlags.get('dynamicPriorityFee')
+      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
+      : this.config.priorityFeeSol;
+  }
+
+  /**
+   * Divides the run's deployable balance into `maxActivePositions` equal slots.
+   *
+   * Snapshotted at arm time into `runSlotStakeSol` and deliberately NOT
+   * recomputed per entry: recomputing would shrink slots 2 and 3 after slot 1
+   * lost money, which is the opposite of the intended risk model — three
+   * independent bets, each survivable at a total loss.
+   *
+   * The router's conviction multiplier is NOT applied on top. A slot already IS
+   * the per-trade risk unit, and halving it reintroduces the measured zero-trade
+   * bug: the full-unit score band is 71 while the highest score seen across
+   * 3,635 real candidates is 66, so every entry would take the half and land
+   * above maxBreakevenPct. Conviction belongs in the decision to enter, not in
+   * shaving an already-sized bet.
+   */
+  private computeRunBudget(): { deployableSol: number; slots: number; slotBudgetSol: number; stakePerSlotSol: number } {
+    const deployableSol = this.deployableForSizing();
+    const slots = Math.max(1, Math.min(this.config.maxActivePositions, 20));
+    const { slotBudgetSol, stakePerSlotSol } = splitWalletIntoSlots({
+      deployableSol,
+      slots,
+      maxSlippagePct: this.config.maxSlippagePct,
+      priorityFeeSol: this.sizingPriorityFee(),
+    });
+    return { deployableSol, slots, slotBudgetSol, stakePerSlotSol };
   }
 
   /**
@@ -449,6 +504,26 @@ export class SniperEngine {
 
       this.config.isBotActive = true;
       this.killSwitchTripped = false;
+
+      // Carve the run budget ONCE, here. Every entry this run stakes one slot,
+      // so a position that goes to zero costs exactly 1/N of the run and leaves
+      // the other slots at full size.
+      if (this.config.walletSplitSizing) {
+        const budget = this.computeRunBudget();
+        this.runSlotStakeSol = budget.stakePerSlotSol;
+        if (this.runSlotStakeSol > 0) {
+          const be = breakevenPct(this.runSlotStakeSol, this.config.priorityFeeSol);
+          this.log('info',
+            `💰 RUN BUDGET: ${budget.deployableSol.toFixed(4)} SOL split into ${budget.slots} slots — ` +
+            `${this.runSlotStakeSol.toFixed(4)} SOL staked per position (${budget.slotBudgetSol.toFixed(4)} SOL all-in per slot, ` +
+            `breakeven ${be}%). A position going to zero costs 1/${budget.slots} of the run.`);
+        } else {
+          this.log('warn', `⚠️ Wallet-split sizing found nothing deployable — entries fall back to the fixed ${this.config.buyAmountSol} SOL stake.`);
+        }
+      } else {
+        this.runSlotStakeSol = 0;
+      }
+
       if (featureFlags.get('playbookRouting') || featureFlags.get('devSellStop')) {
         this.curveWatcher.start();
       }
@@ -466,6 +541,10 @@ export class SniperEngine {
       this.config.isBotActive = false;
       this.unsubscribeStream();
       realModeLock.release();
+      // The budget belongs to the run. Clearing it means the next START re-reads
+      // the wallet and re-splits, rather than staking slots sized for a balance
+      // this run has since spent.
+      this.runSlotStakeSol = 0;
       this.log('warn', '⏸️ SMART SNIPER BOT PAUSED. Automatic buying disabled.');
       this.finishRun();
     }
@@ -641,19 +720,23 @@ export class SniperEngine {
    * path uses — so the dashboard figure and the real order can never disagree.
    */
   private getSizingPreview(): BotStatusResponse['sizing'] {
-    const deployableSol = this.config.tradingMode === 'real'
-      ? this.wallet.getDeployableSol()
-      : Number((this.currentBankrollUsd / (this.config.solPriceUsd || 200)).toFixed(4));
+    const deployableSol = this.deployableForSizing();
+    const sizingPriorityFeeSol = this.sizingPriorityFee();
 
-    const sizingPriorityFeeSol = featureFlags.get('dynamicPriorityFee')
-      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
-      : this.config.priorityFeeSol;
-
-    // The configured stake, clamped to what the balance can actually fund —
-    // exactly what the buy path computes.
-    const nextBuySol = this.config.tradingMode === 'real' && deployableSol > 0
-      ? affordableStakeSol(this.config.buyAmountSol, deployableSol, this.config.maxSlippagePct, sizingPriorityFeeSol)
-      : this.config.buyAmountSol;
+    // With wallet-split sizing the stake is one slot of the run budget. While
+    // the bot is armed that is the snapshot taken at arm time, so the dashboard
+    // shows what the next order will REALLY stake rather than what a fresh
+    // split would produce from a balance that has since moved.
+    let nextBuySol: number;
+    if (this.config.walletSplitSizing) {
+      nextBuySol = this.config.isBotActive && this.runSlotStakeSol > 0
+        ? this.runSlotStakeSol
+        : this.computeRunBudget().stakePerSlotSol;
+    } else {
+      nextBuySol = this.config.tradingMode === 'real' && deployableSol > 0
+        ? affordableStakeSol(this.config.buyAmountSol, deployableSol, this.config.maxSlippagePct, sizingPriorityFeeSol)
+        : this.config.buyAmountSol;
+    }
 
     // How many entries of this size the budget actually funds. Each one costs
     // the stake plus its priority fee plus base fees and ATA rent, so dividing
@@ -1573,14 +1656,16 @@ export class SniperEngine {
 
     // Size against the worst-case priority fee: with dynamicPriorityFee the
     // actual fee is resolved later and may exceed the static config value.
-    const sizingPriorityFeeSol = featureFlags.get('dynamicPriorityFee')
-      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
-      : this.config.priorityFeeSol;
+    const sizingPriorityFeeSol = this.sizingPriorityFee();
 
-    let unitSizeSol = computeEntrySizeSol({
-      buyAmountSol: this.config.buyAmountSol,
-      sizeMultiplier,
-    });
+    // One slot of the run budget, carved at arm time. The conviction multiplier
+    // is deliberately not applied — see computeRunBudget().
+    let unitSizeSol = this.runSlotStakeSol > 0
+      ? this.runSlotStakeSol
+      : computeEntrySizeSol({
+          buyAmountSol: this.config.buyAmountSol,
+          sizeMultiplier,
+        });
 
     // Never order more than the balance can actually fund, fees and the
     // slippage buffer included.
@@ -2016,34 +2101,60 @@ export class SniperEngine {
    */
   public preflightRealMode(): { ok: boolean; reasons: string[]; stakeSol: number; breakevenPct: number; requiredSol: number } {
     const reasons: string[] = [];
-    const sizingPriorityFeeSol = featureFlags.get('dynamicPriorityFee')
-      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
-      : this.config.priorityFeeSol;
-
-    const halfUnitSol = this.config.buyAmountSol * 0.5;
-    const be = breakevenPct(halfUnitSol, this.config.priorityFeeSol);
+    const sizingPriorityFeeSol = this.sizingPriorityFee();
     const maxBe = this.config.maxBreakevenPct ?? 6;
-
-    if (featureFlags.get('enforceTradeEconomics') && be > maxBe) {
-      const neededFull = Math.ceil((2 * (sizingPriorityFeeSol * 2 + 0.00203928 + 0.00001)) / ((maxBe / 100) - 0.03) * 100) / 100;
-      reasons.push(
-        `position size too small. The router sizes a half unit (${halfUnitSol.toFixed(4)} SOL of your ${this.config.buyAmountSol} SOL unit), whose round-trip cost is ${be}% — above the ${maxBe}% limit, so EVERY candidate would be refused. Raise buyAmountSol to about ${neededFull} SOL, or lower priorityFeeSol.`
-      );
-    }
-
-    // What the balance must hold to fund one half-unit order: stake x
-    // (1 + slippage + protocol fees) + priority fee + overhead + the gas float.
-    const requiredPerPosition = halfUnitSol * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
-    const requiredSol = Number((requiredPerPosition + 0.005).toFixed(4));
     const deployable = this.wallet.getDeployableSol();
 
-    if (deployable > 0 && deployable < requiredPerPosition) {
+    // What the next entry would actually stake: one slot of the run budget with
+    // wallet-split sizing, otherwise the router's half unit.
+    const budget = this.computeRunBudget();
+    const stakeSol = this.config.walletSplitSizing
+      ? budget.stakePerSlotSol
+      : this.config.buyAmountSol * 0.5;
+    const be = stakeSol > 0 ? breakevenPct(stakeSol, this.config.priorityFeeSol) : 0;
+
+    // Smallest stake whose round-trip cost fits the limit: fixed costs are
+    // 2 priority fees + 2 base fees + ATA rent, variable is 3% of stake.
+    const fixedSol = sizingPriorityFeeSol * 2 + 0.00001 * 2 + 0.00203928;
+    const minEconomicStake = (maxBe / 100) > 0.03 ? fixedSol / ((maxBe / 100) - 0.03) : Infinity;
+
+    if (stakeSol <= 0) {
       reasons.push(
-        `wallet cannot fund one position. Deployable ${deployable.toFixed(4)} SOL, need ${requiredPerPosition.toFixed(4)} SOL for a ${halfUnitSol.toFixed(4)} SOL stake at ${this.config.maxSlippagePct}% slippage (fund ~${requiredSol} SOL for one position, ~${(requiredPerPosition * this.config.maxActivePositions + 0.005).toFixed(2)} SOL for ${this.config.maxActivePositions} concurrent).`
+        this.config.walletSplitSizing
+          ? `nothing deployable to split. Deployable ${deployable.toFixed(4)} SOL across ${budget.slots} slots leaves no fundable stake.`
+          : `computed stake is zero.`
+      );
+    } else if (featureFlags.get('enforceTradeEconomics') && be > maxBe) {
+      if (this.config.walletSplitSizing) {
+        // Per slot the wallet must hold the stake plus its own buffer; scale up
+        // by the slot count for the whole run, plus the gas float.
+        const neededWallet = minEconomicStake * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
+        reasons.push(
+          `each slot is too small to trade economically. ${deployable.toFixed(4)} SOL split ${budget.slots} ways stakes ` +
+          `${stakeSol.toFixed(4)} SOL per position, a ${be}% round trip — above the ${maxBe}% limit, so EVERY candidate would be refused. ` +
+          `Fund ~${(neededWallet * budget.slots + 0.005).toFixed(2)} SOL for ${budget.slots} slots, or lower maxActivePositions.`
+        );
+      } else {
+        reasons.push(
+          `position size too small. The router sizes a half unit (${stakeSol.toFixed(4)} SOL of your ${this.config.buyAmountSol} SOL unit), ` +
+          `whose round-trip cost is ${be}% — above the ${maxBe}% limit, so EVERY candidate would be refused. ` +
+          `Raise buyAmountSol to about ${(minEconomicStake * 2).toFixed(2)} SOL, or lower priorityFeeSol.`
+        );
+      }
+    }
+
+    // What the balance must hold to fund one order: stake x (1 + slippage +
+    // protocol fees) + priority fee + overhead + the gas float.
+    const requiredPerPosition = stakeSol * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
+    const requiredSol = Number((requiredPerPosition + 0.005).toFixed(4));
+
+    if (stakeSol > 0 && deployable > 0 && deployable < requiredPerPosition) {
+      reasons.push(
+        `wallet cannot fund one position. Deployable ${deployable.toFixed(4)} SOL, need ${requiredPerPosition.toFixed(4)} SOL for a ${stakeSol.toFixed(4)} SOL stake at ${this.config.maxSlippagePct}% slippage.`
       );
     }
 
-    return { ok: reasons.length === 0, reasons, stakeSol: halfUnitSol, breakevenPct: be, requiredSol };
+    return { ok: reasons.length === 0, reasons, stakeSol, breakevenPct: be, requiredSol };
   }
 
   /** Immediate manual stop for the API: pause entries, keep positions. */

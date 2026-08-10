@@ -184,6 +184,37 @@ export function affordableStakeSol(
   return Math.min(requestedSol, ceiling);
 }
 
+/**
+ * Splits a run's deployable balance into N equal, independently survivable
+ * slots — the owner's risk model: "if a trade goes to 0 it's fine", because a
+ * dead slot costs 1/N of the run, never the wallet.
+ *
+ * `slotBudgetSol` is the ALL-IN allowance for one slot: the stake plus its own
+ * slippage buffer, protocol fees, priority fee and rent. `stakePerSlotSol` is
+ * what the order may actually ask for. Dividing the balance by N and staking
+ * that directly would overdraft, because a buy reserves stake x (1 + slippage)
+ * plus fees on top — the exact failure that made every all-in order fail
+ * on-chain with "Transfer: insufficient lamports".
+ *
+ * The budget is snapshotted at arm time and NOT recomputed as the balance moves.
+ * That is the point: a slot that goes to zero must not shrink the two beside it.
+ */
+export function splitWalletIntoSlots(params: {
+  deployableSol: number;
+  slots: number;
+  maxSlippagePct: number;
+  priorityFeeSol: number;
+}): { slotBudgetSol: number; stakePerSlotSol: number } {
+  const { deployableSol, slots, maxSlippagePct, priorityFeeSol } = params;
+  if (!(deployableSol > 0) || !(slots >= 1)) return { slotBudgetSol: 0, stakePerSlotSol: 0 };
+  const slotBudgetSol = deployableSol / slots;
+  const stakePerSlotSol = maxAffordableBuySol(slotBudgetSol, maxSlippagePct, priorityFeeSol);
+  return {
+    slotBudgetSol: Number(slotBudgetSol.toFixed(6)),
+    stakePerSlotSol,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Exit-policy predicates.
 //

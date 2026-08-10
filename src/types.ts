@@ -196,6 +196,13 @@ export interface BotConfig {
   leniencyMode: LeniencyMode;
   activePlaybook: PlaybookType | 'ALL';
   buyAmountSol: number;
+  /**
+   * Split the run's deployable balance into `maxActivePositions` equal slots at
+   * arm time, and stake one slot per entry, instead of using the fixed
+   * `buyAmountSol`. The budget is fixed for the run, so a slot that goes to zero
+   * costs 1/N and does not shrink the others.
+   */
+  walletSplitSizing: boolean;
   takeProfitPct: number;
   takeProfitRung2Pct: number;
   /**
