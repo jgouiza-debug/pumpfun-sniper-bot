@@ -3,14 +3,27 @@
   "version": "1.0.0",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "main": "dist/index.js",
+  "bin": "dist/server.js",
   "scripts": {
-    "build": "tsc && vite build",
+    "build": "vite build && tsc",
+    "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets node18-win-x64 --output dist-exe/pumpfun-sniper-bot.exe",
     "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
     "server": "tsc && node --use-system-ca --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
     "dev": "node --use-system-ca --env-file-if-exists=.env -r ts-node/register src/server.ts",
     "test": "ts-node src/tests/run.ts",
     "replay": "ts-node src/replay.ts"
+  },
+  "pkg": {
+    "scripts": "dist/**/*.js",
+    "assets": [
+      "dist/**/*",
+      ".env"
+    ],
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist-exe"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.0",

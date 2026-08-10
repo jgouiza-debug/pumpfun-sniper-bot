@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BotConfig, BotInstanceInfo, BotStatusResponse, FilterResult, LeniencyMode, Position, TradeHistoryRecord } from './types';
+import { parseClientSecretKey, getStoredClientKey, saveStoredClientKey, clearStoredClientKey, fetchOnChainWalletInfo, ClientWalletInfo } from './services/clientWallet';
 
 // A txid proves execution only when it's a real signature — paper fills carry
 // a sim_ prefix and never touched the chain.
@@ -167,7 +168,46 @@ export function App() {
     }
   };
 
-  const wallet = botStatus?.wallet;
+  // Client-side browser wallet for multi-user web/exe execution
+  const [clientWallet, setClientWallet] = useState<ClientWalletInfo | null>(null);
+
+  useEffect(() => {
+    const savedKey = getStoredClientKey();
+    if (savedKey) {
+      const kp = parseClientSecretKey(savedKey);
+      if (kp) {
+        const pubkey = kp.publicKey.toBase58();
+        setClientWallet({
+          linked: true,
+          address: pubkey,
+          shortAddress: `${pubkey.slice(0, 4)}...${pubkey.slice(-4)}`,
+          solBalance: 0,
+          usdBalance: 0,
+          deployableSol: 0,
+          rpcHealthy: true,
+          source: 'client_browser',
+          privateKey: savedKey,
+        });
+        fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170).then(info => {
+          setClientWallet(prev => prev ? { ...prev, ...info } : null);
+        });
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!clientWallet?.privateKey) return;
+    const interval = setInterval(async () => {
+      const kp = parseClientSecretKey(clientWallet.privateKey!);
+      if (kp) {
+        const info = await fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170);
+        setClientWallet(prev => prev ? { ...prev, ...info } : null);
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [clientWallet?.privateKey, botStatus?.config?.solPriceUsd]);
+
+  const wallet = clientWallet || botStatus?.wallet;
   const run = botStatus?.run;
   const sizing = botStatus?.sizing;
 
@@ -201,60 +241,72 @@ export function App() {
       return;
     }
 
-    const portsToTry = [selectedPort, 3001, 3002];
-    let lastError = '';
+    const kp = parseClientSecretKey(rawInput);
+    if (!kp) {
+      setWalletError('Could not parse that key. Photon exports a base58 string; a JSON byte array or 128-char hex also work.');
+      return;
+    }
 
+    const pubkey = kp.publicKey.toBase58();
+    if (walletPersist) {
+      saveStoredClientKey(rawInput);
+    } else {
+      clearStoredClientKey();
+    }
+
+    const info = await fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170);
+    setClientWallet({
+      linked: true,
+      address: pubkey,
+      shortAddress: `${pubkey.slice(0, 4)}...${pubkey.slice(-4)}`,
+      solBalance: info.solBalance,
+      usdBalance: info.usdBalance,
+      deployableSol: info.deployableSol,
+      rpcHealthy: info.rpcHealthy,
+      source: 'client_browser',
+      privateKey: rawInput,
+    });
+    setWalletKeyInput('');
+
+    const portsToTry = [selectedPort, 3001, 3002];
     for (const port of portsToTry) {
       try {
-        const res = await fetch(`http://localhost:${port}/api/wallet/link`, {
+        await fetch(`http://localhost:${port}/api/wallet/link`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ privateKey: rawInput, persist: walletPersist }),
         });
-
-        if (res.status === 404) {
-          lastError = 'This server build has no /api/wallet/link endpoint. Restart backend server.';
-          continue;
-        }
-
-        let data: any;
-        try {
-          data = await res.json();
-        } catch {
-          lastError = `Server returned invalid non-JSON response (HTTP ${res.status}).`;
-          continue;
-        }
-
-        if (res.ok && data.ok) {
-          setWalletKeyInput('');
-          setWalletError('');
-          return;
-        } else {
-          lastError = data?.error || `Link failed (HTTP ${res.status}).`;
-        }
-      } catch (err) {
-        lastError = `Cannot reach backend API server. Ensure server daemon is running.`;
-      }
+      } catch { /* client mode active */ }
     }
-
-    setWalletError(lastError || 'Link failed. Check your private key format.');
   };
 
   const refreshWallet = async () => {
+    if (clientWallet?.privateKey) {
+      const kp = parseClientSecretKey(clientWallet.privateKey);
+      if (kp) {
+        const info = await fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170);
+        setClientWallet(prev => prev ? { ...prev, ...info } : null);
+      }
+    }
     try {
       await fetch(`${API_BASE}/api/wallet/refresh`, { method: 'POST' });
-    } catch { /* status poll will show staleness */ }
+    } catch { /* status poll covers us */ }
   };
 
   const unlinkWallet = async () => {
-    try {
-      await fetch(`${API_BASE}/api/wallet/unlink`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deleteFile: true }),
-      });
-      setWalletError('');
-    } catch { /* ignore */ }
+    clearStoredClientKey();
+    setClientWallet(null);
+    setWalletError('');
+    const portsToTry = [selectedPort, 3001, 3002];
+    for (const port of portsToTry) {
+      try {
+        await fetch(`http://localhost:${port}/api/wallet/unlink`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deleteFile: true }),
+        });
+      } catch { /* best effort */ }
+    }
   };
 
   // Pull the last completed run report whenever the bot transitions to stopped.
@@ -1151,6 +1203,20 @@ export function App() {
                 </div>
               </div>
 
+              {/* Helius Dedicated RPC API Key Input */}
+              <div className="form-group" style={{ marginTop: '10px' }}>
+                <label className="form-label">Helius Dedicated RPC Key</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="Paste your Helius API Key (Leave empty for universal default)"
+                  value={configForm.heliusApiKey || ''}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, heliusApiKey: e.target.value })}
+                />
+                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px' }}>
+                  Your personal Helius API key for dedicated RPC transaction landing. Universal key active by default.
+                </div>
+              </div>
 
               {/* Photon Wallet Link — real on-chain execution */}
               <div className="form-group" style={{ border: '1px solid rgba(255,255,255,0.14)', padding: 12, marginTop: '6px' }}>

@@ -18,3 +18,4 @@ reports/
 flags.json
 meme-coin-finder-app/
 .vercel
+dist-exe/
