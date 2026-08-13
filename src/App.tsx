@@ -579,6 +579,26 @@ export function App() {
     }
   };
 
+  /**
+   * Erase a credential saved from Settings.
+   *
+   * Needs its own call rather than clearing the input: a blank key field means
+   * "keep the stored one" (the status endpoint never returns a key, so every
+   * save posts it empty), so erasing has to be stated explicitly.
+   */
+  const handleForgetKey = async (field: 'heliusApiKey' | 'pumpPortalApiKey') => {
+    if (!window.confirm(`Forget the saved ${field === 'heliusApiKey' ? 'Helius' : 'PumpPortal'} key?\n\nThe bot will fall back to the .env value, or to no key at all.`)) return;
+    try {
+      await apiFetch(`http://localhost:${selectedPort}/api/bot/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forgetStoredKeys: [field] })
+      });
+    } catch (err) {
+      console.error('Forget key error:', err);
+    }
+  };
+
   // Spawn New Bot Instance
   const handleAddInstance = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1433,7 +1453,30 @@ export function App() {
                 <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px' }}>
                   Free tier at helius.dev. Used for every RPC call, position pricing and transaction submission.
                   There is no built-in key — each user supplies their own.
+                  {' '}Keys entered here are saved to <code>.api-keys.json</code> beside the app and reused on the next start.
                 </div>
+                {/* Which source won matters: a saved key outranks .env, so
+                    editing .env and seeing no change needs an explanation. */}
+                {botStatus?.config?.heliusApiKeySet && (
+                  <div style={{ fontSize: '8px', marginTop: '3px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span style={{ color: 'var(--ink-muted)' }}>
+                      source: {botStatus.config.heliusApiKeySource === 'stored'
+                        ? 'saved in Settings (takes precedence over .env)'
+                        : 'environment / .env'}
+                    </span>
+                    {botStatus.config.heliusApiKeySource === 'stored' && (
+                      <button type="button" className="btn-ghost" style={{ fontSize: '8px', padding: '1px 5px' }}
+                        onClick={() => void handleForgetKey('heliusApiKey')}>
+                        Forget saved key
+                      </button>
+                    )}
+                  </div>
+                )}
+                {!botStatus?.config?.heliusApiKeySet && (
+                  <div style={{ fontSize: '8px', marginTop: '3px', color: '#ff9100' }}>
+                    Running on the public RPC endpoint — heavily rate limited. Positions can still be priced and sold, but snipes will lose races.
+                  </div>
+                )}
               </div>
 
               <div className="form-group" style={{ marginTop: '10px' }}>

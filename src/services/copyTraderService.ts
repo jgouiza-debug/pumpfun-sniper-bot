@@ -11,6 +11,7 @@ import {
   TrackedWalletPublic,
 } from '../types';
 import { sniperEngine } from './sniperEngine';
+import { rpcEndpoint, connectionConfig } from './rpcHealth';
 import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
 import { DexScreenerService } from './dexscreenerService';
 
@@ -103,8 +104,11 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // 0 = copy EVERY buy, which is the whole point of a wallet copier. Raise it
   // only to deliberately ignore the leader's dust.
   minLeaderBuySol: 0,
-  // INERT since 2026-08-12: no automatic sells of any kind. Kept so old saved
-  // configs still load.
+  // Live again since 2026-08-13 (see onLeaderSell). ON by default because a
+  // copy position whose leader has left is a position with no thesis behind
+  // it — the whole reason it was opened was that the leader was in it.
+  // 'mirror' sells the same fraction they did; 'full' exits completely on any
+  // leader sell. Set copySells false to hold through their exit instead.
   copySells: true,
   sellMode: 'mirror',
   // OFF: a leader adding to a bag adds to ours (DCA mirror) instead of being
@@ -134,6 +138,8 @@ export class CopyTraderService {
   // Helius on-chain watcher
   private heliusConn: Connection | null = null;
   private heliusKeyInUse: string | null = null;
+  /** Latches the no-key warning so it is stated once per start, not per poll. */
+  private warnedNoHeliusKey = false;
   /** onLogs subscription id per tracked wallet address. */
   private logSubs = new Map<string, number>();
 
@@ -346,12 +352,24 @@ export class CopyTraderService {
     if (!addresses.length) return;
 
     const key = sniperEngine.getConfig().heliusApiKey || process.env.HELIUS_API_KEY || '';
-    if (!key) return;
+    if (!key) {
+      // Silent `return` here was half of "the copy trader never sells". With no
+      // Helius key this lane simply did not start, and the other lane
+      // (subscribeAccountTrade) delivers nothing on the free PumpPortal tier —
+      // so BOTH sources of a leader-sell signal were dead and the feed showed
+      // no error at all. Say it once, loudly, per start.
+      if (!this.warnedNoHeliusKey) {
+        this.warnedNoHeliusKey = true;
+        console.warn('[CopyTrader] ⚠️ No Helius key — the on-chain wallet watcher cannot start. Combined with the free PumpPortal tier this means NO leader buy or sell will ever be seen. Add a Helius key in Settings.');
+      }
+      return;
+    }
+    this.warnedNoHeliusKey = false;
 
     // Rebuild the connection when the operator changed the key in settings.
     if (!this.heliusConn || this.heliusKeyInUse !== key) {
       this.stopHeliusWatcher();
-      this.heliusConn = new Connection(`https://mainnet.helius-rpc.com/?api-key=${key}`, 'confirmed');
+      this.heliusConn = new Connection(rpcEndpoint(key), connectionConfig());
       this.heliusKeyInUse = key;
     }
 
@@ -852,10 +870,17 @@ export class CopyTraderService {
   }
 
   /**
-   * AUTO-SELLS REMOVED 2026-08-12, owner decision: the bot never sells on its
-   * own — not even to mirror the leader. A leader sell is surfaced in the feed
-   * as a signal (with the exact fraction they dumped) so the owner can decide;
-   * the only sell path left is the manual button (manualSellPosition).
+   * Mirrors a leader's exit, when `copySells` says to.
+   *
+   * HISTORY, because this reversed twice: auto-sells were stripped out
+   * entirely on 2026-08-12 — `copySells` and `sellMode` stayed in the config
+   * purely so old saved files still parsed, and this method only ever wrote a
+   * "HOLDING" line to the feed. Restored 2026-08-13 as a toggle, per the
+   * owner's exits model: an auto-sell is a setting, and it fires on EVIDENCE
+   * rather than on price. A tracked leader dumping their bag is evidence —
+   * it is not a stop-loss, and nothing here reacts to the price falling.
+   *
+   * `copySells: false` returns the previous behaviour exactly.
    */
   private async onLeaderSell(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
     const pos = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
@@ -867,9 +892,8 @@ export class CopyTraderService {
       return;
     }
 
-    // Exact sell fraction from the leader's post-trade balance, for the
-    // signal's wording only. Both feeds supply it: PumpPortal as
-    // newTokenBalance, Helius from post balances.
+    // Exact sell fraction from the leader's post-trade balance. Both feeds
+    // supply it: PumpPortal as newTokenBalance, Helius from post balances.
     let fraction = 1;
     const sold = sig.tokenAmount;
     const remaining = sig.remainingTokens;
@@ -877,11 +901,38 @@ export class CopyTraderService {
       fraction = sold / (sold + remaining);
     }
 
-    wallet.skippedSignals++;
-    this.pushFeed(wallet, sig, 'skipped',
-      `${fraction >= 0.999
-        ? `Leader ${wallet.nickname} EXITED FULLY`
-        : `Leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}% of their bag`} — HOLDING (auto-sells removed; sell manually if you want out).`);
+    const exitedFully = fraction >= 0.999;
+    const describeLeader = exitedFully
+      ? `Leader ${wallet.nickname} EXITED FULLY`
+      : `Leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}% of their bag`;
+
+    if (!this.config.copySells) {
+      wallet.skippedSignals++;
+      this.pushFeed(wallet, sig, 'skipped',
+        `${describeLeader} — HOLDING (copy-sells are off; sell manually if you want out).`);
+      return;
+    }
+
+    // 'mirror' matches their exit proportionally; 'full' treats any leader sell
+    // as the exit signal and closes the whole position.
+    const sellFraction = this.config.sellMode === 'full' ? 1 : fraction;
+    if (sellFraction <= 0) {
+      this.pushFeed(wallet, sig, 'skipped', `${describeLeader} — no measurable fraction to mirror.`);
+      return;
+    }
+
+    this.pushFeed(wallet, sig, 'copied',
+      `${describeLeader} — mirroring ${(sellFraction * 100).toFixed(0)}% exit.`);
+
+    await this.closePosition(
+      pos,
+      sellFraction,
+      exitedFully && this.config.sellMode !== 'full'
+        ? `leader ${wallet.nickname} exited fully`
+        : `leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}%`,
+      sig,
+      wallet
+    );
   }
 
   /**

@@ -7,6 +7,8 @@
   "scripts": {
     "build": "vite build && tsc",
     "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets host --output dist-exe/pumpfun-sniper-bot.exe",
+    "build:mac": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-arm64 --output dist-exe/pumpfun-sniper-bot-macos-arm64",
+    "build:mac-intel": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-x64 --output dist-exe/pumpfun-sniper-bot-macos-x64",
     "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
     "server": "tsc && node --use-system-ca --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
@@ -21,6 +23,7 @@
     "assets": [
       "dist/**/*"
     ],
+    "//targets": "Windows stays on node18 (its prebuilt base exists and the shipped exe is built from it). macOS uses node22 because there is NO prebuilt node18-macos-arm64 base — pkg 404s and then tries to compile from source. Only the win target is listed here so a bare `pkg .` keeps building the Windows exe; the mac binaries come from build:mac / build:mac-intel, and arm64 must be produced ON macOS (see .github/workflows/release.yml).",
     "targets": [
       "node18-win-x64"
     ],

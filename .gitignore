@@ -17,6 +17,9 @@ reports/
 # Bearer token for the local API. Per-install, regenerated if deleted.
 .api-token
 
+# Helius / PumpPortal keys saved from UI Settings. Per-install credentials.
+.api-keys.json
+
 # Per-machine feature flag state (toggled via /api/flags)
 flags.json
 

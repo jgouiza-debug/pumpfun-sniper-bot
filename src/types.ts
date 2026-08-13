@@ -372,8 +372,23 @@ export interface BotConfig {
   // broadcast on every poll. ---
   heliusApiKeySet?: boolean;
   heliusApiKeyHint?: string;
+  /**
+   * Where the live key came from: 'stored' is the one saved from Settings
+   * (.api-keys.json), 'env' is HELIUS_API_KEY / .env, 'none' means the bot is
+   * on the rate-limited public endpoint. Reported because a stored key
+   * outranks .env, so an operator who edits .env and sees no change has to be
+   * able to see why.
+   */
+  heliusApiKeySource?: 'stored' | 'env' | 'none';
   pumpPortalApiKeySet?: boolean;
   pumpPortalApiKeyHint?: string;
+  /**
+   * Write-only signal from the UI: names credentials to erase from disk.
+   * Erasing needs its own field because a blank key input already means
+   * "leave it alone" — the status endpoint never returns a key, so every save
+   * posts the field empty.
+   */
+  forgetStoredKeys?: Array<'heliusApiKey' | 'pumpPortalApiKey'>;
   bankrollUsd: number;
   instanceName?: string;
   instancePort?: number;

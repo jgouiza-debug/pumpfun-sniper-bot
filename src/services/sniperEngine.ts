@@ -37,6 +37,7 @@ import { devSellMonitor } from './devSellMonitor';
 import { CurveWatcher, CurveUpdate } from './curveWatcher';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
 import { rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth } from './rpcHealth';
+import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } from './keyStore';
 
 /**
  * Minimum real SOL that must sit in a bonding curve before we will buy into it.
@@ -315,12 +316,13 @@ export class SniperEngine {
     // in a public repo — so every copy of the exe shipped the builder's Helius
     // credential and anyone reading the repo could spend its quota. Supply it
     // via HELIUS_API_KEY (env or the .env beside the exe) or in UI Settings,
-    // which rebuilds the RPC connection at runtime.
-    heliusApiKey: process.env.HELIUS_API_KEY || '',
+    // which rebuilds the RPC connection at runtime AND writes it to
+    // .api-keys.json so it survives the restart (see keyStore.ts).
+    heliusApiKey: resolveKey('heliusApiKey', process.env.HELIUS_API_KEY).value,
     // Per-user, entered in Settings. Never shipped with a value: it is funded
     // with the holder's own SOL, so a baked-in key would be spending one
     // person's balance for everybody who runs the exe.
-    pumpPortalApiKey: process.env.PUMPPORTAL_API_KEY || '',
+    pumpPortalApiKey: resolveKey('pumpPortalApiKey', process.env.PUMPPORTAL_API_KEY).value,
   };
 
   private marketRegime: MarketRegime = 'RISK_ON';
@@ -334,6 +336,8 @@ export class SniperEngine {
   private wsReconnectAttempt = 0;
   /** Wall-clock of the last launch/migration frame, surfaced in status. */
   private lastFeedMessageAt = 0;
+  /** Where the active Helius credential came from, reported in status. */
+  private heliusKeySource: 'stored' | 'env' | 'none' = 'none';
   private monitorInterval: NodeJS.Timeout | null = null;
   private walletSyncInterval: NodeJS.Timeout | null = null;
   private riskFilter: RiskFilter;
@@ -411,11 +415,20 @@ export class SniperEngine {
       rateLimitMs: 200,
     });
 
-    const apiKey = this.config.heliusApiKey || process.env.HELIUS_API_KEY || '';
+    const resolved = resolveKey('heliusApiKey', process.env.HELIUS_API_KEY);
+    const apiKey = this.config.heliusApiKey || resolved.value;
     this.config.heliusApiKey = apiKey;
+    this.heliusKeySource = apiKey ? (this.config.heliusApiKey === resolved.value ? resolved.source : 'stored') : 'none';
+
     if (!apiKey) {
-      console.warn('⚠️ No Helius API key. Set HELIUS_API_KEY in the .env beside the exe, or enter one in UI Settings.');
+      console.warn('⚠️ No Helius API key. Enter one in UI Settings — it is saved to .api-keys.json and reused on the next start — or set HELIUS_API_KEY in the .env beside the exe.');
       console.warn(`⚠️ Falling back to ${rpcEndpoint(apiKey)} — heavily rate limited. Open positions can still be priced and sold, but do NOT expect to win snipes on it.`);
+    } else {
+      // Which source won is worth stating: a stored key outranks .env, so an
+      // operator who edits .env and sees no change needs to be told why.
+      console.log(resolved.source === 'stored'
+        ? `🔑 Helius key loaded from ${keyStorePath()} (saved from Settings). It takes precedence over .env — delete that file to fall back.`
+        : '🔑 Helius key loaded from the environment/.env.');
     }
 
     this.solanaConnection = new Connection(rpcEndpoint(apiKey), connectionConfig());
@@ -711,9 +724,48 @@ export class SniperEngine {
     // returns a key — so every save posts them empty unless the user typed a
     // new one. Merging that empty string would wipe a working key every time
     // anyone changed an unrelated setting.
+    //
+    // Because blank is already "keep", erasing needs its own signal rather than
+    // overloading this one: `forgetStoredKeys` names the fields to drop.
+    const forget = Array.isArray((newConfig as any).forgetStoredKeys)
+      ? ((newConfig as any).forgetStoredKeys as StorableKeyField[])
+      : [];
+    delete (newConfig as any).forgetStoredKeys;
+
     for (const keyField of ['heliusApiKey', 'pumpPortalApiKey'] as const) {
       if (typeof newConfig[keyField] === 'string' && newConfig[keyField]!.trim() === '') {
         delete newConfig[keyField];
+      }
+    }
+
+    for (const keyField of forget) {
+      if (keyField !== 'heliusApiKey' && keyField !== 'pumpPortalApiKey') continue;
+      clearStoredKey(keyField);
+      delete newConfig[keyField];
+      // Fall back to whatever the environment still offers, so forgetting a
+      // stored key reveals the .env value instead of leaving nothing.
+      const envName = keyField === 'heliusApiKey' ? 'HELIUS_API_KEY' : 'PUMPPORTAL_API_KEY';
+      this.config[keyField] = (process.env[envName] || '').trim();
+      if (keyField === 'heliusApiKey') {
+        this.heliusKeySource = this.config.heliusApiKey ? 'env' : 'none';
+        this.solanaConnection = new Connection(rpcEndpoint(this.config.heliusApiKey), connectionConfig());
+        this.wallet.setConnection(this.solanaConnection);
+        resetRpcHealth();
+      }
+      this.log('info', `🔑 Forgot the saved ${keyField} — now using ${this.config[keyField] ? 'the .env value' : 'no key'}.`);
+    }
+
+    // Persist a newly supplied key so the UI path survives a restart. Before
+    // this, a key typed in Settings lived only in memory: it worked until the
+    // process ended and then silently vanished, which read as "the RPC broke".
+    for (const keyField of ['heliusApiKey', 'pumpPortalApiKey'] as const) {
+      const supplied = newConfig[keyField];
+      if (typeof supplied === 'string' && supplied.trim()) {
+        const savedToDisk = storeKey(keyField, supplied);
+        if (keyField === 'heliusApiKey') this.heliusKeySource = savedToDisk ? 'stored' : 'env';
+        this.log(savedToDisk ? 'info' : 'warn', savedToDisk
+          ? `🔑 Saved ${keyField} to ${keyStorePath()} — it will be reused automatically next start.`
+          : `🔑 ${keyField} accepted for this session only — could not write ${keyStorePath()}, so it will NOT survive a restart.`);
       }
     }
 
@@ -1081,6 +1133,7 @@ export class SniperEngine {
         pumpPortalApiKey: '',
         heliusApiKeySet: Boolean(heliusApiKey),
         heliusApiKeyHint: hint(heliusApiKey),
+        heliusApiKeySource: this.heliusKeySource,
         pumpPortalApiKeySet: Boolean(pumpPortalApiKey),
         pumpPortalApiKeyHint: hint(pumpPortalApiKey),
       } as BotConfig,

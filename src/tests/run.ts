@@ -2422,17 +2422,32 @@ console.log('\n-- No decorative settings: every BotConfig field must drive behav
   // status-only mirrors written by getStatus(), and the flag mirror that lives
   // in featureFlags. Anything else must be consumed somewhere.
   const OUTBOUND_ONLY = new Set([
-    'heliusApiKeySet', 'heliusApiKeyHint',
+    'heliusApiKeySet', 'heliusApiKeyHint', 'heliusApiKeySource',
     'pumpPortalApiKeySet', 'pumpPortalApiKeyHint',
   ]);
+
+  // The mirror image: write-only commands, acted on at the moment the config
+  // POST is handled and deliberately never persisted onto this.config — so they
+  // cannot appear as `config.<field>` by construction. Exempting them from the
+  // scrape would let a dead command sit in the API forever, so the test below
+  // proves each one is actually consumed by the engine.
+  const INBOUND_ONLY = new Set(['forgetStoredKeys']);
 
   test('BotConfig has fields at all (the scrape works)', () => {
     assert.ok(fields.length > 30, `expected a real BotConfig, parsed ${fields.length} fields`);
   });
 
+  test('write-only command fields are actually acted on', () => {
+    const engine = fs.readFileSync(path.join(root, 'services', 'sniperEngine.ts'), 'utf8');
+    for (const f of INBOUND_ONLY) {
+      assert.ok(new RegExp(`\\b${f}\\b`).test(engine),
+        `${f} is accepted by the config API but nothing in the engine acts on it`);
+    }
+  });
+
   test('every setting is read by the code that claims to honour it', () => {
     const inert = fields.filter(f => {
-      if (OUTBOUND_ONLY.has(f)) return false;
+      if (OUTBOUND_ONLY.has(f) || INBOUND_ONLY.has(f)) return false;
       const readAsConfig = new RegExp(`(config|cfg)\\.${f}\\b`).test(allSrc);
       const readAsFlag = new RegExp(`featureFlags\\.get\\('${f}'\\)`).test(allSrc);
       return !readAsConfig && !readAsFlag;
@@ -2726,6 +2741,157 @@ console.log('\n-- The 70.9%: one dropped RPC read no longer reads as unsafe --')
     const v = await inspectMintSafety(flaky as any, MINT, null);
     assert.strictEqual(v.safe, false, 'resilience must not soften the verdict');
     assert.ok(v.reasons.some((r: string) => /mint authority/i.test(r)));
+  });
+}
+
+console.log('\n-- macOS build: the updater must never install another platform\'s binary --');
+{
+  const { releaseAssetName } = require('../services/updaterService');
+  const fsm = require('fs');
+  const pathm = require('path');
+  const root = pathm.join(__dirname, '..', '..');
+
+  test('each platform resolves to its own asset', () => {
+    assert.strictEqual(releaseAssetName('win32', 'x64'), 'pumpfun-sniper-bot.exe');
+    assert.strictEqual(releaseAssetName('darwin', 'arm64'), 'pumpfun-sniper-bot-macos-arm64');
+    assert.strictEqual(releaseAssetName('darwin', 'x64'), 'pumpfun-sniper-bot-macos-x64');
+  });
+
+  test('a Mac build can never resolve to the .exe', () => {
+    // The updater overwrites the RUNNING binary with what it downloads, so a
+    // cross-platform match bricks the install rather than merely failing.
+    for (const arch of ['arm64', 'x64']) {
+      assert.ok(!releaseAssetName('darwin', arch).endsWith('.exe'),
+        'a Mac build resolving to the Windows exe would replace itself with an unrunnable file');
+    }
+    assert.notStrictEqual(releaseAssetName('darwin', 'arm64'), releaseAssetName('darwin', 'x64'));
+  });
+
+  test('the build scripts produce exactly the names the updater asks for', () => {
+    const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
+    const scripts = JSON.stringify(pkgJson.scripts);
+    for (const platform of [['darwin', 'arm64'], ['darwin', 'x64']] as Array<[string, string]>) {
+      const name = releaseAssetName(platform[0] as any, platform[1]);
+      assert.ok(scripts.includes(name),
+        `no build script outputs ${name}, so the updater would look for an asset nothing produces`);
+    }
+  });
+
+  test('macOS targets do not use the node18 base that has no prebuilt', () => {
+    // node18-macos-arm64 404s in the pkg remote cache and then falls back to
+    // building from source, which fails on a non-Mac host (measured 2026-08-13).
+    const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
+    const macScripts = [pkgJson.scripts['build:mac'], pkgJson.scripts['build:mac-intel']].join(' ');
+    assert.ok(!/node18-macos/.test(macScripts), 'node18 has no prebuilt macOS base');
+    assert.ok(/node22-macos-arm64/.test(macScripts) && /node22-macos-x64/.test(macScripts));
+  });
+
+  test('the release workflow ad-hoc signs arm64 and publishes a checksum per asset', () => {
+    const wf = fsm.readFileSync(pathm.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+    assert.ok(/runs-on:\s*macos/.test(wf), 'arm64 signing cannot run on a non-Mac runner');
+    assert.ok(/codesign --force/.test(wf),
+      'Apple Silicon refuses to execute an unsigned arm64 binary at all');
+    for (const name of ['pumpfun-sniper-bot-macos-arm64', 'pumpfun-sniper-bot-macos-x64']) {
+      assert.ok(wf.includes(`${name}.sha256`),
+        `${name} must ship a checksum — the updater refuses any release without one`);
+    }
+  });
+}
+
+console.log('\n-- API keys entered in the UI survive a restart --');
+{
+  const os = require('os');
+  const fsx = require('fs');
+  const pathx = require('path');
+
+  // keyStore resolves its path from cwd (or the exe dir when packaged), so the
+  // test drives it from a scratch directory rather than writing into the repo.
+  const scratch = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'keystore-'));
+  const originalCwd = process.cwd();
+  const store = require('../services/keyStore');
+  const { resolveKey, storeKey, clearStoredKey, loadStoredKeys } = store;
+
+  const inScratch = (fn: () => void) => {
+    process.chdir(scratch);
+    try { fn(); } finally { process.chdir(originalCwd); }
+  };
+
+  test('OLD BUG reproduced: a UI key lived only in memory, so a restart lost it', () => {
+    inScratch(() => {
+      // The old constructor read exactly this and nothing else. With no .env,
+      // a key typed into Settings could not possibly come back.
+      const restarted = process.env.NOPE_UNSET_KEY || '';
+      assert.strictEqual(restarted, '', 'nothing on disk means nothing after a restart');
+    });
+  });
+
+  test('fixed: a key saved from Settings is read back on the next start', () => {
+    inScratch(() => {
+      assert.strictEqual(storeKey('heliusApiKey', 'key-from-ui'), true);
+      assert.strictEqual(loadStoredKeys().heliusApiKey, 'key-from-ui');
+      assert.strictEqual(resolveKey('heliusApiKey', undefined).value, 'key-from-ui');
+    });
+  });
+
+  test('the saved key outranks .env, so replacing a rotated key actually sticks', () => {
+    inScratch(() => {
+      storeKey('heliusApiKey', 'fresh-key');
+      const r = resolveKey('heliusApiKey', 'dead-key-from-env');
+      assert.strictEqual(r.value, 'fresh-key');
+      assert.strictEqual(r.source, 'stored',
+        'otherwise a dead .env key silently reclaims priority every restart');
+    });
+  });
+
+  test('.env is used when nothing has been saved', () => {
+    inScratch(() => {
+      clearStoredKey('heliusApiKey');
+      const r = resolveKey('heliusApiKey', 'from-env');
+      assert.strictEqual(r.value, 'from-env');
+      assert.strictEqual(r.source, 'env');
+    });
+  });
+
+  test('no key anywhere reports none rather than a blank that looks configured', () => {
+    inScratch(() => {
+      clearStoredKey('heliusApiKey');
+      const r = resolveKey('heliusApiKey', undefined);
+      assert.strictEqual(r.value, '');
+      assert.strictEqual(r.source, 'none');
+    });
+  });
+
+  test('forgetting one key leaves the other intact', () => {
+    inScratch(() => {
+      storeKey('heliusApiKey', 'helius-1');
+      storeKey('pumpPortalApiKey', 'pump-1');
+      clearStoredKey('heliusApiKey');
+      const left = loadStoredKeys();
+      assert.strictEqual(left.heliusApiKey, undefined);
+      assert.strictEqual(left.pumpPortalApiKey, 'pump-1');
+    });
+  });
+
+  test('an empty value is never written — a blank field must not erase a key', () => {
+    inScratch(() => {
+      storeKey('heliusApiKey', 'real-key');
+      assert.strictEqual(storeKey('heliusApiKey', '   '), false);
+      assert.strictEqual(loadStoredKeys().heliusApiKey, 'real-key',
+        'blank means keep; erasing goes through forgetStoredKeys');
+    });
+  });
+
+  test('a corrupt store degrades to empty instead of stopping the bot booting', () => {
+    inScratch(() => {
+      fsx.writeFileSync(pathx.join(scratch, '.api-keys.json'), '{ not json');
+      assert.deepStrictEqual(loadStoredKeys(), {});
+      assert.strictEqual(resolveKey('heliusApiKey', 'env-key').value, 'env-key');
+    });
+  });
+
+  test('the store never lands in the repo', () => {
+    const ignored = fsx.readFileSync(pathx.join(__dirname, '..', '..', '.gitignore'), 'utf8');
+    assert.ok(/^\.api-keys\.json$/m.test(ignored), '.api-keys.json must be gitignored — it holds credentials');
   });
 }
 

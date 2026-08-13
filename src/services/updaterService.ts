@@ -4,6 +4,27 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 
+/**
+ * The release asset this build should update itself with.
+ *
+ * Must agree exactly with the names the release workflow uploads, because the
+ * updater overwrites the running binary with whatever it downloads: matching
+ * the wrong asset replaces a Mac build with a Windows one and the app never
+ * starts again.
+ */
+export function releaseAssetName(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch
+): string {
+  if (platform === 'win32') return 'pumpfun-sniper-bot.exe';
+  if (platform === 'darwin') {
+    return arch === 'arm64'
+      ? 'pumpfun-sniper-bot-macos-arm64'
+      : 'pumpfun-sniper-bot-macos-x64';
+  }
+  return `pumpfun-sniper-bot-${platform}-${arch}`;
+}
+
 export interface UpdateCheckResult {
   currentVersion: string;
   latestVersion: string;
@@ -165,12 +186,24 @@ export class UpdaterService {
       let assetSizeBytes: number | undefined;
 
       if (Array.isArray(release.assets)) {
-        const exeAsset = release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.exe'));
-        if (exeAsset?.browser_download_url) {
-          downloadUrl = exeAsset.browser_download_url;
-          assetSizeBytes = Number(exeAsset.size) || undefined;
+        // Pick the asset for THIS platform. Matching '.exe' unconditionally
+        // meant a Mac build would happily download a Windows binary, overwrite
+        // itself with it and relaunch into something that cannot execute.
+        const wanted = releaseAssetName();
+        const binAsset = release.assets.find((a: any) => a?.name === wanted)
+          // Older Windows releases predate the platform suffix.
+          ?? (process.platform === 'win32'
+            ? release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.exe'))
+            : undefined);
+
+        if (binAsset?.browser_download_url) {
+          downloadUrl = binAsset.browser_download_url;
+          assetSizeBytes = Number(binAsset.size) || undefined;
         }
-        const sumAsset = release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.sha256'));
+        // The checksum has to belong to the SAME asset, or verification either
+        // fails or, worse, passes against the wrong file.
+        const sumAsset = release.assets.find((a: any) => a?.name === `${binAsset?.name}.sha256`)
+          ?? release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.sha256'));
         if (sumAsset?.browser_download_url) checksumUrl = sumAsset.browser_download_url;
       }
 
@@ -329,8 +362,11 @@ export class UpdaterService {
     if (!check.hasUpdate) {
       return { ok: false, error: check.error || 'Already on the latest version.' };
     }
-    if (!check.downloadUrl || !check.downloadUrl.endsWith('.exe')) {
-      return { ok: false, error: 'That release has no .exe asset attached.' };
+    // The URL has to end in THIS platform's asset name. A Mac build that
+    // accepted the .exe would overwrite itself with an unrunnable binary.
+    const wantedAsset = releaseAssetName();
+    if (!check.downloadUrl || !check.downloadUrl.endsWith(wantedAsset)) {
+      return { ok: false, error: `That release has no ${wantedAsset} asset attached.` };
     }
     if (!check.checksumUrl) {
       return { ok: false, error: 'That release publishes no .sha256 checksum — refusing to install an unverified binary.' };
@@ -367,6 +403,23 @@ export class UpdaterService {
       if (!guardAfter.ok) throw new Error(guardAfter.reason || 'The bot became busy during the download.');
 
       this.setProgress({ stage: 'swapping', message: 'Installing…' });
+
+      // A file arriving over HTTP has no execute bit, and on macOS/Linux the
+      // swap would otherwise succeed and then fail to relaunch — leaving the
+      // user with a binary that cannot start and no obvious cause. Windows
+      // ignores the mode entirely.
+      if (process.platform !== 'win32') {
+        try { fs.chmodSync(newPath, 0o755); } catch { /* the spawn below will report it */ }
+        // Downloads are quarantined by Gatekeeper; without this the relaunch is
+        // blocked by a dialog the headless restart cannot answer. Best effort:
+        // absent xattr, the user clears it manually per the release notes.
+        if (process.platform === 'darwin') {
+          try {
+            spawn('xattr', ['-d', 'com.apple.quarantine', newPath], { stdio: 'ignore' }).unref();
+          } catch { /* not fatal — the binary still runs once approved */ }
+        }
+      }
+
       try { if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath); } catch { /* best effort */ }
       fs.renameSync(exePath, oldPath);
       try {
