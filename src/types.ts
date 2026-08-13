@@ -275,6 +275,20 @@ export interface BotConfig {
   poolDrainExitFraction?: number;
   /** Exit after this many consecutive ticks of collapsed buy pressure. */
   sellFlowExitTicks?: number;
+  // --- Launch snipe (Play 1, flag launchSnipe) ---
+  /**
+   * Real SOL (beyond the creator's own initial buy) that must flow into a fresh
+   * curve before the snipe fires. 0 fires the instant the create event arrives —
+   * pure block-0 entry with no confirmation at all. Momentum confirmation costs
+   * a few seconds but skips the launches nobody else buys.
+   */
+  launchSnipeMinSolInflow?: number;
+  /** Seconds after creation the snipe stays armed. Past this the token falls back to the normal Play 2 watchlist path. */
+  launchSnipeWindowSeconds?: number;
+  /** Skip launches whose creator initial buy exceeds this (dev owns the curve — their dump is the exit). */
+  launchSnipeMaxDevBuySol?: number;
+  /** Skip launches whose creator initial buy is below this (zero-commitment spam). 0 disables. */
+  launchSnipeMinDevBuySol?: number;
   maxActivePositions: number;
   priorityFeeSol: number;
   /** Hard ceiling for the dynamic priority fee (flag dynamicPriorityFee). */
@@ -284,7 +298,7 @@ export interface BotConfig {
   jitoTipSol: number;
   /** Rolling-hour realized loss (USD) that trips the kill switch (flag killSwitch). */
   maxHourlyLossUsd?: number;
-  /** Max acceptable round-trip cost as % of position size (flag enforceTradeEconomics). */
+  /** Round-trip cost guideline as % of position size (flag enforceTradeEconomics). Advisory: entries above it warn but still trade. */
   maxBreakevenPct?: number;
   solPriceUsd: number;
   privateKey?: string;
@@ -565,12 +579,12 @@ export interface BotStatusResponse {
     /** Round-trip cost as a % of the position — what a trade must beat to profit. */
     breakevenPct: number;
     /**
-     * False when this stake would be refused by the economics gate, i.e. the
-     * bot would screen forever and buy nothing. `tradesAffordable` counts what
-     * the BALANCE funds; this says whether any of them would actually be taken.
+     * False when this stake's round trip exceeds the economics guideline —
+     * every entry starts that far underwater. Advisory: trades still happen,
+     * this only says whether they begin at a structural loss.
      */
     economicsOk?: boolean;
-    /** Why no trade can be placed at this balance, if that is the case. */
+    /** Set only when the balance physically cannot fund a single order. */
     blockedReason?: string;
     /** Slots actually in use this run, after fitting to the wallet. */
     slots?: number;

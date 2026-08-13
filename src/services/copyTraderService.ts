@@ -11,11 +11,13 @@ import {
   TrackedWalletPublic,
 } from '../types';
 import { sniperEngine } from './sniperEngine';
-import { sellAmountParam } from './pipelineUtils';
+import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
 import { DexScreenerService } from './dexscreenerService';
 
 /**
- * Mirrors EVERY buy and sell of chosen leader wallets.
+ * Mirrors EVERY buy of chosen leader wallets. SELLS ARE NEVER AUTOMATIC —
+ * removed 2026-08-12, owner decision: leader sells surface in the feed as
+ * signals, and the only sell path is the manual button.
  *
  * Two signal feeds, deduplicated by transaction signature:
  *
@@ -46,9 +48,6 @@ import { DexScreenerService } from './dexscreenerService';
 const STATE_FILE = path.resolve(process.cwd(), '.copy-trader.json');
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-
-/** Fraction below which we treat a mirrored leader sell as ignorable dust. */
-const MIN_MIRROR_SELL_FRACTION = 0.05;
 
 /** Paper fills assume this much slippage vs. the leader's realized price. */
 const PAPER_SLIPPAGE_PCT = 1.5;
@@ -104,6 +103,8 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // 0 = copy EVERY buy, which is the whole point of a wallet copier. Raise it
   // only to deliberately ignore the leader's dust.
   minLeaderBuySol: 0,
+  // INERT since 2026-08-12: no automatic sells of any kind. Kept so old saved
+  // configs still load.
   copySells: true,
   sellMode: 'mirror',
   // OFF: a leader adding to a bag adds to ours (DCA mirror) instead of being
@@ -112,8 +113,7 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   maxOpenPositions: 10,
   maxSlippagePct: 25,
   perWalletCooldownSec: 0,
-  // Both OFF by default: the copied wallet's own exit is the strategy, and
-  // this bot deliberately carries no price stop-loss.
+  // INERT since 2026-08-12 — no automatic sells; exits are manual only.
   maxHoldSeconds: 0,
   takeProfitPct: 0,
 };
@@ -682,8 +682,23 @@ export class CopyTraderService {
       copySol = sig.solAmount * (this.config.proportionalPct / 100);
     }
     copySol = round4(Math.min(copySol, this.config.maxBuySol));
+
+    // Real mode: never refuse for size and never fail on-chain for size.
+    // Whatever the Photon wallet can actually fund caps the order, so even a
+    // near-empty wallet still copies the trade — just smaller.
+    let clampNote = '';
+    if (this.config.tradingMode === 'real') {
+      const deployableSol = sniperEngine.getWalletStatus().deployableSol;
+      const affordable = round4(affordableStakeSol(
+        copySol, deployableSol, this.config.maxSlippagePct, sniperEngine.getConfig().priorityFeeSol
+      ));
+      if (affordable < copySol && affordable > 0) {
+        clampNote = ` (clamped from ${copySol} SOL — all the wallet can fund)`;
+      }
+      copySol = affordable;
+    }
     if (copySol <= 0) {
-      return skip('Computed copy size is 0 SOL — check sizing settings.');
+      return skip('Computed copy size is 0 SOL — nothing deployable in the wallet.');
     }
 
     // The leader's realized price, straight from their fill; DexScreener as
@@ -726,7 +741,7 @@ export class CopyTraderService {
         fillVerified: Boolean(fill),
       });
       this.pushFeed(wallet, sig, 'copied',
-        `REAL BUY ${copySol} SOL of $${symbol}${existing ? ' (added to position)' : ''} @ ${fmtPrice(entryPriceSol)} SOL/token`,
+        `REAL BUY ${copySol} SOL of $${symbol}${existing ? ' (added to position)' : ''}${clampNote} @ ${fmtPrice(entryPriceSol)} SOL/token`,
         copySol, result.txid);
     } else {
       // Paper: fill at the leader's realized price plus a slippage haircut —
@@ -830,44 +845,37 @@ export class CopyTraderService {
     });
   }
 
+  /**
+   * AUTO-SELLS REMOVED 2026-08-12, owner decision: the bot never sells on its
+   * own — not even to mirror the leader. A leader sell is surfaced in the feed
+   * as a signal (with the exact fraction they dumped) so the owner can decide;
+   * the only sell path left is the manual button (manualSellPosition).
+   */
   private async onLeaderSell(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
     const pos = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
 
     if (!pos) {
       // Visible but cheap: the leader disposed of something we never copied
-      // (bought before tracking, airdrop, transfer-in). Nothing to mirror.
-      this.pushFeed(wallet, sig, 'skipped', 'No copy position in this mint — nothing to sell.');
+      // (bought before tracking, airdrop, transfer-in).
+      this.pushFeed(wallet, sig, 'skipped', 'No copy position in this mint — nothing held.');
       return;
     }
 
-    if (!this.config.copySells) {
-      wallet.skippedSignals++;
-      this.pushFeed(wallet, sig, 'skipped', 'Copy-sells are disabled — holding.');
-      return;
-    }
-
-    // Exact sell fraction from the leader's post-trade balance. Both feeds
-    // supply it: PumpPortal as newTokenBalance, Helius from post balances.
+    // Exact sell fraction from the leader's post-trade balance, for the
+    // signal's wording only. Both feeds supply it: PumpPortal as
+    // newTokenBalance, Helius from post balances.
     let fraction = 1;
-    if (this.config.sellMode === 'mirror') {
-      const sold = sig.tokenAmount;
-      const remaining = sig.remainingTokens;
-      if (remaining !== undefined && sold > 0) {
-        fraction = sold / (sold + remaining);
-      }
-      if (fraction < MIN_MIRROR_SELL_FRACTION) {
-        wallet.skippedSignals++;
-        this.pushFeed(wallet, sig, 'skipped',
-          `Leader trimmed only ${(fraction * 100).toFixed(1)}% — below the ${MIN_MIRROR_SELL_FRACTION * 100}% mirror floor.`);
-        return;
-      }
+    const sold = sig.tokenAmount;
+    const remaining = sig.remainingTokens;
+    if (remaining !== undefined && sold > 0) {
+      fraction = sold / (sold + remaining);
     }
 
-    await this.closePosition(pos, fraction,
-      fraction >= 0.999
-        ? `Leader ${wallet.nickname} exited fully`
-        : `Leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}%`,
-      sig, wallet);
+    wallet.skippedSignals++;
+    this.pushFeed(wallet, sig, 'skipped',
+      `${fraction >= 0.999
+        ? `Leader ${wallet.nickname} EXITED FULLY`
+        : `Leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}% of their bag`} — HOLDING (auto-sells removed; sell manually if you want out).`);
   }
 
   /**
@@ -1023,7 +1031,8 @@ export class CopyTraderService {
 
   /**
    * 1s tick: DexScreener repricing for positions PumpPortal cannot see
-   * (non-pump venues), plus the optional take-profit and max-hold exits.
+   * (non-pump venues). PRICING ONLY — the take-profit and max-hold exits that
+   * lived here were removed 2026-08-12 (no automatic sells, owner decision).
    */
   private startMonitor(): void {
     if (this.monitorInterval) return;
@@ -1054,18 +1063,9 @@ export class CopyTraderService {
           .finally(() => { this.dexPollInFlight = false; });
       }
 
-      for (const pos of open) {
-        if (this.config.takeProfitPct > 0 && pos.pnlPct >= this.config.takeProfitPct) {
-          void this.closePosition(pos, 1, `Take profit hit at +${pos.pnlPct}% (target +${this.config.takeProfitPct}%)`);
-          continue;
-        }
-        if (this.config.maxHoldSeconds > 0) {
-          const heldSec = (Date.now() - pos.entryTime) / 1000;
-          if (heldSec >= this.config.maxHoldSeconds) {
-            void this.closePosition(pos, 1, `Max hold time reached (${Math.round(heldSec)}s)`);
-          }
-        }
-      }
+      // No automatic exits here — closePosition is reached only from the
+      // manual sell button. takeProfitPct / maxHoldSeconds stay in the config
+      // for compatibility but are inert.
     }, MONITOR_INTERVAL_MS);
   }
 

@@ -332,8 +332,13 @@ export class WalletService {
   /**
    * Everything that would stop this wallet from trading for real, as plain
    * sentences. Surfaced in the UI before live mode can be armed.
+   *
+   * Only physical impossibilities live here: no key, no RPC, nothing above the
+   * gas float to deploy. There is deliberately NO minimum-size blocker — owner
+   * decision 2026-08-12: whatever the wallet holds is tradeable, no matter the
+   * amount. Size economics surface as warnings, never as refusals.
    */
-  public getBlockers(minBuySol: number): string[] {
+  public getBlockers(): string[] {
     const blockers: string[] = [];
     if (!this.keypair) {
       blockers.push('No wallet linked.');
@@ -343,13 +348,11 @@ export class WalletService {
     if (this.solBalance <= 0) blockers.push('Wallet holds 0 SOL.');
     else if (this.solBalance <= this.gasFloatSol) {
       blockers.push(`Balance ${this.solBalance} SOL is at or below the ${this.gasFloatSol} SOL gas float — nothing deployable.`);
-    } else if (this.getDeployableSol() < minBuySol) {
-      blockers.push(`Deployable ${this.getDeployableSol()} SOL is below the ${minBuySol} SOL minimum buy size.`);
     }
     return blockers;
   }
 
-  public getStatus(solPriceUsd: number, minBuySol = 0.01): WalletStatus {
+  public getStatus(solPriceUsd: number): WalletStatus {
     const address = this.getAddress();
     return {
       linked: this.keypair !== null,
@@ -361,7 +364,7 @@ export class WalletService {
       deployableSol: this.getDeployableSol(),
       lastCheckedAt: this.lastCheckedAt,
       rpcHealthy: this.rpcHealthy,
-      blockers: this.getBlockers(minBuySol),
+      blockers: this.getBlockers(),
     };
   }
 }

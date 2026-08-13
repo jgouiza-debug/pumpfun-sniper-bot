@@ -630,18 +630,6 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 </div>
 
                 <div className="form-group">
-                  <label className="form-label">Leader Sell Handling</label>
-                  <select
-                    className="form-select"
-                    value={configForm.sellMode || 'mirror'}
-                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, sellMode: e.target.value as 'mirror' | 'full' })}
-                  >
-                    <option value="mirror">Mirror — sell the same fraction the leader sold</option>
-                    <option value="full">Full exit — any leader sell closes the copy</option>
-                  </select>
-                </div>
-
-                <div className="form-group">
                   <label className="form-label">Per-Wallet Cooldown (sec, 0 = off)</label>
                   <input
                     type="number" className="form-input"
@@ -649,38 +637,18 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, perWalletCooldownSec: Number(e.target.value) })}
                   />
                 </div>
+              </div>
 
-                <div className="form-group">
-                  <label className="form-label">Take Profit % (0 = off)</label>
-                  <input
-                    type="number" className="form-input"
-                    value={configForm.takeProfitPct ?? 0}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
-                  />
-                  <div className="form-help" style={{ fontSize: '8px' }}>
-                    Optional cap on top of leader exits. No price stop-loss, by design.
-                  </div>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Max Hold (sec, 0 = off)</label>
-                  <input
-                    type="number" className="form-input"
-                    value={configForm.maxHoldSeconds ?? 0}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxHoldSeconds: Number(e.target.value) })}
-                  />
-                </div>
+              {/* Leader-sell handling, take-profit and max-hold controls used to
+                  sit here. Removed 2026-08-12 with every other automatic exit. */}
+              <div style={{ marginTop: '8px', padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '9px', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
+                🚫 NO AUTOMATIC SELLS — buys are copied, sells are NOT. When a leader
+                sells, the feed shows the signal and the copy position is HELD. Take-profit
+                and max-hold timers are gone too. The ONLY exit is the SELL button on each
+                position.
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#94a3b8' }}>
-                  <input
-                    type="checkbox"
-                    checked={configForm.copySells !== false}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, copySells: e.target.checked })}
-                  />
-                  Copy leader sells (exit when they exit)
-                </label>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#94a3b8' }}>
                   <input
                     type="checkbox"

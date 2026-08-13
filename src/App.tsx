@@ -121,6 +121,11 @@ export function App() {
     activePlaybook: 'ALL',
     tradingMode: 'paper',
     leniencyMode: 'strict',
+    // Launch snipe (Play 1, flag launchSnipe) — mirror the engine defaults.
+    launchSnipeMinSolInflow: 1,
+    launchSnipeWindowSeconds: 60,
+    launchSnipeMaxDevBuySol: 5,
+    launchSnipeMinDevBuySol: 0,
     privateKey: '',
     // No baked-in key: the server supplies its configured key via /api/bot/status.
     heliusApiKey: '',
@@ -144,6 +149,7 @@ export function App() {
     localTxBuild: false,
     honeypotChecks: true,
     enforceTradeEconomics: false,
+    launchSnipe: true,
   });
 
   const fetchFlags = async (port: number) => {
@@ -872,12 +878,17 @@ export function App() {
               MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (sizing.slots || botStatus?.config?.maxActivePositions || 3))}% OF RUN)
             </div>
           )}
-          {/* The balance can fund N orders while every one of them would be
-              refused by the economics gate. Say so here rather than letting the
-              bot look armed and buy nothing. */}
-          {sizing && sizing.economicsOk === false && sizing.blockedReason && (
+          {/* blockedReason now only means the balance physically cannot fund
+              an order. Bad economics no longer block — every amount trades —
+              so they get an advisory line, not a stop sign. */}
+          {sizing && sizing.blockedReason && (
             <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(239,68,68,0.08)' }}>
               ⛔ NO TRADES POSSIBLE — {sizing.blockedReason}
+            </div>
+          )}
+          {sizing && !sizing.blockedReason && sizing.economicsOk === false && (
+            <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
+              ⚠️ ROUND-TRIP COST {sizing.breakevenPct}% — EVERY ENTRY STARTS THAT FAR UNDERWATER. TRADING ANYWAY.
             </div>
           )}
           {sizing && sizing.slotsReducedForEconomics && (
@@ -1333,32 +1344,6 @@ export function App() {
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Take Profit Target (%)</label>
-                    <input
-                      type="number"
-                      className="form-input"
-                      value={configForm.takeProfitPct}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
-                    />
-                  </div>
-
-                  <div className="form-group">
-                    <label className="form-label">Trailing Arm (x peak)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      className="form-input"
-                      value={configForm.trailingArmMultiple}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingArmMultiple: Number(e.target.value) })}
-                    />
-                    <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginTop: '3px' }}>
-                      No price stop-loss. The trailing stop is a moonbag ratchet — it
-                      arms only above this multiple, then gives back {configForm.trailingStopPct}%.
-                      Losses are cut by structural exits, not by a price floor.
-                    </div>
-                  </div>
-
-                  <div className="form-group">
                     <label className="form-label">Max Concurrent Positions</label>
                     <input
                       type="number"
@@ -1367,6 +1352,15 @@ export function App() {
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxActivePositions: Number(e.target.value) })}
                     />
                   </div>
+                </div>
+
+                {/* Take-profit and trailing-stop controls used to sit here.
+                    Removed 2026-08-12 with every other automatic exit. */}
+                <div style={{ marginTop: '8px', padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '9px', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
+                  🚫 NO AUTOMATIC SELLS — this bot never sells on its own. Take-profit,
+                  trailing stop, time stop and structural stops are all removed. Rug
+                  signals (creator dump, pool drain) are logged as warnings; the ONLY
+                  exit is the manual LIQUIDATE button on each position.
                 </div>
 
                 {/* Wallet-split sizing: the run budget is carved into equal
@@ -1386,6 +1380,63 @@ export function App() {
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, walletSplitSizing: e.target.checked })}
                   />
                 </div>
+
+                {/* Launch snipe (Play 1): enabled by the 🚀 Launch Snipe flag
+                    below; these tune WHEN it pulls the trigger. */}
+                <div style={{ marginTop: '10px' }}>
+                  <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                    🚀 Launch Snipe (Play 1)
+                  </div>
+                  <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginBottom: '6px' }}>
+                    Buys fresh launches in their first candle, next to the other snipers, skipping the
+                    slow screening entirely. Inflow 0 = buy the instant the create event arrives; otherwise
+                    wait until that much SOL from other buyers hits the curve inside the window.
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div className="form-group">
+                      <label className="form-label">Confirm Inflow (SOL, 0 = instant)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.launchSnipeMinSolInflow}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinSolInflow: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Snipe Window (seconds)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.launchSnipeWindowSeconds}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeWindowSeconds: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Max Dev Buy (SOL)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.launchSnipeMaxDevBuySol}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMaxDevBuySol: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Min Dev Buy (SOL, 0 = off)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.launchSnipeMinDevBuySol}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinDevBuySol: Number(e.target.value) })}
+                      />
+                    </div>
+                  </div>
+                </div>
               </div>
 
               {/* Feature Flags Matrix */}
@@ -1394,6 +1445,14 @@ export function App() {
                   Engine Feature Flags &amp; Guards
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🚀 Launch Snipe</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Play 1: first-candle entry, screens skipped</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.launchSnipe} onChange={e => handleToggleFlag('launchSnipe', e.target.checked)} />
+                  </div>
+
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
                       <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🛑 Dev Sell Stop</div>

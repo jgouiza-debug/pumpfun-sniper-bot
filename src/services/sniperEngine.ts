@@ -28,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, trailingStopTargetUsd, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -116,16 +116,14 @@ export interface InternalPosition extends Position {
    */
   sellBlockedByBackoff?: boolean;
   /**
-   * Set when a structural stop has fired. Survives a failed sell so the exit is
-   * retried (forced) on every subsequent tick — the alert itself latches inside
-   * DevSellMonitor and will never be raised twice.
+   * True once a structural danger (creator sell, curve/pool drain) has been
+   * logged for this position. Warnings only — automatic sells were removed
+   * 2026-08-12; the owner exits manually.
    */
-  forceExitReason?: string;
-  /** Forced-exit attempts made so far; bounded by config.maxForceExitAttempts. */
-  forceExitAttempts?: number;
-  /** True once the stranded-position error has been logged, so it logs once. */
-  strandedLogged?: boolean;
-  /** When this position first had ANY usable market data. Drives the no-data exit. */
+  structuralAlertLogged?: boolean;
+  /** True once the sell-flow collapse warning has been logged, so it logs once. */
+  sellFlowWarned?: boolean;
+  /** When this position first had ANY usable market data. Dashboard information. */
   firstMarketDataAt?: number;
   /** A full exit simulated cleanly after the fill. */
   sellPathVerified?: boolean;
@@ -133,6 +131,20 @@ export interface InternalPosition extends Position {
   honeypotConfirmed?: boolean;
   /** Legs recorded for this position so far; drives TradeHistoryRecord.legIndex. */
   legCount?: number;
+}
+
+/** A fresh create armed for a launch snipe, waiting for its inflow trigger. */
+interface PendingSnipe {
+  createdAtMs: number;
+  /** Creator's initial buy in SOL — inflow is measured beyond this. */
+  devBuySol: number;
+  /** Real SOL in the curve at creation (the dev buy), the inflow baseline. */
+  baselineRealSol: number;
+  name?: string;
+  symbol?: string;
+  creator?: string;
+  /** True when this lane owns the curve subscription (token not in the watchlist). */
+  ownsCurveSub: boolean;
 }
 
 export class SniperEngine {
@@ -161,19 +173,16 @@ export class SniperEngine {
     buyAmountSol: 0.6,
     walletSplitSizing: true,
     autoFitSlotsToWallet: true,
+    // NO AUTOMATIC SELLS OF ANY KIND. 2026-08-12, owner decision, extending
+    // the 2026-08-09 stop-loss deletion: take-profit rungs, trailing stop,
+    // time stop, no-data exit and the structural stops all no longer sell.
+    // The bot buys; only the owner sells, via the manual LIQUIDATE path.
+    //
+    // The exit-tuning fields below are kept so old saved configs still load,
+    // but they are INERT — except poolDrainExitFraction and sellFlowExitTicks,
+    // which now tune the once-per-position structural WARNINGS.
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
-    // NO PRICE STOP-LOSS. Removed 2026-08-09, deliberately and permanently.
-    // The -35% stop it replaces fired on ordinary pump.fun volatility and
-    // turned noise into realized losses; the loss side is now carried by
-    // structural exits (creator sell, curve/pool drain, sell-flow collapse)
-    // plus the time stop. Do not reintroduce a price floor here.
-    //
-    // The trailing stop survives only as a MOONBAG RATCHET: it arms at 3x, not
-    // at the old 1.3x. At 1.3x arm / 20% trail the forced exit sat at 1.04x —
-    // inside the round-trip breakeven (5.68% at 0.3 SOL), so the
-    // "profit-protecting" stop booked losses. At 3x arm / 30% trail the
-    // earliest exit is 2.1x, far above any breakeven.
     trailingArmMultiple: 3.0,
     useTrailingStop: true,
     trailingStopPct: 30,
@@ -236,6 +245,18 @@ export class SniperEngine {
     // 15 made the economics gate decorative (0.05 SOL @ 11.1% passed). 6 is
     // the audit's number: refuse any trade that needs >6% just to break even.
     maxBreakevenPct: 6,
+    // Launch snipe (Play 1, flag launchSnipe). 1 SOL of stranger inflow inside
+    // 60s: on a launch with real interest that lands within the first handful
+    // of seconds — still the first candle — while the majority of creates that
+    // nobody ever buys simply never trigger. Set the inflow to 0 for pure
+    // block-0 entry with no confirmation at all.
+    launchSnipeMinSolInflow: 1,
+    launchSnipeWindowSeconds: 60,
+    // Dev buy band. Above 5 SOL the creator owns the curve and their dump IS
+    // the chart; the floor stays 0 (off) because plenty of real launches start
+    // with a token-only dev buy.
+    launchSnipeMaxDevBuySol: 5,
+    launchSnipeMinDevBuySol: 0,
     privateKey: '',
     // Universal Helius API Key default
     heliusApiKey: process.env.HELIUS_API_KEY || 'c8547397-ee14-46c2-b10b-85a1eccbaa32',
@@ -305,6 +326,13 @@ export class SniperEngine {
   private curveWatcher: CurveWatcher;
   /** Peak real SOL seen in each held position's curve, for drain detection. */
   private curvePeakSol = new Map<string, number>();
+  /**
+   * Fresh creates armed for a launch snipe (flag launchSnipe), waiting for the
+   * configured SOL inflow to confirm someone besides the dev is buying. Keyed
+   * by mint; entries expire after launchSnipeWindowSeconds and the token falls
+   * back to the ordinary Play 2 watchlist path.
+   */
+  private pendingSnipes = new Map<string, PendingSnipe>();
 
   constructor() {
     this.riskFilter = new RiskFilter();
@@ -346,11 +374,7 @@ export class SniperEngine {
 
   /** Sanitized wallet state for the API. Never contains key material. */
   public getWalletStatus(): WalletStatus {
-    return this.wallet.getStatus(this.config.solPriceUsd, this.minBuySol());
-  }
-
-  private minBuySol(): number {
-    return Math.max(0.005, Math.min(this.config.buyAmountSol, 0.01));
+    return this.wallet.getStatus(this.config.solPriceUsd);
   }
 
   /**
@@ -538,6 +562,10 @@ export class SniperEngine {
       ['maxDailyLossUsd', 0, 1_000_000],
       ['maxConsecutiveLosses', 1, 100],
       ['maxForceExitAttempts', 1, 1000],
+      ['launchSnipeMinSolInflow', 0, 84],
+      ['launchSnipeWindowSeconds', 3, 600],
+      ['launchSnipeMaxDevBuySol', 0, 85],
+      ['launchSnipeMinDevBuySol', 0, 85],
     ];
     for (const [key, lo, hi] of bands) {
       const raw = out[key];
@@ -628,19 +656,21 @@ export class SniperEngine {
           this.config.isBotActive = false;
           return false;
         }
-        const blockers = this.wallet.getBlockers(this.minBuySol());
+        const blockers = this.wallet.getBlockers();
         if (blockers.length > 0) {
           this.log('error', `❌ Cannot start in REAL mode: ${blockers.join(' ')}`);
           this.config.isBotActive = false;
           return false;
         }
 
-        // Economics preflight. Measured 2026-08-08: an 89-minute live run
-        // screened 2,952 tokens, passed 102 and opened ZERO positions, because
-        // every candidate was silently refused by the breakeven gate — a
-        // per-token `warn` that never reaches the run report's funnel. Fail
-        // loudly here instead of looking busy for an hour and trading nothing.
+        // Economics preflight — ADVISORY since 2026-08-12, by owner decision:
+        // whatever is in the Photon wallet is tradeable no matter the amount.
+        // Bad size economics arm with a loud warning instead of a refusal; the
+        // only hard reasons left are physical (nothing deployable at all).
         const preflight = this.preflightRealMode();
+        for (const warning of preflight.warnings) {
+          this.log('warn', `⚠️ Arming anyway: ${warning}`);
+        }
         if (!preflight.ok) {
           for (const reason of preflight.reasons) this.log('error', `❌ Cannot start in REAL mode: ${reason}`);
           this.config.isBotActive = false;
@@ -717,6 +747,12 @@ export class SniperEngine {
       this.config.isBotActive = false;
       this.unsubscribeStream();
       realModeLock.release();
+      // Armed snipes die with the run — a wakeup should never fire a buy that
+      // was armed before the pause.
+      for (const [mint, pending] of this.pendingSnipes) {
+        if (pending.ownsCurveSub && !tokenWatchlist.has(mint)) this.curveWatcher.unwatch(mint);
+      }
+      this.pendingSnipes.clear();
       // The budget belongs to the run. Clearing it means the next START re-reads
       // the wallet and re-splits, rather than staking slots sized for a balance
       // this run has since spent.
@@ -939,10 +975,10 @@ export class SniperEngine {
     // exposure limit, so it always applies.
     const concurrencyCap = Math.min(affordable, this.config.maxActivePositions);
 
-    // "Affordable" is not the same as "tradeable". The balance can fund N orders
-    // while every one of them would be refused by the economics gate — which is
-    // exactly the 0.2 SOL case, and exactly how a bot screens 2,952 tokens and
-    // buys nothing while the dashboard claims 3 trades are affordable.
+    // Economics are ADVISORY since 2026-08-12: a stake whose round trip
+    // exceeds the guideline still trades, so `economicsOk: false` now means
+    // "every entry starts underwater", not "nothing will be bought". The only
+    // genuine block left is a balance that cannot fund any order at all.
     const be = nextBuySol > 0 ? breakevenPct(Number(nextBuySol.toFixed(6)), sizingPriorityFeeSol) : 0;
     const maxBe = this.config.maxBreakevenPct ?? 6;
     const enforced = featureFlags.get('enforceTradeEconomics');
@@ -951,18 +987,13 @@ export class SniperEngine {
     let blockedReason: string | undefined;
     if (nextBuySol <= 0) {
       blockedReason = `Balance ${deployableSol.toFixed(4)} SOL cannot fund a single order.`;
-    } else if (!economicsOk) {
-      blockedReason =
-        `${deployableSol.toFixed(4)} SOL across ${budgetSlots} slot${budgetSlots === 1 ? '' : 's'} stakes ` +
-        `${nextBuySol.toFixed(4)} SOL — a ${be}% round trip against the ${maxBe}% limit. Every trade would be refused.`;
     }
 
     return {
       deployableSol,
       nextBuySol: Number(nextBuySol.toFixed(4)),
       nextBuyUsd: Number((nextBuySol * this.config.solPriceUsd).toFixed(2)),
-      // Report 0 tradeable when nothing would actually be bought.
-      tradesAffordable: economicsOk ? Math.max(0, concurrencyCap) : 0,
+      tradesAffordable: Math.max(0, concurrencyCap),
       breakevenPct: be,
       economicsOk,
       blockedReason,
@@ -1281,6 +1312,16 @@ export class SniperEngine {
               tokenWatchlist.has(payload.mint)) {
             await this.handleWatchedTrade(payload, arrivalMs);
             return;
+          }
+
+          // Launch-snipe fast lane (Play 1): creates are graded on payload data
+          // alone and either bought or armed for a momentum trigger, WITHOUT
+          // the RugCheck/DexScreener round trips — those cost seconds and have
+          // nothing real to say about a seconds-old mint. Creates the lane
+          // declines fall through to the normal screen-and-watchlist path.
+          if (payload.txType === 'create' && featureFlags.get('launchSnipe')) {
+            const handled = await this.handleLaunchCreate(payload, arrivalMs);
+            if (handled) return;
           }
 
           await this.processIncomingToken(payload, arrivalMs);
@@ -1722,13 +1763,187 @@ export class SniperEngine {
   }
 
   /**
-   * Structural stop handler. The playbook ranks this above time, price and
-   * profit rules: insider exits complete in one or two transactions, so the
-   * first sell IS the event. Exit the whole position immediately — price is
-   * secondary to being out.
-   *
-   * This does NOT tighten any of the owner's chosen price/time exits; it adds
-   * an on-chain trigger that previously did not exist at all.
+   * Launch-snipe fast lane (Play 1, flag launchSnipe). Decides on the create
+   * payload alone — the only data that exists within the first second of a
+   * token's life — so entry lands in the first candle with the other snipers
+   * instead of minutes up the curve. Returns true when the lane consumed the
+   * event (bought, or armed a momentum trigger); false lets the normal
+   * screen-and-watchlist path have it.
+   */
+  private async handleLaunchCreate(payload: any, arrivalMs: number): Promise<boolean> {
+    const mint: string = payload.mint;
+    if (!this.config.isBotActive) return false;
+    if (this.pendingSnipes.has(mint)) return true;
+    if (this.activePositions.some(p => p.mint === mint)) return true;
+
+    const vSol = Number(payload.vSolInBondingCurve);
+    const vTokens = Number(payload.vTokensInBondingCurve);
+    // Without curve state there is nothing to price a fill against — let the
+    // normal path (and its screen) have it.
+    if (!isFinite(vSol) || vSol <= 0 || !isFinite(vTokens) || vTokens <= 0) return false;
+
+    const baselineRealSol = Math.max(0, vSol - 30);
+    const reportedDevBuy = Number(payload.solAmount);
+    const devBuySol = isFinite(reportedDevBuy) && reportedDevBuy > 0 ? reportedDevBuy : baselineRealSol;
+
+    // The dev-buy band is the ONLY pre-entry filter, because it is the only
+    // meaningful one the payload can answer in zero time. Everything else
+    // (holders, authorities, sell path) is either structural to pump.fun or
+    // verified post-fill by verifySellPath.
+    const maxDev = this.config.launchSnipeMaxDevBuySol ?? 5;
+    const minDev = this.config.launchSnipeMinDevBuySol ?? 0;
+    if (maxDev > 0 && devBuySol > maxDev) {
+      this.log('gate0', `🚀✗ $${payload.symbol ?? mint.slice(0, 6)} — dev bought ${devBuySol.toFixed(2)} SOL > ${maxDev} cap, snipe declined`, mint);
+      return false;
+    }
+    if (minDev > 0 && devBuySol < minDev) {
+      this.log('gate0', `🚀✗ $${payload.symbol ?? mint.slice(0, 6)} — dev bought ${devBuySol.toFixed(2)} SOL < ${minDev} floor, snipe declined`, mint);
+      return false;
+    }
+
+    const minInflow = this.config.launchSnipeMinSolInflow ?? 1;
+
+    if (minInflow <= 0) {
+      // Pure block-0: buy on arrival, zero confirmation. This is the SS-wall
+      // entry — and also the insider-dominated window; the owner opted in.
+      latencyTimeline.begin(mint, {
+        t1ArrivalMs: arrivalMs,
+        mode: this.config.tradingMode,
+        symbol: payload.symbol || undefined,
+        txType: payload.txType,
+        payload,
+      });
+      latencyTimeline.stamp(mint, 't2ParsedMs');
+      latencyTimeline.stamp(mint, 't3FiltersDoneMs'); // no filters — deliberately
+      await this.fireLaunchSnipe({
+        mint,
+        name: payload.name || undefined,
+        symbol: payload.symbol || undefined,
+        creator: payload.traderPublicKey || payload.creator || undefined,
+        vSol,
+        vTokens,
+        trigger: 'instant block-0 entry, no confirmation',
+      });
+      latencyTimeline.complete(mint);
+      return true;
+    }
+
+    // Arm the momentum trigger and watch the curve live. Watchlist enrollment
+    // mirrors the normal path so an unfired snipe degrades into an ordinary
+    // Play 2 candidate instead of vanishing.
+    this.enrollInWatchlist(payload);
+    let ownsCurveSub = false;
+    if (!this.curveWatcher.isWatching(mint)) {
+      this.curveWatcher.start();
+      if (this.curveWatcher.watch(mint)) {
+        ownsCurveSub = true;
+      } else {
+        const evicted = this.curveWatcher.evictOldest();
+        if (evicted) tokenWatchlist.remove(evicted);
+        ownsCurveSub = this.curveWatcher.watch(mint);
+      }
+    }
+    this.pendingSnipes.set(mint, {
+      createdAtMs: arrivalMs,
+      devBuySol,
+      baselineRealSol,
+      name: payload.name || undefined,
+      symbol: payload.symbol || undefined,
+      creator: payload.traderPublicKey || payload.creator || undefined,
+      ownsCurveSub,
+    });
+    this.log('gate0', `🚀 $${payload.symbol ?? mint.slice(0, 6)} armed: buying on ${minInflow} SOL inflow within ${this.config.launchSnipeWindowSeconds ?? 60}s (dev bought ${devBuySol.toFixed(2)} SOL)`, mint);
+    return true;
+  }
+
+  /**
+   * Executes a Play 1 entry NOW. Screening is deliberately absent — block-0
+   * speed and a RugCheck round trip are mutually exclusive, and the post-fill
+   * sell-path verification still runs in real mode. The shared
+   * withEntrySlot/commitEntry path keeps the position cap, sizing and
+   * economics warnings identical to every other play.
+   */
+  private async fireLaunchSnipe(args: {
+    mint: string; name?: string; symbol?: string; creator?: string;
+    vSol: number; vTokens: number; trigger: string;
+  }): Promise<void> {
+    const { mint, vSol, vTokens } = args;
+    const solPrice = this.config.solPriceUsd || 200;
+    const realSol = Math.max(0, vSol - 30);
+    const priceUsd = vTokens > 0 ? (vSol / vTokens) * solPrice : 0;
+    // Every pump.fun launch mints the same 1B supply; spot price is the curve's.
+    const marketCapUsd = Number((priceUsd * 1_000_000_000).toFixed(2));
+
+    const launchData: Partial<PumpTokenLaunch> = {
+      mint,
+      // A fresh create trades on the bonding curve, full stop. 'auto' would let
+      // PumpPortal resolve against an index that has never seen this mint.
+      pool: 'pump',
+      name: args.name,
+      symbol: args.symbol,
+      creator: args.creator ?? 'Unknown',
+      timestamp: Date.now(),
+      vSolInBondingCurve: vSol,
+      vTokensInBondingCurve: vTokens,
+      liquidityUsd: Number((realSol * solPrice).toFixed(2)),
+      marketCapUsd,
+      fdvUsd: marketCapUsd,
+      bondingProgress: (realSol / 85) * 100,
+      priceUsd,
+      ageSeconds: 0,
+    };
+
+    const symbol = args.symbol ?? mint.slice(0, 6);
+    const filterResult: FilterResult = {
+      mint,
+      tokenName: args.name ?? symbol,
+      tokenSymbol: symbol,
+      isSafe: true,
+      // Zero, honestly: scoring needs market/holder data a seconds-old mint
+      // does not have. A launch snipe is a speed bet, not a graded one.
+      score: 0,
+      marketCapUsd,
+      fdvUsd: marketCapUsd,
+      volume5mUsd: 0,
+      liquidityUsd: launchData.liquidityUsd ?? 0,
+      // Structural to pump.fun's program (it mints with both authorities
+      // revoked and holds the curve itself) — platform facts, not measurements
+      // of this particular token.
+      mintAuthorityRevoked: true,
+      freezeAuthorityRevoked: true,
+      lpLockedPct: 100,
+      reasons: [`LAUNCH SNIPE: ${args.trigger} — screening skipped for speed`],
+      evaluatedAt: Date.now(),
+      photonUrl: `https://photon-sol.tinyastro.io/en/lp/${mint}`,
+      rugCheckUrl: `https://rugcheck.xyz/tokens/${mint}`,
+      bondingProgress: launchData.bondingProgress,
+      priceUsd,
+    };
+
+    this.log('info', `🚀 [LAUNCH SNIPE] $${symbol} — ${args.trigger} | curve ${realSol.toFixed(2)} SOL | PLAY_1`, mint);
+    reportService.recordScreened(true, 'launch snipe');
+    latencyTimeline.stamp(mint, 't4DecisionMs');
+
+    await this.withEntrySlot(mint, symbol, () =>
+      this.commitEntry(filterResult, launchData, 'PLAY_1', 1)
+    );
+  }
+
+  /** Disarms a pending launch snipe, releasing its curve slot when this lane owns it. */
+  private releasePendingSnipe(mint: string, pending: PendingSnipe, why: string): void {
+    this.pendingSnipes.delete(mint);
+    if (pending.ownsCurveSub && !tokenWatchlist.has(mint) && !this.activePositions.some(p => p.mint === mint)) {
+      this.curveWatcher.unwatch(mint);
+    }
+    this.log('gate0', `🚀✗ $${pending.symbol ?? mint.slice(0, 6)} snipe disarmed — ${why}`, mint);
+  }
+
+  /**
+   * Structural alert handler — WARNING ONLY since 2026-08-12, owner decision:
+   * the bot never sells on its own, full stop. A creator dump is still the
+   * single most important thing to know about a held bag, so it is logged as
+   * loudly as anything this engine prints — but pulling the trigger is the
+   * owner's manual call via LIQUIDATE.
    */
   private async handleStructuralAlert(alert: { mint: string; kind: string; detail: string }): Promise<void> {
     const pos = this.activePositions.find(p => p.mint === alert.mint);
@@ -1736,20 +1951,10 @@ export class SniperEngine {
       devSellMonitor.untrack(alert.mint);
       return;
     }
-    this.log('sell', `🚨 [STRUCTURAL STOP: ${alert.kind}] $${pos.tokenSymbol} — ${alert.detail}. Selling everything now.`, alert.mint);
-
-    // Latch the reason on the position, not on the monitor. DevSellMonitor sets
-    // `devSold = true` permanently on the first creator sell, so an alert whose
-    // exit fails can never be raised a second time. With the price stop-loss
-    // gone this is the position's only remaining loss-side exit, so the intent
-    // to leave has to outlive one failed transaction: the exit ladder retries a
-    // forced full exit every tick until the tokens are actually gone.
-    pos.forceExitReason = `structural stop: ${alert.detail}`;
-    await this.executeSell(pos, `SOLD ALL — structural stop: ${alert.detail}`, true);
-
-    // Only stop watching once the position is genuinely closed. Untracking after
-    // a failed sell discards the creator subscription for a bag we still hold.
-    if (!this.activePositions.some(p => p.id === pos.id)) devSellMonitor.untrack(alert.mint);
+    if (!pos.structuralAlertLogged) {
+      pos.structuralAlertLogged = true;
+      this.log('warn', `🚨 [STRUCTURAL ALERT: ${alert.kind}] $${pos.tokenSymbol} — ${alert.detail}. AUTO-SELL REMOVED — holding; use LIQUIDATE if you want out.`, alert.mint);
+    }
   }
 
   /** Adds a fresh create to the curve watchlist and subscribes to its trades. */
@@ -1795,6 +2000,53 @@ export class SniperEngine {
           });
           this.curvePeakSol.delete(u.mint);
           return;
+        }
+      }
+    }
+
+    // --- Launch-snipe momentum trigger (Play 1) ---
+    // Runs BEFORE the playbookRouting gate: the snipe owns its own curve
+    // subscription and must work even with routing off.
+    const pending = this.pendingSnipes.get(u.mint);
+    if (pending && featureFlags.get('launchSnipe')) {
+      if (!this.config.isBotActive || u.complete) {
+        this.releasePendingSnipe(u.mint, pending, u.complete ? 'curve completed before trigger' : 'bot paused');
+      } else {
+        const windowMs = (this.config.launchSnipeWindowSeconds ?? 60) * 1000;
+        const ageMs = u.at - pending.createdAtMs;
+        if (ageMs > windowMs) {
+          this.releasePendingSnipe(u.mint, pending, `no ${this.config.launchSnipeMinSolInflow ?? 1} SOL inflow inside ${(windowMs / 1000).toFixed(0)}s — falls back to the Play 2 path`);
+        } else {
+          const inflow = u.realSolInCurve - pending.baselineRealSol;
+          const minInflow = this.config.launchSnipeMinSolInflow ?? 1;
+          const committed = this.activePositions.length + this.entriesInFlight.size;
+          // A full book leaves the snipe ARMED (not disarmed): a slot freeing
+          // up inside the window can still take the entry.
+          if (inflow >= minInflow && committed < this.config.maxActivePositions) {
+            this.pendingSnipes.delete(u.mint);
+            // Stop the Play 2 path double-entering the same token later.
+            tokenWatchlist.markTriggered(u.mint);
+            latencyTimeline.begin(u.mint, {
+              t1ArrivalMs: u.at,
+              mode: this.config.tradingMode,
+              symbol: pending.symbol,
+              txType: 'create',
+              payload: { mint: u.mint, trigger: 'launch-snipe-inflow', inflowSol: inflow },
+            });
+            latencyTimeline.stamp(u.mint, 't2ParsedMs');
+            latencyTimeline.stamp(u.mint, 't3FiltersDoneMs');
+            await this.fireLaunchSnipe({
+              mint: u.mint,
+              name: pending.name,
+              symbol: pending.symbol,
+              creator: pending.creator ?? u.creator ?? undefined,
+              vSol: u.vSolInBondingCurve,
+              vTokens: u.vTokensInBondingCurve,
+              trigger: `${inflow.toFixed(2)} SOL inflow in ${(ageMs / 1000).toFixed(1)}s`,
+            });
+            latencyTimeline.complete(u.mint);
+            return;
+          }
         }
       }
     }
@@ -1871,20 +2123,32 @@ export class SniperEngine {
     // across a 30-second window: N candidates could all read "0 open" and all
     // buy. entriesInFlight closes that window — it is claimed here and released
     // in the finally below, so the count is exact at every instant.
-    if (this.entriesInFlight.has(filterResult.mint)) return;
-    if (this.activePositions.some(p => p.mint === filterResult.mint)) return;
+    await this.withEntrySlot(filterResult.mint, filterResult.tokenSymbol, () =>
+      this.evaluatePlaybookTriggerInner(filterResult, launchData, isMigration)
+    );
+  }
+
+  /**
+   * The one concurrency discipline every entry path shares — router entries and
+   * launch snipes alike. Claims the mint synchronously before the first await
+   * and enforces the position cap against open + in-flight, so no two paths can
+   * ever disagree about how many slots are committed.
+   */
+  private async withEntrySlot(mint: string, symbol: string, fn: () => Promise<void>): Promise<void> {
+    if (this.entriesInFlight.has(mint)) return;
+    if (this.activePositions.some(p => p.mint === mint)) return;
 
     const committed = this.activePositions.length + this.entriesInFlight.size;
     if (committed >= this.config.maxActivePositions) {
-      this.log('warn', `⚠️ Position limit reached (${this.activePositions.length} open + ${this.entriesInFlight.size} in flight / ${this.config.maxActivePositions}). Skipping buy for $${filterResult.tokenSymbol}.`);
+      this.log('warn', `⚠️ Position limit reached (${this.activePositions.length} open + ${this.entriesInFlight.size} in flight / ${this.config.maxActivePositions}). Skipping buy for $${symbol}.`);
       return;
     }
 
-    this.entriesInFlight.add(filterResult.mint);
+    this.entriesInFlight.add(mint);
     try {
-      await this.evaluatePlaybookTriggerInner(filterResult, launchData, isMigration);
+      await fn();
     } finally {
-      this.entriesInFlight.delete(filterResult.mint);
+      this.entriesInFlight.delete(mint);
     }
   }
 
@@ -1948,6 +2212,20 @@ export class SniperEngine {
       }
     }
 
+    await this.commitEntry(filterResult, launchData, selectedPlay, sizeMultiplier);
+  }
+
+  /**
+   * Sizing + execution tail shared by every entry path. The caller has already
+   * decided WHETHER to buy (router verdict or launch-snipe trigger) and holds
+   * the entry slot; this owns HOW MUCH and the order itself.
+   */
+  private async commitEntry(
+    filterResult: FilterResult,
+    launchData: Partial<PumpTokenLaunch>,
+    selectedPlay: PlaybookType,
+    sizeMultiplier: number
+  ): Promise<void> {
     if (this.config.activePlaybook !== 'ALL' && this.config.activePlaybook !== selectedPlay) return;
 
     // Read the wallet as it is right now: the background sync only runs every
@@ -1996,10 +2274,12 @@ export class SniperEngine {
 
     const be = breakevenPct(unitSizeSol, this.config.priorityFeeSol);
     if (featureFlags.get('enforceTradeEconomics')) {
+      // ADVISORY since 2026-08-12, by owner decision: everything the Photon
+      // wallet holds is tradeable no matter the amount, so a round trip above
+      // the guideline is named out loud but never refused.
       const maxBe = this.config.maxBreakevenPct ?? 6;
       if (be > maxBe) {
-        this.log('warn', `⚠️ Skipping $${filterResult.tokenSymbol}: round-trip cost ${be}% of a ${unitSizeSol} SOL position exceeds the ${maxBe}% limit. Increase buyAmountSol or lower priorityFeeSol.`, filterResult.mint);
-        return;
+        this.log('warn', `⚠️ $${filterResult.tokenSymbol}: round-trip cost ${be}% of a ${unitSizeSol} SOL position exceeds the ${maxBe}% guideline — trading anyway, this entry needs +${be}% just to break even.`, filterResult.mint);
       }
     }
 
@@ -2509,9 +2789,15 @@ export class SniperEngine {
    * above minScoreFullUnit (71 strict), and the highest score observed across
    * 3,635 real candidates is 66. The half unit is the realistic case, not the
    * pessimistic one.
+   *
+   * `reasons` block arming and are reserved for physical impossibility (no
+   * fundable stake at all). `warnings` are the size-economics findings — since
+   * 2026-08-12 they arm anyway, by owner decision: everything in the Photon
+   * wallet is tradeable no matter the amount, with the cost stated out loud.
    */
-  public preflightRealMode(): { ok: boolean; reasons: string[]; stakeSol: number; breakevenPct: number; requiredSol: number } {
+  public preflightRealMode(): { ok: boolean; reasons: string[]; warnings: string[]; stakeSol: number; breakevenPct: number; requiredSol: number } {
     const reasons: string[] = [];
+    const warnings: string[] = [];
     const sizingPriorityFeeSol = this.sizingPriorityFee();
     const maxBe = this.config.maxBreakevenPct ?? 6;
     const deployable = this.wallet.getDeployableSol();
@@ -2537,23 +2823,13 @@ export class SniperEngine {
       );
     } else if (featureFlags.get('enforceTradeEconomics') && be > maxBe) {
       if (this.config.walletSplitSizing) {
-        // Per slot the wallet must hold the stake plus its own buffer; scale up
-        // by the slot count for the whole run, plus the gas float.
-        const perSlotWallet = minEconomicStake * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingPriorityFeeSol + 0.0025;
-        const fraction = Math.min(100, Math.max(1, this.config.maxDeployedFractionPct ?? 60)) / 100;
-
-        reasons.push(
-          `each slot is too small to trade economically. ${deployable.toFixed(4)} SOL deployable, committing ` +
-          `${Math.round(fraction * 100)}% split ${budget.slots} way${budget.slots === 1 ? '' : 's'}, stakes ` +
-          `${stakeSol.toFixed(4)} SOL per position — a ${be}% round trip against the ${maxBe}% limit, so EVERY candidate would be refused.`
+        warnings.push(
+          `size economics are against you. ${deployable.toFixed(4)} SOL deployable split ${budget.slots} way${budget.slots === 1 ? '' : 's'} stakes ` +
+          `${stakeSol.toFixed(4)} SOL per position — a ${be}% round trip against the ${maxBe}% guideline, so every entry starts ${be}% underwater.`
         );
 
-        // Name the concrete ways out, computed rather than hand-waved.
-        //
-        // The first question is whether ANY slot count works at this balance.
-        // Reporting only "fund X to keep N slots" is misleading when even one
-        // slot fails — it implies the slot count is the problem when the wallet
-        // is. Check the best case (1 slot, everything deployed) first.
+        // Name the concrete ways to fix the economics, computed rather than
+        // hand-waved — still worth saying even though trading proceeds.
         const fixes: string[] = [];
         const bestCase = fitSlotsToWallet({
           deployableSol: deployable, maxSlots: 1,
@@ -2562,40 +2838,23 @@ export class SniperEngine {
         });
 
         if (bestCase.slots === 0) {
-          // Nothing works at this balance. Say so, and give the real number.
           const minWallet = minWalletForSlots({
             slots: 1, maxSlippagePct: this.config.maxSlippagePct,
             priorityFeeSol: sizingPriorityFeeSol, maxBreakevenPct: maxBe,
           });
-          reasons.push(
-            `NO configuration can trade at this balance — not even 1 slot with 100% deployed. ` +
-            `This is wallet size, not settings: fixed Solana costs are ~${(sizingPriorityFeeSol * 2 + 0.00203928 + 0.00001).toFixed(4)} SOL per round trip ` +
-            `no matter how small the stake, so below a certain size fees alone exceed the ${maxBe}% limit.`
+          warnings.push(
+            `no slot count clears the guideline at this balance: fixed Solana costs are ~${(sizingPriorityFeeSol * 2 + 0.00203928 + 0.00001).toFixed(4)} SOL per round trip ` +
+            `no matter how small the stake. Funding ~${minWallet.toFixed(2)} SOL would bring one position back inside ${maxBe}%.`
           );
-          fixes.push(`fund at least ~${minWallet.toFixed(2)} SOL for a single position at the current ${sizingPriorityFeeSol} priority fee`);
-          const cheapWallet = minWalletForSlots({
-            slots: 1, maxSlippagePct: this.config.maxSlippagePct,
-            priorityFeeSol: 0.001, maxBreakevenPct: maxBe,
-          });
-          if (cheapWallet < minWallet) {
-            fixes.push(`or ~${cheapWallet.toFixed(2)} SOL if you also drop priorityFeeSol to 0.001 (cheaper fills lose migration races)`);
-          }
-          fixes.push(`raising maxBreakevenPct instead would let it trade, but every trade would then need >${be}% just to break even — that is how a wallet bleeds out with no rug involved`);
         } else {
-          // One slot works; the requested slot count is the thing to change.
-          const needFullWallet = (perSlotWallet * budget.slots) / fraction + 0.005;
-          fixes.push(`set maxActivePositions to ${bestCase.slots} — ${bestCase.stakePerSlotSol.toFixed(4)} SOL at ${bestCase.breakevenPct}%, which clears the limit today`);
-          fixes.push(`or fund ~${needFullWallet.toFixed(2)} SOL to keep ${budget.slots} slot${budget.slots === 1 ? '' : 's'} at the current ${Math.round(fraction * 100)}% cap`);
-          if (fraction < 1) {
-            fixes.push(`or raise maxDeployedFractionPct to 100`);
-          }
+          fixes.push(`set maxActivePositions to ${bestCase.slots} — ${bestCase.stakePerSlotSol.toFixed(4)} SOL at ${bestCase.breakevenPct}%, which clears the guideline today`);
+          warnings.push(`Options: ${fixes.join('; ')}.`);
         }
-        reasons.push(`Options: ${fixes.join('; ')}.`);
       } else {
-        reasons.push(
-          `position size too small. The router sizes a half unit (${stakeSol.toFixed(4)} SOL of your ${this.config.buyAmountSol} SOL unit), ` +
-          `whose round-trip cost is ${be}% — above the ${maxBe}% limit, so EVERY candidate would be refused. ` +
-          `Raise buyAmountSol to about ${(minEconomicStake * 2).toFixed(2)} SOL, or lower priorityFeeSol.`
+        warnings.push(
+          `position size is small for the fee load. The router sizes a half unit (${stakeSol.toFixed(4)} SOL of your ${this.config.buyAmountSol} SOL unit), ` +
+          `whose round-trip cost is ${be}% against the ${maxBe}% guideline — every entry starts that far underwater. ` +
+          `Raising buyAmountSol to about ${(minEconomicStake * 2).toFixed(2)} SOL, or lowering priorityFeeSol, would fix the ratio.`
         );
       }
     }
@@ -2606,12 +2865,16 @@ export class SniperEngine {
     const requiredSol = Number((requiredPerPosition + 0.005).toFixed(4));
 
     if (stakeSol > 0 && deployable > 0 && deployable < requiredPerPosition) {
-      reasons.push(
-        `wallet cannot fund one position. Deployable ${deployable.toFixed(4)} SOL, need ${requiredPerPosition.toFixed(4)} SOL for a ${stakeSol.toFixed(4)} SOL stake at ${this.config.maxSlippagePct}% slippage.`
+      // Not a refusal: the entry path clamps every order to what the balance
+      // can actually fund via affordableStakeSol, so the trade still goes out —
+      // just smaller than configured.
+      warnings.push(
+        `the configured ${stakeSol.toFixed(4)} SOL stake needs ${requiredPerPosition.toFixed(4)} SOL with fees and slippage, but only ` +
+        `${deployable.toFixed(4)} SOL is deployable — orders will be clamped down to what the wallet can fund.`
       );
     }
 
-    return { ok: reasons.length === 0, reasons, stakeSol, breakevenPct: be, requiredSol };
+    return { ok: reasons.length === 0, reasons, warnings, stakeSol, breakevenPct: be, requiredSol };
   }
 
   /**
@@ -2624,10 +2887,9 @@ export class SniperEngine {
    * so until now the entire blocked-sell scam class was undetectable.
    *
    * Runs a few seconds AFTER the fill (it needs the tokens to exist) and off the
-   * hot path, so it costs the entry nothing. A failure latches a forced exit —
-   * which will itself fail if the token truly cannot be sold, and is then capped
-   * by maxForceExitAttempts and reported as STRANDED rather than burning fees
-   * forever.
+   * hot path, so it costs the entry nothing. A failure is logged as a loud
+   * verdict on the position — auto-sells were removed 2026-08-12, so acting on
+   * it (or not) is the owner's manual call.
    */
   private async verifySellPath(pos: InternalPosition): Promise<void> {
     if (!featureFlags.get('honeypotChecks')) return;
@@ -2660,15 +2922,17 @@ export class SniperEngine {
     );
 
     if (result === false) {
-      this.log('error', `🍯 [HONEYPOT CONFIRMED] $${pos.tokenSymbol} — a full sell SIMULATES AS REVERTING. Exiting immediately; if the sell truly cannot land this position will be marked STRANDED.`, pos.mint);
-      pos.forceExitReason = 'honeypot: sell simulation reverts';
+      // AUTO-SELL REMOVED 2026-08-12: the honeypot verdict no longer latches a
+      // forced exit — it is a loud fact for the owner. A manual LIQUIDATE on a
+      // true honeypot will fail the same way the automatic one would have.
       pos.honeypotConfirmed = true;
+      this.log('error', `🍯 [HONEYPOT CONFIRMED] $${pos.tokenSymbol} — a full sell SIMULATES AS REVERTING. AUTO-SELL REMOVED — holding; LIQUIDATE may not land if the sell truly reverts.`, pos.mint);
     } else if (result === true) {
       pos.sellPathVerified = true;
       this.log('info', `✅ [SELL PATH OK] $${pos.tokenSymbol} — a full exit simulates cleanly.`, pos.mint);
     }
     // null = could not simulate; leave the position alone rather than acting on
-    // an unknown. The structural exits and the time stop still apply.
+    // an unknown.
   }
 
   /** Immediate manual stop for the API: pause entries, keep positions. */
@@ -2678,104 +2942,44 @@ export class SniperEngine {
     return { stopped: true };
   }
 
+  /**
+   * Per-tick position update — PRICING AND VISIBILITY ONLY.
+   *
+   * Every automatic exit that used to live here (structural stops, no-data
+   * exit, time stops, profit rungs, trailing stop) was removed 2026-08-12 at
+   * the owner's direction: THE BOT NEVER SELLS ON ITS OWN. Danger signals are
+   * still detected and logged once per position so a manual LIQUIDATE can be
+   * an informed one — but nothing in this method submits a sell.
+   */
   private async updateAndCheckPositionExit(pos: InternalPosition, prefetched?: DexScreenerData): Promise<void> {
     try {
       const dexData = prefetched ?? await DexScreenerService.getTokenMarketData(pos.mint);
 
       let currentMarketCap = dexData.hasPair && dexData.marketCapUsd > 0 ? dexData.marketCapUsd : pos.buyPriceUsd * 1000000000;
 
-      const timeElapsedSec = Math.floor((Date.now() - pos.entryTime) / 1000);
-
-      // A structural stop that already fired outranks every other rule and keeps
-      // retrying until the bag is gone.
-      //
-      // This sits AFTER dexData is fetched and BELOW the price update further
-      // down only in the sense that it re-runs each tick — but it deliberately
-      // still short-circuits, because once we have decided to leave, nothing
-      // below can change that decision. What it must NOT do is retry forever:
-      // executeSell passes force=true, which bypasses the 5s..10min fee-burn
-      // backoff, so an unsellable token (honeypot, dead pool) would submit a
-      // full-fee failing transaction every second indefinitely. Precedent: 35
-      // failed txs and 0.035 SOL in under a minute.
-      if (pos.forceExitReason) {
-        pos.forceExitAttempts = (pos.forceExitAttempts ?? 0) + 1;
-        const capExceeded = pos.forceExitAttempts > (this.config.maxForceExitAttempts ?? 20);
-        const agedOut = timeElapsedSec >= this.config.maxHoldSeconds;
-
-        if (capExceeded || agedOut) {
-          if (!pos.strandedLogged) {
-            pos.strandedLogged = true;
-            this.log('error',
-              `🧟 STRANDED: $${pos.tokenSymbol} could not be sold after ${pos.forceExitAttempts} forced attempts (${pos.forceExitReason}). ` +
-              `Halting automatic retries to stop burning fees — the position stays open and LIQUIDATE still works.`, pos.mint);
-          }
-          return;
-        }
-        await this.executeSell(pos, `SOLD ALL — ${pos.forceExitReason}`, true);
-        return;
-      }
-
-      // Fresh-migration blind window. Play 3 — the only play this bot actually
-      // reaches — enters at graduation, when DexScreener has typically not
-      // indexed the new pool yet (measured: 51 of 71 rows had hasLiveMarketData
-      // true with liquidityUsd 0). POOL_DRAINED and SELL_FLOW both require an
-      // indexed pair, and a migrated position gets no curve subscription, so for
-      // those first minutes the ONLY loss-side exit is the 30-minute timer.
-      //
-      // This is the no-price-stop replacement for that hole: if a position has
-      // had NO usable market data at all for noDataExitSeconds, leave. It cannot
-      // fire on volatility because it never looks at a price — only at whether a
-      // market exists.
+      // Track when a market first appears — dashboard information, formerly the
+      // no-data exit's trigger.
       const hasUsableMarket =
         (dexData.hasPair && (dexData.priceUsd > 0 || dexData.liquidityUsd > 0)) ||
         (pos.lastCurvePriceUsd ?? 0) > 0;
       if (hasUsableMarket) {
         pos.firstMarketDataAt = pos.firstMarketDataAt ?? Date.now();
-      } else if (!pos.firstMarketDataAt) {
-        const blindSec = this.config.noDataExitSeconds ?? 180;
-        if (timeElapsedSec >= blindSec) {
-          this.log('warn', `⏱️ [NO-DATA EXIT] $${pos.tokenSymbol} — no market data ${blindSec}s after entry. Leaving rather than holding blind to the ${Math.floor(this.config.maxHoldSeconds / 60)}-minute timer.`, pos.mint);
-          await this.executeSell(pos, `SOLD ALL — no market data ${blindSec}s after entry (never indexed)`);
-          return;
-        }
       }
 
       // Pre-migration: no DexScreener pair exists, but the bonding curve
       // account IS the market — CurveWatcher streams its reserves. A fresh
-      // curve price (<30s) lets the full exit ladder (stop-loss, take-profit,
-      // trailing stop) protect on-curve positions that previously could only
-      // ever time out.
+      // curve price (<30s) keeps the P&L honest for on-curve positions.
       const curvePriceFresh =
         (pos.lastCurvePriceUsd ?? 0) > 0 &&
         pos.lastCurvePriceAt !== undefined &&
         Date.now() - pos.lastCurvePriceAt < 30_000;
 
       if (!dexData.hasPair && !curvePriceFresh) {
-        if (this.config.tradingMode === 'real') {
-          // Real money: never act on an invented price — no stop-loss or
-          // take-profit off a random walk. But a token that never indexes on
-          // DexScreener must still age out, or it becomes an unsellable
-          // position held forever. PumpPortal sells by percentage, so the
-          // exit needs no price; the fill tells us what it was worth.
-          if (timeElapsedSec >= this.config.maxHoldSeconds) {
-            await this.executeSell(pos, `Time stop with no market data (${Math.floor(this.config.maxHoldSeconds / 60)} min, pair never indexed)`);
-          }
-          return;
-        }
-        // honestPaper: paper behaves exactly like real money here — an unpriced
-        // position sits at its entry price and ages out. It does NOT get an
-        // invented chart.
-        //
-        // The legacy line below multiplies price by 1 + (rand*0.12 - 0.048)
-        // every 2s. Measured: +1.127% geometric drift per tick = +40.2% per
-        // minute. Across 200,000 simulated positions under the engine's own
-        // exit rules, 95.1% hit the +100% take-profit (median 114s) and 0.0%
-        // ever hit the stop-loss. That is the whole reason paper looked
-        // profitable while the live wallet shrank.
-        if (featureFlags.get('honestPaper')) {
-          if (timeElapsedSec >= this.config.maxHoldSeconds) {
-            await this.executeSell(pos, `SOLD ALL — max hold time reached (${Math.floor(this.config.maxHoldSeconds / 60)} min), price never available`);
-          }
+        if (this.config.tradingMode === 'real' || featureFlags.get('honestPaper')) {
+          // No market and no fresh curve price: nothing honest to reprice
+          // from, so the position sits at its last known price. It does NOT
+          // get an invented chart — and since 2026-08-12 it does not age out
+          // either; it waits for the owner.
           return;
         }
         const mockFluctuation = 1 + ((Math.random() * 0.12) - 0.048);
@@ -2834,139 +3038,44 @@ export class SniperEngine {
       pos.pnlSol = Number((pos.pnlUsd / this.config.solPriceUsd).toFixed(4));
       pos.pnlPct = Number((((currentPriceUsd - pos.buyPriceUsd) / pos.buyPriceUsd) * 100).toFixed(1));
 
-      // STRUCTURAL EXIT — pool drained. The post-migration twin of CURVE_DRAINED
-      // (which only sees the bonding curve). `dexData.liquidityUsd` was already
-      // being fetched on every exit tick and thrown away. Liquidity leaving the
-      // pool is the event that actually makes a bag unsellable, and unlike a
-      // price stop it cannot be triggered by ordinary volatility.
+      // STRUCTURAL ALERT — pool drained. Liquidity leaving the pool is the
+      // event that actually makes a bag unsellable, so it is still detected —
+      // but since 2026-08-12 it WARNS once instead of selling.
       if (dexData.hasPair && dexData.liquidityUsd > 0) {
         const drainFraction = this.config.poolDrainExitFraction ?? 0.5;
-        if (isPoolDrained({
+        if (!pos.structuralAlertLogged && isPoolDrained({
           peakLiquidityUsd: pos.peakLiquidityUsd ?? 0,
           currentLiquidityUsd: dexData.liquidityUsd,
           drainFraction,
         })) {
           const pct = Math.round((1 - dexData.liquidityUsd / pos.peakLiquidityUsd!) * 100);
-          this.log('sell', `🚨 [STRUCTURAL STOP: POOL_DRAINED] $${pos.tokenSymbol} — liquidity fell ${pct}% from $${Math.round(pos.peakLiquidityUsd!).toLocaleString()} to $${Math.round(dexData.liquidityUsd).toLocaleString()}. Selling everything now.`, pos.mint);
-          pos.forceExitReason = `structural stop: pool liquidity drained ${pct}% from its peak`;
-          await this.executeSell(pos, `SOLD ALL — structural stop: pool liquidity drained ${pct}%`, true);
-          return;
+          pos.structuralAlertLogged = true;
+          this.log('warn', `🚨 [STRUCTURAL ALERT: POOL_DRAINED] $${pos.tokenSymbol} — liquidity fell ${pct}% from $${Math.round(pos.peakLiquidityUsd!).toLocaleString()} to $${Math.round(dexData.liquidityUsd).toLocaleString()}. AUTO-SELL REMOVED — holding; use LIQUIDATE if you want out.`, pos.mint);
         }
         pos.peakLiquidityUsd = Math.max(pos.peakLiquidityUsd ?? 0, dexData.liquidityUsd);
       }
 
-      // STRUCTURAL EXIT — sell flow. Buy pressure collapsing across consecutive
-      // ticks on a pool that is still trading is the crowd leaving, which is a
-      // different event from the price wobbling. Requires real volume so a dead
-      // pair with no trades cannot trip it.
+      // STRUCTURAL ALERT — sell flow. Buy pressure collapsing across
+      // consecutive ticks is the crowd leaving. Also warn-once now.
       const sellFlowTicks = this.config.sellFlowExitTicks ?? 3;
       if (dexData.hasPair && dexData.volume5mUsd > 0 && typeof dexData.buyPressurePct === 'number') {
         if (dexData.buyPressurePct < 25) {
           pos.lowBuyPressureTicks = (pos.lowBuyPressureTicks ?? 0) + 1;
-          if (pos.lowBuyPressureTicks >= sellFlowTicks) {
-            this.log('sell', `🚨 [STRUCTURAL STOP: SELL_FLOW] $${pos.tokenSymbol} — buy pressure ${dexData.buyPressurePct.toFixed(0)}% for ${pos.lowBuyPressureTicks} consecutive ticks. Selling everything now.`, pos.mint);
-            pos.forceExitReason = `structural stop: buy pressure collapsed to ${dexData.buyPressurePct.toFixed(0)}%`;
-            await this.executeSell(pos, `SOLD ALL — structural stop: buy pressure collapsed to ${dexData.buyPressurePct.toFixed(0)}%`, true);
-            return;
+          if (pos.lowBuyPressureTicks >= sellFlowTicks && !pos.sellFlowWarned) {
+            pos.sellFlowWarned = true;
+            this.log('warn', `🚨 [STRUCTURAL ALERT: SELL_FLOW] $${pos.tokenSymbol} — buy pressure ${dexData.buyPressurePct.toFixed(0)}% for ${pos.lowBuyPressureTicks} consecutive ticks. AUTO-SELL REMOVED — holding; use LIQUIDATE if you want out.`, pos.mint);
           }
         } else {
           pos.lowBuyPressureTicks = 0;
         }
       }
 
-      // Moonbag ratchet. Arms only once the position has genuinely run
-      // (trailingArmMultiple, default 3x). The old 1.3x arm made this the bot's
-      // primary liquidator: it forced an exit at 1.04x — below the 5.68%
-      // round-trip breakeven — and any position peaking between 1.30x and
-      // 1.8824x cleared no profit rung at all before being fully liquidated on
-      // one 20% wick, which on pump.fun is noise.
-      const armedTarget = trailingStopTargetUsd({
-        highestPriceUsd: pos.highestPriceUsd,
-        buyPriceUsd: pos.buyPriceUsd,
-        armMultiple: this.config.trailingArmMultiple ?? 3.0,
-        trailingStopPct: this.config.trailingStopPct,
-        useTrailingStop: this.config.useTrailingStop,
-      });
-      if (armedTarget !== undefined) pos.trailingStopTargetUsd = armedTarget;
-
-      const pullbackFromPeakPct = ((pos.highestPriceUsd - currentPriceUsd) / pos.highestPriceUsd) * 100;
-      // Each profit rung has its OWN latch. They used to share
-      // `principalRecovered`, which made them mutually exclusive: whichever
-      // fired first consumed the latch, so a token that pulled back at +65% and
-      // then ran to +100% took exactly one 50% sale and nothing more until
-      // +400%. A 2.9x round trip banked one leg near +65% and rode the rest to
-      // the time stop.
-      if (pos.pnlPct >= 60 && pullbackFromPeakPct >= 15 && !pos.pullbackRungTaken) {
-        // Sell first, book only what actually happened. Flags are set after a
-        // confirmed sell so a failed exit is retried next tick instead of
-        // silently recorded as banked profit.
-        const sale = await this.sellPctReal(pos, 50);
-        if (sale === null) return;
-
-        pos.pullbackRungTaken = true;
-        pos.principalRecovered = true;
-        pos.status = 'PARTIAL_PROFIT';
-        this.recordPartialSell(pos, 0.5, `price fell ${pullbackFromPeakPct.toFixed(0)}% from its peak while up ${pos.pnlPct}%`, sale.actual, 'PULLBACK_PARTIAL');
-        this.log('sell', `📉 [SOLD 50%] $${pos.tokenSymbol} — was up +${pos.pnlPct}%, price dropped ${pullbackFromPeakPct.toFixed(0)}% from peak $${pos.highestPriceUsd.toFixed(6)}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
-        return;
-      }
-
-      if (pos.pnlPct >= this.config.takeProfitPct && !pos.tp1Taken) {
-        const sale = await this.sellPctReal(pos, 50);
-        if (sale === null) return;
-
-        pos.tp1Taken = true;
-        pos.principalRecovered = true;
-        pos.status = 'PARTIAL_PROFIT';
-        this.recordPartialSell(pos, 0.5, `hit take-profit target of +${this.config.takeProfitPct}%`, sale.actual, 'TP1');
-        this.log('sell', `💰 [SOLD 50%] $${pos.tokenSymbol} — hit +${pos.pnlPct}% (target +${this.config.takeProfitPct}%)${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
-        return;
-      }
-
-      if (pos.pnlPct >= this.config.takeProfitRung2Pct && !pos.moonbagRiding) {
-        const sale = await this.sellPctReal(pos, 50);
-        if (sale === null) return;
-
-        pos.moonbagRiding = true;
-        this.recordPartialSell(pos, 0.5, `hit second take-profit target of +${this.config.takeProfitRung2Pct}%`, sale.actual, 'TP2');
-        this.log('sell', `🔥 [SOLD 50%] $${pos.tokenSymbol} — hit +${pos.pnlPct}% (target +${this.config.takeProfitRung2Pct}%)${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding the rest.`, pos.mint);
-        return;
-      }
-
-      // Trailing stop: scale out, do not liquidate. The first trigger takes half
-      // and re-anchors (recordPartialSell clears the target), so a single wick
-      // can no longer take the whole position — the old code sold 50% at
-      // 0.85x peak and then force-sold the remainder at 0.80x peak on the very
-      // next tick. Only a second, independently re-armed trigger closes it.
-      if (pos.trailingStopTargetUsd && currentPriceUsd <= pos.trailingStopTargetUsd) {
-        pos.trailingTriggerCount = (pos.trailingTriggerCount ?? 0) + 1;
-        const trailReason = `trailing stop: price fell ${this.config.trailingStopPct}% from its peak of $${pos.highestPriceUsd.toFixed(6)}`;
-
-        if (pos.trailingTriggerCount >= 2) {
-          await this.executeSell(pos, `SOLD ALL — ${trailReason} (second trigger)`);
-          return;
-        }
-
-        const sale = await this.sellPctReal(pos, 50);
-        if (sale === null) return;
-        pos.status = 'PARTIAL_PROFIT';
-        this.recordPartialSell(pos, 0.5, trailReason, sale.actual, 'TRAILING_PARTIAL');
-        this.log('sell', `📉 [SOLD 50%] $${pos.tokenSymbol} — ${trailReason}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%; the stop must re-arm from here.`, pos.mint);
-        return;
-      }
-
-      // NO PRICE STOP-LOSS. The `-stopLossPct` block that stood here was deleted
-      // 2026-08-09 at the owner's direction: on this asset class a 35% drawdown
-      // is routine intra-trade noise, and stopping out of it converted recoverable
-      // volatility into realized losses. The loss side is now carried by the
-      // structural exits above (creator sell, curve drain, pool drain, sell-flow
-      // collapse) and the time stop below. A position on an intact pool that
-      // simply bleeds is held to `maxHoldSeconds` — that is the accepted risk.
-
-      if (timeElapsedSec >= this.config.maxHoldSeconds) {
-        await this.executeSell(pos, `SOLD ALL — max hold time reached (${Math.floor(this.config.maxHoldSeconds / 60)} min)`);
-        return;
-      }
+      // NO AUTOMATIC EXITS. The full ladder that stood here — pullback rung,
+      // TP1/TP2 profit rungs, trailing-stop moonbag ratchet, time stop — was
+      // deleted 2026-08-12 at the owner's direction, following the 2026-08-09
+      // deletion of the price stop-loss. The bot buys; only the owner sells,
+      // via the manual LIQUIDATE path (manualSellPosition -> executeSell).
+      // Do not reintroduce an automatic sell trigger of any kind here.
 
     } catch (err: any) {
       // ignore

@@ -35,7 +35,11 @@ export interface FeatureFlagSet {
    * costs — it cannot predict live results. Affects PAPER MODE ONLY.
    */
   honestPaper: boolean;
-  /** Refuse entries whose round-trip cost exceeds maxBreakevenPct of position size. */
+  /**
+   * Warn on entries whose round-trip cost exceeds maxBreakevenPct of position
+   * size. ADVISORY since 2026-08-12 (owner decision: everything in the wallet
+   * is tradeable no matter the amount) — it used to refuse those entries.
+   */
   enforceTradeEconomics: boolean;
   /**
    * Route entries by measured curve phase (Plays 2/3/4) instead of the legacy
@@ -59,6 +63,15 @@ export interface FeatureFlagSet {
    * Spends 100% of available deployable balance on every trade entry without budget limits.
    */
   allInSizing: boolean;
+  /**
+   * Play 1: buy fresh creates inside the block-0 window the router otherwise
+   * bans, skipping the RugCheck/DexScreener screen entirely (it costs seconds
+   * and has no data for a seconds-old mint anyway). Tuned by the
+   * launchSnipe* fields on BotConfig. The honeypot sell-path check still runs
+   * post-fill. HIGH RISK BY DESIGN: this is the insider-dominated window with
+   * the highest rug density — opt-in, owner decision 2026-08-12.
+   */
+  launchSnipe: boolean;
 }
 
 /**
@@ -82,6 +95,7 @@ export const DEFAULTS: FeatureFlagSet = {
   honeypotChecks: false,
   devSellStop: false,
   allInSizing: true,
+  launchSnipe: false,
 };
 
 /**

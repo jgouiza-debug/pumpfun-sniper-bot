@@ -1323,16 +1323,19 @@ console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit
     assert.ok(!/pnlPct\s*<=/.test(block), 'must not compare against a P&L threshold');
   });
 
-  test('#5: forced exits are bounded, so an unsellable token stops burning fees', () => {
-    assert.ok(/maxForceExitAttempts/.test(engineSrc));
-    assert.ok(/forceExitAttempts/.test(engineSrc));
-    assert.ok(/STRANDED/.test(engineSrc), 'a stranded position must be reported, not retried silently');
+  // #5 and #11 asserted the forced-exit retry machinery and the profit rungs.
+  // Superseded 2026-08-12, owner decision: ALL automatic sells were removed,
+  // so the invariant flipped — the machinery must NOT exist.
+  test('#5 superseded: the forced-exit retry machinery is gone with all automatic sells', () => {
+    assert.ok(!/forceExitReason/.test(engineSrc), 'no forced-exit latch may remain in the engine');
+    assert.ok(/AUTO-SELL REMOVED/.test(engineSrc), 'the removal must be stated where the exits used to fire');
   });
 
-  test('#11: the profit rungs have independent latches', () => {
-    assert.ok(/pullbackRungTaken/.test(engineSrc), 'pullback rung needs its own latch');
-    assert.ok(/tp1Taken/.test(engineSrc), 'TP1 needs its own latch');
-    assert.ok(/pullbackRungTaken/.test(typesSrc) && /tp1Taken/.test(typesSrc));
+  test('#11 superseded: the profit rungs are gone — the bot never sells on its own', () => {
+    assert.ok(!/pullbackRungTaken/.test(engineSrc) && !/tp1Taken/.test(engineSrc),
+      'no profit-rung trigger may remain in the engine');
+    assert.ok(/NO AUTOMATIC EXITS/.test(engineSrc),
+      'the monitor must state that exits are manual only');
   });
 
   test('#11: neither rung is gated on the shared principalRecovered flag any more', () => {
@@ -1384,11 +1387,21 @@ console.log('\n-- Config clamps and circuit breakers (audit #15, #29) --');
 
   test('#14: entries are reserved before the first await', () => {
     assert.ok(/entriesInFlight/.test(engineSrc));
-    const guard = engineSrc.slice(engineSrc.indexOf('private async evaluatePlaybookTrigger('), engineSrc.indexOf('evaluatePlaybookTriggerInner('));
+    // The guard was extracted into withEntrySlot (2026-08-12) so the launch
+    // snipe and the router share ONE reservation discipline. The invariant is
+    // unchanged: the cap counts in-flight entries, claimed synchronously.
+    const guard = engineSrc.slice(engineSrc.indexOf('private async withEntrySlot('), engineSrc.indexOf('this.entriesInFlight.add'));
     assert.ok(/activePositions\.length \+ this\.entriesInFlight\.size/.test(guard),
       'the cap must count in-flight entries, not just confirmed positions');
     assert.ok(/finally/.test(engineSrc.slice(engineSrc.indexOf('this.entriesInFlight.add'), engineSrc.indexOf('this.entriesInFlight.add') + 400)),
       'the reservation must be released in a finally');
+  });
+
+  test('#14: every entry path goes through the shared slot guard', () => {
+    const trigger = engineSrc.slice(engineSrc.indexOf('private async evaluatePlaybookTrigger('), engineSrc.indexOf('private async withEntrySlot('));
+    assert.ok(/withEntrySlot\(/.test(trigger), 'router entries must claim a slot');
+    const snipe = engineSrc.slice(engineSrc.indexOf('private async fireLaunchSnipe('), engineSrc.indexOf('private releasePendingSnipe('));
+    assert.ok(/withEntrySlot\(/.test(snipe), 'launch snipes must claim a slot');
   });
 }
 
@@ -1556,9 +1569,10 @@ console.log('\n-- Creator resolution and the real sell simulation (audit #22, #4
     assert.ok(!/await this\.verifySellPath/.test(engineSrc), 'must never be awaited on the entry path');
   });
 
-  test('#4: a confirmed honeypot latches a forced exit', () => {
-    assert.ok(/honeypotConfirmed/.test(engineSrc));
-    assert.ok(/honeypot: sell simulation reverts/.test(engineSrc));
+  test('#4 updated: a confirmed honeypot is logged loudly but NOT auto-sold', () => {
+    assert.ok(/honeypotConfirmed/.test(engineSrc), 'the verdict must still latch on the position');
+    assert.ok(/HONEYPOT CONFIRMED/.test(engineSrc), 'the verdict must still be logged');
+    assert.ok(!/forceExitReason/.test(engineSrc), 'the verdict must not trigger an automatic exit');
   });
 
   test('#4: an inconclusive simulation does NOT exit the position', () => {
@@ -1963,6 +1977,53 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
     for (const k of ['localTxBuild', 'entryGateV2', 'dynamicPriorityFee']) {
       assert.strictEqual(PACKAGED_DEFAULTS[k], false, `${k} must not auto-enable in a shipped build`);
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Launch snipe (Play 1) — first-candle entry, owner opt-in 2026-08-12.
+// The router's BLOCK_0 ban made migrations/mid-curve the ONLY entries, which
+// is why every buy landed minutes after the wall of same-block snipers. The
+// fast lane trades that screen for speed; these pin its safety properties.
+// ---------------------------------------------------------------------------
+console.log('\n-- Launch snipe (Play 1): first-candle entry --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const { DEFAULTS, PACKAGED_DEFAULTS } = require('../services/featureFlags');
+
+  test('the lane is opt-in: launchSnipe ships OFF in dev AND packaged defaults', () => {
+    assert.strictEqual(DEFAULTS.launchSnipe, false, 'block-0 buying must never be a silent default');
+    assert.strictEqual(PACKAGED_DEFAULTS.launchSnipe, false, 'a shipped exe must not snipe launches out of the box');
+  });
+
+  test('the fast lane only intercepts creates, and only when the flag is on', () => {
+    const hook = engineSrc.slice(engineSrc.indexOf("payload.txType === 'create' && featureFlags.get('launchSnipe')"), engineSrc.indexOf('await this.processIncomingToken'));
+    assert.ok(/handleLaunchCreate/.test(hook), 'the lane must run before the slow screen');
+  });
+
+  test('a snipe routes at the bonding curve, never venue auto', () => {
+    const fire = engineSrc.slice(engineSrc.indexOf('private async fireLaunchSnipe('), engineSrc.indexOf('private releasePendingSnipe('));
+    assert.ok(/pool: 'pump'/.test(fire),
+      "'auto' resolves against an index that has never seen a seconds-old mint");
+    assert.ok(!/pool: 'auto'/.test(fire));
+  });
+
+  test('momentum is measured beyond the dev buy, not from zero', () => {
+    assert.ok(/u\.realSolInCurve - pending\.baselineRealSol/.test(engineSrc),
+      'counting the creator\'s own buy as inflow would let every dev self-trigger the snipe');
+  });
+
+  test('armed snipes die with the run', () => {
+    const stop = engineSrc.slice(engineSrc.indexOf('// Armed snipes die with the run'), engineSrc.indexOf('SMART SNIPER BOT PAUSED'));
+    assert.ok(/pendingSnipes\.clear\(\)/.test(stop),
+      'a wakeup must never fire a buy that was armed before the pause');
+  });
+
+  test('an unfired snipe falls back to the Play 2 path instead of vanishing', () => {
+    const arm = engineSrc.slice(engineSrc.indexOf('// Arm the momentum trigger'), engineSrc.indexOf('private async fireLaunchSnipe('));
+    assert.ok(/enrollInWatchlist/.test(arm));
   });
 }
 
