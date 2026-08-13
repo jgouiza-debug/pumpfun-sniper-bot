@@ -2744,6 +2744,61 @@ console.log('\n-- The 70.9%: one dropped RPC read no longer reads as unsafe --')
   });
 }
 
+console.log('\n-- Upgrade must not switch on selling for someone who never chose it --');
+{
+  // The migration is pure logic on the parsed file, so it is exercised
+  // directly rather than by booting the singleton (which owns sockets).
+  const COPY_CONFIG_VERSION = 2;
+  const migrate = (raw: any) => {
+    const cfg = { ...raw.config };
+    if (Number(raw.configVersion) < COPY_CONFIG_VERSION || raw.configVersion === undefined) {
+      if (cfg.copySells) cfg.copySells = false;
+    }
+    return cfg;
+  };
+
+  test('a pre-2026-08-13 config does NOT start auto-selling on upgrade', () => {
+    // copySells defaulted true for the whole period it did nothing, so the
+    // saved true is a default nobody acted on — not a decision to honour.
+    const old = { config: { copySells: true, sellMode: 'mirror', enabled: true, tradingMode: 'real' } };
+    assert.strictEqual(migrate(old).copySells, false,
+      'honouring this would switch a real account to automatic selling with no prompt');
+  });
+
+  test('the migration runs once and then leaves the toggle alone', () => {
+    const chosen = { configVersion: 2, config: { copySells: true, sellMode: 'mirror' } };
+    assert.strictEqual(migrate(chosen).copySells, true,
+      'once stamped, copySells means what the operator set');
+  });
+
+  test('someone who had it off stays off', () => {
+    const off = { config: { copySells: false } };
+    assert.strictEqual(migrate(off).copySells, false);
+  });
+
+  test('the persisted file stamps the version, or the migration repeats forever', () => {
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/configVersion:\s*COPY_CONFIG_VERSION/.test(src),
+      'without the stamp, every restart would re-disable a toggle the operator turned on');
+    assert.ok(/const COPY_CONFIG_VERSION = 2/.test(src));
+  });
+
+  test('the migration writes the stamp immediately instead of waiting for a change', () => {
+    // Measured on the first smoke test: the warning printed, the in-memory
+    // config was migrated, and nothing reached disk — because persist() only
+    // fires on a change. configVersion stayed unset and the migration re-ran
+    // on every boot.
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    const start = src.indexOf('MIGRATION to schema 2');
+    assert.ok(start > 0, 'migration block not found — this test is pinned to it');
+    const migrationBlock = src.slice(start, start + 2500);
+    assert.ok(/this\.persist\(\)/.test(migrationBlock),
+      'the migration must persist its own stamp, or it never converges');
+  });
+}
+
 console.log('\n-- macOS build: the updater must never install another platform\'s binary --');
 {
   const { releaseAssetName } = require('../services/updaterService');

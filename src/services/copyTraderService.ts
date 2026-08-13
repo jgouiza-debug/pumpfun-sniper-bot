@@ -48,6 +48,16 @@ import { DexScreenerService } from './dexscreenerService';
 
 const STATE_FILE = path.resolve(process.cwd(), '.copy-trader.json');
 
+/**
+ * Schema version of `.copy-trader.json`.
+ *
+ * 1 (implicit, no field) — written any time before 2026-08-13. `copySells`
+ *   may say true, but auto-sells did not exist, so the value reflects a
+ *   default nobody acted on rather than a decision.
+ * 2 — auto-sells are live and `copySells` means what it says.
+ */
+const COPY_CONFIG_VERSION = 2;
+
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
 /** Paper fills assume this much slippage vs. the leader's realized price. */
@@ -1188,6 +1198,8 @@ export class CopyTraderService {
       this.persistTimer = null;
       try {
         fs.writeFileSync(STATE_FILE, JSON.stringify({
+          // Stamped so the copySells opt-out migration runs exactly once.
+          configVersion: COPY_CONFIG_VERSION,
           config: this.config,
           wallets: [...this.wallets.values()],
           positions: this.positions.filter(p => p.status !== 'CLOSED'),
@@ -1207,6 +1219,28 @@ export class CopyTraderService {
         // Never auto-arm REAL trading from a file on disk. Paper may resume;
         // real requires the operator to flip the switch this session.
         if (this.config.tradingMode === 'real') this.config.enabled = false;
+
+        // MIGRATION to schema 2 (auto-sells restored 2026-08-13).
+        //
+        // `copySells` defaulted to true through the whole period when it did
+        // nothing at all — auto-sells were removed on 2026-08-12 and the field
+        // survived only so old files still parsed. So every config written
+        // before today claims copySells:true while its owner has only ever
+        // seen a bot that holds. Honouring that value on upgrade would switch
+        // real accounts to automatic selling on the strength of a setting
+        // nobody chose. Opt them out once; the toggle is theirs afterwards.
+        if (Number(raw.configVersion) < COPY_CONFIG_VERSION || raw.configVersion === undefined) {
+          if (this.config.copySells) {
+            this.config.copySells = false;
+            console.warn('[CopyTrader] Automatic selling is now available and is OFF for this install. Your saved config predates the feature, so it was not switched on for you — enable "copy sells" in the Copy Trading tab if you want the bot to mirror leader exits.');
+          }
+          // Write the stamp NOW. persist() otherwise only fires on a change, so
+          // the file kept its old shape and the migration re-ran on every start
+          // — re-disabling the toggle each boot for anyone who had turned it on
+          // but not since touched another setting. (Observed on the first
+          // smoke test: the warning printed but configVersion stayed unset.)
+          this.persist();
+        }
       }
 
       if (Array.isArray(raw.wallets)) {
