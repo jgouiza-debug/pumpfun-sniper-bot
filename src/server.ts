@@ -15,6 +15,7 @@ import { featureFlags, FeatureFlagSet } from './services/featureFlags';
 import { latencyTimeline, LatencyTimelineLogger } from './services/latencyTimeline';
 import { entryGateV2 } from './services/entryGateV2';
 import { localTxBuilder } from './services/localTxBuilder';
+import { updaterService } from './services/updaterService';
 // ─── Hardened crash guards ──────────────────────────────────────────────────
 // @solana/web3.js retries 429 / timeout errors internally then re-throws.
 // Without these guards that unhandled rejection kills the process instantly.
@@ -430,6 +431,16 @@ app.post('/api/copy/sell', async (req, res) => {
 app.post('/api/copy/clear-history', (req, res) => {
   copyTrader.clearHistory();
   res.json({ success: true });
+});
+
+// GET auto-updater status check against GitHub API
+app.get('/api/updater/check', async (req, res) => {
+  try {
+    const status = await updaterService.checkForUpdates();
+    res.json(status);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to check for updates' });
+  }
 });
 
 // SSE push of the copy-trader state — same contract as /api/stream.

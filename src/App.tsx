@@ -138,6 +138,10 @@ export function App() {
   const [walletError, setWalletError] = useState<string>('');
   const [lastReport, setLastReport] = useState<any>(null);
 
+  // Auto-Updater State
+  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false);
+
   // Feature Flags State
   const [featureFlags, setFeatureFlags] = useState<Record<string, boolean>>({
     allInSizing: true,
@@ -356,6 +360,27 @@ export function App() {
     }, 500);
     return () => clearInterval(iv);
   }, []);
+
+  const handleCheckUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      const res = await fetch(`http://localhost:${selectedPort}/api/updater/check`);
+      if (res.ok) {
+        const data = await res.json();
+        setUpdateInfo(data);
+      }
+    } catch {
+      /* ignore offline */
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  useEffect(() => {
+    handleCheckUpdate();
+    const interval = setInterval(handleCheckUpdate, 300000);
+    return () => clearInterval(interval);
+  }, [selectedPort]);
 
   // Real-time status: the server pushes over SSE the moment anything changes
   // (order submitted, fill confirmed, price moved), coalesced to at most one
@@ -630,6 +655,18 @@ export function App() {
 
   return (
     <div>
+      {/* Auto-Update Notification Banner */}
+      {updateInfo?.hasUpdate && (
+        <div style={{ background: '#16a34a', color: '#ffffff', padding: '10px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '13px', fontWeight: 600, borderBottom: '1px solid #15803d' }}>
+          <span>🚀 UPDATE AVAILABLE: Version {updateInfo.latestVersion} is out! (Current: {updateInfo.currentVersion}) — {updateInfo.releaseNotes}</span>
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <a href={updateInfo.downloadUrl || updateInfo.releaseUrl} target="_blank" rel="noreferrer" style={{ background: '#ffffff', color: '#16a34a', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}>
+              📥 DOWNLOAD NEW .EXE
+            </a>
+          </div>
+        </div>
+      )}
+
       {/* Editorial Bloomberg Header */}
       <header className="header">
         <div>
@@ -1354,13 +1391,53 @@ export function App() {
                   </div>
                 </div>
 
-                {/* Take-profit and trailing-stop controls used to sit here.
-                    Removed 2026-08-12 with every other automatic exit. */}
-                <div style={{ marginTop: '8px', padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '9px', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
-                  🚫 NO AUTOMATIC SELLS — this bot never sells on its own. Take-profit,
-                  trailing stop, time stop and structural stops are all removed. Rug
-                  signals (creator dump, pool drain) are logged as warnings; the ONLY
-                  exit is the manual LIQUIDATE button on each position.
+                {/* Take-profit Automation Controls (Positive P&L Only — No Stop-Losses) */}
+                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(0,230,118,0.05)', border: '1px solid rgba(0,230,118,0.2)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#00e676', marginBottom: '6px' }}>
+                    💰 Take-Profit Automation (Positive P&L Only — No Stop-Losses)
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div className="form-group">
+                      <label className="form-label">Take Profit 1 Target (+%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.takeProfitPct ?? 100}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Take Profit 2 Target (+%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.takeProfitRung2Pct ?? 400}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitRung2Pct: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Trailing Profit Arm Multiple (x)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.trailingArmMultiple ?? 3.0}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingArmMultiple: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Trailing Profit Distance (%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.trailingStopPct ?? 30}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingStopPct: Number(e.target.value) })}
+                      />
+                    </div>
+                  </div>
                 </div>
 
                 {/* Wallet-split sizing: the run budget is carved into equal

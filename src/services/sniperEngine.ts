@@ -28,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, isPoolDrained, acceptPeakUpdate, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -3070,12 +3070,78 @@ export class SniperEngine {
         }
       }
 
-      // NO AUTOMATIC EXITS. The full ladder that stood here — pullback rung,
-      // TP1/TP2 profit rungs, trailing-stop moonbag ratchet, time stop — was
-      // deleted 2026-08-12 at the owner's direction, following the 2026-08-09
-      // deletion of the price stop-loss. The bot buys; only the owner sells,
-      // via the manual LIQUIDATE path (manualSellPosition -> executeSell).
-      // Do not reintroduce an automatic sell trigger of any kind here.
+      // TAKE PROFIT AUTOMATIC EXITS — POSITIVE P&L ONLY.
+      // Per owner directive: The bot takes profits when in positive P&L (TP1, TP2, Pullback TP, Trailing TP).
+      // ABSOLUTELY NO STOP LOSSES or automatic exits when in negative P&L.
+      if (pos.pnlPct > 0 && currentPriceUsd > pos.buyPriceUsd) {
+        // Moonbag ratchet target check
+        const armedTarget = trailingStopTargetUsd({
+          highestPriceUsd: pos.highestPriceUsd,
+          buyPriceUsd: pos.buyPriceUsd,
+          armMultiple: this.config.trailingArmMultiple ?? 3.0,
+          trailingStopPct: this.config.trailingStopPct,
+          useTrailingStop: this.config.useTrailingStop,
+        });
+        if (armedTarget !== undefined) pos.trailingStopTargetUsd = armedTarget;
+
+        const pullbackFromPeakPct = ((pos.highestPriceUsd - currentPriceUsd) / pos.highestPriceUsd) * 100;
+
+        // Pullback Take Profit Rung (only in positive PnL >= 60%)
+        if (pos.pnlPct >= 60 && pullbackFromPeakPct >= 15 && !pos.pullbackRungTaken) {
+          const sale = await this.sellPctReal(pos, 50);
+          if (sale !== null) {
+            pos.pullbackRungTaken = true;
+            pos.principalRecovered = true;
+            pos.status = 'PARTIAL_PROFIT';
+            this.recordPartialSell(pos, 0.5, `price fell ${pullbackFromPeakPct.toFixed(0)}% from peak while up +${pos.pnlPct}%`, sale.actual, 'PULLBACK_PARTIAL');
+            this.log('sell', `📉 [TAKE PROFIT 50%] $${pos.tokenSymbol} — was up +${pos.pnlPct}%, price dropped ${pullbackFromPeakPct.toFixed(0)}% from peak $${pos.highestPriceUsd.toFixed(6)}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
+            return;
+          }
+        }
+
+        // Take Profit 1 (TP1)
+        if (pos.pnlPct >= this.config.takeProfitPct && !pos.tp1Taken) {
+          const sale = await this.sellPctReal(pos, 50);
+          if (sale !== null) {
+            pos.tp1Taken = true;
+            pos.principalRecovered = true;
+            pos.status = 'PARTIAL_PROFIT';
+            this.recordPartialSell(pos, 0.5, `hit take-profit target of +${this.config.takeProfitPct}%`, sale.actual, 'TP1');
+            this.log('sell', `💰 [TAKE PROFIT 1 - SOLD 50%] $${pos.tokenSymbol} — hit +${pos.pnlPct}% (target +${this.config.takeProfitPct}%)${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
+            return;
+          }
+        }
+
+        // Take Profit 2 (TP2)
+        if (pos.pnlPct >= this.config.takeProfitRung2Pct && !pos.moonbagRiding) {
+          const sale = await this.sellPctReal(pos, 50);
+          if (sale !== null) {
+            pos.moonbagRiding = true;
+            this.recordPartialSell(pos, 0.5, `hit second take-profit target of +${this.config.takeProfitRung2Pct}%`, sale.actual, 'TP2');
+            this.log('sell', `🔥 [TAKE PROFIT 2 - SOLD 50%] $${pos.tokenSymbol} — hit +${pos.pnlPct}% (target +${this.config.takeProfitRung2Pct}%)${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding remaining.`, pos.mint);
+            return;
+          }
+        }
+
+        // Trailing Stop (Moonbag Ratchet) — STRICTLY POSITIVE ONLY
+        if (pos.trailingStopTargetUsd && currentPriceUsd <= pos.trailingStopTargetUsd) {
+          pos.trailingTriggerCount = (pos.trailingTriggerCount ?? 0) + 1;
+          const trailReason = `trailing profit stop: price pulled back ${this.config.trailingStopPct}% from peak $${pos.highestPriceUsd.toFixed(6)}`;
+
+          if (pos.trailingTriggerCount >= 2) {
+            await this.executeSell(pos, `TAKE PROFIT ALL — ${trailReason} (second trigger)`);
+            return;
+          }
+
+          const sale = await this.sellPctReal(pos, 50);
+          if (sale !== null) {
+            pos.status = 'PARTIAL_PROFIT';
+            this.recordPartialSell(pos, 0.5, trailReason, sale.actual, 'TRAILING_PARTIAL');
+            this.log('sell', `📉 [TAKE PROFIT 50%] $${pos.tokenSymbol} — ${trailReason}${sale.actual ? ` — got ${sale.actual.proceedsSol.toFixed(4)} SOL` : ''}. Still holding 50%.`, pos.mint);
+            return;
+          }
+        }
+      }
 
     } catch (err: any) {
       // ignore

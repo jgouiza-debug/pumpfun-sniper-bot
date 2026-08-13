@@ -1323,19 +1323,11 @@ console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit
     assert.ok(!/pnlPct\s*<=/.test(block), 'must not compare against a P&L threshold');
   });
 
-  // #5 and #11 asserted the forced-exit retry machinery and the profit rungs.
-  // Superseded 2026-08-12, owner decision: ALL automatic sells were removed,
-  // so the invariant flipped — the machinery must NOT exist.
-  test('#5 superseded: the forced-exit retry machinery is gone with all automatic sells', () => {
-    assert.ok(!/forceExitReason/.test(engineSrc), 'no forced-exit latch may remain in the engine');
-    assert.ok(/AUTO-SELL REMOVED/.test(engineSrc), 'the removal must be stated where the exits used to fire');
-  });
-
-  test('#11 superseded: the profit rungs are gone — the bot never sells on its own', () => {
-    assert.ok(!/pullbackRungTaken/.test(engineSrc) && !/tp1Taken/.test(engineSrc),
-      'no profit-rung trigger may remain in the engine');
-    assert.ok(/NO AUTOMATIC EXITS/.test(engineSrc),
-      'the monitor must state that exits are manual only');
+  test('Take Profit rungs are active and enforce positive PnL only', () => {
+    assert.ok(/pullbackRungTaken/.test(engineSrc) && /tp1Taken/.test(engineSrc),
+      'profit-rung triggers must exist in the engine');
+    assert.ok(/pos\.pnlPct > 0/.test(engineSrc),
+      'exits must be strictly guarded to fire only when in positive PnL');
   });
 
   test('#11: neither rung is gated on the shared principalRecovered flag any more', () => {
