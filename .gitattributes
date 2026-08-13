@@ -1,1 +1,2 @@
 *.exe filter=lfs diff=lfs merge=lfs -text
+pumpfun-sniper-bot-macos-* filter=lfs diff=lfs merge=lfs -text
