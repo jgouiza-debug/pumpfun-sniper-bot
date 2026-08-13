@@ -1,4 +1,4 @@
-name: Build and Release Executable
+﻿name: Build and Release Executable
 
 # Two distinct jobs share one file:
 #  - every push to master builds the exe as a smoke test and publishes nothing;
@@ -6,7 +6,7 @@ name: Build and Release Executable
 #    installs from.
 #
 # The updater REFUSES to install a release with no .sha256 asset, so the
-# checksum step below is not optional decoration — drop it and every client
+# checksum step below is not optional decoration â€” drop it and every client
 # silently loses the ability to update.
 on:
   push:
@@ -29,11 +29,20 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
           cache: 'npm'
 
+      # npm ci VALIDATES the lock rather than resolving it, and npm 10 and 11
+      # disagree about ws's optional peers (utf-8-validate, bufferutil): a lock
+      # written by 11 makes 10 abort with "Missing: utf-8-validate from lock
+      # file". Every run in this repo's history failed here, which is why no
+      # release was ever published and no client could ever auto-update.
+      # Pinning the major to the one that writes the lock keeps ci strict
+      # instead of loosening it to npm install.
       - name: Install Dependencies
-        run: npm ci
+        run: |
+          npm i -g npm@11
+          npm ci
 
       # The exe reports the version baked into the package.json inside its pkg
       # snapshot. Without this the tag and the shipped build disagree, the
@@ -78,7 +87,7 @@ jobs:
   # macOS has to build ON macOS. pkg can fetch a prebuilt x64 base from any
   # host, but an arm64 Mach-O will not execute on Apple Silicon without at
   # least an ad-hoc code signature, and that signing step cannot run on a
-  # Windows or Linux runner — attempting it produces a 0-byte file (measured
+  # Windows or Linux runner â€” attempting it produces a 0-byte file (measured
   # 2026-08-13). Hence a separate macos runner rather than extra targets above.
   build-and-release-macos:
     runs-on: macos-14   # Apple Silicon runner: builds arm64 natively, x64 via pkg
@@ -89,11 +98,20 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
           cache: 'npm'
 
+      # npm ci VALIDATES the lock rather than resolving it, and npm 10 and 11
+      # disagree about ws's optional peers (utf-8-validate, bufferutil): a lock
+      # written by 11 makes 10 abort with "Missing: utf-8-validate from lock
+      # file". Every run in this repo's history failed here, which is why no
+      # release was ever published and no client could ever auto-update.
+      # Pinning the major to the one that writes the lock keeps ci strict
+      # instead of loosening it to npm install.
       - name: Install Dependencies
-        run: npm ci
+        run: |
+          npm i -g npm@11
+          npm ci
 
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/')
@@ -111,7 +129,7 @@ jobs:
           npm run build:mac-intel
 
       # Ad-hoc signature. Apple Silicon refuses to execute an unsigned arm64
-      # binary outright — this is not the same thing as notarisation, which
+      # binary outright â€” this is not the same thing as notarisation, which
       # only affects the Gatekeeper prompt on first open.
       - name: Ad-hoc codesign (arm64)
         run: |
