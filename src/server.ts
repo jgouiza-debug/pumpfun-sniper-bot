@@ -1,3 +1,7 @@
+// MUST STAY FIRST. This import populates process.env from a .env beside the
+// exe, and every service imported below reads its credentials at construction
+// time — the SniperEngine singleton included. See services/loadEnv.ts.
+import './services/loadEnv';
 import express from 'express';
 import http from 'http';
 import fs from 'fs';
@@ -16,67 +20,66 @@ import { latencyTimeline, LatencyTimelineLogger } from './services/latencyTimeli
 import { entryGateV2 } from './services/entryGateV2';
 import { localTxBuilder } from './services/localTxBuilder';
 import { updaterService } from './services/updaterService';
+import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
 // ─── Hardened crash guards ──────────────────────────────────────────────────
 // @solana/web3.js retries 429 / timeout errors internally then re-throws.
 // Without these guards that unhandled rejection kills the process instantly.
-process.on('uncaughtException', (err: Error) => {
+//
+// Staying alive is the point; staying SILENT was a bug. These used to `return`
+// on anything network-shaped, so a storm of RPC failures — the exact condition
+// under which a position stops being priced and an exit stops being evaluated —
+// left no trace anywhere. A trading process must never hide its own faults, so
+// every one is logged; only the log level differs.
+function reportProcessFault(kind: 'Uncaught Exception' | 'Unhandled Rejection', err: any): void {
   const msg = err?.message || String(err);
-  if (/429|timeout|ECONNRESET|ETIMEDOUT|socket hang up|network/i.test(msg)) return;
-  console.warn('⚠️ [Uncaught Exception — server kept alive]:', msg);
-});
-
-process.on('unhandledRejection', (reason: any) => {
-  const msg = reason?.message || String(reason);
-  if (/429|timeout|ECONNRESET|ETIMEDOUT|socket hang up|network/i.test(msg)) return;
-  console.warn('⚠️ [Unhandled Rejection — server kept alive]:', msg);
-});
-
-
-/**
- * Load a .env sitting NEXT TO the executable.
- *
- * `npm run dev` gets this from node's --env-file-if-exists flag, but a pkg-built
- * exe is launched by double-click with no flags — so without this an end user
- * has no file-based way to supply a key. The .env is deliberately NOT bundled
- * into the binary (see the note in package.json "pkg"), because that would bake
- * the builder's own Helius key into every copy handed out.
- *
- * Precedence: a real environment variable always wins over the file, and the
- * key entered in the UI wins over both (it is applied at runtime).
- */
-function loadEnvBesideExecutable(): void {
-  // process.execPath is the exe itself when packaged; cwd otherwise.
-  const isPackaged = Boolean((process as any).pkg);
-  const baseDir = isPackaged ? path.dirname(process.execPath) : process.cwd();
-  const envPath = path.join(baseDir, '.env');
-  try {
-    if (!fs.existsSync(envPath)) return;
-    for (const rawLine of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const eq = line.indexOf('=');
-      if (eq <= 0) continue;
-      const key = line.slice(0, eq).trim();
-      let value = line.slice(eq + 1).trim();
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-      // Never clobber a variable the user set in their shell.
-      if (process.env[key] === undefined) process.env[key] = value;
-    }
-    console.log(`🔑 Loaded settings from ${envPath}`);
-  } catch {
-    // A malformed .env must not stop the bot from starting — the UI can still
-    // supply the key.
+  const expected = /429|timeout|ECONNRESET|ETIMEDOUT|socket hang up|network/i.test(msg);
+  if (expected) {
+    // Routine transport noise: one line, no stack, still visible and countable.
+    console.warn(`⚠️ [${kind} — transport, server kept alive]: ${msg}`);
+    return;
   }
+  console.error(`❌ [${kind} — UNEXPECTED, server kept alive]: ${msg}`);
+  if (err?.stack) console.error(err.stack);
 }
-loadEnvBesideExecutable();
+
+process.on('uncaughtException', (err: Error) => reportProcessFault('Uncaught Exception', err));
+process.on('unhandledRejection', (reason: any) => reportProcessFault('Unhandled Rejection', reason));
+
 
 const app = express();
-app.use(cors());
+
+// Refuse non-loopback origins before any handler runs. This is the control that
+// actually stops a random browser tab from POSTing to the trading endpoints —
+// `cors()` alone never did, because it only gates whether the caller may READ
+// the response, not whether the handler executes. See services/apiAuth.ts.
+app.use(originGuard);
+
+// CORS headers still matter for the instance switcher: the UI served by :3001
+// reads responses from the API on :3002. Loopback only, mirroring the guard.
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || isLoopbackOrigin(origin)),
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Sniper-Token'],
+}));
 app.use(express.json());
 
 const PORT = Number(process.env.PORT) || 3001;
+
+// Hand the token to the local UI. Reachable only from a loopback origin (the
+// guard above), which is the same bar the mutating endpoints sit behind — so
+// this exposes nothing a same-machine browser page could not already reach. It
+// exists for the vite dev server on :3010 and for cross-instance calls, where
+// the token injected into the served HTML is not the target instance's.
+app.get('/api/session-token', (req, res) => {
+  res.json({ token: apiToken() });
+});
+
+// Every state-changing API call needs the token. Applied by method rather than
+// per-route so an endpoint added later is protected by default instead of by
+// remembering. GETs stay open behind the origin guard — they are status reads.
+app.use('/api', (req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  return requireApiToken(req, res, next);
+});
 
 // Serve the built UI from this same process, so http://localhost:3001 is the
 // whole app — no separate vite window to keep alive. `npm run build` refreshes
@@ -96,11 +99,31 @@ for (const dir of candidateDirs) {
   }
 }
 
+/**
+ * Serve index.html with this instance's API token embedded.
+ *
+ * A cross-origin page cannot read this HTML (no CORS on the document), so the
+ * token reaches our own UI and nothing else. `index: false` on the static
+ * middleware is load-bearing — otherwise it would serve the raw file for `/`
+ * and the UI would boot without a token.
+ */
+function indexHtmlWithToken(distDir: string): string {
+  const html = fs.readFileSync(path.join(distDir, 'index.html'), 'utf8');
+  const inject = `<script>window.__SNIPER_API_TOKEN__=${JSON.stringify(apiToken())};</script>`;
+  return html.includes('</head>')
+    ? html.replace('</head>', `${inject}</head>`)
+    : inject + html;
+}
+
 if (validDistDir) {
-  app.use(express.static(validDistDir));
+  app.use(express.static(validDistDir, { index: false }));
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api')) return next();
-    res.sendFile(path.join(validDistDir!, 'index.html'));
+    try {
+      res.type('html').send(indexHtmlWithToken(validDistDir!));
+    } catch {
+      res.sendFile(path.join(validDistDir!, 'index.html'));
+    }
   });
   console.log(`🖥️  Serving UI from ${validDistDir} — open http://localhost:${PORT}`);
 } else {
@@ -441,6 +464,44 @@ app.get('/api/updater/check', async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to check for updates' });
   }
+});
+
+// GET download/verify progress for an in-flight self-update
+app.get('/api/updater/progress', (req, res) => {
+  res.json(updaterService.getProgress());
+});
+
+// POST download, verify and install the published release, then restart.
+// Token-gated like every other mutating route: this one replaces the binary.
+app.post('/api/updater/apply', async (req, res) => {
+  const result = await updaterService.applyUpdate();
+  res.status(result.ok ? 200 : 400).json(result);
+});
+
+/**
+ * Refuse to restart mid-trade.
+ *
+ * An update swaps the exe and relaunches it. With a position open that would
+ * strand the bag between two processes, and the real-mode lock would be held by
+ * a PID that is about to vanish. Wired here rather than inside the updater so
+ * that module stays free of engine imports.
+ */
+updaterService.setRestartGuard(() => {
+  const status = sniperEngine.getStatus();
+  if (status.activePositions?.length) {
+    return { ok: false, reason: `${status.activePositions.length} position(s) still open — close them before updating.` };
+  }
+  if (status.isBotActive) {
+    return { ok: false, reason: 'Stop the bot before updating.' };
+  }
+  const copy = copyTrader.getStatus();
+  if (copy.positions?.length) {
+    return { ok: false, reason: `${copy.positions.length} copy position(s) still open — close them before updating.` };
+  }
+  if (copy.enabled) {
+    return { ok: false, reason: 'Stop copy trading before updating.' };
+  }
+  return { ok: true };
 });
 
 // SSE push of the copy-trader state — same contract as /api/stream.

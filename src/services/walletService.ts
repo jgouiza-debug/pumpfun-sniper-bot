@@ -191,6 +191,20 @@ export class WalletService {
         return Keypair.fromSeed(Uint8Array.from(Buffer.from(trimmed, 'hex')));
       }
 
+      // Base58 FIRST — it is what Phantom / Solflare / Photon actually export,
+      // and the base64 branch below cannot be trusted to decline a base58 key.
+      // The base58 alphabet is a subset of the base64 one, so an 86-character
+      // base58 key matches the base64 regex and Buffer.from(x,'base64') decodes
+      // it to exactly 64 bytes of garbage. That produced a VALID-LOOKING keypair
+      // for a wallet the user does not own: the bot would link, show a 0 balance
+      // for an address they never heard of, and sign with it. Trying base58
+      // first makes the correct interpretation win whenever it is possible.
+      try {
+        const decoded = bs58.decode(trimmed);
+        if (decoded.length === 64) return Keypair.fromSecretKey(decoded);
+        if (decoded.length === 32) return Keypair.fromSeed(decoded);
+      } catch { /* not base58 — fall through to base64 */ }
+
       // Base64 string
       if (/^[A-Za-z0-9+/=]{44,88}$/.test(trimmed)) {
         try {
@@ -199,11 +213,6 @@ export class WalletService {
           if (decodedB64.length === 32) return Keypair.fromSeed(Uint8Array.from(decodedB64));
         } catch { /* proceed */ }
       }
-
-      // Base58 string (most common for Phantom / Solflare / Photon exports)
-      const decoded = bs58.decode(trimmed);
-      if (decoded.length === 64) return Keypair.fromSecretKey(decoded);
-      if (decoded.length === 32) return Keypair.fromSeed(decoded);
     } catch {
       return null;
     }

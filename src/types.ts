@@ -53,6 +53,14 @@ export interface PumpTokenLaunch {
   socialCount?: number;
   isBoosted?: boolean;
   hasLiveMarketData?: boolean;
+  /**
+   * True when `liquidityUsd` is the ~158-SOL migration ASSERTION rather than a
+   * reading. DexScreener needs minutes to index a fresh pool, so at decision
+   * time this is asserted for roughly every migration — which makes it the most
+   * dangerous number in the payload if anything mistakes it for a measurement.
+   * Never let a threshold treat an asserted value as evidence.
+   */
+  liquidityIsAsserted?: boolean;
 }
 
 export interface RugCheckRisk {
@@ -123,25 +131,29 @@ export interface FilterConfig {
   maxDevHoldingsPct: number;
 }
 
+/**
+ * Gate 0 — MEASURED CHECKS ONLY.
+ *
+ * Ten fields used to live here that were assigned a literal `true` and never
+ * computed: noToken2022Hooks, sellSimPassed, insiderPctClean,
+ * sniperHoldingsPctClean, maxSingleHolderPctClean, devPriorRugRateClean,
+ * devSoldAnyClean, buyPressureClean, notHoneypot, notDumping. They rendered as
+ * ten green checkmarks in the dashboard and three of them were counted into
+ * `allPassed`, which is what made "Gate 0 all passed" mean nothing — and what
+ * let a score-based override treat that phrase as a safety verdict.
+ *
+ * They are gone rather than defaulted. A check that is not performed must not
+ * have a field, because a field invites a checkmark.
+ */
 export interface Gate0Result {
   mintAuthorityRevoked: boolean;
   freezeAuthorityRevoked: boolean;
-  noToken2022Hooks: boolean;
   lpBurnedOrLocked: boolean;
-  sellSimPassed: boolean;
   bundledSupplyPctClean: boolean;
-  insiderPctClean: boolean;
-  sniperHoldingsPctClean: boolean;
   top10PctClean: boolean;
-  maxSingleHolderPctClean: boolean;
   devHoldingsPctClean: boolean;
-  devPriorRugRateClean: boolean;
-  devSoldAnyClean: boolean;
   liquidityMinClean: boolean;
   washScoreClean: boolean;
-  buyPressureClean?: boolean;
-  notHoneypot?: boolean;
-  notDumping?: boolean;
   /** RugCheck's own aggregate risk score is within the configured ceiling. */
   rugcheckScoreClean?: boolean;
   marketRegimeValid: boolean;
@@ -242,6 +254,38 @@ export interface BotConfig {
    * structural exits blind and the only fallback is maxHoldSeconds.
    */
   noDataExitSeconds?: number;
+  // --- Exit policy: which automatic sells are allowed to fire ---
+  //
+  // Every loss-side exit is a switch the owner sets, not a policy baked into
+  // the engine. Between 2026-08-12 and 2026-08-13 all of them were deleted
+  // outright, which meant a position that rugged had exactly one exit — the
+  // owner noticing. The switches restore the choice without taking it back:
+  // turn any of these off and the bot goes back to warning and holding.
+  //
+  // The thresholds they act on are the existing fields above
+  // (poolDrainExitFraction, sellFlowExitTicks, maxHoldSeconds,
+  // noDataExitSeconds), which until now only tuned log lines.
+  /** Sell 100% when pool liquidity drains past poolDrainExitFraction of peak. */
+  exitOnPoolDrain?: boolean;
+  /** Sell 50%, then 100%, after sellFlowExitTicks ticks of collapsed buy pressure. */
+  exitOnSellFlowCollapse?: boolean;
+  /** Sell 100% when the creator dumps (needs the devSellStop flag for detection). */
+  exitOnDevSell?: boolean;
+  /** Sell 100% when the post-buy sell simulation reverts (needs honeypotChecks). */
+  exitOnHoneypot?: boolean;
+  /** Sell 100% once the position is older than maxHoldSeconds. */
+  exitOnMaxHold?: boolean;
+  /** Sell 100% when no market data has appeared noDataExitSeconds after entry. */
+  exitOnNoData?: boolean;
+  /**
+   * Sell 100% at a fixed drawdown from the verified fill price. OFF by owner
+   * decision: on pump.fun a 20-35% dip is noise, and a stop inside the entry
+   * band converts ordinary volatility into a realized loss. The structural
+   * exits above cut rugs on evidence instead of on price.
+   */
+  exitOnPriceStop?: boolean;
+  /** Drawdown percentage for the price stop. Only read when exitOnPriceStop. */
+  stopLossPct?: number;
   /** Give up automatic retries of a forced exit after this many attempts. */
   maxForceExitAttempts?: number;
   /**
@@ -293,9 +337,14 @@ export interface BotConfig {
   priorityFeeSol: number;
   /** Hard ceiling for the dynamic priority fee (flag dynamicPriorityFee). */
   maxPriorityFeeSol?: number;
+  /** Buy-side slippage tolerance. Deliberately tighter than the sell side. */
   maxSlippagePct: number;
-  /** Reserved for a future Jito bundle path — currently NOT wired to anything. */
-  jitoTipSol: number;
+  /**
+   * Sell-side tolerance, floored at maxSlippagePct. Exits may pay more than
+   * entries: a missed buy costs nothing, an unsellable bag has no upper bound.
+   * One capped retry on a 6004; buys never escalate at all.
+   */
+  maxSellSlippagePct?: number;
   /** Rolling-hour realized loss (USD) that trips the kill switch (flag killSwitch). */
   maxHourlyLossUsd?: number;
   /** Round-trip cost guideline as % of position size (flag enforceTradeEconomics). Advisory: entries above it warn but still trade. */
@@ -303,6 +352,28 @@ export interface BotConfig {
   solPriceUsd: number;
   privateKey?: string;
   heliusApiKey?: string;
+  /**
+   * PumpPortal Data API key, per user, entered in Settings.
+   *
+   * Trading does NOT need this: `/api/trade-local` builds an unsigned
+   * transaction for anyone and charges 0.5% per side. What the key buys is the
+   * TRADE STREAM. Measured 2026-08-05, `subscribeTokenTrade` replies "only
+   * available when connecting with an API key funded with at least 0.02 SOL"
+   * and delivers zero events without one — which is why unique-buyer counts,
+   * buy-pressure, Play 2 (the only entry that buys before the crowd) and the
+   * creator-dump stops are all inert on the free tier.
+   *
+   * Per-user by design: it is funded with the holder's own SOL, so it must
+   * never be baked into a shared build.
+   */
+  pumpPortalApiKey?: string;
+  // --- Status-only mirrors. Never sent by the UI; set by getStatus() so the
+  // dashboard can show whether a key exists without the key itself being
+  // broadcast on every poll. ---
+  heliusApiKeySet?: boolean;
+  heliusApiKeyHint?: string;
+  pumpPortalApiKeySet?: boolean;
+  pumpPortalApiKeyHint?: string;
   bankrollUsd: number;
   instanceName?: string;
   instancePort?: number;
@@ -378,6 +449,9 @@ export type ExitCode =
   | 'TRAILING_FULL'
   | 'TIME_STOP'
   | 'NO_DATA_STOP'
+  | 'PRICE_STOP'
+  /** Entry abandoned because the fill landed far above the decision price. */
+  | 'BAD_FILL'
   | 'STRUCTURAL'
   | 'HONEYPOT'
   | 'MANUAL'

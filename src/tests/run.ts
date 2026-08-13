@@ -987,18 +987,21 @@ console.log('\n-- Exit policy: no price stop-loss --');
     }), undefined);
   });
 
-  test('a position down 60% has NO price exit — that is the point', () => {
-    // No stop-loss helper exists to call. Assert the config surface is gone so
-    // a future edit cannot quietly reintroduce a price floor.
+  test('a position down 60% has no price exit UNLESS the owner switched one on', () => {
+    // 2026-08-13: the price stop is a setting again, so the guard changed shape.
+    // What must hold is that it is opt-in and that nothing reads the threshold
+    // outside the switch — a price floor must never come back by accident.
     const engineSrc = require('fs').readFileSync(
       require('path').join(__dirname, '../services/sniperEngine.ts'), 'utf8');
-    assert.ok(!/config\.stopLossPct/.test(engineSrc),
-      'engine must not reference config.stopLossPct');
-    assert.ok(!/pnlPct\s*<=\s*-/.test(engineSrc),
-      'engine must not contain a negative-pnl price stop');
-    const typesSrc = require('fs').readFileSync(
-      require('path').join(__dirname, '../types.ts'), 'utf8');
-    assert.ok(!/\bstopLossPct\b/.test(typesSrc), 'BotConfig must not carry stopLossPct');
+    assert.ok(/exitOnPriceStop:\s*false/.test(engineSrc),
+      'the price stop must ship OFF');
+    const priceStopBlock = engineSrc.slice(
+      engineSrc.indexOf('if (this.config.exitOnPriceStop)'),
+      engineSrc.indexOf('// TAKE PROFIT'));
+    assert.ok(/pnlPct\s*<=\s*-/.test(priceStopBlock),
+      'the only negative-pnl comparison must live inside the switch');
+    assert.strictEqual(engineSrc.split(/pnlPct\s*<=\s*-/).length - 1, 1,
+      'exactly one negative-pnl price comparison may exist in the engine');
   });
 
   console.log('\n-- Exit policy: structural exits replace the price stop --');
@@ -1306,9 +1309,45 @@ console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit
   const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
   const typesSrc = fs.readFileSync(path.join(__dirname, '../types.ts'), 'utf8');
 
-  test('the price stop-loss is still gone (guard against regression)', () => {
-    assert.ok(!/config\.stopLossPct/.test(engineSrc));
-    assert.ok(!/\bstopLossPct\b/.test(typesSrc));
+  test('the price stop exists but is gated on a switch that ships OFF', () => {
+    // It came back on 2026-08-13 as an owner-controlled setting, not as policy.
+    // What must never regress is the DEFAULT: price alone does not sell.
+    assert.ok(/exitOnPriceStop/.test(typesSrc), 'the switch must be configurable');
+    assert.ok(/config\.exitOnPriceStop/.test(engineSrc), 'the engine must read the switch');
+    assert.ok(/exitOnPriceStop:\s*false/.test(engineSrc),
+      'the engine default for the price stop must be false');
+    // Every read of the threshold must sit behind the switch.
+    const stopIdx = engineSrc.indexOf('config.stopLossPct');
+    assert.ok(stopIdx > engineSrc.indexOf('config.exitOnPriceStop'),
+      'stopLossPct must only be read inside the exitOnPriceStop branch');
+  });
+
+  test('each loss-side exit has its own switch, and they default to owner policy', () => {
+    // Owner stance 2026-08-13: act on evidence and on time, never on price.
+    const defaults: Array<[string, boolean]> = [
+      ['exitOnPoolDrain', true],
+      ['exitOnSellFlowCollapse', true],
+      ['exitOnDevSell', true],
+      ['exitOnHoneypot', true],
+      ['exitOnMaxHold', true],
+      ['exitOnNoData', true],
+      ['exitOnPriceStop', false],
+    ];
+    for (const [key, expected] of defaults) {
+      assert.ok(new RegExp(`${key}\\?:\\s*boolean`).test(typesSrc), `${key} must be in BotConfig`);
+      assert.ok(new RegExp(`${key}:\\s*${expected}`).test(engineSrc),
+        `${key} must default to ${expected} in the engine`);
+      assert.ok(new RegExp(`config\\.${key}`).test(engineSrc), `${key} must gate real behaviour`);
+    }
+  });
+
+  test('every structural danger can still only WARN when its switch is off', () => {
+    // The warn-and-hold path is what makes these switches reversible, so it has
+    // to survive alongside the sells.
+    for (const marker of ['is OFF in Settings']) {
+      const hits = engineSrc.split(marker).length - 1;
+      assert.ok(hits >= 4, `expected the warn-only fallback on every exit family, saw ${hits}`);
+    }
   });
 
   test('#13: a no-data exit exists and is time-based, not price-based', () => {
@@ -1323,11 +1362,14 @@ console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit
     assert.ok(!/pnlPct\s*<=/.test(block), 'must not compare against a P&L threshold');
   });
 
-  test('Take Profit rungs are active and enforce positive PnL only', () => {
+  test('Take Profit rungs are active and never fire in negative PnL', () => {
     assert.ok(/pullbackRungTaken/.test(engineSrc) && /tp1Taken/.test(engineSrc),
       'profit-rung triggers must exist in the engine');
+    // Scoped to the PROFIT rungs only. The loss side has its own switches; what
+    // this guards is that a take-profit rung can never be the thing that books
+    // a loss, which is how the trailing stop once became the main liquidator.
     assert.ok(/pos\.pnlPct > 0/.test(engineSrc),
-      'exits must be strictly guarded to fire only when in positive PnL');
+      'take-profit rungs must be guarded to fire only when in positive PnL');
   });
 
   test('#11: neither rung is gated on the shared principalRecovered flag any more', () => {
@@ -1964,11 +2006,23 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
     }
   });
 
-  test('experimental flags stay off even when packaged', () => {
-    // These change execution paths and need shadow validation first.
-    for (const k of ['localTxBuild', 'entryGateV2', 'dynamicPriorityFee']) {
-      assert.strictEqual(PACKAGED_DEFAULTS[k], false, `${k} must not auto-enable in a shipped build`);
-    }
+  test('localTxBuild stays off until a parity run proves it', () => {
+    // The one flag that still needs per-session evidence: it replaces the
+    // transaction PumpPortal would have built. entryGateV2, dynamicPriorityFee
+    // and timelineSlotSampling were promoted 2026-08-13 — they had been shadow-
+    // validated for days and shipping them off meant the live path kept using
+    // the code they exist to replace.
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxBuild, false,
+      'a locally built tx must never ship enabled without shadow parity');
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxShadowCompare, true,
+      'the parity evidence localTxBuild requires must be collected by default');
+  });
+
+  test('divergence from DEFAULTS is declared, not accidental', () => {
+    const { INTENDED_PACKAGED_DIVERGENCE } = require('../services/featureFlags');
+    const actual = Object.keys(DEFAULTS).filter(k => PACKAGED_DEFAULTS[k] !== DEFAULTS[k]).sort();
+    assert.deepStrictEqual(actual, [...INTENDED_PACKAGED_DIVERGENCE].sort(),
+      'a packaged build that silently differs from DEFAULTS is how a local experiment ships to users');
   });
 }
 
@@ -2016,6 +2070,376 @@ console.log('\n-- Launch snipe (Play 1): first-candle entry --');
   test('an unfired snipe falls back to the Play 2 path instead of vanishing', () => {
     const arm = engineSrc.slice(engineSrc.indexOf('// Arm the momentum trigger'), engineSrc.indexOf('private async fireLaunchSnipe('));
     assert.ok(/enrollInWatchlist/.test(arm));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Security batch, 2026-08-13. Each of these guards a hole that was live in a
+// process holding a signing key.
+// ---------------------------------------------------------------------------
+console.log('\n-- Security: API origin/auth, key handling, lock atomicity --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const crypto = require('crypto');
+  const src = (rel: string) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+  const { isLoopbackOrigin } = require('../services/apiAuth');
+
+  // Digest of the retired key, not the key. Spelling the literal out here would
+  // put it straight back into the public repo this test exists to keep it out
+  // of — the assertion would pass while the leak it guards against continued.
+  const RETIRED_KEY_SHA256 = '04ff24ca29fec5d41ddb983164f7ba95ca9aafc56c237ff998faa1bc73d0730e';
+  const UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+  const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
+
+  test('no Helius key is hardcoded anywhere in source', () => {
+    // It was in four places, in a public repo, so every distributed exe carried
+    // the builder's credential.
+    for (const rel of ['services/clientWallet.ts', 'services/sniperEngine.ts', 'server.ts']) {
+      const embedded = (src(rel).match(UUID_RE) ?? []) as string[];
+      assert.ok(
+        !embedded.some((u) => sha256(u.toLowerCase()) === RETIRED_KEY_SHA256),
+        `${rel} still embeds the key`,
+      );
+    }
+  });
+
+  test('the browser never persists key material', () => {
+    const client = src('services/clientWallet.ts');
+    assert.ok(!/localStorage/.test(client), 'the signing key must not touch browser storage');
+    assert.ok(!/helius-rpc\.com/.test(client), 'browser code must not carry an RPC credential');
+  });
+
+  test('cross-origin requests are refused, loopback ones on any port are not', () => {
+    assert.ok(isLoopbackOrigin('http://localhost:3001'));
+    assert.ok(isLoopbackOrigin('http://127.0.0.1:3002'), 'the instance switcher uses other ports');
+    assert.ok(isLoopbackOrigin('http://[::1]:3001'), 'Windows resolves localhost to ::1 first');
+    assert.ok(!isLoopbackOrigin('https://evil.com'), 'this is the attack the wildcard CORS allowed');
+    assert.ok(!isLoopbackOrigin('http://localhost.evil.com'), 'suffix must not be enough');
+    assert.ok(!isLoopbackOrigin('null'), 'sandboxed frames post Origin: null');
+    assert.ok(!isLoopbackOrigin('file://'), '');
+  });
+
+  test('every mutating API call requires the token, by method not by memory', () => {
+    const server = src('server.ts');
+    assert.ok(/app\.use\(originGuard\)/.test(server), 'the origin guard must run before any handler');
+    assert.ok(!/app\.use\(cors\(\)\)/.test(server), 'wildcard CORS must be gone');
+    const gate = server.slice(server.indexOf("app.use('/api'"), server.indexOf("app.use('/api'") + 400);
+    assert.ok(/requireApiToken/.test(gate) && /req\.method === 'GET'/.test(gate),
+      'non-GET /api traffic must be token-gated wholesale');
+  });
+
+  test('process faults are never swallowed silently', () => {
+    const server = src('server.ts');
+    const fn = server.slice(server.indexOf('function reportProcessFault'), server.indexOf('process.on(\'uncaughtException\''));
+    assert.ok(/console\.(warn|error)/.test(fn), 'a trading process must log its own faults');
+    assert.ok(!/if \(expected\) return;/.test(fn), 'the bare early return was the bug');
+  });
+
+  test('no untrusted value is interpolated into a shell command', () => {
+    const engine = src('services/sniperEngine.ts');
+    assert.ok(!/exec\(`cmd \/c start/.test(engine),
+      'mint arrives off a third-party websocket and used to land on a command line');
+  });
+
+  test('the real-mode lock is taken with an atomic exclusive create', () => {
+    const lock = src('services/realModeLock.ts');
+    assert.ok(/openSync\(LOCK_FILE, 'wx'/.test(lock),
+      "check-then-write let two instances arm against the same wallet");
+  });
+
+  test('base58 keys are decoded as base58, not silently as base64', () => {
+    const wallet = src('services/walletService.ts');
+    const b58 = wallet.indexOf('bs58.decode(trimmed)');
+    const b64 = wallet.indexOf("Buffer.from(trimmed, 'base64')");
+    assert.ok(b58 > 0 && b64 > 0 && b58 < b64,
+      'an 86-char base58 key base64-decodes to 64 bytes and derives the WRONG wallet');
+  });
+}
+
+console.log('\n-- Exit reasons classify to the right bucket --');
+{
+  const { classifyExitReason } = require('../services/pipelineUtils');
+
+  test('a price stop is not filed as a profit exit', () => {
+    assert.strictEqual(classifyExitReason('SOLD ALL — price stop: down 31% from fill (limit 30%)'), 'PRICE_STOP');
+    assert.strictEqual(classifyExitReason('TAKE PROFIT ALL — trailing profit stop: price pulled back 30% from peak'), 'TRAILING_FULL');
+  });
+
+  test('the new structural strings still classify as structural', () => {
+    assert.strictEqual(classifyExitReason('SOLD ALL — structural stop: pool drained 60% (from $12,000 to $4,800)'), 'STRUCTURAL');
+    assert.strictEqual(classifyExitReason('SOLD ALL — structural stop: buy pressure 12% for 3 consecutive ticks'), 'STRUCTURAL');
+  });
+}
+
+console.log('\n-- Self-updater: version identity, verification, restart safety --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const updaterSrc = fs.readFileSync(path.join(__dirname, '../services/updaterService.ts'), 'utf8');
+  const workflow = fs.readFileSync(path.join(__dirname, '../../.github/workflows/release.yml'), 'utf8');
+  const { updaterService } = require('../services/updaterService');
+
+  test('the build knows its own version, not a hardcoded 1.0.0', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf8'));
+    assert.strictEqual(updaterService.getCurrentVersion(), pkg.version,
+      'reading package.json from process.cwd() left every packaged exe on 1.0.0 forever');
+  });
+
+  test('version resolution does not depend on the working directory', () => {
+    assert.ok(/__dirname/.test(updaterSrc),
+      'a packaged exe has no package.json beside it, so cwd cannot be the source');
+  });
+
+  test('an unverified binary is never installed', () => {
+    assert.ok(/checksumUrl/.test(updaterSrc) && /sha256OfFile/.test(updaterSrc));
+    assert.ok(/refusing to install an unverified binary/.test(updaterSrc),
+      'a release with no published checksum must be refused, not installed anyway');
+    const applyIdx = updaterSrc.indexOf('public async applyUpdate');
+    const swapIdx = updaterSrc.indexOf('stage: \'swapping\'');
+    const verifyIdx = updaterSrc.indexOf('Checksum mismatch');
+    assert.ok(applyIdx < verifyIdx && verifyIdx < swapIdx,
+      'verification must happen before the swap, not after');
+  });
+
+  test('a failed swap restores the working build', () => {
+    const swap = updaterSrc.slice(updaterSrc.indexOf("stage: 'swapping'"), updaterSrc.indexOf("stage: 'restarting'"));
+    assert.ok(/renameSync\(oldPath, exePath\)/.test(swap),
+      'a half-finished swap must never leave the user with no exe');
+  });
+
+  test('an update cannot run mid-trade', () => {
+    assert.ok(/restartGuard/.test(updaterSrc));
+    const apply = updaterSrc.slice(updaterSrc.indexOf('public async applyUpdate'));
+    assert.strictEqual(apply.split('this.restartGuard()').length - 1, 2,
+      'the guard must be re-checked after the download, since a position can open during it');
+  });
+
+  test('the commit fallback no longer claims an update it cannot install', () => {
+    const fallback = updaterSrc.slice(updaterSrc.indexOf('private async checkForCommitUpdates'));
+    assert.ok(/commits\/master/.test(fallback), 'the default branch is master');
+    assert.ok(!/heads\/main\.zip/.test(fallback), 'it used to link a branch that does not exist');
+  });
+
+  test('the release workflow publishes the checksum the updater requires', () => {
+    assert.ok(/\.sha256/.test(workflow), 'without this asset every client refuses to update');
+    assert.ok(/npm version \$version/.test(workflow), 'the tag must be stamped into the build');
+    assert.ok(/npm test/.test(workflow), 'a release must not ship a failing build');
+  });
+}
+
+console.log('\n-- Phase 0/1: fill quality, slippage, and a gate that means something --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const riskSrc = fs.readFileSync(path.join(__dirname, '../filters/riskFilter.ts'), 'utf8');
+  const typesSrc = fs.readFileSync(path.join(__dirname, '../types.ts'), 'utf8');
+  const { classifyExitReason } = require('../services/pipelineUtils');
+
+  test('a fill far above the decision price abandons the entry', () => {
+    assert.ok(/decisionPriceUsd/.test(engineSrc), 'the decision price must be captured before the fill overwrites it');
+    assert.ok(/MAX_FILL_SLIPPAGE_MULTIPLE/.test(engineSrc));
+    assert.strictEqual(classifyExitReason('SOLD ALL — bad fill: entered at 2.55x the decision price'), 'BAD_FILL');
+  });
+
+  test('the abort is checked against the VERIFIED fill, not an estimate', () => {
+    const block = engineSrc.slice(engineSrc.indexOf('FILL SANITY'), engineSrc.indexOf('FILL SANITY') + 1600);
+    assert.ok(/fillVerified &&/.test(block),
+      'an estimated price cannot prove a bad fill, and acting on one would exit good entries');
+  });
+
+  test('buys never escalate slippage; sells get exactly one capped retry', () => {
+    const retry = engineSrc.slice(engineSrc.indexOf('due to Slippage (6004)'), engineSrc.indexOf('if (confirmed === \'failed\')'));
+    assert.ok(/action === 'sell' && retryCount < 1/.test(retry),
+      'the old path retried buys at 25 -> 42 -> 68%, which is the same as no tolerance at all');
+    assert.ok(!/Math\.min\(100,/.test(retry), 'nothing may escalate toward 100%');
+    assert.ok(/MAX_SELL_RETRY_SLIPPAGE_PCT/.test(retry));
+  });
+
+  test('the shipped slippage defaults are asymmetric and tight', () => {
+    const { sniperEngine } = require('../services/sniperEngine');
+    const cfg = sniperEngine.getConfig();
+    assert.strictEqual(cfg.maxSlippagePct, 10, 'buy tolerance');
+    assert.strictEqual(cfg.maxSellSlippagePct, 15, 'sell tolerance');
+    assert.ok(cfg.maxSellSlippagePct > cfg.maxSlippagePct,
+      'exits may pay more than entries: a missed buy costs nothing, a stuck bag has no ceiling');
+  });
+
+  test('a strategy score can no longer overrule a safety verdict', () => {
+    assert.ok(!/minScoreHalfUnit;\s*\n\s*if \(filterResult\.score >= halfUnitFloor\)/.test(engineSrc),
+      'the override that turned KINGLON from unsafe into a buy must be gone');
+    assert.ok(/THE SCORE OVERRIDE IS GONE/.test(engineSrc), 'and its removal must stay documented');
+  });
+
+  test('Gate 0 has no fields it does not compute', () => {
+    for (const dead of ['noToken2022Hooks', 'sellSimPassed', 'insiderPctClean', 'sniperHoldingsPctClean',
+                        'maxSingleHolderPctClean', 'devPriorRugRateClean', 'devSoldAnyClean',
+                        'buyPressureClean', 'notHoneypot', 'notDumping']) {
+      // Match code, not prose: the comment above allPassed names two of these
+      // deliberately, to record what was removed and why.
+      assert.ok(!new RegExp(`${dead}\\s*[,=:]`).test(riskSrc), `${dead} is still assigned or returned in riskFilter`);
+      assert.ok(!new RegExp(`${dead}\\??:\\s*boolean`).test(typesSrc), `${dead} must leave Gate0Result too`);
+    }
+  });
+
+  test('allPassed is a conjunction of measured terms only', () => {
+    const conj = riskSrc.slice(riskSrc.indexOf('const allPassed ='), riskSrc.indexOf('return {'));
+    for (const term of conj.split('&&').map((s: string) => s.replace(/const allPassed =/, '').trim()).filter(Boolean)) {
+      assert.ok(new RegExp(`(const|let)\\s+${term.replace(';', '')}\\s*=`).test(riskSrc),
+        `${term} is in allPassed but is not computed in this file`);
+    }
+  });
+
+  test('ALL-IN MODE is wired to sizing instead of only to a label', () => {
+    assert.ok(/deployedFractionPct\(\)/.test(engineSrc));
+    const fn = engineSrc.slice(engineSrc.indexOf('private deployedFractionPct'), engineSrc.indexOf('private deployedFractionPct') + 400);
+    assert.ok(/allInSizing/.test(fn), 'the flag must actually change the deployed fraction');
+  });
+
+  test('the default run commits half the wallet, not all of it', () => {
+    const { sniperEngine } = require('../services/sniperEngine');
+    assert.strictEqual(sniperEngine.getConfig().maxDeployedFractionPct, 50);
+  });
+}
+
+console.log('\n-- Entry gate: the momentum ceiling refuses the KINGLON shape --');
+{
+  const { EntryGateV2 } = require('../services/entryGateV2');
+  const gate = new EntryGateV2();
+
+  // A clean migration payload: nothing about the TOKEN is wrong. The only
+  // question these tests ask is whether the MOMENT is sane.
+  const cleanRug = {
+    isInferred: false,
+    score: 1,
+    token: { mintAuthority: null, freezeAuthority: null },
+    fileMeta: { top10Pct: 18, maxSingleHolderPct: 5, insiderPct: 10, holderSampleSize: 40, rugged: false },
+  };
+  const migratePayload = { txType: 'migrate', mint: 'k', marketCapSol: 410 };
+  const evalWith = (market: any) => gate.evaluate(migratePayload, cleanRug, true, market);
+
+  test('THE ACTUAL TRADE: +362% in 5m on a 77s-old pair is refused', () => {
+    const r = evalWith({ priceChange5mPct: 362, pairAgeSeconds: 77, volume5mUsd: 4000, socialCount: 1 });
+    assert.strictEqual(r.isSafe, false);
+    assert.ok(r.reasons.some((x: string) => /buying the snipers' exit/.test(x)),
+      `expected the momentum ceiling to fire, got: ${JSON.stringify(r.reasons)}`);
+  });
+
+  test('the same token at a sane moment passes', () => {
+    const r = evalWith({ priceChange5mPct: 20, pairAgeSeconds: 77, volume5mUsd: 4000, socialCount: 1 });
+    assert.strictEqual(r.isSafe, true, JSON.stringify(r.reasons));
+  });
+
+  test('real volume behind the move is an exemption, thin volume is not', () => {
+    const thin = evalWith({ priceChange5mPct: 300, pairAgeSeconds: 60, volume5mUsd: 900, socialCount: 1 });
+    const deep = evalWith({ priceChange5mPct: 300, pairAgeSeconds: 60, volume5mUsd: 80_000, socialCount: 1 });
+    assert.strictEqual(thin.isSafe, false);
+    assert.strictEqual(deep.isSafe, true, JSON.stringify(deep.reasons));
+  });
+
+  test('an older pair that moves is not the same animal', () => {
+    const r = evalWith({ priceChange5mPct: 300, pairAgeSeconds: 900, volume5mUsd: 900, socialCount: 1 });
+    assert.strictEqual(r.isSafe, true, JSON.stringify(r.reasons));
+  });
+
+  test('missing market data is unverified, not silently safe', () => {
+    const r = evalWith({ socialCount: 1 });
+    assert.ok(r.unverifiedFields.includes('priceChange5m'),
+      'an unindexed chart must be recorded as unknown rather than treated as flat');
+  });
+
+  test('socials are required when resolved and excused when not indexed', () => {
+    const none = evalWith({ priceChange5mPct: 5, pairAgeSeconds: 300, socialCount: 0 });
+    assert.strictEqual(none.isSafe, false);
+    assert.ok(none.reasons.some((x: string) => /socials/.test(x)));
+
+    // Not indexed yet is the norm at the migration moment — rejecting on it
+    // would be rejecting DexScreener's lag, not the token.
+    const unknown = evalWith({ priceChange5mPct: 5, pairAgeSeconds: 300 });
+    assert.strictEqual(unknown.isSafe, true, JSON.stringify(unknown.reasons));
+    assert.ok(unknown.unverifiedFields.includes('socialCount'));
+  });
+
+  test('the ceiling can be disabled without touching code', () => {
+    const off = new EntryGateV2({ maxMigrationPump5mPct: 0 });
+    const r = off.evaluate(migratePayload, cleanRug, true, { priceChange5mPct: 362, pairAgeSeconds: 77, socialCount: 1 });
+    assert.strictEqual(r.isSafe, true, JSON.stringify(r.reasons));
+  });
+}
+
+console.log('\n-- No decorative settings: every BotConfig field must drive behaviour --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.join(__dirname, '..');
+
+  const readAll = (dir: string): string => {
+    let out = '';
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'tests') continue;
+        out += readAll(full);
+      } else if (/\.tsx?$/.test(entry.name)) {
+        out += fs.readFileSync(full, 'utf8');
+      }
+    }
+    return out;
+  };
+
+  const typesSrc = fs.readFileSync(path.join(root, 'types.ts'), 'utf8');
+  const allSrc = readAll(root);
+
+  const body = typesSrc.match(/export interface BotConfig \{([\s\S]*?)\n\}/)![1];
+  const fields: string[] = (body.match(/^ {2}(\w+)\??:/gm) || [])
+    .map((m: string) => m.trim().replace(/\??:$/, ''));
+
+  // Fields that exist to CARRY information outward rather than to be read:
+  // status-only mirrors written by getStatus(), and the flag mirror that lives
+  // in featureFlags. Anything else must be consumed somewhere.
+  const OUTBOUND_ONLY = new Set([
+    'heliusApiKeySet', 'heliusApiKeyHint',
+    'pumpPortalApiKeySet', 'pumpPortalApiKeyHint',
+  ]);
+
+  test('BotConfig has fields at all (the scrape works)', () => {
+    assert.ok(fields.length > 30, `expected a real BotConfig, parsed ${fields.length} fields`);
+  });
+
+  test('every setting is read by the code that claims to honour it', () => {
+    const inert = fields.filter(f => {
+      if (OUTBOUND_ONLY.has(f)) return false;
+      const readAsConfig = new RegExp(`(config|cfg)\\.${f}\\b`).test(allSrc);
+      const readAsFlag = new RegExp(`featureFlags\\.get\\('${f}'\\)`).test(allSrc);
+      return !readAsConfig && !readAsFlag;
+    });
+    assert.deepStrictEqual(inert, [],
+      'these settings are rendered, clamped and saved but never read — ' +
+      'a knob the operator can move that the bot cannot feel is worse than no knob');
+  });
+
+  test('the settings that were inert on 2026-08-13 are wired', () => {
+    // Regression pins for the specific five found by the audit.
+    assert.ok(/config\.maxRugcheckScore/.test(allSrc), 'the configured RugCheck ceiling must reach the filter');
+    assert.ok(/config\.maxForceExitAttempts/.test(allSrc), 'the retry cap must bound automatic sell attempts');
+    assert.ok(/config\.minHolderSample/.test(allSrc) && /config\.minTotalHolders/.test(allSrc),
+      'holder-sample floors must reach the gate');
+    assert.ok(/config\.minLpBurnedOrLockedPct/.test(allSrc), 'the LP floor must reach the risk filter');
+    assert.ok(!/jitoTipSol/.test(typesSrc), 'an unwired Jito tip field must not exist');
+  });
+
+  test('a thin holder sample cannot read as a clean distribution', () => {
+    const { EntryGateV2 } = require('../services/entryGateV2');
+    const gate = new EntryGateV2({ minHolderSample: 5, minTotalHolders: 10 });
+    const oneHolder = {
+      isInferred: false, score: 1,
+      token: { mintAuthority: null, freezeAuthority: null },
+      fileMeta: { top10Pct: 4, holderSampleSize: 1, totalHolders: 1, rugged: false },
+    };
+    const r = gate.evaluate({ txType: 'migrate' }, oneHolder, true, { priceChange5mPct: 5, pairAgeSeconds: 300, socialCount: 1 });
+    assert.strictEqual(r.isSafe, false, '"top 10 = 4%" off a single holder row is arithmetic, not evidence');
+    assert.ok(r.unverifiedFields.includes('holderConcentration'));
   });
 }
 

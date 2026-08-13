@@ -115,8 +115,6 @@ export class RiskFilter {
       failedReasons.push('Freeze authority is active (Honeypot risk)');
     }
 
-    const noToken2022Hooks = true;
-
     const markets = report?.markets || [];
     let lpBurnedOrLocked = true;
     if (markets.length > 0) {
@@ -127,8 +125,6 @@ export class RiskFilter {
     if (!lpBurnedOrLocked) {
       failedReasons.push(`LP locked/burned (${markets[0]?.lp?.lpLockedPct || 0}%) < min required (${this.config.minLpLockedPct}%)`);
     }
-
-    const sellSimPassed = true;
 
     const bundledKnown = typeof launch.bundledSupplyPct === 'number';
     const bundledSupplyPct = launch.bundledSupplyPct ?? 0;
@@ -141,9 +137,6 @@ export class RiskFilter {
       failedReasons.push('Bundled supply unverified — no holder data (unknown is not safe)');
     }
 
-    const insiderPctClean = true;
-    const sniperHoldingsPctClean = true;
-
     const top10Known = typeof launch.top10Pct === 'number';
     const top10Pct = launch.top10Pct ?? 0;
     const top10PctClean = top10Known
@@ -155,7 +148,6 @@ export class RiskFilter {
       failedReasons.push('Top 10 holder concentration unverified — RugCheck has no holder data (unknown is not safe)');
     }
 
-    const maxSingleHolderPctClean = true;
     const devKnown = typeof launch.devHoldingsPct === 'number';
     const devHoldingsPct = launch.devHoldingsPct ?? 0;
     const devHoldingsPctClean = devKnown
@@ -166,9 +158,6 @@ export class RiskFilter {
     } else if (!devKnown && requireVerified) {
       failedReasons.push('Dev holdings unverified — no holder data (unknown is not safe)');
     }
-
-    const devPriorRugRateClean = true;
-    const devSoldAnyClean = true;
 
     // The $8,000 floor is a POST-MIGRATION rule (AMM pool depth). Applied to a
     // bonding curve it is unsatisfiable by construction: the curve graduates at
@@ -201,17 +190,16 @@ export class RiskFilter {
     }
 
     const washScoreClean = (launch.washScore || 0) <= this.config.maxWashScore;
-    const buyPressureClean = true;
-    const notHoneypot = true;
-    const notDumping = true;
     const marketRegimeValid = this.marketRegime !== 'RISK_OFF';
 
+    // Every term below is COMPUTED from data this function actually looked at.
+    // `noToken2022Hooks` and `sellSimPassed` used to sit in this conjunction as
+    // literal `true`s, contributing nothing while making the result look more
+    // thorough than it was.
     const allPassed =
       mintAuthorityRevoked &&
       freezeAuthorityRevoked &&
-      noToken2022Hooks &&
       lpBurnedOrLocked &&
-      sellSimPassed &&
       bundledSupplyPctClean &&
       top10PctClean &&
       devHoldingsPctClean &&
@@ -223,22 +211,12 @@ export class RiskFilter {
     return {
       mintAuthorityRevoked,
       freezeAuthorityRevoked,
-      noToken2022Hooks,
       lpBurnedOrLocked,
-      sellSimPassed,
       bundledSupplyPctClean,
-      insiderPctClean,
-      sniperHoldingsPctClean,
       top10PctClean,
-      maxSingleHolderPctClean,
       devHoldingsPctClean,
-      devPriorRugRateClean,
-      devSoldAnyClean,
       liquidityMinClean,
       washScoreClean,
-      buyPressureClean,
-      notHoneypot,
-      notDumping,
       rugcheckScoreClean,
       marketRegimeValid,
       allPassed,

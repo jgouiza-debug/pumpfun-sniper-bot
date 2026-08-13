@@ -12,6 +12,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "ui"],
       "port": 3010
+    },
+    {
+      "name": "sniper-verify",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "set SNIPER_NO_WINDOW=1&& set PORT=3009&& npm run dev"],
+      "port": 3009
     }
   ]
 }

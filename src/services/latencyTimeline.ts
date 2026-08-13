@@ -56,6 +56,13 @@ export interface CandidateTimeline {
   /** Set when both gates ran and disagreed — the shadow-mode money signal. */
   divergence?: boolean;
 
+  /**
+   * True when the liquidity this decision saw was the migration ASSERTION, not
+   * a reading. Recorded so an analysis of past decisions can tell which ones
+   * were made against a constant — roughly every migration, at decision time.
+   */
+  liquidityIsAsserted?: boolean;
+
   decision: 'rejected' | 'passed_no_buy' | 'buy_attempted' | 'buy_confirmed' | 'buy_failed';
   activeGate: 'v1-legacy' | 'v2-realdata';
 

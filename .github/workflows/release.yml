@@ -1,5 +1,13 @@
 name: Build and Release Executable
 
+# Two distinct jobs share one file:
+#  - every push to master builds the exe as a smoke test and publishes nothing;
+#  - a v* tag builds, checksums and publishes the release the in-app updater
+#    installs from.
+#
+# The updater REFUSES to install a release with no .sha256 asset, so the
+# checksum step below is not optional decoration — drop it and every client
+# silently loses the ability to update.
 on:
   push:
     tags:
@@ -27,15 +35,42 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      # The exe reports the version baked into the package.json inside its pkg
+      # snapshot. Without this the tag and the shipped build disagree, the
+      # updater compares against a stale number, and clients either never see
+      # the update or re-install one they already have.
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          Write-Host "Stamping version $version"
+          npm version $version --no-git-tag-version --allow-same-version
+
+      - name: Run Tests
+        run: npm test
+
       - name: Build Executable
         run: npm run build:exe
 
-      - name: Create Release and Upload Asset
+      - name: Generate SHA256
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $exe = "dist-exe/pumpfun-sniper-bot.exe"
+          $hash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  pumpfun-sniper-bot.exe" | Out-File -FilePath "dist-exe/pumpfun-sniper-bot.exe.sha256" -Encoding ascii -NoNewline
+          Write-Host "SHA256: $hash"
+
+      - name: Create Release and Upload Assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: dist-exe/pumpfun-sniper-bot.exe
+          files: |
+            dist-exe/pumpfun-sniper-bot.exe
+            dist-exe/pumpfun-sniper-bot.exe.sha256
           draft: false
           prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

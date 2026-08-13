@@ -1,6 +1,8 @@
 import axios from 'axios';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 
 export interface UpdateCheckResult {
   currentVersion: string;
@@ -8,119 +10,220 @@ export interface UpdateCheckResult {
   hasUpdate: boolean;
   releaseUrl: string;
   downloadUrl?: string;
+  /** SHA256 asset URL. Without it an update cannot be applied — see apply(). */
+  checksumUrl?: string;
+  assetSizeBytes?: number;
   releaseNotes?: string;
   publishedAt?: string;
+  /** True when this build can replace itself in place (packaged exe only). */
+  canSelfUpdate: boolean;
   error?: string;
 }
+
+export type UpdateStage =
+  | 'idle'
+  | 'downloading'
+  | 'verifying'
+  | 'swapping'
+  | 'restarting'
+  | 'done'
+  | 'failed';
+
+export interface UpdateProgress {
+  stage: UpdateStage;
+  receivedBytes: number;
+  totalBytes: number;
+  pct: number;
+  message: string;
+  error?: string;
+}
+
+/** Suffix left behind for the previous build; cleaned up on the next start. */
+const OLD_SUFFIX = '.old';
+const NEW_SUFFIX = '.new';
 
 export class UpdaterService {
   private repoOwner = 'jgouiza-debug';
   private repoName = 'pumpfun-sniper-bot';
-  private currentVersion = '1.0.0';
+  private currentVersion = '0.0.0';
+
+  private progress: UpdateProgress = {
+    stage: 'idle',
+    receivedBytes: 0,
+    totalBytes: 0,
+    pct: 0,
+    message: 'No update in progress.',
+  };
+
+  /**
+   * Answers "is it safe to restart right now". Wired to the engine by server.ts
+   * so this module does not import it (the engine imports the updater's route
+   * neighbours, and a cycle here would be a startup hazard).
+   */
+  private restartGuard: () => { ok: boolean; reason?: string } = () => ({ ok: true });
 
   constructor() {
     this.readLocalVersion();
+    this.cleanupPreviousBuild();
   }
 
+  public setRestartGuard(fn: () => { ok: boolean; reason?: string }): void {
+    this.restartGuard = fn;
+  }
+
+  /**
+   * Resolve this build's version.
+   *
+   * The old implementation read `package.json` from `process.cwd()`. A packaged
+   * exe has no package.json beside it, so EVERY exe user reported 1.0.0 forever
+   * and no comparison against a release tag could ever be true.
+   *
+   * `__dirname/../../package.json` resolves correctly in all three cases:
+   * ts-node (src/services -> repo root), compiled JS (dist/services -> root),
+   * and the pkg snapshot (/snapshot/<proj>/dist/services -> /snapshot/<proj>),
+   * because pkg always embeds package.json in the snapshot.
+   */
   private readLocalVersion(): void {
-    try {
-      const pkgPath = path.resolve(process.cwd(), 'package.json');
-      if (fs.existsSync(pkgPath)) {
-        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-        if (pkg.version) {
-          this.currentVersion = pkg.version;
-        }
-      }
-    } catch {
-      // fallback to default 1.0.0
+    const fromEnv = process.env.SNIPER_VERSION?.trim();
+    if (fromEnv) {
+      this.currentVersion = fromEnv.replace(/^v/, '');
+      return;
     }
+
+    const candidates = [
+      path.join(__dirname, '..', '..', 'package.json'),
+      path.join(__dirname, '..', 'package.json'),
+      path.resolve(process.cwd(), 'package.json'),
+    ];
+
+    for (const pkgPath of candidates) {
+      try {
+        if (!fs.existsSync(pkgPath)) continue;
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        if (pkg?.version) {
+          this.currentVersion = String(pkg.version);
+          return;
+        }
+      } catch {
+        // try the next candidate
+      }
+    }
+  }
+
+  /** True only for a pkg-built exe, the only build that can swap itself. */
+  public isPackaged(): boolean {
+    return Boolean((process as any).pkg);
   }
 
   public getCurrentVersion(): string {
     return this.currentVersion;
   }
 
+  public getProgress(): UpdateProgress {
+    return { ...this.progress };
+  }
+
+  /** Remove the previous build left behind by a successful swap. */
+  private cleanupPreviousBuild(): void {
+    if (!this.isPackaged()) return;
+    const old = process.execPath + OLD_SUFFIX;
+    try {
+      if (fs.existsSync(old)) {
+        fs.unlinkSync(old);
+        console.log('🧹 Removed the previous build after a successful update.');
+      }
+    } catch {
+      // Still running from the OS's perspective, or locked by AV. It is inert
+      // either way and the next start tries again.
+    }
+  }
+
   public async checkForUpdates(): Promise<UpdateCheckResult> {
+    const base: UpdateCheckResult = {
+      currentVersion: this.currentVersion,
+      latestVersion: this.currentVersion,
+      hasUpdate: false,
+      releaseUrl: `https://github.com/${this.repoOwner}/${this.repoName}`,
+      canSelfUpdate: this.isPackaged(),
+    };
+
     try {
       const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/releases/latest`;
       const response = await axios.get(url, {
         headers: {
           'User-Agent': 'PumpfunSniperBot-AutoUpdater',
-          'Accept': 'application/vnd.github.v3+json'
+          'Accept': 'application/vnd.github.v3+json',
         },
-        timeout: 5000
+        timeout: 8000,
       });
 
       const release = response.data;
       const latestTag = (release.tag_name || '').replace(/^v/, '');
-      const hasUpdate = this.isVersionGreater(latestTag, this.currentVersion);
 
-      // Find exe asset if uploaded
-      let downloadUrl = release.html_url;
+      let downloadUrl: string | undefined;
+      let checksumUrl: string | undefined;
+      let assetSizeBytes: number | undefined;
+
       if (Array.isArray(release.assets)) {
-        const exeAsset = release.assets.find((a: any) => a.name && a.name.endsWith('.exe'));
-        if (exeAsset && exeAsset.browser_download_url) {
+        const exeAsset = release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.exe'));
+        if (exeAsset?.browser_download_url) {
           downloadUrl = exeAsset.browser_download_url;
+          assetSizeBytes = Number(exeAsset.size) || undefined;
         }
+        const sumAsset = release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.sha256'));
+        if (sumAsset?.browser_download_url) checksumUrl = sumAsset.browser_download_url;
       }
 
       return {
-        currentVersion: this.currentVersion,
+        ...base,
         latestVersion: latestTag || this.currentVersion,
-        hasUpdate,
-        releaseUrl: release.html_url || `https://github.com/${this.repoOwner}/${this.repoName}`,
-        downloadUrl,
+        hasUpdate: this.isVersionGreater(latestTag, this.currentVersion),
+        releaseUrl: release.html_url || base.releaseUrl,
+        downloadUrl: downloadUrl ?? release.html_url,
+        checksumUrl,
+        assetSizeBytes,
         releaseNotes: release.body || release.name || 'New release available.',
-        publishedAt: release.published_at
+        publishedAt: release.published_at,
       };
     } catch (err: any) {
-      // If 404 (no releases created yet), check commits on main branch
-      if (err.response && err.response.status === 404) {
-        return this.checkForCommitUpdates();
-      }
-
-      return {
-        currentVersion: this.currentVersion,
-        latestVersion: this.currentVersion,
-        hasUpdate: false,
-        releaseUrl: `https://github.com/${this.repoOwner}/${this.repoName}`,
-        error: `Could not check for updates: ${err?.message || 'Network error'}`
-      };
+      if (err?.response?.status === 404) return this.checkForCommitUpdates(base);
+      return { ...base, error: `Could not check for updates: ${err?.message || 'Network error'}` };
     }
   }
 
-  private async checkForCommitUpdates(): Promise<UpdateCheckResult> {
+  /**
+   * Fallback when the repo has no published releases at all.
+   *
+   * It reports honestly that there is nothing installable rather than
+   * pretending. The old version returned `hasUpdate: false` unconditionally
+   * even on the release path's success — combined with a repo that had zero
+   * releases, that made the update banner unreachable by construction.
+   */
+  private async checkForCommitUpdates(base: UpdateCheckResult): Promise<UpdateCheckResult> {
     try {
       const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/commits/master`;
       const response = await axios.get(url, {
         headers: {
           'User-Agent': 'PumpfunSniperBot-AutoUpdater',
-          'Accept': 'application/vnd.github.v3+json'
+          'Accept': 'application/vnd.github.v3+json',
         },
-        timeout: 5000
+        timeout: 8000,
       });
 
       const commit = response.data;
-      const shortSha = commit.sha ? commit.sha.substring(0, 7) : 'latest';
-      const commitDate = commit.commit?.committer?.date;
+      const shortSha = commit?.sha ? String(commit.sha).substring(0, 7) : 'latest';
 
       return {
-        currentVersion: this.currentVersion,
-        latestVersion: `main-${shortSha}`,
+        ...base,
+        latestVersion: `master-${shortSha}`,
         hasUpdate: false,
-        releaseUrl: commit.html_url || `https://github.com/${this.repoOwner}/${this.repoName}`,
-        downloadUrl: `https://github.com/${this.repoOwner}/${this.repoName}/archive/refs/heads/main.zip`,
-        releaseNotes: commit.commit?.message || 'Latest commit on main branch.',
-        publishedAt: commitDate
+        releaseUrl: commit?.html_url || base.releaseUrl,
+        releaseNotes: commit?.commit?.message || 'Latest commit on master.',
+        publishedAt: commit?.commit?.committer?.date,
+        error: 'No published release yet — push a v* tag to build and publish one.',
       };
     } catch (err: any) {
-      return {
-        currentVersion: this.currentVersion,
-        latestVersion: this.currentVersion,
-        hasUpdate: false,
-        releaseUrl: `https://github.com/${this.repoOwner}/${this.repoName}`,
-        error: `Commit check failed: ${err?.message || String(err)}`
-      };
+      return { ...base, error: `Commit check failed: ${err?.message || String(err)}` };
     }
   }
 
@@ -136,6 +239,161 @@ export class UpdaterService {
       if (rVal < lVal) return false;
     }
     return false;
+  }
+
+  private setProgress(patch: Partial<UpdateProgress>): void {
+    this.progress = { ...this.progress, ...patch };
+    if (this.progress.totalBytes > 0) {
+      this.progress.pct = Math.min(100, Math.round((this.progress.receivedBytes / this.progress.totalBytes) * 100));
+    }
+  }
+
+  /** Fetch and parse the published `<hex>  <filename>` checksum file. */
+  private async fetchExpectedSha256(checksumUrl: string): Promise<string | null> {
+    try {
+      const res = await axios.get(checksumUrl, {
+        headers: { 'User-Agent': 'PumpfunSniperBot-AutoUpdater' },
+        timeout: 15000,
+        responseType: 'text',
+        transformResponse: [(d) => d],
+      });
+      const match = String(res.data).match(/\b[a-fA-F0-9]{64}\b/);
+      return match ? match[0].toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async downloadTo(url: string, destPath: string): Promise<void> {
+    const res = await axios.get(url, {
+      responseType: 'stream',
+      timeout: 0,
+      maxRedirects: 5,
+      headers: { 'User-Agent': 'PumpfunSniperBot-AutoUpdater' },
+    });
+
+    const total = Number(res.headers['content-length']) || this.progress.totalBytes || 0;
+    this.setProgress({ totalBytes: total, receivedBytes: 0 });
+
+    await new Promise<void>((resolve, reject) => {
+      const out = fs.createWriteStream(destPath);
+      res.data.on('data', (chunk: Buffer) => {
+        this.setProgress({ receivedBytes: this.progress.receivedBytes + chunk.length });
+      });
+      res.data.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', resolve);
+      res.data.pipe(out);
+    });
+  }
+
+  private async sha256OfFile(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(filePath);
+      stream.on('error', reject);
+      stream.on('data', (d) => hash.update(d));
+      stream.on('end', () => resolve(hash.digest('hex').toLowerCase()));
+    });
+  }
+
+  /**
+   * Replace this exe with the published release and restart into it.
+   *
+   * The Windows swap: a running image cannot be OVERWRITTEN, but it can be
+   * RENAMED. So the sequence is rename-self-aside, move the new build into the
+   * original path, launch it, exit. The next start deletes the `.old` file.
+   *
+   * Two refusals are deliberate and fail closed:
+   *  - No published SHA256 means no update. An unverified binary that replaces
+   *    the process holding the signing key is not worth the convenience.
+   *  - Never mid-trade. Restarting with an open position would strand it
+   *    between processes, and the real-mode lock would be held by a PID that is
+   *    about to disappear.
+   */
+  public async applyUpdate(): Promise<{ ok: boolean; error?: string }> {
+    if (this.progress.stage !== 'idle' && this.progress.stage !== 'failed' && this.progress.stage !== 'done') {
+      return { ok: false, error: 'An update is already in progress.' };
+    }
+
+    if (!this.isPackaged()) {
+      return { ok: false, error: 'Self-update only applies to the packaged .exe. In a dev checkout, use git pull.' };
+    }
+
+    const guard = this.restartGuard();
+    if (!guard.ok) {
+      return { ok: false, error: guard.reason || 'The bot is busy — stop it before updating.' };
+    }
+
+    const check = await this.checkForUpdates();
+    if (!check.hasUpdate) {
+      return { ok: false, error: check.error || 'Already on the latest version.' };
+    }
+    if (!check.downloadUrl || !check.downloadUrl.endsWith('.exe')) {
+      return { ok: false, error: 'That release has no .exe asset attached.' };
+    }
+    if (!check.checksumUrl) {
+      return { ok: false, error: 'That release publishes no .sha256 checksum — refusing to install an unverified binary.' };
+    }
+
+    const exePath = process.execPath;
+    const newPath = exePath + NEW_SUFFIX;
+    const oldPath = exePath + OLD_SUFFIX;
+
+    try {
+      this.setProgress({
+        stage: 'downloading',
+        receivedBytes: 0,
+        totalBytes: check.assetSizeBytes ?? 0,
+        message: `Downloading ${check.latestVersion}…`,
+        error: undefined,
+      });
+
+      try { if (fs.existsSync(newPath)) fs.unlinkSync(newPath); } catch { /* replaced below */ }
+      await this.downloadTo(check.downloadUrl, newPath);
+
+      this.setProgress({ stage: 'verifying', message: 'Verifying signature…' });
+      const expected = await this.fetchExpectedSha256(check.checksumUrl);
+      if (!expected) {
+        throw new Error('Could not read the published checksum.');
+      }
+      const actual = await this.sha256OfFile(newPath);
+      if (actual !== expected) {
+        throw new Error(`Checksum mismatch — expected ${expected.slice(0, 12)}…, got ${actual.slice(0, 12)}…. The download was corrupt or tampered with.`);
+      }
+
+      // Re-check the guard: a position could have opened during the download.
+      const guardAfter = this.restartGuard();
+      if (!guardAfter.ok) throw new Error(guardAfter.reason || 'The bot became busy during the download.');
+
+      this.setProgress({ stage: 'swapping', message: 'Installing…' });
+      try { if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath); } catch { /* best effort */ }
+      fs.renameSync(exePath, oldPath);
+      try {
+        fs.renameSync(newPath, exePath);
+      } catch (err) {
+        // Put the working build back rather than leaving no exe at all.
+        try { fs.renameSync(oldPath, exePath); } catch { /* nothing further we can do */ }
+        throw err;
+      }
+
+      this.setProgress({ stage: 'restarting', message: 'Restarting into the new version…' });
+
+      const child = spawn(exePath, [], { detached: true, stdio: 'ignore' });
+      child.unref();
+
+      this.setProgress({ stage: 'done', message: `Updated to ${check.latestVersion}. Restarting…` });
+
+      // Give the HTTP response time to reach the browser before the process
+      // disappears underneath it.
+      setTimeout(() => process.exit(0), 1200).unref();
+      return { ok: true };
+    } catch (err: any) {
+      const message = err?.message || String(err);
+      try { if (fs.existsSync(newPath)) fs.unlinkSync(newPath); } catch { /* best effort */ }
+      this.setProgress({ stage: 'failed', message: 'Update failed.', error: message });
+      return { ok: false, error: message };
+    }
   }
 }
 

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { CopyFeedEvent, CopyPosition, CopyStatusResponse, CopyTradeRecord, CopyTraderConfig, TrackedWalletPublic } from './types';
+import { apiFetch } from './apiClient';
 
 const isOnChainTxid = (txid?: string): boolean => Boolean(txid && !txid.startsWith('sim_'));
 
@@ -125,7 +126,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
   const post = async (url: string, body?: object): Promise<any> => {
     try {
-      const res = await fetch(`${apiBase}${url}`, {
+      const res = await apiFetch(`${apiBase}${url}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: body ? JSON.stringify(body) : undefined,

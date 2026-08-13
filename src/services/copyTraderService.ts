@@ -514,10 +514,16 @@ export class CopyTraderService {
     if (this.ws) return;
 
     try {
-      this.ws = new WebSocket('wss://pumpportal.fun/api/data');
+      // Same user-supplied key as the sniper. subscribeAccountTrade — the whole
+      // basis of copy trading — is per-trade data, so on the free tier this
+      // socket connects and then reports nothing at all.
+      this.ws = new WebSocket(sniperEngine.pumpPortalDataUrl());
 
       this.ws.on('open', () => {
         this.streamConnected = true;
+        if (!sniperEngine.hasPumpPortalKey()) {
+          console.warn('[CopyTrader] ⚠️ Connected on the FREE PumpPortal tier — subscribeAccountTrade delivers no events, so no leader trade can ever be mirrored. Add a funded PumpPortal key in Settings.');
+        }
         this.subscribedMints.clear();
         const keys = this.enabledWalletAddresses();
         if (keys.length) this.sendWs({ method: 'subscribeAccountTrade', keys });

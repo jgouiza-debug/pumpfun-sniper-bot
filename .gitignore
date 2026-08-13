@@ -14,6 +14,9 @@ reports/
 # Live-trading mutex (transient)
 .real-mode.lock
 
+# Bearer token for the local API. Per-install, regenerated if deleted.
+.api-token
+
 # Per-machine feature flag state (toggled via /api/flags)
 flags.json
 

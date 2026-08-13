@@ -74,25 +74,64 @@ export class RealModeLock {
     return { heldByThisInstance: false, heldByOther: holder };
   }
 
+  /**
+   * Take the lock, or report who holds it.
+   *
+   * `open(..., 'wx')` is the whole point: create-if-absent is one atomic
+   * syscall, so two instances arming in the same moment cannot both succeed.
+   * The previous read-then-write left a window between "nobody holds it" and
+   * "I hold it" wide enough for the other process to win too — and both would
+   * then size against the same balance and double-spend it.
+   *
+   * Failure is always closed: an unwritable lock means no live trading, never
+   * unguarded live trading.
+   */
   public acquire(port: number, instanceName: string): { ok: boolean; holder?: LockHolder } {
-    const holder = this.getHolder();
+    const payload = JSON.stringify(
+      { pid: process.pid, port, instanceName, startedAt: Date.now() } satisfies LockHolder,
+      null,
+      2
+    );
 
-    if (holder && holder.pid !== process.pid) {
-      return { ok: false, holder };
+    // Two passes at most: the second only runs after clearing a lock proven
+    // stale, so this cannot spin.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = fs.openSync(LOCK_FILE, 'wx', 0o600);
+        try {
+          fs.writeFileSync(fd, payload);
+        } finally {
+          fs.closeSync(fd);
+        }
+        this.owned = true;
+        return { ok: true };
+      } catch (err: any) {
+        if (err?.code !== 'EEXIST') return { ok: false };
+
+        const holder = this.read();
+
+        // Re-arming in the same process: refresh the record rather than
+        // reporting ourselves as the blocker.
+        if (holder && holder.pid === process.pid) {
+          try {
+            fs.writeFileSync(LOCK_FILE, payload);
+            this.owned = true;
+            return { ok: true };
+          } catch {
+            return { ok: false };
+          }
+        }
+
+        if (holder && RealModeLock.isAlive(holder.pid)) return { ok: false, holder };
+
+        // Unparseable, or written by a process that is gone. Note the honest
+        // limit: a PID recycled onto an unrelated live process still reads as
+        // "held", which fails closed — delete .real-mode.lock to clear it.
+        this.forceClear();
+      }
     }
 
-    try {
-      fs.writeFileSync(
-        LOCK_FILE,
-        JSON.stringify({ pid: process.pid, port, instanceName, startedAt: Date.now() } satisfies LockHolder, null, 2)
-      );
-      this.owned = true;
-      return { ok: true };
-    } catch {
-      // If the lock cannot be written, fail closed rather than allowing a
-      // second instance to trade unguarded.
-      return { ok: false };
-    }
+    return { ok: false };
   }
 
   /** Releases only if this process owns it, so we never free someone else's lock. */
