@@ -9,6 +9,7 @@ import { RiskFilter } from './filters/riskFilter';
 import { DexScreenerService } from './services/dexscreenerService';
 import { FilterResult, PumpTokenLaunch } from './types';
 import { sniperEngine } from './services/sniperEngine';
+import { copyTrader } from './services/copyTraderService';
 import { reportService } from './services/reportService';
 import { featureFlags, FeatureFlagSet } from './services/featureFlags';
 import { latencyTimeline, LatencyTimelineLogger } from './services/latencyTimeline';
@@ -365,6 +366,108 @@ app.get('/api/stream', (req, res) => {
 
   push(); // snapshot on connect — no blank dashboard while waiting for the first event
   const unsubscribe = sniperEngine.onChange(schedulePush);
+  const heartbeat = setInterval(push, SSE_HEARTBEAT_MS);
+
+  req.on('close', () => {
+    alive = false;
+    unsubscribe();
+    clearInterval(heartbeat);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+  });
+});
+
+// ---------------- COPY TRADING ----------------
+
+// GET full copy-trader state: config, wallets, positions, feed, stats
+app.get('/api/copy/status', (req, res) => {
+  res.json(copyTrader.getStatus());
+});
+
+// POST master switch: { enabled: boolean }
+app.post('/api/copy/toggle', (req, res) => {
+  const result = copyTrader.setEnabled(req.body?.enabled === true);
+  if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+  res.json({ success: true, status: copyTrader.getStatus() });
+});
+
+// POST partial config update — unknown keys dropped, numerics clamped
+app.post('/api/copy/config', (req, res) => {
+  const result = copyTrader.updateConfig(req.body || {});
+  if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+  res.json({ success: true, config: copyTrader.getStatus().config });
+});
+
+// POST track a new leader wallet: { address, nickname? }
+app.post('/api/copy/wallets', (req, res) => {
+  const { address, nickname } = req.body || {};
+  const result = copyTrader.addWallet(String(address || ''), nickname);
+  if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+  res.json({ success: true });
+});
+
+// POST stop tracking: { address }
+app.post('/api/copy/wallets/remove', (req, res) => {
+  const removed = copyTrader.removeWallet(String(req.body?.address || ''));
+  res.status(removed ? 200 : 404).json({ success: removed });
+});
+
+// POST per-wallet patch: { address, enabled?, nickname? }
+app.post('/api/copy/wallets/update', (req, res) => {
+  const { address, enabled, nickname } = req.body || {};
+  const updated = copyTrader.updateWallet(String(address || ''), { enabled, nickname });
+  res.status(updated ? 200 : 404).json({ success: updated });
+});
+
+// POST force-sell one copy position: { positionId }
+app.post('/api/copy/sell', async (req, res) => {
+  const { positionId } = req.body || {};
+  if (!positionId) return res.status(400).json({ error: 'positionId is required' });
+  const success = await copyTrader.manualSellPosition(String(positionId));
+  res.json({ success });
+});
+
+// POST wipe feed + receipts (open positions are kept)
+app.post('/api/copy/clear-history', (req, res) => {
+  copyTrader.clearHistory();
+  res.json({ success: true });
+});
+
+// SSE push of the copy-trader state — same contract as /api/stream.
+app.get('/api/copy/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  let alive = true;
+  let lastPushAt = 0;
+  let coalesceTimer: NodeJS.Timeout | null = null;
+
+  const push = () => {
+    if (!alive) return;
+    lastPushAt = Date.now();
+    try {
+      res.write(`data: ${JSON.stringify(copyTrader.getStatus())}\n\n`);
+    } catch {
+      alive = false;
+    }
+  };
+
+  const schedulePush = () => {
+    if (!alive || coalesceTimer) return;
+    const sinceLast = Date.now() - lastPushAt;
+    if (sinceLast >= SSE_MIN_GAP_MS) {
+      push();
+      return;
+    }
+    coalesceTimer = setTimeout(() => {
+      coalesceTimer = null;
+      push();
+    }, SSE_MIN_GAP_MS - sinceLast);
+  };
+
+  push();
+  const unsubscribe = copyTrader.onChange(schedulePush);
   const heartbeat = setInterval(push, SSE_HEARTBEAT_MS);
 
   req.on('close', () => {

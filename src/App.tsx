@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BotConfig, BotInstanceInfo, BotStatusResponse, FilterResult, LeniencyMode, Position, TradeHistoryRecord } from './types';
 import { parseClientSecretKey, getStoredClientKey, saveStoredClientKey, clearStoredClientKey, fetchOnChainWalletInfo, ClientWalletInfo } from './services/clientWallet';
+import { CopyTradingPage } from './CopyTradingPage';
 
 // A txid proves execution only when it's a real signature — paper fills carry
 // a sim_ prefix and never touched the chain.
@@ -75,6 +76,10 @@ function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean })
 }
 
 export function App() {
+  // Page routing: the sniper terminal and the copy trading desk share the
+  // backend instance but render as separate full-screen pages.
+  const [activePage, setActivePage] = useState<'sniper' | 'copy'>('sniper');
+
   // Multi-Instance State
   const [instances, setInstances] = useState<BotInstanceInfo[]>([
     { id: 'bot-1', name: 'Bot #1 (Main)', port: 3001, status: 'active', tradingMode: 'paper', leniencyMode: 'strict' },
@@ -580,6 +585,43 @@ export function App() {
   const secondsToWipe = Math.max(0, Math.ceil((logClearedAt + LOG_WIPE_INTERVAL_MS - wipeTick) / 1000));
   const stats = botStatus?.stats || { totalTrades: 0, winCount: 0, lossCount: 0, winRatePct: 0, totalNetPnlUsd: 0, totalNetPnlSol: 0 };
 
+  // Shared page switcher — rendered in both headers so either desk is one
+  // click away. Styled like the instance buttons for visual continuity.
+  const pageTabs = (
+    <div style={{ display: 'flex', gap: '4px', marginTop: '4px' }}>
+      <button
+        className={`btn-instance ${activePage === 'sniper' ? 'active' : ''}`}
+        onClick={() => setActivePage('sniper')}
+      >
+        🎯 SNIPER TERMINAL
+      </button>
+      <button
+        className={`btn-instance ${activePage === 'copy' ? 'active' : ''}`}
+        onClick={() => setActivePage('copy')}
+      >
+        👥 COPY TRADING
+      </button>
+    </div>
+  );
+
+  if (activePage === 'copy') {
+    return (
+      <div>
+        <header className="header">
+          <div>
+            <div className="brand-title">PUMPPORTAL TERMINAL — MEME COIN WALLET COPY TRADING DESK</div>
+            <div className="brand-subtitle">PORT {selectedPort} / HELIUS ON-CHAIN WALLET WATCHER + PUMPPORTAL FAST LANE / PHOTON MAINNET SIGNER</div>
+            {pageTabs}
+          </div>
+          {/* Right side deliberately empty: CopyTradingPage pins its START/STOP
+              and settings controls to this corner. */}
+          <div style={{ minWidth: '380px' }} />
+        </header>
+        <CopyTradingPage apiBase={API_BASE} />
+      </div>
+    );
+  }
+
   return (
     <div>
       {/* Editorial Bloomberg Header */}
@@ -587,6 +629,7 @@ export function App() {
         <div>
           <div className="brand-title">PUMPPORTAL TERMINAL — MULTI-INSTANCE ALGORITHMIC SNIPER</div>
           <div className="brand-subtitle">PORT {selectedPort} / HELIUS RPC / PHOTON MAINNET SIGNER / PLAYBOOK V1.0</div>
+          {pageTabs}
         </div>
 
         {/* Multi-Instance Switcher Bar */}

@@ -2,9 +2,9 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "api",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "name": "sniper-server",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "set SNIPER_NO_WINDOW=1&& npm run dev"],
       "port": 3001
     },
     {

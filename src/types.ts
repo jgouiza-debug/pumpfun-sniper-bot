@@ -598,3 +598,174 @@ export interface PeriodicReportSummary {
   failedCount: number;
   safeTokens: FilterResult[];
 }
+
+// ---------------- COPY TRADING ----------------
+
+/**
+ * How a copy buy is sized relative to the leader's buy.
+ *  - 'fixed': always stake `fixedBuySol`, regardless of the leader's size.
+ *  - 'proportional': stake `proportionalPct`% of the leader's SOL amount,
+ *    clamped to `maxBuySol`.
+ */
+export type CopyBuySizeMode = 'fixed' | 'proportional';
+
+/**
+ * What a leader sell does to the copied position.
+ *  - 'mirror': sell the same fraction of holdings the leader sold, measured
+ *    from the leader's post-trade balance in the stream payload (exact — the
+ *    payload carries `newTokenBalance`).
+ *  - 'full': any leader sell closes the whole copied position.
+ */
+export type CopySellMode = 'mirror' | 'full';
+
+export interface CopyTraderConfig {
+  /** Master switch — nothing is watched or traded while false. */
+  enabled: boolean;
+  tradingMode: 'paper' | 'real';
+  buySizeMode: CopyBuySizeMode;
+  fixedBuySol: number;
+  /** % of the leader's SOL amount to copy when buySizeMode='proportional'. */
+  proportionalPct: number;
+  /** Hard per-trade ceiling in SOL, applied in both sizing modes. */
+  maxBuySol: number;
+  /** Ignore leader buys below this size. 0 (the default) copies EVERY buy. */
+  minLeaderBuySol: number;
+  copySells: boolean;
+  sellMode: CopySellMode;
+  maxOpenPositions: number;
+  maxSlippagePct: number;
+  /**
+   * Skip a leader buy for a mint we already hold a copy position in. OFF by
+   * default: a repeat buy ADDS to the copy position (mirroring a leader who
+   * DCAs in), with the entry price re-averaged.
+   */
+  blockRepeatBuys: boolean;
+  /** Seconds after a copied buy from a wallet before its next buy is copied. 0 = off. */
+  perWalletCooldownSec: number;
+  /**
+   * Safety exits for copy positions, both OFF (0) by default: the copied
+   * wallet's own exit is the strategy. maxHoldSeconds is a structural
+   * abandon-ship timer, takeProfitPct an optional profit cap — deliberately
+   * no price stop-loss, consistent with the sniper engine.
+   */
+  maxHoldSeconds: number;
+  takeProfitPct: number;
+}
+
+/** A leader wallet being tracked, with per-wallet lifetime counters. */
+export interface TrackedWalletPublic {
+  address: string;
+  shortAddress: string;
+  nickname: string;
+  enabled: boolean;
+  addedAt: number;
+  lastSeenAt: number | null;
+  buysSeen: number;
+  sellsSeen: number;
+  copiedBuys: number;
+  copiedSells: number;
+  skippedSignals: number;
+  realizedPnlUsd: number;
+}
+
+export interface CopyPosition {
+  id: string;
+  mint: string;
+  tokenSymbol: string;
+  tokenName: string;
+  /** Leader wallet this position was copied from. */
+  leaderWallet: string;
+  leaderNickname: string;
+  /** Venue from the leader's trade payload, reused for our exit routing. */
+  pool?: string;
+  tokensHeld: number;
+  investedSol: number;
+  investedUsd: number;
+  entryPriceSol: number;
+  currentPriceSol: number;
+  pnlPct: number;
+  pnlUsd: number;
+  pnlSol: number;
+  entryTime: number;
+  buyTxid?: string;
+  fillVerified?: boolean;
+  status: 'OPEN' | 'PARTIAL' | 'CLOSED';
+  exitInFlight?: boolean;
+}
+
+/** One line in the live copy feed: every leader signal and what we did with it. */
+export interface CopyFeedEvent {
+  id: string;
+  timestamp: number;
+  leaderWallet: string;
+  leaderNickname: string;
+  mint: string;
+  tokenSymbol: string;
+  side: 'buy' | 'sell';
+  leaderSolAmount: number;
+  action: 'copied' | 'skipped' | 'failed';
+  detail: string;
+  copySol?: number;
+  txid?: string;
+  /**
+   * Which feed delivered the signal: 'pumpportal' (pump.fun fast lane) or
+   * 'helius' (on-chain wallet watcher — catches every venue).
+   */
+  via?: 'pumpportal' | 'helius';
+}
+
+/** A closed (or partially closed) copy leg — the copy page's receipt row. */
+export interface CopyTradeRecord {
+  id: string;
+  positionId: string;
+  mint: string;
+  tokenSymbol: string;
+  leaderWallet: string;
+  leaderNickname: string;
+  side: 'buy' | 'sell';
+  solAmount: number;
+  tokensMoved: number;
+  priceSol: number;
+  pnlUsd: number;
+  pnlSol: number;
+  pnlPct: number;
+  timestamp: number;
+  txid?: string;
+  fillVerified?: boolean;
+  exitReason: string;
+}
+
+export interface CopyStatusResponse {
+  enabled: boolean;
+  /** True while the PumpPortal account-trade stream is connected. */
+  streamConnected: boolean;
+  /**
+   * True while the Helius on-chain wallet watcher holds live log
+   * subscriptions for the tracked wallets. This is the feed that sees EVERY
+   * buy and sell the leader makes, on any venue — PumpPortal only carries
+   * pump.fun activity.
+   */
+  heliusConnected: boolean;
+  tradingMode: 'paper' | 'real';
+  config: CopyTraderConfig;
+  wallets: TrackedWalletPublic[];
+  positions: CopyPosition[];
+  history: CopyTradeRecord[];
+  feed: CopyFeedEvent[];
+  solPriceUsd: number;
+  /** Mirrors the engine wallet — copy real mode uses the same signer. */
+  wallet: WalletStatusPublic;
+  stats: {
+    signalsSeen: number;
+    copiedBuys: number;
+    copiedSells: number;
+    skippedSignals: number;
+    openPositions: number;
+    realizedPnlUsd: number;
+    realizedPnlSol: number;
+    unrealizedPnlUsd: number;
+    winCount: number;
+    lossCount: number;
+    winRatePct: number;
+  };
+}

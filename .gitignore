@@ -16,6 +16,9 @@ reports/
 
 # Per-machine feature flag state (toggled via /api/flags)
 flags.json
+
+# Copy-trader runtime state (tracked wallets, open copy positions)
+.copy-trader.json
 meme-coin-finder-app/
 .vercel
 dist-exe/

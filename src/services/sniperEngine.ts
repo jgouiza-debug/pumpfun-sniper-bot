@@ -46,7 +46,7 @@ import { CurveWatcher, CurveUpdate } from './curveWatcher';
 const MIN_CURVE_LIQUIDITY_SOL = 10;
 
 /** A confirmed real trade: the signature plus what it actually did on-chain. */
-interface TradeResult {
+export interface TradeResult {
   txid: string;
   /** Null when the fill could not be read back — callers keep estimates. */
   fill: ActualFill | null;
@@ -3112,6 +3112,34 @@ export class SniperEngine {
     this.dailyPnlUsd = 0;
     this.consecutiveLosses = 0;
     this.log('info', '🧹 Trade History & Performance Logs Reset.');
+  }
+
+  // ---------------- EXTERNAL EXECUTION (copy trader) ----------------
+
+  /**
+   * Execute a real mainnet trade on behalf of another module (the copy
+   * trader). Same signer, same trade-local build, same slippage retries and
+   * fill inspection as the sniper's own orders — a copy trade must not get a
+   * second, worse execution path.
+   */
+  public async executeExternalTrade(
+    action: 'buy' | 'sell',
+    mint: string,
+    solAmount: number,
+    amountPct?: string,
+    pool?: string,
+    slippageOverride?: number
+  ): Promise<TradeResult | null> {
+    return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, slippageOverride);
+  }
+
+  public getSolPriceUsd(): number {
+    return this.config.solPriceUsd;
+  }
+
+  /** Mints the sniper currently holds — the copy trader must not sell into these. */
+  public getHeldMints(): Set<string> {
+    return new Set(this.activePositions.map(p => p.mint));
   }
 
   public resetAll(): void {
