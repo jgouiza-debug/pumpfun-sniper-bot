@@ -23,7 +23,30 @@ import { RugCheckReport } from '../types';
 let passed = 0;
 let failed = 0;
 
-function test(name: string, fn: () => void): void {
+/**
+ * Async tests settle here before the summary prints.
+ *
+ * WHY: `test()` called `fn()` inside a try/catch and incremented `passed`
+ * immediately. For an `async () => {...}` body that returns a promise, the
+ * catch can never fire — the assertions run after `test()` has already
+ * returned and recorded a pass. Every async test in this file was therefore
+ * self-certifying: `inspectMintSafety`, the sell simulation and the updater
+ * checks all reported ok whatever they actually did. A suite that cannot fail
+ * is not evidence, and this one is the thing standing between a config change
+ * and real money.
+ */
+const pendingTests: Array<{ name: string; fn: () => Promise<void> }> = [];
+
+function test(name: string, fn: () => void | Promise<void>): void {
+  // Queue async bodies WITHOUT starting them. Awaiting a batch that is already
+  // in flight would run them concurrently, and several share process-wide state
+  // (rpcHealth counters, feature flags) — concurrent mutation of that state
+  // makes assertions depend on scheduling order rather than on behaviour.
+  if (fn.constructor && fn.constructor.name === 'AsyncFunction') {
+    pendingTests.push({ name, fn: fn as () => Promise<void> });
+    return;
+  }
+
   try {
     fn();
     passed++;
@@ -2443,5 +2466,286 @@ console.log('\n-- No decorative settings: every BotConfig field must drive behav
   });
 }
 
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+// ---------------------------------------------------------------------------
+// Feed liveness and RPC resilience, 2026-08-13. Both of these were measured
+// from a 17,538-candidate session that produced 4 buys.
+// ---------------------------------------------------------------------------
+console.log('\n-- Feed watchdog: a socket that dies without closing --');
+{
+  const { attachKeepalive, reconnectDelayMs } = require('../services/wsKeepalive');
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const fakeWs = () => {
+    const handlers: Record<string, Function[]> = {};
+    const ws: any = {
+      terminated: false,
+      pings: 0,
+      on(ev: string, fn: Function) {
+        if (!handlers[ev]) handlers[ev] = [];
+        handlers[ev].push(fn);
+        return ws;
+      },
+      emit(ev: string, ...args: any[]) { (handlers[ev] || []).forEach((f) => f(...args)); },
+      ping() { ws.pings++; },
+      terminate() { ws.terminated = true; },
+    };
+    return ws;
+  };
+
+  test('OLD BUG: reconnect hung off close alone, which a half-open socket never fires', () => {
+    // The 2026-08-13 13:16 failure: readyState stayed OPEN, no close event, no
+    // reconnect, no log line. The bot simply stopped hearing about launches.
+    const ws = fakeWs();
+    let closes = 0;
+    ws.on('close', () => closes++);
+    // Nothing arrives, nothing closes. Under the old code this was terminal.
+    assert.strictEqual(closes, 0, 'a half-open socket produces no close event by itself');
+  });
+
+  test('fixed: silence past staleMs terminates the socket so close (and reconnect) fire', async () => {
+    const ws = fakeWs();
+    let sawStale = 0;
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40, onStale: () => sawStale++ });
+    await sleep(120);
+    ka.stop();
+    assert.strictEqual(ws.terminated, true, 'a silent socket must be terminated, not trusted');
+    assert.strictEqual(sawStale, 1, 'the operator must be told, once');
+  });
+
+  test('a socket that keeps delivering is never terminated', async () => {
+    const ws = fakeWs();
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40 });
+    for (let i = 0; i < 8; i++) { ka.touch(); await sleep(15); }
+    ka.stop();
+    assert.strictEqual(ws.terminated, false, 'a live feed must not be killed by its own watchdog');
+  });
+
+  test('a pong counts as life, so an idle curve subscription survives', async () => {
+    // CurveWatcher subscribes to accounts that may legitimately go minutes
+    // without a trade. Data-staleness alone would kill those connections.
+    const ws = fakeWs();
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40 });
+    for (let i = 0; i < 8; i++) { ws.emit('pong'); await sleep(15); }
+    ka.stop();
+    assert.strictEqual(ws.terminated, false, 'pong is proof of life on a quiet feed');
+    assert.ok(ws.pings > 0, 'the watchdog must actually ping');
+  });
+
+  test('stop() ends the watchdog so a closed socket is not terminated later', async () => {
+    const ws = fakeWs();
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 30 });
+    ka.stop();
+    await sleep(80);
+    assert.strictEqual(ws.terminated, false);
+  });
+
+  test('reconnect backoff grows, stays capped, and is jittered', () => {
+    assert.ok(reconnectDelayMs(0) <= 2000, 'first retry is prompt');
+    assert.ok(reconnectDelayMs(10) <= 30000, 'backoff is capped');
+    assert.ok(reconnectDelayMs(10) >= 15000, 'a capped backoff still waits');
+    const samples = new Set(Array.from({ length: 24 }, () => reconnectDelayMs(4)));
+    assert.ok(samples.size > 1, 'jitter stops two feeds reconnecting in lockstep');
+  });
+}
+
+console.log('\n-- RPC: transient failure is not a honeypot verdict --');
+{
+  const {
+    withRpcRetry, isCredentialError, isRateLimitError,
+    rpcEndpoint, rpcWsEndpoint, isFallbackEndpoint, connectionConfig,
+    rpcHealth, resetRpcHealth,
+  } = require('../services/rpcHealth');
+
+  test('a transient failure is retried and then succeeds', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const v = await withRpcRetry(async () => {
+      calls++;
+      if (calls < 3) throw new Error('socket hang up');
+      return 'ok';
+    }, { attempts: 4, baseDelayMs: 1 });
+    assert.strictEqual(v, 'ok');
+    assert.strictEqual(calls, 3, 'it must actually retry, not just wrap the call');
+  });
+
+  test('a rejected credential fails fast instead of retrying pointlessly', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    await assert.rejects(async () => {
+      await withRpcRetry(async () => { calls++; throw new Error('Unauthorized: 401'); },
+        { attempts: 5, baseDelayMs: 1 });
+    });
+    assert.strictEqual(calls, 1, 'a dead key fails identically every time — retrying only adds latency');
+    assert.strictEqual(rpcHealth().credentialRejected, true,
+      'the operator must be told the KEY is dead, not that the token was unverifiable');
+  });
+
+  test('a not-yet-visible account is retried rather than read as absent', async () => {
+    // The case that cost entries: getAccountInfo returns null for a few hundred
+    // ms on a mint that is 400ms old, and null was treated as "unverifiable".
+    resetRpcHealth();
+    let calls = 0;
+    const v = await withRpcRetry(async () => { calls++; return calls < 3 ? null : { data: 'here' }; },
+      { attempts: 4, baseDelayMs: 1, retryOnEmpty: true });
+    assert.deepStrictEqual(v, { data: 'here' });
+    assert.strictEqual(calls, 3);
+  });
+
+  test('retryOnEmpty still gives up and returns empty rather than hanging', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const v = await withRpcRetry(async () => { calls++; return null; },
+      { attempts: 3, baseDelayMs: 1, retryOnEmpty: true });
+    assert.strictEqual(v, null);
+    assert.strictEqual(calls, 3, 'bounded, not infinite');
+  });
+
+  test('error classification distinguishes a dead key from a busy one', () => {
+    assert.ok(isCredentialError(new Error('Request failed with status 401')));
+    assert.ok(isCredentialError(new Error('invalid api key')));
+    assert.ok(!isCredentialError(new Error('429 Too Many Requests')));
+    assert.ok(isRateLimitError(new Error('429 Too Many Requests')));
+    assert.ok(!isRateLimitError(new Error('socket hang up')));
+  });
+
+  test('health counts successes and failures so "barely working" has a number', async () => {
+    resetRpcHealth();
+    await withRpcRetry(async () => 1, { attempts: 1 });
+    await assert.rejects(async () => withRpcRetry(async () => { throw new Error('boom'); }, { attempts: 1, baseDelayMs: 1 }));
+    const h = rpcHealth();
+    assert.strictEqual(h.ok, 1);
+    assert.strictEqual(h.failed, 1);
+    assert.strictEqual(h.successRate, 0.5);
+    assert.strictEqual(h.lastError, 'boom');
+  });
+
+  test('a missing key degrades to a usable endpoint instead of an unusable URL', () => {
+    const savedUrl = process.env.SOLANA_RPC_URL;
+    const savedFallback = process.env.SOLANA_RPC_FALLBACK_URL;
+    delete process.env.SOLANA_RPC_URL;
+    delete process.env.SOLANA_RPC_FALLBACK_URL;
+    try {
+      // The old expression produced ".../?api-key=" — every call fails, so the
+      // bot could not even price or exit an open position.
+      const url = rpcEndpoint('');
+      assert.ok(!/api-key=$/.test(url), 'never build a URL with an empty api-key');
+      assert.ok(/^https:\/\//.test(url));
+      assert.strictEqual(isFallbackEndpoint(''), true);
+      assert.ok(rpcWsEndpoint('').startsWith('ws'));
+    } finally {
+      if (savedUrl !== undefined) process.env.SOLANA_RPC_URL = savedUrl;
+      if (savedFallback !== undefined) process.env.SOLANA_RPC_FALLBACK_URL = savedFallback;
+    }
+  });
+
+  test('endpoint precedence: explicit override > key > fallback', () => {
+    const saved = process.env.SOLANA_RPC_URL;
+    try {
+      process.env.SOLANA_RPC_URL = 'https://my-node.example/rpc';
+      assert.strictEqual(rpcEndpoint('somekey'), 'https://my-node.example/rpc');
+      assert.strictEqual(isFallbackEndpoint('somekey'), false);
+      delete process.env.SOLANA_RPC_URL;
+      assert.ok(rpcEndpoint('somekey').includes('somekey'));
+    } finally {
+      if (saved !== undefined) process.env.SOLANA_RPC_URL = saved; else delete process.env.SOLANA_RPC_URL;
+    }
+  });
+
+  test('the connection is configured deliberately, not by default', () => {
+    const cfg = connectionConfig();
+    assert.strictEqual(cfg.commitment, 'confirmed');
+    assert.strictEqual(cfg.disableRetryOnRateLimit, false, 'honouring Retry-After is what keeps a shared key alive');
+    assert.ok((cfg.confirmTransactionInitialTimeout ?? 0) >= 30_000, 'sniping submits into congestion');
+  });
+}
+
+console.log('\n-- The 70.9%: one dropped RPC read no longer reads as unsafe --');
+{
+  const { inspectMintSafety } = require('../services/honeypotDetector');
+  const { resetRpcHealth } = require('../services/rpcHealth');
+  const SPL = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+  const MINT = 'So11111111111111111111111111111111111111112';
+  const renouncedMint = () => {
+    const d = Buffer.alloc(82);
+    d.writeUInt32LE(0, 0);
+    d.writeUInt32LE(0, 46);
+    d[45] = 1;
+    return d;
+  };
+
+  test('a mint that throws once is still verified, not written off as unverifiable', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const flaky = {
+      getAccountInfo: async () => {
+        calls++;
+        if (calls === 1) throw new Error('socket hang up');
+        return { owner: { toBase58: () => SPL }, data: renouncedMint() };
+      },
+    };
+    const v = await inspectMintSafety(flaky as any, MINT, null);
+    assert.ok(!v.unverified.includes('mintAccount'),
+      'this single retry is the difference for 70.9% of candidates on 2026-08-13');
+    assert.strictEqual(v.details.mintAuthorityActive, false);
+  });
+
+  test('a mint not yet propagated is retried, then read', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const slow = {
+      getAccountInfo: async () => {
+        calls++;
+        return calls < 2 ? null : { owner: { toBase58: () => SPL }, data: renouncedMint() };
+      },
+    };
+    const v = await inspectMintSafety(slow as any, MINT, null);
+    assert.ok(!v.unverified.includes('mintAccount'), 'a 400ms-old mint is late, not missing');
+  });
+
+  test('a genuinely absent account is STILL unverified — retry must not invent a pass', async () => {
+    resetRpcHealth();
+    const dead = { getAccountInfo: async () => null };
+    const v = await inspectMintSafety(dead as any, MINT, null);
+    assert.ok(v.unverified.includes('mintAccount'),
+      'unknown must stay unknown; retry buys evidence, it does not manufacture it');
+  });
+
+  test('a live mint authority is still caught after a retry', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const d = Buffer.alloc(82);
+    d.writeUInt32LE(1, 0);
+    d[45] = 1;
+    const flaky = {
+      getAccountInfo: async () => {
+        calls++;
+        if (calls === 1) throw new Error('ETIMEDOUT');
+        return { owner: { toBase58: () => SPL }, data: d };
+      },
+    };
+    const v = await inspectMintSafety(flaky as any, MINT, null);
+    assert.strictEqual(v.safe, false, 'resilience must not soften the verdict');
+    assert.ok(v.reasons.some((r: string) => /mint authority/i.test(r)));
+  });
+}
+
+void (async () => {
+  // Async tests run here, one at a time. Before this existed they were counted
+  // as passed the instant they were called, so their assertions never ran
+  // against the result at all.
+  if (pendingTests.length) {
+    console.log(`\n-- Async tests (${pendingTests.length}, run sequentially) --`);
+  }
+  for (const t of pendingTests) {
+    try {
+      await t.fn();
+      passed++;
+      console.log(`  ok    ${t.name}`);
+    } catch (err: any) {
+      failed++;
+      console.error(`  FAIL  ${t.name}\n        ${err?.message ?? err}`);
+    }
+  }
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed > 0 ? 1 : 0);
+})();

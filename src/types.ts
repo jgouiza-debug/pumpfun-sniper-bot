@@ -667,6 +667,32 @@ export interface BotStatusResponse {
     /** True when the balance forced fewer slots than requested. */
     slotsReducedForEconomics?: boolean;
   };
+  /**
+   * RPC and feed liveness.
+   *
+   * Added because "RPC is barely working" and "the feed died an hour ago" both
+   * presented identically: a bot that logged nothing and bought nothing. On
+   * 2026-08-13, 70.9% of candidates were discarded on a failed RPC read and the
+   * launch feed went silent at 13:16 with no error — neither was visible
+   * anywhere in the UI.
+   */
+  health?: {
+    rpc: {
+      ok: number;
+      failed: number;
+      consecutiveFailures: number;
+      /** The provider is rejecting the key itself — retrying will not help. */
+      credentialRejected: boolean;
+      successRate: number;
+      lastError: string | null;
+    };
+    feed: {
+      connected: boolean;
+      /** Null before the first frame of the session. */
+      lastMessageAgoMs: number | null;
+      reconnectAttempts: number;
+    };
+  };
 }
 
 export interface BotInstanceInfo {

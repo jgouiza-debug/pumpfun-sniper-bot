@@ -35,6 +35,8 @@ import { tokenWatchlist } from './tokenWatchlist';
 import { inspectMintSafety, simulateSellPath } from './honeypotDetector';
 import { devSellMonitor } from './devSellMonitor';
 import { CurveWatcher, CurveUpdate } from './curveWatcher';
+import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
+import { rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth } from './rpcHealth';
 
 /**
  * Minimum real SOL that must sit in a bonding curve before we will buy into it.
@@ -326,6 +328,12 @@ export class SniperEngine {
   private tradeHistory: TradeHistoryRecord[] = [];
   private logs: BotLogEntry[] = [];
   private ws: WebSocket | null = null;
+  /** Liveness watchdog for `ws`. See wsKeepalive.ts for why `close` is not enough. */
+  private wsKeepalive: KeepaliveHandle | null = null;
+  /** Consecutive failed reconnects, for backoff. Reset by a successful open. */
+  private wsReconnectAttempt = 0;
+  /** Wall-clock of the last launch/migration frame, surfaced in status. */
+  private lastFeedMessageAt = 0;
   private monitorInterval: NodeJS.Timeout | null = null;
   private walletSyncInterval: NodeJS.Timeout | null = null;
   private riskFilter: RiskFilter;
@@ -406,17 +414,18 @@ export class SniperEngine {
     const apiKey = this.config.heliusApiKey || process.env.HELIUS_API_KEY || '';
     this.config.heliusApiKey = apiKey;
     if (!apiKey) {
-      console.warn('⚠️ No Helius API key. Set HELIUS_API_KEY in the .env beside the exe, or enter one in UI Settings. Until then every RPC call fails and the bot cannot price positions or trade.');
+      console.warn('⚠️ No Helius API key. Set HELIUS_API_KEY in the .env beside the exe, or enter one in UI Settings.');
+      console.warn(`⚠️ Falling back to ${rpcEndpoint(apiKey)} — heavily rate limited. Open positions can still be priced and sold, but do NOT expect to win snipes on it.`);
     }
-    const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
 
-    this.solanaConnection = new Connection(rpcUrl, 'confirmed');
+    this.solanaConnection = new Connection(rpcEndpoint(apiKey), connectionConfig());
     this.wallet = new WalletService(this.solanaConnection);
     this.priorityFeeService = new PriorityFeeService(() => this.solanaConnection);
     this.curveWatcher = new CurveWatcher(
-      () => `wss://mainnet.helius-rpc.com/?api-key=${this.config.heliusApiKey || ''}`,
+      () => rpcWsEndpoint(this.config.heliusApiKey),
       (u) => { void this.handleCurveUpdate(u); },
-      40
+      40,
+      (level, msg) => this.log(level, `📉 ${msg}`)
     );
     if (featureFlags.get('localTxBuild') || featureFlags.get('localTxShadowCompare')) {
       localTxBuilder.start(this.solanaConnection);
@@ -746,13 +755,17 @@ export class SniperEngine {
     }
 
     if (newConfig.heliusApiKey) {
-      const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${this.config.heliusApiKey}`;
-      this.solanaConnection = new Connection(rpcUrl, 'confirmed');
+      const rpcUrl = rpcEndpoint(this.config.heliusApiKey);
+      this.solanaConnection = new Connection(rpcUrl, connectionConfig());
       this.wallet.setConnection(this.solanaConnection);
+      // A new credential clears the "this key is rejected" latch, so a fixed key
+      // stops the bot reporting a dead one.
+      resetRpcHealth();
       if (featureFlags.get('localTxBuild') || featureFlags.get('localTxShadowCompare')) {
         localTxBuilder.start(this.solanaConnection);
       }
-      this.log('info', `🚀 Helius Dedicated RPC Engine Updated: ${rpcUrl.slice(0, 42)}...`);
+      // The key is a credential: log the host, never the query string.
+      this.log('info', `🚀 RPC endpoint updated: ${(() => { try { return new URL(rpcUrl).host; } catch { return 'custom endpoint'; } })()}`);
     }
 
     // A key arriving through the config endpoint is routed into WalletService
@@ -1075,6 +1088,24 @@ export class SniperEngine {
       run: this.getLiveRunSummary(),
       stats: this.computeStats(),
       sizing: this.getSizingPreview(),
+      health: {
+        rpc: (() => {
+          const h = rpcHealth();
+          return {
+            ok: h.ok,
+            failed: h.failed,
+            consecutiveFailures: h.consecutiveFailures,
+            credentialRejected: h.credentialRejected,
+            successRate: Number(h.successRate.toFixed(3)),
+            lastError: h.lastError,
+          };
+        })(),
+        feed: {
+          connected: this.ws?.readyState === WebSocket.OPEN,
+          lastMessageAgoMs: this.lastFeedMessageAt ? now - this.lastFeedMessageAt : null,
+          reconnectAttempts: this.wsReconnectAttempt,
+        },
+      },
     };
   }
 
@@ -1448,8 +1479,17 @@ export class SniperEngine {
 
     try {
       this.ws = new WebSocket(this.pumpPortalDataUrl());
+      const socket = this.ws;
+
+      this.wsKeepalive = attachKeepalive(socket, {
+        onStale: (silentMs) => {
+          this.log('warn', `📡 Launch feed silent for ${(silentMs / 1000).toFixed(0)}s — the socket is dead but never closed. Forcing a reconnect. (This exact failure blinded the bot from 13:16 on 2026-08-13 with no error logged.)`);
+        },
+      });
 
       this.ws.on('open', () => {
+        this.wsReconnectAttempt = 0;
+        this.lastFeedMessageAt = Date.now();
         if (this.hasPumpPortalKey()) {
           this.log('info', '📡 WebSocket connected to PumpPortal with your API key — per-trade data (unique buyers, buy pressure, creator dumps) is live.');
         } else {
@@ -1470,6 +1510,12 @@ export class SniperEngine {
       });
 
       this.ws.on('message', async (data: WebSocket.Data) => {
+        // Liveness is a property of the SOCKET, not of whether we act on the
+        // frame. Touching after the isBotActive check would make a paused bot
+        // look dead and terminate a perfectly good connection every 75s.
+        this.wsKeepalive?.touch();
+        this.lastFeedMessageAt = Date.now();
+
         if (!this.config.isBotActive) return;
         // T1 is stamped here, before parse, so the timeline captures true
         // in-process arrival — not "whenever we got around to it".
@@ -1523,9 +1569,13 @@ export class SniperEngine {
       });
 
       this.ws.on('close', () => {
+        this.wsKeepalive?.stop();
+        this.wsKeepalive = null;
         this.ws = null;
         if (this.config.isBotActive) {
-          setTimeout(() => this.subscribeStream(), 2000);
+          const delay = reconnectDelayMs(this.wsReconnectAttempt++);
+          this.log('warn', `📡 Launch feed disconnected — reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${this.wsReconnectAttempt}).`);
+          setTimeout(() => this.subscribeStream(), delay);
         }
       });
     } catch (err: any) {
@@ -1534,6 +1584,8 @@ export class SniperEngine {
   }
 
   private unsubscribeStream(): void {
+    this.wsKeepalive?.stop();
+    this.wsKeepalive = null;
     if (this.ws) {
       try { this.ws.close(); } catch (e) {}
       this.ws = null;
