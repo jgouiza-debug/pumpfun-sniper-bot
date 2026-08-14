@@ -200,10 +200,14 @@ export class UpdaterService {
           downloadUrl = binAsset.browser_download_url;
           assetSizeBytes = Number(binAsset.size) || undefined;
         }
-        // The checksum has to belong to the SAME asset, or verification either
-        // fails or, worse, passes against the wrong file.
+        // The checksum has to belong to the SAME asset. The old code took the
+        // first '.sha256' in the array regardless of which binary it described,
+        // which on a multi-platform release meant verifying the Windows exe
+        // against the macOS hash. Exact-name match first, both extensions —
+        // macOS checksums ship as .sha256sum precisely so that exactly one
+        // '.sha256' exists for pre-1.0.1 clients (see release.yml).
         const sumAsset = release.assets.find((a: any) => a?.name === `${binAsset?.name}.sha256`)
-          ?? release.assets.find((a: any) => typeof a?.name === 'string' && a.name.endsWith('.sha256'));
+          ?? release.assets.find((a: any) => a?.name === `${binAsset?.name}.sha256sum`);
         if (sumAsset?.browser_download_url) checksumUrl = sumAsset.browser_download_url;
       }
 

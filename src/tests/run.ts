@@ -2841,6 +2841,41 @@ console.log('\n-- macOS build: the updater must never install another platform\'
     assert.ok(/node22-macos-arm64/.test(macScripts) && /node22-macos-x64/.test(macScripts));
   });
 
+  test('a multi-platform release leaves exactly one .sha256, for pre-1.0.1 clients', () => {
+    // Clients shipped before 1.0.1 find their checksum with
+    // assets.find(a => a.name.endsWith('.sha256')) — first match, no check that
+    // it describes the binary they just downloaded. GitHub returns assets
+    // alphabetically and '-macos' sorts before '.exe', so publishing macOS
+    // checksums as .sha256 made every existing Windows client verify its exe
+    // against the macOS arm64 hash and refuse to install. Observed on the real
+    // v1.0.1 release, 2026-08-13.
+    const published = [
+      'pumpfun-sniper-bot-macos-arm64',
+      'pumpfun-sniper-bot-macos-arm64.sha256sum',
+      'pumpfun-sniper-bot-macos-x64',
+      'pumpfun-sniper-bot-macos-x64.sha256sum',
+      'pumpfun-sniper-bot.exe',
+      'pumpfun-sniper-bot.exe.sha256',
+    ].sort();
+
+    const dotSha256 = published.filter(n => n.endsWith('.sha256'));
+    assert.strictEqual(dotSha256.length, 1,
+      'more than one .sha256 asset and the old matcher picks by luck of ordering');
+
+    // The legacy matcher, verbatim, must now land on the right pair.
+    const legacyBinary = published.find(n => n.endsWith('.exe'));
+    const legacyChecksum = published.find(n => n.endsWith('.sha256'));
+    assert.strictEqual(legacyChecksum, `${legacyBinary}.sha256`,
+      'an existing exe must verify against its OWN hash, not another platform\'s');
+  });
+
+  test('the workflow publishes macOS checksums as .sha256sum, not .sha256', () => {
+    const wf = fsm.readFileSync(pathm.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+    assert.ok(/macos-arm64\.sha256sum/.test(wf) && /macos-x64\.sha256sum/.test(wf));
+    assert.ok(!/macos-arm64\.sha256\b(?!sum)/.test(wf),
+      'a macOS .sha256 asset would break every pre-1.0.1 client again');
+  });
+
   test('the release workflow ad-hoc signs arm64 and publishes a checksum per asset', () => {
     const wf = fsm.readFileSync(pathm.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
     assert.ok(/runs-on:\s*macos/.test(wf), 'arm64 signing cannot run on a non-Mac runner');

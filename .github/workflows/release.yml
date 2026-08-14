@@ -141,10 +141,22 @@ jobs:
         run: |
           cd dist-exe
           for f in pumpfun-sniper-bot-macos-arm64 pumpfun-sniper-bot-macos-x64; do
-            # Name the file inside the checksum so it matches the asset the
-            # updater downloads for this platform.
-            shasum -a 256 "$f" | awk '{printf "%s  '"$f"'", $1}' > "$f.sha256"
-            cat "$f.sha256"; echo
+            # .sha256sum, NOT .sha256, and the extension is load-bearing.
+            #
+            # Every client shipped before 1.0.1 finds its checksum with
+            # `assets.find(a => a.name.endsWith('.sha256'))` — the FIRST match in
+            # the array, with no check that it belongs to the binary it just
+            # downloaded. GitHub returns assets alphabetically and '-macos'
+            # sorts before '.exe', so publishing these as .sha256 made every
+            # existing Windows client verify its exe against the macOS arm64
+            # hash and abort with "the download was corrupt or tampered with".
+            # Measured against the real v1.0.1 release on 2026-08-13.
+            #
+            # Keeping exactly one .sha256 asset in the release makes that old
+            # matcher correct by construction. Remove this only when no 1.0.0
+            # clients remain in the wild.
+            shasum -a 256 "$f" | awk '{printf "%s  '"$f"'", $1}' > "$f.sha256sum"
+            cat "$f.sha256sum"; echo
           done
 
       - name: Upload macOS assets to the release
@@ -153,9 +165,9 @@ jobs:
         with:
           files: |
             dist-exe/pumpfun-sniper-bot-macos-arm64
-            dist-exe/pumpfun-sniper-bot-macos-arm64.sha256
+            dist-exe/pumpfun-sniper-bot-macos-arm64.sha256sum
             dist-exe/pumpfun-sniper-bot-macos-x64
-            dist-exe/pumpfun-sniper-bot-macos-x64.sha256
+            dist-exe/pumpfun-sniper-bot-macos-x64.sha256sum
           draft: false
           prerelease: false
           generate_release_notes: true
