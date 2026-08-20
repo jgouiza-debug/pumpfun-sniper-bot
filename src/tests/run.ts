@@ -2985,6 +2985,266 @@ console.log('\n-- API keys entered in the UI survive a restart --');
   });
 }
 
+console.log('\n-- "RPC stays down on a valid key": the four causes --');
+{
+  const {
+    normalizeHeliusKey, resolveRpcEndpoint, rpcEndpoint, isFallbackEndpoint,
+    withRpcRetry, rpcHealth, resetRpcHealth,
+  } = require('../services/rpcHealth');
+
+  // A synthetic UUID. Deliberately NOT the key this repo once hardcoded — that
+  // one is burned and must not reappear in current source.
+  const UUID = '00000000-1111-2222-3333-444444444444';
+
+  /** Runs fn with the RPC env vars set to exactly `vars`, then restores them. */
+  const withEnv = (vars: Record<string, string | undefined>, fn: () => void) => {
+    const names = ['SOLANA_RPC_URL', 'SOLANA_RPC_WS_URL', 'SOLANA_RPC_FALLBACK_URL'];
+    const saved: Record<string, string | undefined> = {};
+    for (const n of names) { saved[n] = process.env[n]; delete process.env[n]; }
+    for (const [k, v] of Object.entries(vars)) if (v !== undefined) process.env[k] = v;
+    try { fn(); } finally {
+      for (const n of names) {
+        if (saved[n] !== undefined) process.env[n] = saved[n]!; else delete process.env[n];
+      }
+    }
+  };
+
+  // ---- Cause 1: a stale SOLANA_RPC_URL silently outranks a good key ----
+
+  test('OLD BUG: an env override outranks the Helius key — now it is reported, not silent', () => {
+    withEnv({ SOLANA_RPC_URL: 'https://dead-node.example/rpc' }, () => {
+      const r = resolveRpcEndpoint(UUID);
+      assert.strictEqual(r.source, 'env-override');
+      assert.strictEqual(r.host, 'dead-node.example');
+      assert.strictEqual(r.keyOverridden, true,
+        'a configured key that is being ignored MUST be reported — this is the whole bug');
+    });
+  });
+
+  test('no override: the key is used and nothing claims it was overridden', () => {
+    withEnv({}, () => {
+      const r = resolveRpcEndpoint(UUID);
+      assert.strictEqual(r.source, 'helius');
+      assert.strictEqual(r.host, 'mainnet.helius-rpc.com');
+      assert.strictEqual(r.keyOverridden, false);
+      assert.ok(r.url.includes(UUID));
+    });
+  });
+
+  test('keyOverridden is false with no key — an override is then the intended path', () => {
+    withEnv({ SOLANA_RPC_URL: 'https://my-node.example/rpc' }, () => {
+      assert.strictEqual(resolveRpcEndpoint('').keyOverridden, false);
+      assert.strictEqual(resolveRpcEndpoint('').source, 'env-override');
+    });
+  });
+
+  test('the fallback chain still degrades rather than dying', () => {
+    withEnv({}, () => {
+      const r = resolveRpcEndpoint('');
+      assert.strictEqual(r.source, 'public');
+      assert.ok(!/api-key=$/.test(r.url), 'never build a URL with an empty api-key');
+      assert.strictEqual(isFallbackEndpoint(''), true);
+    });
+    withEnv({ SOLANA_RPC_FALLBACK_URL: 'https://backup.example/rpc' }, () => {
+      assert.strictEqual(resolveRpcEndpoint('').source, 'fallback-env');
+    });
+  });
+
+  test('the host is exposed but the credential never is', () => {
+    withEnv({}, () => {
+      const r = resolveRpcEndpoint(UUID);
+      assert.ok(!r.host.includes(UUID), 'the host must never carry the key — it is shown in the UI');
+      assert.ok(!r.host.includes('api-key'));
+    });
+  });
+
+  // ---- Cause 2: no validation on the key, and the bad value got persisted ----
+
+  test('OLD BUG: a pasted RPC URL nested inside another URL — now the key is extracted', () => {
+    const n = normalizeHeliusKey(`https://mainnet.helius-rpc.com/?api-key=${UUID}`);
+    assert.strictEqual(n.ok, true);
+    assert.strictEqual(n.key, UUID, 'the api-key must be lifted out, not nested');
+    assert.ok(n.note, 'the operator is told what was repaired');
+    withEnv({}, () => {
+      assert.ok(!rpcEndpoint(`https://mainnet.helius-rpc.com/?api-key=${UUID}`).includes('helius-rpc.com/?api-key=https'),
+        'the old bug built ...api-key=https://... and failed every call forever');
+    });
+  });
+
+  test('a websocket URL form is accepted the same way', () => {
+    assert.strictEqual(normalizeHeliusKey(`wss://mainnet.helius-rpc.com/?api-key=${UUID}`).key, UUID);
+  });
+
+  test('a URL with no api-key is REFUSED, and points at the right setting', () => {
+    const n = normalizeHeliusKey('https://my-node.example/rpc');
+    assert.strictEqual(n.ok, false);
+    assert.strictEqual(n.key, '');
+    assert.ok(/SOLANA_RPC_URL/.test(n.note), 'refusing is only useful if it says what to do instead');
+  });
+
+  test('junk that cannot survive a query string is refused rather than encoded', () => {
+    for (const bad of ['my key with spaces', 'abc/def', 'a?b', 'x&y=z']) {
+      assert.strictEqual(normalizeHeliusKey(bad).ok, false, `${bad} must be refused`);
+    }
+  });
+
+  test('quotes from a .env line or JSON blob are stripped', () => {
+    assert.strictEqual(normalizeHeliusKey(`"${UUID}"`).key, UUID);
+    assert.strictEqual(normalizeHeliusKey(`'${UUID}'`).key, UUID);
+    assert.strictEqual(normalizeHeliusKey(`  ${UUID}\n`).key, UUID);
+  });
+
+  test('a clean key passes with no note at all', () => {
+    const n = normalizeHeliusKey(UUID);
+    assert.strictEqual(n.ok, true);
+    assert.strictEqual(n.key, UUID);
+    assert.strictEqual(n.note, undefined);
+  });
+
+  test('a non-UUID token is warned about but still accepted — the format is theirs to change', () => {
+    const n = normalizeHeliusKey('some-token-that-is-not-a-uuid');
+    assert.strictEqual(n.ok, true);
+    assert.ok(n.note, 'accepting silently would recreate the invisible-breakage bug');
+  });
+
+  test('an empty key is not usable and says so', () => {
+    assert.strictEqual(normalizeHeliusKey('').ok, false);
+    assert.strictEqual(normalizeHeliusKey(undefined).ok, false);
+  });
+
+  // ---- Cause 6: background pollers must not dominate the success rate ----
+
+  test('countHealth:false keeps a heartbeat out of the rolling success rate', async () => {
+    resetRpcHealth();
+    await withRpcRetry(async () => 1, { attempts: 1, countHealth: false });
+    await assert.rejects(async () => withRpcRetry(async () => { throw new Error('boom'); },
+      { attempts: 1, baseDelayMs: 1, countHealth: false }));
+    const h = rpcHealth();
+    assert.strictEqual(h.ok, 0);
+    assert.strictEqual(h.failed, 0);
+    assert.strictEqual(h.consecutiveFailures, 0);
+  });
+
+  test('an uncounted call still latches a rejected credential — that is real signal', async () => {
+    resetRpcHealth();
+    await assert.rejects(async () => withRpcRetry(async () => { throw new Error('401 Unauthorized'); },
+      { attempts: 3, baseDelayMs: 1, countHealth: false }));
+    assert.strictEqual(rpcHealth().credentialRejected, true);
+  });
+
+  test('counted calls are still counted — the default did not change', async () => {
+    resetRpcHealth();
+    await withRpcRetry(async () => 1, { attempts: 1 });
+    const h = rpcHealth();
+    assert.strictEqual(h.ok, 1);
+  });
+}
+
+console.log('\n-- One blip must not blank the wallet or refuse to arm --');
+{
+  const { WalletService } = require('../services/walletService');
+  const { resetRpcHealth } = require('../services/rpcHealth');
+
+  const LAMPORTS = 1_000_000_000;
+  /** A Connection stand-in whose getBalance/getSlot behaviour the test drives. */
+  const fakeConn = (impl: { balance?: () => Promise<number>; slot?: () => Promise<number> }) => ({
+    getBalance: impl.balance ?? (async () => 2 * LAMPORTS),
+    getSlot: impl.slot ?? (async () => 1),
+    onAccountChange: () => 1,
+    removeAccountChangeListener: async () => {},
+  });
+
+  // A throwaway keypair, so no real credential appears in the suite.
+  const { Keypair } = require('@solana/web3.js');
+  const bs58x = require('bs58').default ?? require('bs58');
+  const secret = bs58x.encode(Keypair.generate().secretKey);
+
+  test('OLD BUG: one 429 flipped RPC to DOWN, which refuses to arm REAL mode', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const w = new WalletService(fakeConn({
+      balance: async () => { calls++; if (calls <= 1) throw new Error('429 Too Many Requests'); return 2 * LAMPORTS; },
+    }) as any);
+    assert.strictEqual((await w.link(secret)).ok, true, 'a retried blip must not fail the link');
+    assert.ok(!w.getBlockers().some((b: string) => /RPC unreachable/.test(b)),
+      'a single 429 must not become a blocker that refuses REAL mode');
+  });
+
+  test('a sustained outage still reads as DOWN — hysteresis must not hide a real one', async () => {
+    resetRpcHealth();
+    let healthy = true;
+    const w = new WalletService(fakeConn({
+      balance: async () => { if (!healthy) throw new Error('ECONNRESET'); return 2 * LAMPORTS; },
+      slot: async () => { if (!healthy) throw new Error('ECONNRESET'); return 1; },
+    }) as any);
+    // Link while healthy: `getBlockers` short-circuits on "no wallet linked",
+    // so the RPC blocker is only reachable once a wallet exists.
+    assert.strictEqual((await w.link(secret)).ok, true);
+
+    healthy = false;
+    await w.checkRpcHealth();
+    await w.checkRpcHealth();
+    assert.strictEqual(w.getStatus(0).rpcHealthy, false);
+    assert.ok(w.getBlockers().some((b: string) => /RPC unreachable/.test(b)),
+      'a real outage must still refuse to arm REAL mode');
+  });
+
+  test('a recovered RPC clears the latch on the FIRST good read', async () => {
+    resetRpcHealth();
+    let down = true;
+    const w = new WalletService(fakeConn({
+      slot: async () => { if (down) throw new Error('ECONNRESET'); return 1; },
+    }) as any);
+    await w.checkRpcHealth();
+    await w.checkRpcHealth();
+    assert.strictEqual(w.getStatus(0).rpcHealthy, false);
+    down = false;
+    await w.checkRpcHealth();
+    assert.strictEqual(w.getStatus(0).rpcHealthy, true, 'recovery needs no hysteresis');
+  });
+
+  test('OLD BUG: a link that reports failure left the wallet armed anyway', async () => {
+    resetRpcHealth();
+    const w = new WalletService(fakeConn({
+      balance: async () => { throw new Error('ECONNRESET'); },
+      slot: async () => { throw new Error('ECONNRESET'); },
+    }) as any);
+    const res = await w.link(secret);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(w.isLinked(), false,
+      'a failed link must not leave a keypair the engine will sign with');
+    assert.strictEqual(w.getAddress(), null);
+    assert.strictEqual(res.status.linked, false, 'the status handed back must agree');
+  });
+
+  test('a failed re-link restores the wallet that was already working', async () => {
+    resetRpcHealth();
+    let healthy = true;
+    const w = new WalletService(fakeConn({
+      balance: async () => { if (!healthy) throw new Error('ECONNRESET'); return 2 * LAMPORTS; },
+      slot: async () => { if (!healthy) throw new Error('ECONNRESET'); return 1; },
+    }) as any);
+    assert.strictEqual((await w.link(secret)).ok, true);
+    const original = w.getAddress();
+
+    healthy = false;
+    const other = bs58x.encode(Keypair.generate().secretKey);
+    assert.strictEqual((await w.link(other)).ok, false);
+    assert.strictEqual(w.getAddress(), original,
+      'a failed link must not swap the signing wallet out from under the operator');
+  });
+
+  test('a malformed key is still rejected without touching the linked wallet', async () => {
+    resetRpcHealth();
+    const w = new WalletService(fakeConn({}) as any);
+    assert.strictEqual((await w.link(secret)).ok, true);
+    const original = w.getAddress();
+    const res = await w.link('not-a-key');
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(w.getAddress(), original);
+  });
+}
+
 void (async () => {
   // Async tests run here, one at a time. Before this existed they were counted
   // as passed the instant they were called, so their assertions never ran

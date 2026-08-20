@@ -78,6 +78,19 @@ export interface RpcRetryOptions {
    * and skipping it.
    */
   retryOnEmpty?: boolean;
+  /**
+   * Whether this call belongs in the rolling success-rate figure. Default true.
+   *
+   * Set false for background pollers. The counters exist to explain why
+   * CANDIDATES were rejected (see the header): a health heartbeat firing every
+   * two seconds, or an 8-second balance poll, would outnumber the screening
+   * calls many times over and turn `successRate` into a measure of the
+   * heartbeat rather than of the RPC's quality where it costs money.
+   *
+   * A rejected credential still latches — that is real signal no matter which
+   * call happened to notice it.
+   */
+  countHealth?: boolean;
   onRetry?: (attempt: number, delayMs: number, reason: string) => void;
 }
 
@@ -91,6 +104,7 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
   const attempts = Math.max(1, opts.attempts ?? 3);
   const baseDelayMs = opts.baseDelayMs ?? 120;
   const maxDelayMs = opts.maxDelayMs ?? 1_000;
+  const countHealth = opts.countHealth !== false;
 
   let lastErr: unknown = null;
 
@@ -105,8 +119,10 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
         continue;
       }
 
-      state.ok++;
-      state.consecutiveFailures = 0;
+      if (countHealth) {
+        state.ok++;
+        state.consecutiveFailures = 0;
+      }
       return value;
     } catch (err) {
       lastErr = err;
@@ -131,10 +147,12 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
     }
   }
 
-  state.failed++;
-  state.consecutiveFailures++;
-  state.lastError = lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'unknown');
-  state.lastErrorAt = Date.now();
+  if (countHealth) {
+    state.failed++;
+    state.consecutiveFailures++;
+    state.lastError = lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'unknown');
+    state.lastErrorAt = Date.now();
+  }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'RPC call failed'));
 }
 
@@ -152,7 +170,111 @@ export function rpcHealth(): RpcHealthSnapshot {
 }
 
 /**
- * Which endpoint to talk to, in precedence order.
+ * Normalizes whatever the operator pasted into the "Helius RPC Key" field.
+ *
+ * WHY: `rpcEndpoint` used to interpolate the string unconditionally, and
+ * NOTHING validated it — not the UI field, not `updateConfig`, not `storeKey`.
+ * Paste the full Helius RPC URL instead of the bare key (the dashboard shows
+ * both, and the URL is the one people copy) and you built
+ * `...?api-key=https://mainnet.helius-rpc.com/?api-key=xxx`, which fails every
+ * call forever.
+ *
+ * That was far worse than a transient failure, because the broken value was
+ * then written to `.api-keys.json`, and a stored key outranks `.env`. The bad
+ * credential survived every restart while `heliusApiKeySet` reported true — the
+ * operator had done everything right and the bot said RPC DOWN indefinitely
+ * with no way to see why.
+ *
+ * The rule: repair what is unambiguously repairable, REFUSE what provably
+ * cannot work, and pass through anything else with a warning. Helius keys are
+ * UUIDs today, but that is their choice to change, so a non-UUID token is
+ * warned about and still accepted — only characters that cannot survive being
+ * placed in a query string are rejected outright.
+ */
+export interface NormalizedRpcKey {
+  /** The bare API key. Empty when the input could not be used. */
+  key: string;
+  ok: boolean;
+  /** Populated whenever the input was not already a clean bare key. */
+  note?: string;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function normalizeHeliusKey(raw: string | undefined | null): NormalizedRpcKey {
+  let value = (raw || '').trim();
+  if (!value) return { key: '', ok: false, note: 'No key supplied.' };
+
+  // Copied out of a JSON file or a quoted .env line.
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1).trim();
+  }
+
+  // A pasted endpoint URL. The key is in the query string — take it rather than
+  // nesting one URL inside another.
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    try {
+      const parsed = new URL(value);
+      const embedded = (parsed.searchParams.get('api-key') || parsed.searchParams.get('api_key') || '').trim();
+      if (embedded) {
+        return {
+          key: embedded,
+          ok: true,
+          note: `Read the api-key out of the ${parsed.host} URL you pasted — store just the key next time.`,
+        };
+      }
+      return {
+        key: '',
+        ok: false,
+        note: `That is an endpoint URL with no api-key in it. This field wants the bare Helius key; to point the bot at a custom node, set SOLANA_RPC_URL=${value} in the .env beside the app instead.`,
+      };
+    } catch {
+      return { key: '', ok: false, note: 'That looks like a URL but could not be parsed.' };
+    }
+  }
+
+  // Anything that cannot survive being placed in a query string is not a key,
+  // and silently encoding it would recreate the same invisible breakage.
+  if (/[\s/?#&=]/.test(value)) {
+    return { key: '', ok: false, note: 'A Helius API key contains no spaces, slashes or URL punctuation — this does not look like one.' };
+  }
+
+  if (!UUID_RE.test(value)) {
+    return {
+      key: value,
+      ok: true,
+      note: 'That is not the UUID shape Helius issues. Accepting it, but if RPC stays down this is the first thing to re-check.',
+    };
+  }
+
+  return { key: value, ok: true };
+}
+
+export type RpcEndpointSource = 'env-override' | 'helius' | 'fallback-env' | 'public';
+
+export interface ResolvedRpcEndpoint {
+  url: string;
+  source: RpcEndpointSource;
+  /** Host only. Safe to log and to show in the UI — never the query string. */
+  host: string;
+  /**
+   * True when a Helius key IS configured but something else won anyway. This is
+   * the state that produced "valid credentials, RPC still down": the operator
+   * sees `heliusApiKeySet: true` and has no way to learn the key is unused.
+   */
+  keyOverridden: boolean;
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return 'custom endpoint';
+  }
+}
+
+/**
+ * Which endpoint to talk to, in precedence order, and WHY that one won.
  *
  * Before this, a missing or dead Helius key produced
  * `https://mainnet.helius-rpc.com/?api-key=` — a URL that fails every single
@@ -168,15 +290,37 @@ export function rpcHealth(): RpcHealthSnapshot {
  *   <helius key>             the normal path
  *   SOLANA_RPC_FALLBACK_URL  operator-supplied backup
  *   public mainnet           last resort, loudly warned about
+ *
+ * The `source` half is new and is the actual fix for the reported bug. A stale
+ * `SOLANA_RPC_URL` in the .env beside the exe silently outranked a freshly
+ * typed, perfectly good Helius key, and NOTHING anywhere — status payload, UI,
+ * startup log — reported which endpoint was really in use. Callers now surface
+ * this so the answer is visible instead of deducible.
  */
-export function rpcEndpoint(heliusKey: string | undefined | null): string {
+export function resolveRpcEndpoint(heliusKey: string | undefined | null): ResolvedRpcEndpoint {
+  const key = normalizeHeliusKey(heliusKey).key;
+
   const explicit = (process.env.SOLANA_RPC_URL || '').trim();
-  if (explicit) return explicit;
+  if (explicit) {
+    return { url: explicit, source: 'env-override', host: hostOf(explicit), keyOverridden: Boolean(key) };
+  }
 
-  const key = (heliusKey || '').trim();
-  if (key) return `https://mainnet.helius-rpc.com/?api-key=${key}`;
+  if (key) {
+    const url = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
+    return { url, source: 'helius', host: hostOf(url), keyOverridden: false };
+  }
 
-  return (process.env.SOLANA_RPC_FALLBACK_URL || '').trim() || 'https://api.mainnet-beta.solana.com';
+  const fallback = (process.env.SOLANA_RPC_FALLBACK_URL || '').trim();
+  if (fallback) {
+    return { url: fallback, source: 'fallback-env', host: hostOf(fallback), keyOverridden: false };
+  }
+
+  const pub = 'https://api.mainnet-beta.solana.com';
+  return { url: pub, source: 'public', host: hostOf(pub), keyOverridden: false };
+}
+
+export function rpcEndpoint(heliusKey: string | undefined | null): string {
+  return resolveRpcEndpoint(heliusKey).url;
 }
 
 /** WebSocket peer of {@link rpcEndpoint}, for accountSubscribe. */
@@ -184,8 +328,8 @@ export function rpcWsEndpoint(heliusKey: string | undefined | null): string {
   const explicit = (process.env.SOLANA_RPC_WS_URL || '').trim();
   if (explicit) return explicit;
 
-  const key = (heliusKey || '').trim();
-  if (key) return `wss://mainnet.helius-rpc.com/?api-key=${key}`;
+  const key = normalizeHeliusKey(heliusKey).key;
+  if (key) return `wss://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
 
   const fallback = (process.env.SOLANA_RPC_FALLBACK_URL || '').trim();
   if (fallback) return fallback.replace(/^http/, 'ws');
@@ -194,7 +338,8 @@ export function rpcWsEndpoint(heliusKey: string | undefined | null): string {
 
 /** True when we are running without a real credential — worth saying out loud. */
 export function isFallbackEndpoint(heliusKey: string | undefined | null): boolean {
-  return !(process.env.SOLANA_RPC_URL || '').trim() && !(heliusKey || '').trim();
+  const source = resolveRpcEndpoint(heliusKey).source;
+  return source === 'fallback-env' || source === 'public';
 }
 
 /**

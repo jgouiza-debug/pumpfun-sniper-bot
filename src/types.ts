@@ -700,6 +700,17 @@ export interface BotStatusResponse {
       credentialRejected: boolean;
       successRate: number;
       lastError: string | null;
+      /**
+       * Which endpoint the bot is REALLY talking to, host only — the query
+       * string carries the credential and is never sent to the browser.
+       *
+       * Present because "valid key, RPC still down" had no diagnosis path: a
+       * stale SOLANA_RPC_URL silently outranks the key and nothing reported it.
+       */
+      endpointHost?: string;
+      endpointSource?: 'env-override' | 'helius' | 'fallback-env' | 'public';
+      /** A Helius key is configured but something else won — the key is unused. */
+      keyOverridden?: boolean;
     };
     feed: {
       connected: boolean;

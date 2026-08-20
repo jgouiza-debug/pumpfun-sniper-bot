@@ -207,6 +207,14 @@ export function App() {
   // material and opens no RPC connection of its own: it POSTs the pasted key to
   // the loopback server once and reads address/balance back off /api/bot/status.
   const wallet = botStatus?.wallet;
+  // Which endpoint is REALLY in use. A stale SOLANA_RPC_URL outranks the Helius
+  // key silently, so "key set" plus "RPC DOWN" used to be unexplainable from
+  // the UI alone. The host is safe to show; the credential is in the query
+  // string and never leaves the server.
+  const rpcInfo = botStatus?.health?.rpc;
+  const rpcEndpointLabel = rpcInfo?.endpointHost
+    ? `${rpcInfo.endpointHost} (${rpcInfo.endpointSource})`
+    : null;
   const run = botStatus?.run;
   const sizing = botStatus?.sizing;
 
@@ -766,7 +774,14 @@ export function App() {
               fontWeight: 700,
               fontFamily: 'var(--font-mono)'
             }}
-            title={wallet?.rpcHealthy !== false ? 'Helius Dedicated RPC Connection Active (Universal Key Locked)' : 'RPC Connection Offline'}
+            title={[
+              wallet?.rpcHealthy !== false ? 'RPC connection active' : 'RPC connection offline',
+              rpcEndpointLabel ? `Endpoint: ${rpcEndpointLabel}` : null,
+              rpcInfo?.keyOverridden
+                ? 'SOLANA_RPC_URL is set, so your Helius key is NOT being used.'
+                : null,
+              rpcInfo?.credentialRejected ? 'The provider rejected the API key itself.' : null,
+            ].filter(Boolean).join('\n')}
           >
             <span style={{
               width: '7px',
@@ -776,7 +791,51 @@ export function App() {
               boxShadow: wallet?.rpcHealthy !== false ? '0 0 6px #00e676' : '0 0 6px #ff1744'
             }} />
             RPC {wallet?.rpcHealthy !== false ? 'OK' : 'DOWN'}
+            {rpcEndpointLabel && (
+              <span style={{ opacity: 0.7, fontWeight: 400 }}>· {rpcInfo!.endpointHost}</span>
+            )}
           </div>
+
+          {/* The exact state that produced "valid key, RPC still down". */}
+          {rpcInfo?.keyOverridden && (
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '6px 12px',
+                borderRadius: '4px',
+                border: '1px solid rgba(255, 171, 0, 0.5)',
+                background: 'rgba(255, 171, 0, 0.12)',
+                color: '#ffab00',
+                fontSize: '11px',
+                fontWeight: 700,
+                fontFamily: 'var(--font-mono)'
+              }}
+              title={`SOLANA_RPC_URL in the .env beside the app points at ${rpcInfo.endpointHost} and takes precedence over the Helius key. Remove it for the key to take effect.`}
+            >
+              ⚠ HELIUS KEY UNUSED — SOLANA_RPC_URL OVERRIDE
+            </div>
+          )}
+
+          {rpcInfo?.credentialRejected && (
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '6px 12px',
+                borderRadius: '4px',
+                border: '1px solid rgba(255, 23, 68, 0.5)',
+                background: 'rgba(255, 23, 68, 0.12)',
+                color: '#ff1744',
+                fontSize: '11px',
+                fontWeight: 700,
+                fontFamily: 'var(--font-mono)'
+              }}
+              title={rpcInfo.lastError || 'The RPC provider rejected the API key.'}
+            >
+              ⚠ RPC KEY REJECTED
+            </div>
+          )}
 
           <button
             className="btn-terminal-outline"

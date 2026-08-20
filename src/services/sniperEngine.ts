@@ -36,7 +36,10 @@ import { inspectMintSafety, simulateSellPath } from './honeypotDetector';
 import { devSellMonitor } from './devSellMonitor';
 import { CurveWatcher, CurveUpdate } from './curveWatcher';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
-import { rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth } from './rpcHealth';
+import {
+  rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth,
+  resolveRpcEndpoint, normalizeHeliusKey,
+} from './rpcHealth';
 import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } from './keyStore';
 
 /**
@@ -429,9 +432,21 @@ export class SniperEngine {
       console.log(resolved.source === 'stored'
         ? `🔑 Helius key loaded from ${keyStorePath()} (saved from Settings). It takes precedence over .env — delete that file to fall back.`
         : '🔑 Helius key loaded from the environment/.env.');
+      const shape = normalizeHeliusKey(apiKey);
+      if (shape.note) console.warn(`⚠️ Helius key: ${shape.note}`);
     }
 
-    this.solanaConnection = new Connection(rpcEndpoint(apiKey), connectionConfig());
+    // Say which endpoint actually won, at startup and not only on a key change.
+    // A stale SOLANA_RPC_URL in the .env beside the exe silently outranks a
+    // perfectly good key, and until now nothing anywhere reported that — the
+    // operator saw "key set" plus "RPC DOWN" and had no way to connect the two.
+    const startupEndpoint = resolveRpcEndpoint(apiKey);
+    console.log(`🌐 RPC endpoint: ${startupEndpoint.host} (source: ${startupEndpoint.source})`);
+    if (startupEndpoint.keyOverridden) {
+      console.warn(`⚠️ SOLANA_RPC_URL is set, so your Helius key is NOT being used — every call goes to ${startupEndpoint.host}. Remove SOLANA_RPC_URL from the .env beside the app to use the key.`);
+    }
+
+    this.solanaConnection = new Connection(startupEndpoint.url, connectionConfig());
     this.wallet = new WalletService(this.solanaConnection);
     this.priorityFeeService = new PriorityFeeService(() => this.solanaConnection);
     this.curveWatcher = new CurveWatcher(
@@ -748,11 +763,31 @@ export class SniperEngine {
       this.config[keyField] = (process.env[envName] || '').trim();
       if (keyField === 'heliusApiKey') {
         this.heliusKeySource = this.config.heliusApiKey ? 'env' : 'none';
-        this.solanaConnection = new Connection(rpcEndpoint(this.config.heliusApiKey), connectionConfig());
+        const endpoint = resolveRpcEndpoint(this.config.heliusApiKey);
+        this.solanaConnection = new Connection(endpoint.url, connectionConfig());
         this.wallet.setConnection(this.solanaConnection);
         resetRpcHealth();
+        this.log('info', `🌐 RPC endpoint now ${endpoint.host} (source: ${endpoint.source}).`);
       }
       this.log('info', `🔑 Forgot the saved ${keyField} — now using ${this.config[keyField] ? 'the .env value' : 'no key'}.`);
+    }
+
+    // Repair or refuse a malformed Helius key BEFORE it can be persisted.
+    //
+    // Nothing used to validate this field, and a bad value went straight to
+    // .api-keys.json — where it outranks .env and so survived every restart,
+    // with `heliusApiKeySet` reporting true the whole time. Pasting the full
+    // Helius RPC URL rather than the bare key was enough to break every call
+    // permanently, with nothing in the UI able to explain it.
+    if (typeof newConfig.heliusApiKey === 'string' && newConfig.heliusApiKey.trim()) {
+      const shape = normalizeHeliusKey(newConfig.heliusApiKey);
+      if (!shape.ok) {
+        this.log('error', `❌ Helius key rejected — nothing was saved, the previous key is untouched. ${shape.note}`);
+        delete newConfig.heliusApiKey;
+      } else {
+        if (shape.note) this.log('warn', `⚠️ Helius key: ${shape.note}`);
+        newConfig.heliusApiKey = shape.key;
+      }
     }
 
     // Persist a newly supplied key so the UI path survives a restart. Before
@@ -807,8 +842,8 @@ export class SniperEngine {
     }
 
     if (newConfig.heliusApiKey) {
-      const rpcUrl = rpcEndpoint(this.config.heliusApiKey);
-      this.solanaConnection = new Connection(rpcUrl, connectionConfig());
+      const endpoint = resolveRpcEndpoint(this.config.heliusApiKey);
+      this.solanaConnection = new Connection(endpoint.url, connectionConfig());
       this.wallet.setConnection(this.solanaConnection);
       // A new credential clears the "this key is rejected" latch, so a fixed key
       // stops the bot reporting a dead one.
@@ -817,7 +852,12 @@ export class SniperEngine {
         localTxBuilder.start(this.solanaConnection);
       }
       // The key is a credential: log the host, never the query string.
-      this.log('info', `🚀 RPC endpoint updated: ${(() => { try { return new URL(rpcUrl).host; } catch { return 'custom endpoint'; } })()}`);
+      this.log('info', `🚀 RPC endpoint updated: ${endpoint.host} (source: ${endpoint.source})`);
+      // The failure this exists to end: a new key is accepted, the endpoint
+      // "updates", and the bot keeps talking to a stale override.
+      if (endpoint.keyOverridden) {
+        this.log('warn', `⚠️ Your Helius key is NOT in use — SOLANA_RPC_URL is set, so every call goes to ${endpoint.host}. Remove it from the .env beside the app for the key to take effect.`);
+      }
     }
 
     // A key arriving through the config endpoint is routed into WalletService
@@ -1020,7 +1060,14 @@ export class SniperEngine {
       const livePrice = await DexScreenerService.getSolPriceUsd();
       if (livePrice > 0) this.config.solPriceUsd = Number(livePrice.toFixed(2));
 
-      if (!this.wallet.isLinked()) return;
+      if (!this.wallet.isLinked()) {
+        // refreshBalance() is the only other thing that re-verifies RPC health,
+        // and it never runs without a linked wallet. Without this, a fixed
+        // Helius key that lost the single startup health-check race left the
+        // UI reporting RPC DOWN indefinitely — nothing ever asked again.
+        await this.wallet.checkRpcHealth();
+        return;
+      }
 
       const solBalance = await this.wallet.refreshBalance();
       this.liveWalletSolBalance = solBalance;
@@ -1036,7 +1083,7 @@ export class SniperEngine {
       }
     } catch {
       // Silently ignore any RPC/network error (429, timeout, etc.)
-      // — the next 10-second tick will retry automatically.
+      // — the next tick (2s, below) will retry automatically.
     }
   }
 
@@ -1144,6 +1191,7 @@ export class SniperEngine {
       health: {
         rpc: (() => {
           const h = rpcHealth();
+          const endpoint = resolveRpcEndpoint(this.config.heliusApiKey);
           return {
             ok: h.ok,
             failed: h.failed,
@@ -1151,6 +1199,10 @@ export class SniperEngine {
             credentialRejected: h.credentialRejected,
             successRate: Number(h.successRate.toFixed(3)),
             lastError: h.lastError,
+            // Host only — never the query string, which carries the credential.
+            endpointHost: endpoint.host,
+            endpointSource: endpoint.source,
+            keyOverridden: endpoint.keyOverridden,
           };
         })(),
         feed: {

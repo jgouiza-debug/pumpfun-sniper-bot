@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { withRpcRetry } from './rpcHealth';
 
 export type WalletSource = 'none' | 'runtime' | 'env' | 'file';
 
@@ -42,6 +43,21 @@ export class WalletService {
   private lastCheckedAt = 0;
   private rpcHealthy = false;
 
+  /**
+   * Hysteresis on `rpcHealthy`. One failure is not an outage.
+   *
+   * This flag is not cosmetic: `getBlockers()` turns it into
+   * "RPC unreachable — cannot confirm balance", and `toggleBot` refuses to arm
+   * REAL mode while any blocker stands. Flipping it on a single 429 from a
+   * shared Helius key meant a momentary blip could refuse to start the bot on a
+   * wallet and a credential that were both entirely fine.
+   */
+  private consecutiveRpcFailures = 0;
+  /** Whether the LAST probe proved the RPC, regardless of the latched flag. */
+  private lastProbeOk = false;
+
+  private static readonly FAILURES_BEFORE_DOWN = 2;
+
   /** SOL held back so exits always have gas, even when fully deployed. */
   private gasFloatSol = 0.005;
 
@@ -59,13 +75,47 @@ export class WalletService {
     if (this.keypair) this.subscribeToBalance();
   }
 
+  /** A proven read. Clears the latch immediately — recovery needs no hysteresis. */
+  private markRpcOk(): void {
+    this.consecutiveRpcFailures = 0;
+    this.lastProbeOk = true;
+    this.rpcHealthy = true;
+  }
+
+  /** A failed read. Only goes DOWN once failures repeat — see FAILURES_BEFORE_DOWN. */
+  private markRpcFailure(): void {
+    this.consecutiveRpcFailures++;
+    this.lastProbeOk = false;
+    if (this.consecutiveRpcFailures >= WalletService.FAILURES_BEFORE_DOWN) {
+      this.rpcHealthy = false;
+    }
+  }
+
+  /**
+   * A single unretried getSlot used to latch `rpcHealthy` false on one cold
+   * connection or momentary blip, with nothing to un-latch it until a wallet
+   * got linked (refreshBalance is the only other writer). A fixed Helius key
+   * would lose that one race and the badge stayed on DOWN forever. Retrying
+   * here, plus the unconditional recheck in sniperEngine's 2s wallet-sync tick,
+   * means a real outage still reads as down but a blip self-heals.
+   *
+   * `countHealth: false` keeps this heartbeat out of the rolling success rate.
+   * It fires every 2s while no wallet is linked — i.e. exactly when nothing is
+   * being screened — so counting it would replace a measure of RPC quality on
+   * the trading path with a measure of the heartbeat itself.
+   */
   public async checkRpcHealth(): Promise<boolean> {
     try {
-      await this.connection.getSlot('confirmed');
-      this.rpcHealthy = true;
+      await withRpcRetry(() => this.connection.getSlot('confirmed'), {
+        attempts: 2,
+        baseDelayMs: 150,
+        maxDelayMs: 400,
+        countHealth: false,
+      });
+      this.markRpcOk();
       return true;
     } catch {
-      this.rpcHealthy = false;
+      this.markRpcFailure();
       return false;
     }
   }
@@ -92,7 +142,7 @@ export class WalletService {
         (accountInfo) => {
           this.solBalance = Number((accountInfo.lamports / LAMPORTS_PER_SOL).toFixed(5));
           this.lastCheckedAt = Date.now();
-          this.rpcHealthy = true;
+          this.markRpcOk();
         },
         'confirmed'
       );
@@ -233,6 +283,16 @@ export class WalletService {
       };
     }
 
+    // Snapshot what to go back to. A link that reports failure MUST leave the
+    // service exactly as it found it: the previous version assigned the keypair
+    // first and the RPC-failure path returned ok:false without ever undoing it,
+    // so the UI said "link failed" while the engine was armed with that wallet
+    // and would sign with it. With `persist` set, nothing was written either —
+    // so it looked linked for the session and vanished on the next restart.
+    const prevKeypair = this.keypair;
+    const prevSource = this.source;
+    const prevCheckedAt = this.lastCheckedAt;
+
     this.keypair = kp;
     this.source = 'runtime';
     this.lastCheckedAt = 0;
@@ -240,10 +300,18 @@ export class WalletService {
 
     const balance = await this.refreshBalance(true);
 
-    if (!this.rpcHealthy) {
+    // `lastProbeOk`, not `rpcHealthy`: linking demands a PROVEN read. The
+    // latched flag now tolerates one failure by design, and inheriting that
+    // tolerance here would report a successful link on a balance never read.
+    if (!this.lastProbeOk) {
+      this.keypair = prevKeypair;
+      this.source = prevSource;
+      this.lastCheckedAt = prevCheckedAt;
+      this.unsubscribeBalance();
+      if (this.keypair) this.subscribeToBalance();
       return {
         ok: false,
-        error: 'Key parsed, but the RPC could not be reached to confirm the balance. Check the Helius key and try again.',
+        error: 'Key parsed, but the RPC could not be reached to confirm the balance. The wallet was NOT linked. Check the Helius key and try again.',
         status: this.getStatus(0),
       };
     }
@@ -322,13 +390,21 @@ export class WalletService {
     const pubkey: PublicKey = this.keypair.publicKey;
     this.inflightBalance = (async () => {
       try {
-        const lamports = await this.connection.getBalance(pubkey, 'confirmed');
+        // This was the one RPC call in this file with no retry, while every
+        // other read went through withRpcRetry. A single 429 from a shared key
+        // therefore reached `getBlockers()` and could refuse to arm REAL mode.
+        const lamports = await withRpcRetry(() => this.connection.getBalance(pubkey, 'confirmed'), {
+          attempts: 2,
+          baseDelayMs: 150,
+          maxDelayMs: 400,
+          countHealth: false,
+        });
         this.solBalance = Number((lamports / LAMPORTS_PER_SOL).toFixed(5));
-        this.rpcHealthy = true;
+        this.markRpcOk();
         this.lastCheckedAt = Date.now();
-      } catch (err: any) {
+      } catch {
         // Keep the last known balance; mark the RPC unhealthy so the UI can say so.
-        this.rpcHealthy = false;
+        this.markRpcFailure();
       } finally {
         this.inflightBalance = null;
       }
