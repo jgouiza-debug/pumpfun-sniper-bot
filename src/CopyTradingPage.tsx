@@ -191,9 +191,12 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
   const feed: CopyFeedEvent[] = status?.feed || [];
   const stats = status?.stats;
   const engineWallet = status?.wallet;
+  const sellsLabel = status?.config?.copySells ? (status.config.sellMode === 'full' ? 'FULL' : 'MIRROR') : 'OFF';
+  const autoClearMin = status?.config?.feedAutoClearMinutes ?? 0;
 
   const feedColor = (ev: CopyFeedEvent): string => {
     if (ev.action === 'failed') return 'log-level-error';
+    if (ev.action === 'pending') return 'log-level-warn';
     if (ev.action === 'skipped') return 'log-level-gate0';
     return ev.side === 'buy' ? 'log-level-snipe' : 'log-level-sell';
   };
@@ -214,9 +217,9 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           </div>
           <div
             style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}
-            title="ON-CHAIN is the Helius wallet watcher — it sees every buy and sell on any venue. PUMP.FUN is the PumpPortal fast lane for pump.fun trades."
+            title="ON-CHAIN is the Helius wallet watcher — it sees every buy and sell on any venue. PUMP.FUN is the PumpPortal fast lane for pump.fun trades. SELLS is the copy-sells setting — OFF means leader sells are shown but the position is held."
           >
-            {mode.toUpperCase()} · ON-CHAIN {status?.heliusConnected ? 'OK' : '—'} · PUMP.FUN {status?.streamConnected ? 'OK' : '—'}
+            {mode.toUpperCase()} · ON-CHAIN {status?.heliusConnected ? 'OK' : '—'} · PUMP.FUN {status?.streamConnected ? 'OK' : '—'} · SELLS {sellsLabel}
           </div>
         </div>
 
@@ -510,7 +513,9 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
         <div className="viewport-column">
           <div className="section-header">
             <div className="section-title">Leader Signal Feed — Live Copy Decisions</div>
-            <div className="section-count">{feed.length} EVENTS</div>
+            <div className="section-count">
+              {feed.length} EVENTS{autoClearMin > 0 ? ` · AUTO-CLEAR ${autoClearMin}M` : ''}
+            </div>
           </div>
 
           <div className="console-container">
@@ -523,8 +528,8 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 <div key={ev.id} className="log-line">
                   <span className="log-time">[{new Date(ev.timestamp).toLocaleTimeString()}]</span>
                   <span className={feedColor(ev)}>
-                    {ev.action === 'copied' ? '✅' : ev.action === 'failed' ? '❌' : '⏭️'}
-                    {ev.via ? ` [${ev.via === 'helius' ? 'CHAIN' : 'PUMP'}]` : ''}{' '}
+                    {ev.action === 'copied' ? '✅' : ev.action === 'failed' ? '❌' : ev.action === 'pending' ? '⏳' : '⏭️'}
+                    {ev.via ? ` [${ev.via === 'helius' ? 'CHAIN' : ev.via === 'manual' ? 'MANUAL' : 'PUMP'}]` : ''}{' '}
                     {ev.leaderNickname} {ev.side.toUpperCase()} ${ev.tokenSymbol}
                     {ev.leaderSolAmount > 0 ? ` (${ev.leaderSolAmount} SOL)` : ''} — {ev.detail}
                   </span>
@@ -638,15 +643,51 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, perWalletCooldownSec: Number(e.target.value) })}
                   />
                 </div>
+
+                <div className="form-group">
+                  <label className="form-label">Auto-Clear Feed (min, 0 = keep)</label>
+                  <input
+                    type="number" className="form-input"
+                    value={configForm.feedAutoClearMinutes ?? 30}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, feedAutoClearMinutes: Number(e.target.value) })}
+                  />
+                  <div className="form-help" style={{ fontSize: '8px' }}>
+                    Feed lines older than this drop off on their own. Receipts are never auto-cleared.
+                  </div>
+                </div>
               </div>
 
-              {/* Leader-sell handling, take-profit and max-hold controls used to
-                  sit here. Removed 2026-08-12 with every other automatic exit. */}
-              <div style={{ marginTop: '8px', padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '9px', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
-                🚫 NO AUTOMATIC SELLS — buys are copied, sells are NOT. When a leader
-                sells, the feed shows the signal and the copy position is HELD. Take-profit
-                and max-hold timers are gone too. The ONLY exit is the SELL button on each
-                position.
+              {/* Exits. Auto-sells were removed 2026-08-12 and restored as a toggle
+                  on 2026-08-13 — but the control never reached this form, so
+                  upgraded installs (where the migration switches copySells OFF)
+                  had no way to turn it back on and never sold. */}
+              <div style={{ marginTop: '10px', padding: '8px', border: '1px solid rgba(148,163,184,0.35)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+                  <input
+                    type="checkbox"
+                    checked={configForm.copySells === true}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, copySells: e.target.checked })}
+                  />
+                  Copy sells — when a tracked leader sells, sell too
+                </label>
+                {configForm.copySells === true && (
+                  <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label">When the leader sells</label>
+                    <select
+                      className="form-select"
+                      value={configForm.sellMode || 'mirror'}
+                      onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, sellMode: e.target.value as 'mirror' | 'full' })}
+                    >
+                      <option value="mirror">Mirror — sell the same fraction of our bag that they sold of theirs</option>
+                      <option value="full">Full — any leader sell closes our whole position</option>
+                    </select>
+                  </div>
+                )}
+                <div className="form-help" style={{ fontSize: '8px' }}>
+                  {configForm.copySells === true
+                    ? 'Fires on the leader\'s exit only — never on price. A sell that fails is retried (up to 6 attempts, alternating venue); one arriving while another is in flight is queued, not dropped. No take-profit, no stop-loss. The SELL button always works.'
+                    : 'OFF — leader sells show in the feed and the position is HELD. The SELL button on each position is the only exit.'}
+                </div>
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' }}>

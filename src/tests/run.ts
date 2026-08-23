@@ -3245,6 +3245,277 @@ console.log('\n-- One blip must not blank the wallet or refuse to arm --');
   });
 }
 
+// ---------------------------------------------------------------------------
+// Copy trader exits, 2026-08-22. Reported by the owner as "copy trade is not
+// selling at the same time as the person being copied, and sometimes not at
+// all". Four code-level causes, each with its failing case below.
+// ---------------------------------------------------------------------------
+console.log('\n-- Copy trader: leader sells are queued, routed by the sell venue, and retried --');
+{
+  const {
+    ExitQueue, leaderSellFraction, sellVenueCandidates, sellRetryDelayMs, copySellSlippagePct,
+    COPY_SELL_MAX_ATTEMPTS,
+  } = require('../services/copyExitPolicy');
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  test('OLD BUG: an exit already in flight silently swallowed the next leader sell', async () => {
+    // closePosition() opened with `if (pos.exitInFlight) return;`. Reproduced
+    // with the leader selling 50% and then the rest while our first sell was
+    // still confirming.
+    const pos = { exitInFlight: false, tokensHeld: 100 };
+    const sells: number[] = [];
+    const oldClosePosition = async (fraction: number) => {
+      if (pos.exitInFlight) return;
+      pos.exitInFlight = true;
+      await sleep(20);
+      sells.push(fraction);
+      pos.tokensHeld *= (1 - fraction);
+      pos.exitInFlight = false;
+    };
+    await Promise.all([oldClosePosition(0.5), oldClosePosition(1)]);
+    assert.deepStrictEqual(sells, [0.5], 'the second chunk was never sold');
+    assert.strictEqual(pos.tokensHeld, 50, 'half the bag stayed behind with the leader gone');
+  });
+
+  test('fixed: the queue runs both in order, so "50% then the rest" leaves us flat like the leader', async () => {
+    const q = new ExitQueue();
+    const pos = { tokensHeld: 100 };
+    const sells: number[] = [];
+    const sell = (fraction: number) => q.run('pos', async () => {
+      await sleep(20);
+      sells.push(fraction);
+      pos.tokensHeld *= (1 - fraction);
+    });
+    await Promise.all([sell(0.5), sell(1)]);
+    assert.deepStrictEqual(sells, [0.5, 1]);
+    assert.strictEqual(pos.tokensHeld, 0);
+  });
+
+  test('a failed exit does not block the one queued behind it', async () => {
+    const q = new ExitQueue();
+    const ran: string[] = [];
+    const first = q.run('pos', async () => { await sleep(10); throw new Error('trade-local 500'); });
+    const second = q.run('pos', async () => { ran.push('second'); });
+    await assert.rejects(first);
+    await second;
+    assert.deepStrictEqual(ran, ['second']);
+    assert.strictEqual(q.isBusy('pos'), false);
+  });
+
+  test('positions never wait on each other', async () => {
+    const q = new ExitQueue();
+    const order: string[] = [];
+    await Promise.all([
+      q.run('a', async () => { await sleep(30); order.push('a'); }),
+      q.run('b', async () => { order.push('b'); }),
+    ]);
+    assert.deepStrictEqual(order, ['b', 'a']);
+  });
+
+  test('isBusy reports running or queued work, and clears afterwards', async () => {
+    const q = new ExitQueue();
+    const p = q.run('pos', async () => { await sleep(10); });
+    assert.strictEqual(q.isBusy('pos'), true);
+    assert.strictEqual(q.depth('pos'), 1);
+    await p;
+    assert.strictEqual(q.isBusy('pos'), false);
+    assert.strictEqual(q.depth('pos'), 0);
+  });
+
+  test('OLD BUG: the exit went to the venue recorded at BUY time', () => {
+    // A curve buy ('pump') sold after graduation was routed to a completed
+    // curve: BondingCurveComplete on-chain, every attempt. The buy-time pool is
+    // not even an input any more.
+    const candidates = sellVenueCandidates('pump-amm');
+    assert.strictEqual(candidates[0], 'pump-amm', 'route by the venue the leader actually sold on');
+    assert.ok(!candidates.includes('pump'));
+  });
+
+  test('an on-chain (Helius) sell carries no venue, so auto is first; auto is never duplicated', () => {
+    assert.deepStrictEqual(sellVenueCandidates(undefined), ['auto']);
+    assert.deepStrictEqual(sellVenueCandidates(''), ['auto']);
+    assert.deepStrictEqual(sellVenueCandidates('auto'), ['auto']);
+    assert.deepStrictEqual(sellVenueCandidates('raydium'), ['raydium', 'auto']);
+  });
+
+  test('a failed sell is retried with backoff, bounded, and capped so the queue behind it moves', () => {
+    assert.ok(COPY_SELL_MAX_ATTEMPTS >= 3, 'one attempt was the old behaviour');
+    assert.ok(sellRetryDelayMs(1) < sellRetryDelayMs(2));
+    assert.ok(sellRetryDelayMs(2) < sellRetryDelayMs(3));
+    assert.ok(sellRetryDelayMs(20) <= 10_000);
+    assert.ok(sellRetryDelayMs(0) >= 1_000, 'never a hot loop');
+  });
+
+  test("the leader's sell fraction comes from their post-trade balance", () => {
+    assert.strictEqual(leaderSellFraction(50, 50), 0.5);
+    assert.strictEqual(leaderSellFraction(25, 0), 1, 'selling the rest is a full exit');
+    assert.strictEqual(leaderSellFraction(10, undefined), 1, 'unknown balance reads as a full exit');
+    assert.strictEqual(leaderSellFraction(0, 100), 0, 'a zero-size sell is nothing to mirror');
+  });
+
+  test("sell slippage is the wider of the copy setting and the engine's sell band", () => {
+    // The copy BUY number was passed as the override, bypassing the engine's
+    // looser sell tolerance exactly when the leader's dump moved the price.
+    assert.strictEqual(copySellSlippagePct(25, 15), 25);
+    assert.strictEqual(copySellSlippagePct(10, 15), 15);
+    assert.strictEqual(copySellSlippagePct(10, undefined), 10);
+    assert.strictEqual(copySellSlippagePct(500, undefined), 100);
+  });
+}
+
+console.log('\n-- Copy trader: the on-chain wallet watcher owns its socket --');
+{
+  const { WalletLogWatcher } = require('../services/walletLogWatcher');
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const fakeSocket = () => {
+    const handlers: Record<string, Function[]> = {};
+    const s: any = {
+      readyState: 0,
+      sent: [] as any[],
+      closed: false,
+      terminated: false,
+      on(ev: string, fn: Function) { (handlers[ev] ||= []).push(fn); return s; },
+      emit(ev: string, ...args: any[]) { (handlers[ev] || []).forEach((f) => f(...args)); },
+      send(data: string) { s.sent.push(JSON.parse(data)); },
+      close() { s.closed = true; s.readyState = 3; s.emit('close'); },
+      terminate() { s.terminated = true; s.readyState = 3; s.emit('close'); },
+      ping() {},
+      open() { s.readyState = 1; s.emit('open'); },
+      ack(address: string, subId: number) {
+        const req = s.sent.find((m: any) => m.method === 'logsSubscribe' && m.params[0]?.mentions?.[0] === address);
+        assert.ok(req, `no logsSubscribe request for ${address}`);
+        s.emit('message', JSON.stringify({ jsonrpc: '2.0', id: req.id, result: subId }));
+      },
+      notify(subId: number, signature: string, err: unknown = null) {
+        s.emit('message', JSON.stringify({
+          jsonrpc: '2.0', method: 'logsNotification',
+          params: { subscription: subId, result: { context: { slot: 1 }, value: { signature, err, logs: [] } } },
+        }));
+      },
+    };
+    return s;
+  };
+
+  const make = (extra: any = {}) => {
+    const sockets: any[] = [];
+    const seen: any[] = [];
+    const w = new WalletLogWatcher({
+      getWsUrl: () => 'wss://test',
+      onLog: (ev: any) => seen.push(ev),
+      socketFactory: () => { const s = fakeSocket(); sockets.push(s); return s; },
+      reconnectDelay: () => 5,
+      ...extra,
+    });
+    return { w, sockets, seen };
+  };
+
+  test('subscribes every tracked wallet with logsSubscribe at processed, healthy only once acknowledged', () => {
+    const { w, sockets } = make();
+    w.setAddresses(['A', 'B']);
+    w.start();
+    sockets[0].open();
+    const subs = sockets[0].sent.filter((m: any) => m.method === 'logsSubscribe');
+    assert.strictEqual(subs.length, 2);
+    assert.deepStrictEqual(subs[0].params[0], { mentions: ['A'] });
+    assert.strictEqual(subs[0].params[1].commitment, 'processed', 'confirmed was the slowest moment to learn about a trade');
+    assert.strictEqual(w.isHealthy(), false, 'a request is not a subscription');
+    sockets[0].ack('A', 11);
+    sockets[0].ack('B', 12);
+    assert.strictEqual(w.isHealthy(), true);
+    assert.strictEqual(w.liveSubscriptionCount(), 2);
+    w.stop();
+  });
+
+  test('a notification reaches the wallet that owns the subscription; failed txs are passed through for the caller to drop', () => {
+    const { w, sockets, seen } = make();
+    w.setAddresses(['A', 'B']);
+    w.start();
+    sockets[0].open();
+    sockets[0].ack('A', 11);
+    sockets[0].ack('B', 12);
+    sockets[0].notify(12, 'sigB');
+    sockets[0].notify(11, 'sigA', { InstructionError: [0, 'Custom'] });
+    sockets[0].notify(99, 'sigUnknown');
+    assert.deepStrictEqual(
+      seen.map((e: any) => [e.address, e.signature, e.err === null]),
+      [['B', 'sigB', true], ['A', 'sigA', false]]
+    );
+    w.stop();
+  });
+
+  test('OLD BUG: onLogs reconnected only from close, so a half-open socket stayed deaf; now silence terminates it and every wallet is re-subscribed', async () => {
+    const { w, sockets } = make({ pingMs: 10, staleMs: 40 });
+    w.setAddresses(['A']);
+    w.start();
+    sockets[0].open();
+    sockets[0].ack('A', 11);
+    assert.strictEqual(w.isHealthy(), true);
+    await sleep(75); // nothing arrives and nothing pongs
+    assert.strictEqual(sockets[0].terminated, true, 'a silent socket must be terminated, not trusted');
+    assert.strictEqual(w.isHealthy(), false, 'ON-CHAIN must read down while blind');
+    assert.strictEqual(sockets.length, 2, 'a fresh socket is opened');
+    sockets[1].open();
+    const resubs = sockets[1].sent.filter((m: any) => m.method === 'logsSubscribe');
+    assert.deepStrictEqual(resubs.map((m: any) => m.params[0].mentions[0]), ['A']);
+    sockets[1].ack('A', 21);
+    assert.strictEqual(w.isHealthy(), true);
+    w.stop();
+  });
+
+  test('changing the tracked set diffs in place: removed wallets unsubscribe, new ones subscribe, no reconnect', () => {
+    const { w, sockets } = make();
+    w.setAddresses(['A', 'B']);
+    w.start();
+    sockets[0].open();
+    sockets[0].ack('A', 11);
+    sockets[0].ack('B', 12);
+    w.setAddresses(['B', 'C']);
+    const unsub = sockets[0].sent.find((m: any) => m.method === 'logsUnsubscribe');
+    assert.deepStrictEqual(unsub.params, [11]);
+    assert.ok(sockets[0].sent.some((m: any) => m.method === 'logsSubscribe' && m.params[0].mentions[0] === 'C'));
+    assert.strictEqual(sockets.length, 1);
+    assert.strictEqual(w.trackedCount(), 2);
+    w.stop();
+  });
+
+  test('stop() closes the socket and does not reconnect', async () => {
+    const { w, sockets } = make();
+    w.setAddresses(['A']);
+    w.start();
+    sockets[0].open();
+    w.stop();
+    assert.strictEqual(sockets[0].closed, true);
+    await sleep(30);
+    assert.strictEqual(sockets.length, 1);
+    assert.strictEqual(w.isConnected(), false);
+  });
+
+  test('the copy trader, the engine and the UI are wired to all of this', () => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(!/\.onLogs\(/.test(svc), 'Connection.onLogs reconnects only from close — a half-open socket stays deaf forever');
+    assert.ok(/new WalletLogWatcher\(/.test(svc));
+    assert.ok(!/if \(pos\.exitInFlight\) return;/.test(svc), 'the silent drop must stay gone');
+    assert.ok(/exitQueue\.run\(/.test(svc), 'exits are queued per position');
+    assert.ok(/attachKeepalive\(/.test(svc), 'the PumpPortal lane needs the watchdog too');
+    assert.ok(/sellVenueCandidates\(/.test(svc) && !/pctParam, pos\.pool/.test(svc), 'the buy-time venue must never route the exit');
+    assert.ok(/COPY_SELL_MAX_ATTEMPTS/.test(svc), 'a failed sell is retried');
+    assert.ok(/feedAutoClearMinutes/.test(svc), 'the feed clears itself');
+
+    const ui = fsx.readFileSync(pathx.join(__dirname, '..', 'CopyTradingPage.tsx'), 'utf8');
+    assert.ok(/copySells/.test(ui), 'v1.0.1 switched copySells off for upgraded installs and pointed at a control that did not exist');
+    assert.ok(/sellMode/.test(ui));
+    assert.ok(!/NO AUTOMATIC SELLS/.test(ui), 'the 08-12 banner contradicted the backend');
+    assert.ok(/feedAutoClearMinutes/.test(ui), 'automatic feed clearing is an operator setting');
+
+    const eng = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+    assert.ok(/external:\s*true/.test(eng) && /noteTradeFailure\(/.test(eng),
+      "a copy sell failing on a venue the leader left must not trip the sniper's breaker");
+  });
+}
+
 void (async () => {
   // Async tests run here, one at a time. Before this existed they were counted
   // as passed the instant they were called, so their assertions never ran

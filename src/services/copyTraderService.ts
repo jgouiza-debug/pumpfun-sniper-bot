@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
-import { Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { Connection, LAMPORTS_PER_SOL, PublicKey, type ParsedTransactionWithMeta } from '@solana/web3.js';
 import {
   CopyFeedEvent,
   CopyPosition,
@@ -10,24 +10,33 @@ import {
   CopyTraderConfig,
   TrackedWalletPublic,
 } from '../types';
-import { sniperEngine } from './sniperEngine';
-import { rpcEndpoint, connectionConfig } from './rpcHealth';
+import { sniperEngine, type TradeResult } from './sniperEngine';
+import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError } from './rpcHealth';
 import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
 import { DexScreenerService } from './dexscreenerService';
+import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
+import { WalletLogWatcher } from './walletLogWatcher';
+import {
+  ExitQueue, leaderSellFraction, sellVenueCandidates, sellRetryDelayMs, copySellSlippagePct,
+  COPY_SELL_MAX_ATTEMPTS,
+} from './copyExitPolicy';
 
 /**
- * Mirrors EVERY buy of chosen leader wallets. SELLS ARE NEVER AUTOMATIC —
- * removed 2026-08-12, owner decision: leader sells surface in the feed as
- * signals, and the only sell path is the manual button.
+ * Mirrors EVERY buy of chosen leader wallets — and, with `copySells` on,
+ * their sells too. Auto-sells were removed 2026-08-12 and restored as a
+ * toggle on 2026-08-13 (see onLeaderSell); with the toggle off, leader sells
+ * surface in the feed as signals and the only sell path is the manual button.
  *
  * Two signal feeds, deduplicated by transaction signature:
  *
  *  1. HELIUS ON-CHAIN WATCHER (the complete feed). Each tracked wallet gets a
- *     log subscription on the Helius RPC websocket; every confirmed
- *     transaction that mentions the wallet is fetched and its SOL + token
- *     balance deltas read. A swap is a swap regardless of venue — pump.fun,
- *     Raydium, Jupiter, anything — because the wallet's balances move the same
- *     way. This is what makes "copy ALL of their trades" literal.
+ *     `logsSubscribe` on our own Helius websocket (WalletLogWatcher: keepalive
+ *     watchdog, 'processed' commitment, so the signal arrives before the
+ *     cluster has even confirmed the leader's tx); the transaction is then
+ *     fetched and its SOL + token balance deltas read. A swap is a swap
+ *     regardless of venue — pump.fun, Raydium, Jupiter, anything — because
+ *     the wallet's balances move the same way. This is what makes "copy ALL
+ *     of their trades" literal.
  *
  *  2. PUMPPORTAL FAST LANE. subscribeAccountTrade delivers pump.fun trades
  *     with less latency and richer metadata (symbol, venue, post-trade
@@ -74,6 +83,14 @@ const HISTORY_LIMIT = 200;
 const MONITOR_INTERVAL_MS = 1000;
 const PROCESSED_SIG_LIMIT = 3000;
 
+/**
+ * Polling budget for reading a leader transaction after its 'processed' log.
+ * `getTransaction` only answers at 'confirmed', which typically lands 0.4–1s
+ * behind 'processed'.
+ */
+const TX_FETCH_DEADLINE_MS = 8000;
+const TX_FETCH_INTERVAL_MS = 250;
+
 /** A leader trade normalized from either feed into one shape. */
 interface LeaderSignal {
   signature?: string;
@@ -88,7 +105,7 @@ interface LeaderSignal {
   /** Venue hint for execution routing; undefined → 'auto'. */
   pool?: string;
   symbol?: string;
-  via: 'pumpportal' | 'helius';
+  via: 'pumpportal' | 'helius' | 'manual';
   /** True when this leg is half of a token→token swap (no SOL amount to scale from). */
   isTokenSwap?: boolean;
 }
@@ -127,9 +144,14 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   maxOpenPositions: 10,
   maxSlippagePct: 25,
   perWalletCooldownSec: 0,
-  // INERT since 2026-08-12 — no automatic sells; exits are manual only.
+  // INERT since 2026-08-12 — no time- or price-based exits. Leader sells
+  // (copySells) and the manual button are the only ways out.
   maxHoldSeconds: 0,
   takeProfitPct: 0,
+  // Feed lines older than this fall off on their own; 0 keeps them until the
+  // CLEAR button. Receipts (history) are never auto-cleared — they are the
+  // audit trail of real money.
+  feedAutoClearMinutes: 30,
 };
 
 export class CopyTraderService {
@@ -142,6 +164,8 @@ export class CopyTraderService {
   // PumpPortal fast lane
   private ws: WebSocket | null = null;
   private streamConnected = false;
+  private wsKeepalive: KeepaliveHandle | null = null;
+  private wsReconnectAttempt = 0;
   /** Mints currently subscribed for price ticks (open positions). */
   private subscribedMints = new Set<string>();
 
@@ -150,12 +174,22 @@ export class CopyTraderService {
   private heliusKeyInUse: string | null = null;
   /** Latches the no-key warning so it is stated once per start, not per poll. */
   private warnedNoHeliusKey = false;
-  /** onLogs subscription id per tracked wallet address. */
-  private logSubs = new Map<string, number>();
+  /** Our own logsSubscribe socket — see WalletLogWatcher for why not Connection.onLogs. */
+  private logWatcher: WalletLogWatcher | null = null;
+  /** Signatures whose transaction is being fetched right now ('processed' logs can repeat). */
+  private analyzingSigs = new Set<string>();
 
   /** Signatures already handled — the cross-feed dedup. FIFO-pruned. */
   private processedSigs = new Set<string>();
   private processedSigOrder: string[] = [];
+
+  /**
+   * One exit at a time per position, in arrival order — never dropped. See
+   * copyExitPolicy.ExitQueue for the bug this replaces.
+   */
+  private exitQueue = new ExitQueue();
+  /** Position ids whose operator pressed SELL while an automatic retry was backing off. */
+  private manualExitRequested = new Set<string>();
 
   private monitorInterval: NodeJS.Timeout | null = null;
   private dexPollInFlight = false;
@@ -185,7 +219,7 @@ export class CopyTraderService {
     return {
       enabled: this.config.enabled,
       streamConnected: this.streamConnected,
-      heliusConnected: this.logSubs.size > 0,
+      heliusConnected: this.logWatcher?.isHealthy() ?? false,
       tradingMode: this.config.tradingMode,
       config: { ...this.config },
       wallets: walletList.map(w => this.publicWallet(w)),
@@ -309,7 +343,14 @@ export class CopyTraderService {
   public async manualSellPosition(positionId: string): Promise<boolean> {
     const pos = this.positions.find(p => p.id === positionId && p.status !== 'CLOSED');
     if (!pos) return false;
-    await this.closePosition(pos, 1, 'Manual force sell from copy page');
+    // A leader-triggered sell that is mid-backoff yields to the button: the
+    // operator pressing SELL means "now", not "after five more retries".
+    this.manualExitRequested.add(pos.id);
+    const owner = this.wallets.get(pos.leaderWallet) ?? this.standInWallet(pos);
+    const manualSig: LeaderSignal = {
+      mint: pos.mint, side: 'sell', solAmount: 0, tokenAmount: 0, symbol: pos.tokenSymbol, via: 'manual',
+    };
+    await this.closePosition(pos, 1, 'Manual force sell from copy page', manualSig, owner);
     return true;
   }
 
@@ -343,23 +384,40 @@ export class CopyTraderService {
     this.stopHeliusWatcher();
   }
 
-  /** Wallet set changed — rebuild both feeds' subscriptions. User-action rate. */
+  /**
+   * Wallet set changed. PumpPortal takes its key list in the subscribe
+   * message, so that socket is rebuilt; the on-chain watcher diffs its
+   * subscriptions in place and keeps its socket. User-action rate.
+   */
   private restartSignalFeeds(): void {
     if (!this.config.enabled) return;
-    this.stopSignalFeeds();
-    this.startSignalFeeds();
+    this.disconnectPumpPortal();
+    this.connectPumpPortal();
+    this.startHeliusWatcher();
   }
 
   // ---------------- HELIUS ON-CHAIN WATCHER ----------------
 
   /**
-   * One log subscription per tracked wallet on the Helius websocket. Every
-   * confirmed transaction touching the wallet is pulled and read as balance
-   * deltas — venue-agnostic by construction.
+   * One `logsSubscribe` per tracked wallet on our own Helius websocket. Every
+   * transaction touching the wallet is pulled and read as balance deltas —
+   * venue-agnostic by construction.
+   *
+   * This used to be `Connection.onLogs` at 'confirmed'. Two problems, both
+   * behind "the copy sell is late or never happens": web3.js reconnects only
+   * from `close`, so a half-open socket kept ON-CHAIN reading OK while
+   * delivering nothing; and 'confirmed' is the slowest moment to learn about
+   * a trade. WalletLogWatcher owns the socket, pings it, and subscribes at
+   * 'processed'.
    */
   private startHeliusWatcher(): void {
     const addresses = this.enabledWalletAddresses();
-    if (!addresses.length) return;
+    if (!addresses.length) {
+      // Every wallet disabled or removed: drop the subscriptions, keep the socket.
+      this.logWatcher?.setAddresses([]);
+      this.emitChange();
+      return;
+    }
 
     const key = sniperEngine.getConfig().heliusApiKey || process.env.HELIUS_API_KEY || '';
     if (!key) {
@@ -376,41 +434,35 @@ export class CopyTraderService {
     }
     this.warnedNoHeliusKey = false;
 
-    // Rebuild the connection when the operator changed the key in settings.
+    // Rebuild both the HTTP connection and the socket when the operator
+    // changed the key in settings.
     if (!this.heliusConn || this.heliusKeyInUse !== key) {
       this.stopHeliusWatcher();
       this.heliusConn = new Connection(rpcEndpoint(key), connectionConfig());
       this.heliusKeyInUse = key;
     }
 
-    for (const address of addresses) {
-      if (this.logSubs.has(address)) continue;
-      try {
-        const subId = this.heliusConn.onLogs(
-          new PublicKey(address),
-          (logs) => {
-            if (logs.err) return; // failed tx — nothing moved
-            if (!logs.signature || this.processedSigs.has(logs.signature)) return;
-            void this.handleWalletLog(address, logs.signature);
-          },
-          'confirmed'
-        );
-        this.logSubs.set(address, subId);
-      } catch {
-        // Subscription failed (bad RPC, momentary outage) — the PumpPortal
-        // lane still covers pump.fun; a feed restart retries this.
-      }
+    if (!this.logWatcher) {
+      this.logWatcher = new WalletLogWatcher({
+        getWsUrl: () => rpcWsEndpoint(this.heliusKeyInUse),
+        commitment: 'processed',
+        onLog: (ev) => {
+          if (ev.err) return; // failed tx — nothing moved
+          if (this.processedSigs.has(ev.signature) || this.analyzingSigs.has(ev.signature)) return;
+          void this.handleWalletLog(ev.address, ev.signature);
+        },
+        log: (level, msg) => (level === 'warn' ? console.warn : console.log)(`[CopyTrader] ${msg}`),
+        onStatusChange: () => this.emitChange(),
+      });
     }
+    this.logWatcher.setAddresses(addresses);
+    this.logWatcher.start();
     this.emitChange();
   }
 
   private stopHeliusWatcher(): void {
-    if (this.heliusConn) {
-      for (const subId of this.logSubs.values()) {
-        void this.heliusConn.removeOnLogsListener(subId).catch(() => {});
-      }
-    }
-    this.logSubs.clear();
+    this.logWatcher?.stop();
+    this.logWatcher = null;
     this.emitChange();
   }
 
@@ -418,7 +470,15 @@ export class CopyTraderService {
     const wallet = this.wallets.get(leaderAddress);
     if (!wallet || !wallet.enabled || !this.config.enabled || !this.heliusConn) return;
 
-    const signals = await this.analyzeLeaderTx(leaderAddress, signature);
+    // A 'processed' log can be delivered more than once (two forks, or a
+    // reconnect replaying the slot); one fetch per signature at a time.
+    this.analyzingSigs.add(signature);
+    let signals: LeaderSignal[];
+    try {
+      signals = await this.analyzeLeaderTx(leaderAddress, signature);
+    } finally {
+      this.analyzingSigs.delete(signature);
+    }
     if (!signals.length) return;
 
     // Claim the signature only once we know it was a trade, so the PumpPortal
@@ -432,6 +492,33 @@ export class CopyTraderService {
   }
 
   /**
+   * Poll for the leader's transaction until the RPC can serve it at
+   * 'confirmed'. The log arrives at 'processed', so the first polls are
+   * expected to miss; a thrown 429 or socket reset is a reason to wait, not
+   * to give up — giving up here is a leader sell we never mirror. (The old
+   * code made one fetch, one 700ms retry, and dropped the signal on any
+   * exception.)
+   */
+  private async fetchParsedTx(signature: string): Promise<ParsedTransactionWithMeta | null> {
+    if (!this.heliusConn) return null;
+    const deadline = Date.now() + TX_FETCH_DEADLINE_MS;
+    while (Date.now() < deadline) {
+      try {
+        const parsed = await this.heliusConn.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        });
+        if (parsed) return parsed;
+        await sleep(TX_FETCH_INTERVAL_MS);
+      } catch (err) {
+        await sleep(isRateLimitError(err) ? TX_FETCH_INTERVAL_MS * 4 : TX_FETCH_INTERVAL_MS);
+      }
+    }
+    console.warn(`[CopyTrader] Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s — signal dropped.`);
+    return null;
+  }
+
+  /**
    * Read a transaction as the leader wallet's balance deltas and classify:
    * token up + SOL down = BUY; token down + SOL up = SELL; token down + other
    * token up = token→token swap (a sell leg and a buy leg). WSOL moves count
@@ -440,23 +527,7 @@ export class CopyTraderService {
   private async analyzeLeaderTx(leaderAddress: string, signature: string): Promise<LeaderSignal[]> {
     if (!this.heliusConn) return [];
 
-    let parsed = null;
-    try {
-      parsed = await this.heliusConn.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
-      if (!parsed) {
-        // onLogs can outrun tx availability by a moment.
-        await sleep(700);
-        parsed = await this.heliusConn.getParsedTransaction(signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-      }
-    } catch {
-      return [];
-    }
+    const parsed = await this.fetchParsedTx(signature);
     if (!parsed || !parsed.meta || parsed.meta.err) return [];
 
     const meta = parsed.meta;
@@ -545,9 +616,22 @@ export class CopyTraderService {
       // Same user-supplied key as the sniper. subscribeAccountTrade — the whole
       // basis of copy trading — is per-trade data, so on the free tier this
       // socket connects and then reports nothing at all.
-      this.ws = new WebSocket(sniperEngine.pumpPortalDataUrl());
+      const socket = new WebSocket(sniperEngine.pumpPortalDataUrl());
+      this.ws = socket;
 
-      this.ws.on('open', () => {
+      // Same watchdog as the sniper's launch feed: a socket that dies without
+      // a FIN never fires `close`, so reconnect-on-close alone left this lane
+      // "connected" and deaf. Silence past the threshold terminates it, which
+      // synthesises `close` and runs the reconnect below.
+      this.wsKeepalive = attachKeepalive(socket, {
+        onStale: (silentMs) => {
+          console.warn(`[CopyTrader] PumpPortal lane silent for ${(silentMs / 1000).toFixed(0)}s (no data, no pong) — forcing a reconnect.`);
+        },
+      });
+
+      socket.on('open', () => {
+        if (this.ws !== socket) return; // superseded by a restart
+        this.wsReconnectAttempt = 0;
         this.streamConnected = true;
         if (!sniperEngine.hasPumpPortalKey()) {
           console.warn('[CopyTrader] ⚠️ Connected on the FREE PumpPortal tier — subscribeAccountTrade delivers no events, so no leader trade can ever be mirrored. Add a funded PumpPortal key in Settings.');
@@ -564,21 +648,28 @@ export class CopyTraderService {
         this.emitChange();
       });
 
-      this.ws.on('message', (data: WebSocket.Data) => {
+      socket.on('message', (data: WebSocket.Data) => {
+        if (this.ws !== socket) return;
+        this.wsKeepalive?.touch();
         try {
           const payload = JSON.parse(data.toString());
           void this.handlePumpPortalMessage(payload);
         } catch { /* malformed frame */ }
       });
 
-      this.ws.on('error', () => { /* close handler drives reconnect */ });
+      socket.on('error', () => { /* close handler drives reconnect */ });
 
-      this.ws.on('close', () => {
+      socket.on('close', () => {
+        // An old socket closing after a restart must not null out the live one
+        // — that used to leave an orphan socket delivering duplicate ticks.
+        if (this.ws !== socket) return;
+        this.wsKeepalive?.stop();
+        this.wsKeepalive = null;
         this.ws = null;
         this.streamConnected = false;
         this.emitChange();
         if (this.config.enabled) {
-          setTimeout(() => this.connectPumpPortal(), 2000);
+          setTimeout(() => this.connectPumpPortal(), reconnectDelayMs(this.wsReconnectAttempt++));
         }
       });
     } catch {
@@ -588,11 +679,15 @@ export class CopyTraderService {
   }
 
   private disconnectPumpPortal(): void {
-    if (this.ws) {
-      try { this.ws.close(); } catch { /* dying socket */ }
-      this.ws = null;
+    const socket = this.ws;
+    this.ws = null;
+    this.wsKeepalive?.stop();
+    this.wsKeepalive = null;
+    if (socket) {
+      try { socket.close(); } catch { /* dying socket */ }
     }
     this.streamConnected = false;
+    this.subscribedMints.clear();
   }
 
   private sendWs(payload: object): boolean {
@@ -904,12 +999,7 @@ export class CopyTraderService {
 
     // Exact sell fraction from the leader's post-trade balance. Both feeds
     // supply it: PumpPortal as newTokenBalance, Helius from post balances.
-    let fraction = 1;
-    const sold = sig.tokenAmount;
-    const remaining = sig.remainingTokens;
-    if (remaining !== undefined && sold > 0) {
-      fraction = sold / (sold + remaining);
-    }
+    const fraction = leaderSellFraction(sig.tokenAmount, sig.remainingTokens);
 
     const exitedFully = fraction >= 0.999;
     const describeLeader = exitedFully
@@ -931,8 +1021,15 @@ export class CopyTraderService {
       return;
     }
 
-    this.pushFeed(wallet, sig, 'copied',
-      `${describeLeader} — mirroring ${(sellFraction * 100).toFixed(0)}% exit.`);
+    // An exit already running for this position does not swallow this one:
+    // the queue applies it to whatever is left once the in-flight sell lands.
+    // (The old exitInFlight guard returned silently here — a leader selling in
+    // two chunks had the second chunk logged as mirrored and never sold.)
+    const queued = this.exitQueue.isBusy(pos.id);
+    this.pushFeed(wallet, sig, queued ? 'pending' : 'copied',
+      queued
+        ? `${describeLeader} — ${(sellFraction * 100).toFixed(0)}% exit QUEUED behind the sell already in flight.`
+        : `${describeLeader} — mirroring ${(sellFraction * 100).toFixed(0)}% exit.`);
 
     await this.closePosition(
       pos,
@@ -949,17 +1046,42 @@ export class CopyTraderService {
    * Sell `fraction` (0-1] of a copy position. Real mode routes through the
    * engine's execution path as a percentage-of-holdings order; paper mode
    * fills at the last observed price with the same slippage haircut as entry.
+   *
+   * Exits for one position run strictly one after another, in the order the
+   * signals arrived — never dropped. Each queued fraction applies to what is
+   * LEFT when its turn comes, which is exactly how the leader's own sequence
+   * of partial sells composes: "50%, then the rest" leaves us flat, like them.
    */
-  private async closePosition(
+  private closePosition(
     pos: CopyPositionInternal,
     fraction: number,
     reason: string,
     leaderSig?: LeaderSignal,
     wallet?: TrackedWalletInternal
   ): Promise<void> {
-    if (pos.exitInFlight) return;
-    pos.exitInFlight = true;
+    return this.exitQueue.run(pos.id, () => this.runExit(pos, fraction, reason, leaderSig, wallet));
+  }
 
+  private async runExit(
+    pos: CopyPositionInternal,
+    fraction: number,
+    reason: string,
+    leaderSig?: LeaderSignal,
+    wallet?: TrackedWalletInternal
+  ): Promise<void> {
+    const feedSig: LeaderSignal = leaderSig
+      ?? { mint: pos.mint, side: 'sell', solAmount: 0, tokenAmount: 0, symbol: pos.tokenSymbol, via: 'manual' };
+    const isManual = feedSig.via === 'manual';
+    if (isManual) this.manualExitRequested.delete(pos.id);
+
+    if (pos.status === 'CLOSED' || pos.tokensHeld <= 1e-9) {
+      // An earlier queued exit already emptied the bag (a 'full'-mode sell, or
+      // a leader who sold "the rest" twice). Nothing left to mirror.
+      if (wallet) this.pushFeed(wallet, feedSig, 'skipped', `$${pos.tokenSymbol} position is already closed — nothing left to sell.`);
+      return;
+    }
+
+    pos.exitInFlight = true;
     try {
       fraction = Math.max(0, Math.min(1, fraction));
       const solPriceUsd = sniperEngine.getSolPriceUsd();
@@ -970,15 +1092,8 @@ export class CopyTraderService {
       let fillVerified = false;
 
       if (this.config.tradingMode === 'real' && pos.buyTxid && !pos.buyTxid.startsWith('sim_')) {
-        const pctParam = sellAmountParam(fraction * 100);
-        const result = await sniperEngine.executeExternalTrade(
-          'sell', pos.mint, 0, pctParam, pos.pool, this.config.maxSlippagePct
-        );
-        if (!result) {
-          if (wallet) this.pushFeed(wallet, leaderSig ?? { mint: pos.mint, side: 'sell', solAmount: 0, tokenAmount: 0, via: 'helius' }, 'failed',
-            `Real SELL ${(fraction * 100).toFixed(0)}% of $${pos.tokenSymbol} failed — position kept, see engine log.`);
-          return;
-        }
+        const result = await this.executeRealSell(pos, fraction, feedSig, wallet);
+        if (!result) return; // the feed already carries the failure
         txid = result.txid;
         const fill = result.fill;
         if (fill) {
@@ -1010,7 +1125,7 @@ export class CopyTraderService {
       const owner = wallet ?? this.wallets.get(pos.leaderWallet);
       if (owner) {
         owner.realizedPnlUsd = round2(owner.realizedPnlUsd + pnlUsd);
-        if (leaderSig) owner.copiedSells++;
+        if (!isManual) owner.copiedSells++;
       }
 
       this.pushHistory({
@@ -1033,8 +1148,8 @@ export class CopyTraderService {
         exitReason: reason,
       });
 
-      if (wallet && leaderSig) {
-        this.pushFeed(wallet, leaderSig, 'copied',
+      if (wallet) {
+        this.pushFeed(wallet, feedSig, 'copied',
           `${this.config.tradingMode === 'real' ? 'REAL' : 'PAPER'} SELL ${(fraction * 100).toFixed(0)}% of $${pos.tokenSymbol} — ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${reason})`,
           round4(solReceived), txid);
       }
@@ -1042,9 +1157,71 @@ export class CopyTraderService {
       if (pos.status === 'CLOSED') this.unsubscribeMintIfIdle(pos.mint);
       this.persist();
       this.emitChange();
+    } catch (err: any) {
+      // Nothing below is expected to throw, but an exit that did would become
+      // an unhandled rejection — and on Node that ends the process with the
+      // bag still in the wallet. Report it where the operator is looking.
+      if (wallet) this.pushFeed(wallet, feedSig, 'failed', `Exit of $${pos.tokenSymbol} threw: ${err?.message ?? err} — position kept.`);
+      console.error(`[CopyTrader] Exit of ${pos.mint} threw:`, err);
     } finally {
       pos.exitInFlight = false;
     }
+  }
+
+  /**
+   * The real-mode sell, with the retry policy the sniper's own exits already
+   * had and copy exits did not: up to COPY_SELL_MAX_ATTEMPTS attempts with
+   * backoff, alternating between the leader's sell venue and 'auto'.
+   *
+   * Venue: the leader's SELL carries the venue that is live right now. The
+   * venue recorded at BUY time is stale the moment the token graduates, and a
+   * sell routed to a completed bonding curve fails on-chain every time.
+   *
+   * Slippage: the wider of the copy setting and the engine's own sell band.
+   * Passing the copy buy-side number as the override used to bypass the
+   * engine's looser sell tolerance exactly when the leader's dump was moving
+   * the price.
+   */
+  private async executeRealSell(
+    pos: CopyPositionInternal,
+    fraction: number,
+    feedSig: LeaderSignal,
+    wallet?: TrackedWalletInternal
+  ): Promise<TradeResult | null> {
+    const pctParam = sellAmountParam(fraction * 100);
+    const pct = (fraction * 100).toFixed(0);
+    const venues = sellVenueCandidates(feedSig.pool);
+    const slippage = copySellSlippagePct(this.config.maxSlippagePct, sniperEngine.getConfig().maxSellSlippagePct);
+    const isManual = feedSig.via === 'manual';
+
+    for (let attempt = 1; attempt <= COPY_SELL_MAX_ATTEMPTS; attempt++) {
+      const pool = venues[(attempt - 1) % venues.length];
+      if (attempt > 1) {
+        if (!isManual && this.manualExitRequested.has(pos.id)) {
+          // The operator pressed SELL while this was backing off: "now", not
+          // "after five more retries". The manual exit is queued right behind.
+          if (wallet) this.pushFeed(wallet, feedSig, 'pending', `Automatic retries for $${pos.tokenSymbol} stopped — the SELL button takes over.`);
+          return null;
+        }
+        const delayMs = sellRetryDelayMs(attempt - 1);
+        if (wallet) {
+          this.pushFeed(wallet, feedSig, 'pending',
+            `Real SELL ${pct}% of $${pos.tokenSymbol} failed (attempt ${attempt - 1}/${COPY_SELL_MAX_ATTEMPTS}) — retrying in ${(delayMs / 1000).toFixed(1)}s via ${pool}.`);
+        }
+        await sleep(delayMs);
+        // The operator may have switched to paper mid-retry; a real order must
+        // not follow from a stale decision.
+        if (this.config.tradingMode !== 'real') return null;
+      }
+      const result = await sniperEngine.executeExternalTrade('sell', pos.mint, 0, pctParam, pool, slippage);
+      if (result) return result;
+    }
+
+    if (wallet) {
+      this.pushFeed(wallet, feedSig, 'failed',
+        `Real SELL ${pct}% of $${pos.tokenSymbol} failed ${COPY_SELL_MAX_ATTEMPTS}x (venues tried: ${venues.join(', ')}) — position kept. The SELL button retries; the engine log has the on-chain errors.`);
+    }
+    return null;
   }
 
   // ---------------- PRICING & MONITOR ----------------
@@ -1098,8 +1275,9 @@ export class CopyTraderService {
 
   /**
    * 1s tick: DexScreener repricing for positions PumpPortal cannot see
-   * (non-pump venues). PRICING ONLY — the take-profit and max-hold exits that
-   * lived here were removed 2026-08-12 (no automatic sells, owner decision).
+   * (non-pump venues), plus the feed's automatic clearing. NO EXITS — the
+   * take-profit and max-hold exits that lived here were removed 2026-08-12
+   * (owner decision: nothing sells on price or time).
    */
   private startMonitor(): void {
     if (this.monitorInterval) return;
@@ -1130,9 +1308,21 @@ export class CopyTraderService {
           .finally(() => { this.dexPollInFlight = false; });
       }
 
-      // No automatic exits here — closePosition is reached only from the
-      // manual sell button. takeProfitPct / maxHoldSeconds stay in the config
-      // for compatibility but are inert.
+      // Automatic feed clearing: lines older than the configured window fall
+      // off. Newest-first storage, so the oldest line is the last element and
+      // one comparison decides whether anything needs pruning.
+      const clearMin = this.config.feedAutoClearMinutes;
+      if (clearMin > 0 && this.feed.length) {
+        const cutoff = Date.now() - clearMin * 60_000;
+        if (this.feed[this.feed.length - 1].timestamp < cutoff) {
+          this.feed = this.feed.filter(ev => ev.timestamp >= cutoff);
+          this.emitChange();
+        }
+      }
+
+      // No price-based exits here. closePosition is reached from onLeaderSell
+      // (when copySells is on) and from the manual sell button; takeProfitPct
+      // and maxHoldSeconds stay in the config for compatibility but are inert.
     }, MONITOR_INTERVAL_MS);
   }
 
@@ -1173,6 +1363,28 @@ export class CopyTraderService {
   private pushHistory(record: CopyTradeRecord): void {
     this.history.unshift(record);
     if (this.history.length > HISTORY_LIMIT) this.history.length = HISTORY_LIMIT;
+  }
+
+  /**
+   * Feed attribution for a position whose leader wallet has since been
+   * removed from tracking — the manual SELL button must still report.
+   */
+  private standInWallet(pos: CopyPositionInternal): TrackedWalletInternal {
+    return {
+      address: pos.leaderWallet,
+      shortAddress: shortAddr(pos.leaderWallet),
+      nickname: pos.leaderNickname,
+      enabled: false,
+      addedAt: 0,
+      lastSeenAt: null,
+      buysSeen: 0,
+      sellsSeen: 0,
+      copiedBuys: 0,
+      copiedSells: 0,
+      skippedSignals: 0,
+      realizedPnlUsd: 0,
+      lastCopiedBuyAt: null,
+    };
   }
 
   private publicWallet(w: TrackedWalletInternal): TrackedWalletPublic {
@@ -1330,6 +1542,7 @@ function sanitizeConfig(partial: Partial<CopyTraderConfig>): Partial<CopyTraderC
   if (isFiniteNum(partial.perWalletCooldownSec)) out.perWalletCooldownSec = clamp(partial.perWalletCooldownSec!, 0, 86400);
   if (isFiniteNum(partial.maxHoldSeconds)) out.maxHoldSeconds = clamp(partial.maxHoldSeconds!, 0, 86400);
   if (isFiniteNum(partial.takeProfitPct)) out.takeProfitPct = clamp(partial.takeProfitPct!, 0, 100000);
+  if (isFiniteNum(partial.feedAutoClearMinutes)) out.feedAutoClearMinutes = Math.round(clamp(partial.feedAutoClearMinutes!, 0, 10080));
   return out;
 }
 

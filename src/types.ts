@@ -801,6 +801,11 @@ export interface CopyTraderConfig {
    */
   maxHoldSeconds: number;
   takeProfitPct: number;
+  /**
+   * Feed lines older than this many minutes are removed automatically. 0 keeps
+   * them until the CLEAR button. Receipts (history) are never auto-cleared.
+   */
+  feedAutoClearMinutes: number;
 }
 
 /** A leader wallet being tracked, with per-wallet lifetime counters. */
@@ -854,15 +859,17 @@ export interface CopyFeedEvent {
   tokenSymbol: string;
   side: 'buy' | 'sell';
   leaderSolAmount: number;
-  action: 'copied' | 'skipped' | 'failed';
+  /** 'pending' = queued behind an in-flight exit, or a retry backing off. */
+  action: 'copied' | 'skipped' | 'failed' | 'pending';
   detail: string;
   copySol?: number;
   txid?: string;
   /**
-   * Which feed delivered the signal: 'pumpportal' (pump.fun fast lane) or
-   * 'helius' (on-chain wallet watcher — catches every venue).
+   * Which feed delivered the signal: 'pumpportal' (pump.fun fast lane),
+   * 'helius' (on-chain wallet watcher — catches every venue), or 'manual'
+   * (the SELL button on the copy page).
    */
-  via?: 'pumpportal' | 'helius';
+  via?: 'pumpportal' | 'helius' | 'manual';
 }
 
 /** A closed (or partially closed) copy leg — the copy page's receipt row. */

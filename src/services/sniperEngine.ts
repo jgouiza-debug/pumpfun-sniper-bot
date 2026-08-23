@@ -1368,7 +1368,8 @@ export class SniperEngine {
     amountPct?: string,
     pool?: string,
     slippageOverride?: number,
-    retryCount = 0
+    retryCount = 0,
+    opts: { external?: boolean } = {}
   ): Promise<TradeResult | null> {
     const keypair = this.wallet.getKeypair();
     if (!keypair) {
@@ -1509,12 +1510,12 @@ export class SniperEngine {
             const nextSlippage = Math.min(MAX_SELL_RETRY_SLIPPAGE_PCT, Math.round(effectiveSlippage * 1.5 + 5));
             this.log('warn', `⚡ [SELL RETRY] Re-submitting the exit for ${mint.slice(0, 6)} at ${nextSlippage}% slippage (one attempt only).`, mint);
             void this.syncLiveWalletBalance();
-            return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, nextSlippage, retryCount + 1);
+            return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, nextSlippage, retryCount + 1, opts);
           }
           if (action === 'buy') {
             this.log('warn', `↩️ Buy abandoned rather than re-priced. Filling outside ${effectiveSlippage}% would have cost more than the miss.`, mint);
           }
-          this.noteTxFailure(`${action} exceeded slippage`);
+          this.noteTradeFailure(`${action} exceeded slippage`, opts.external);
           void this.syncLiveWalletBalance();
           return null;
         }
@@ -1523,7 +1524,7 @@ export class SniperEngine {
           // was spent. There is nothing to track — opening a position here
           // would invent tokens the wallet never bought.
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain — no tokens moved, only the fee was burned. Inspect: https://solscan.io/tx/${txid}`, mint);
-          this.noteTxFailure(`${action} rejected on-chain`);
+          this.noteTradeFailure(`${action} rejected on-chain`, opts.external);
           void this.syncLiveWalletBalance();
           return null;
         }
@@ -1599,7 +1600,9 @@ export class SniperEngine {
       } catch {
         // RPC hiccup — keep polling until the deadline.
       }
-      await new Promise(res => setTimeout(res, 1500));
+      // 500ms, not 1500: a confirmation is usually visible within 1–2s, and a
+      // queued copy exit waits on this poll before it can start.
+      await new Promise(res => setTimeout(res, 500));
     }
     return 'timeout';
   }
@@ -3260,6 +3263,20 @@ export class SniperEngine {
   }
 
   /**
+   * Copy-trade orders share the signer but not the breaker. A copy sell that
+   * fails on a venue the leader has left says nothing about the sniper's own
+   * path, and counting it tripped the 5-strike breaker and switched the
+   * sniper off. The copy trader runs its own bounded retries instead.
+   */
+  private noteTradeFailure(detail: string, external: boolean | undefined): void {
+    if (external) {
+      this.log('warn', `⚠️ Copy-trade ${detail} — not counted toward the sniper's transaction breaker.`);
+      return;
+    }
+    this.noteTxFailure(detail);
+  }
+
+  /**
    * A transaction that burned a fee without doing anything.
    *
    * Kept separate from the loss-based kill switch because the two see different
@@ -3933,7 +3950,7 @@ export class SniperEngine {
     pool?: string,
     slippageOverride?: number
   ): Promise<TradeResult | null> {
-    return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, slippageOverride);
+    return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, slippageOverride, 0, { external: true });
   }
 
   public getSolPriceUsd(): number {
