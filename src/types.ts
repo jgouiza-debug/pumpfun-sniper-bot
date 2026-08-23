@@ -289,6 +289,17 @@ export interface BotConfig {
   /** Give up automatic retries of a forced exit after this many attempts. */
   maxForceExitAttempts?: number;
   /**
+   * Refuse new entries once the launch feed has been silent for this many slots
+   * (~400ms each). 0 disables. Trading on state of unknown age is worse than
+   * not trading.
+   */
+  maxFeedStaleSlots?: number;
+  /** Max entry ATTEMPTS per rolling hour. Counts attempts, not fills, because
+   *  a failed attempt still pays its fee. 0 disables. */
+  maxEntriesPerHour?: number;
+  /** Trip the breaker after this many consecutive transactions fail to land. */
+  maxConsecutiveTxFailures?: number;
+  /**
    * Ceiling on the fraction of the deployable balance the run may commit across
    * all slots. Without it, wallet-split sizing deploys ~100% of the wallet.
    */

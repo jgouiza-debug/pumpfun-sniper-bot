@@ -14,7 +14,10 @@
     "ui": "vite",
     "dev": "node --use-system-ca --env-file-if-exists=.env -r ts-node/register src/server.ts",
     "test": "ts-node src/tests/run.ts",
-    "replay": "ts-node src/replay.ts"
+    "replay": "ts-node src/replay.ts",
+    "test:filters": "ts-node src/tests/filterProofs.ts",
+    "test:guardrails": "ts-node src/tests/guardrailProofs.ts",
+    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts"
   },
   "pkg": {
     "scripts": "dist/**/*.js",
@@ -23,7 +26,7 @@
     "assets": [
       "dist/**/*"
     ],
-    "//targets": "Windows stays on node18 (its prebuilt base exists and the shipped exe is built from it). macOS uses node22 because there is NO prebuilt node18-macos-arm64 base — pkg 404s and then tries to compile from source. Only the win target is listed here so a bare `pkg .` keeps building the Windows exe; the mac binaries come from build:mac / build:mac-intel, and arm64 must be produced ON macOS (see .github/workflows/release.yml).",
+    "//targets": "Windows stays on node18 (its prebuilt base exists and the shipped exe is built from it). macOS uses node22 because there is NO prebuilt node18-macos-arm64 base \u2014 pkg 404s and then tries to compile from source. Only the win target is listed here so a bare `pkg .` keeps building the Windows exe; the mac binaries come from build:mac / build:mac-intel, and arm64 must be produced ON macOS (see .github/workflows/release.yml).",
     "targets": [
       "node18-win-x64"
     ],

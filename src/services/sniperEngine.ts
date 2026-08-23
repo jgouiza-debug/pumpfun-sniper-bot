@@ -37,6 +37,10 @@ import { devSellMonitor } from './devSellMonitor';
 import { CurveWatcher, CurveUpdate } from './curveWatcher';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
 import {
+  EntryRateLimiter, FailureBreaker, FeedFreshnessGate, evaluateGuardrails,
+} from './guardrails';
+import { PositionStore, describeRestoration, type PersistedPosition } from './positionStore';
+import {
   rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth,
   resolveRpcEndpoint, normalizeHeliusKey,
 } from './rpcHealth';
@@ -120,6 +124,17 @@ const MAX_FILL_SLIPPAGE_MULTIPLE = 1.2;
 
 /** Share of the deployable balance a run may commit across all slots. */
 const DEFAULT_DEPLOYED_FRACTION_PCT = 50;
+
+/**
+ * Unattended-operation limits. Deliberately generous — these are runaway
+ * backstops, not strategy. A bot taking 30 entries an hour is not doing
+ * anything the strategy intended; a bot that has failed 5 transactions in a row
+ * is broken, not unlucky.
+ */
+const DEFAULT_MAX_ENTRIES_PER_HOUR = 30;
+const DEFAULT_MAX_CONSECUTIVE_TX_FAILURES = 5;
+/** ~150 slots at ~400ms. Past this the feed's state is of unknown age. */
+const DEFAULT_MAX_FEED_STALE_SLOTS = 150;
 
 export interface InternalPosition extends Position {
   priceTicks?: PriceTick[];
@@ -290,6 +305,11 @@ export class SniperEngine {
     // the full 30-minute timer. Not a price stop — it never reads a price.
     noDataExitSeconds: 180,
     maxForceExitAttempts: 20,
+    // Runaway backstops for unattended operation. Generous by design: these
+    // catch a broken bot, not a bad strategy.
+    maxFeedStaleSlots: DEFAULT_MAX_FEED_STALE_SLOTS,
+    maxEntriesPerHour: DEFAULT_MAX_ENTRIES_PER_HOUR,
+    maxConsecutiveTxFailures: DEFAULT_MAX_CONSECUTIVE_TX_FAILURES,
     // Rug screening. A genuine graduation sits near 5:1; 20:1 rejects the thin
     // pools while leaving normal graduations alone. Tune from recorded data —
     // every rejection is logged with its measured ratio.
@@ -386,6 +406,18 @@ export class SniperEngine {
   private priorityFeeService: PriorityFeeService;
   // One kill-switch trip per pause: reset when the bot is (re)started.
   private killSwitchTripped = false;
+
+  /**
+   * Unattended-operation breakers, covering what the loss-based kill switch
+   * cannot see: a wallet ground down by transactions that never land (nothing
+   * closes, so realized P&L stays flat), a runaway entry loop, and trading on a
+   * feed that has gone quiet. All three stop ENTRIES only — exits stay on the
+   * owner's hold-biased rules. See services/guardrails.ts.
+   */
+  private entryRateLimiter = new EntryRateLimiter(DEFAULT_MAX_ENTRIES_PER_HOUR);
+  private failureBreaker = new FailureBreaker(DEFAULT_MAX_CONSECUTIVE_TX_FAILURES);
+  /** Survives restarts so a crash cannot orphan an open bag. */
+  private positionStore = new PositionStore();
   /** SSE/UI subscribers notified the moment state changes. See onChange(). */
   private changeListeners = new Set<() => void>();
   // Migration event arrival times, so Play 3's 90-second window is measured
@@ -411,6 +443,27 @@ export class SniperEngine {
   constructor() {
     this.riskFilter = new RiskFilter();
     this.riskFilter.setLeniencyMode(this.config.leniencyMode);
+
+    // CRASH RECOVERY. Report what a previous process believed it was holding.
+    //
+    // Deliberately NOT auto-resumed into `activePositions`. A restored record
+    // says "a dead process thought it held this" — it is not proof the tokens
+    // are still in the wallet, and nothing in this codebase reads an on-chain
+    // token balance to check. Auto-resuming would let the engine attempt sells
+    // against holdings that may already be gone, inventing failures and burning
+    // fees. Until a balance reconciliation exists, the honest behaviour is to
+    // put it in front of the operator loudly and let them decide.
+    const restored = this.positionStore.load();
+    if (restored.error || restored.positions.length) {
+      const summary = describeRestoration(restored);
+      console.warn(`\n${'='.repeat(78)}`);
+      console.warn(restored.error ? summary : `⚠️ OPEN POSITIONS FROM A PREVIOUS RUN — ${summary}`);
+      for (const p of restored.positions) {
+        console.warn(`   • $${p.tokenSymbol} ${p.mint} — ${p.tokensHeld.toLocaleString()} tokens, cost $${p.investedUsd.toFixed(2)}, opened ${new Date(p.entryTime).toISOString()}`);
+      }
+      console.warn('   These are NOT being managed by this process. Check the wallet and use LIQUIDATE if they are still held.');
+      console.warn(`${'='.repeat(78)}\n`);
+    }
 
     this.rugCheckService = new RugCheckService({
       maxRetries: 2,
@@ -1461,6 +1514,7 @@ export class SniperEngine {
           if (action === 'buy') {
             this.log('warn', `↩️ Buy abandoned rather than re-priced. Filling outside ${effectiveSlippage}% would have cost more than the miss.`, mint);
           }
+          this.noteTxFailure(`${action} exceeded slippage`);
           void this.syncLiveWalletBalance();
           return null;
         }
@@ -1469,6 +1523,7 @@ export class SniperEngine {
           // was spent. There is nothing to track — opening a position here
           // would invent tokens the wallet never bought.
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain — no tokens moved, only the fee was burned. Inspect: https://solscan.io/tx/${txid}`, mint);
+          this.noteTxFailure(`${action} rejected on-chain`);
           void this.syncLiveWalletBalance();
           return null;
         }
@@ -1484,6 +1539,9 @@ export class SniperEngine {
           return { txid, fill: null };
         }
 
+        // The transaction landed. Clears the consecutive-failure streak — the
+        // breaker is about a broken path, and this path just worked.
+        this.failureBreaker.recordSuccess();
         latencyTimeline.stamp(mint, 't7ConfirmedMs');
 
         // Quotes are opinions; balance deltas are facts. Read what the swap
@@ -2657,6 +2715,33 @@ export class SniperEngine {
       }
     }
 
+    // UNATTENDED-OPERATION BREAKERS — the last gate before money moves.
+    //
+    // Placed here, after sizing and economics, because these are about the
+    // BOT's health rather than the token's: a stale feed, a transaction path
+    // that keeps failing, or an entry loop running away. Each refuses the entry
+    // and says exactly why; none of them touches an open position.
+    // Re-read the operator's caps before checking, so a Settings change takes
+    // effect on the next entry rather than on the next restart.
+    this.entryRateLimiter.setMaxPerWindow(this.config.maxEntriesPerHour ?? DEFAULT_MAX_ENTRIES_PER_HOUR);
+    const guard = evaluateGuardrails([
+      this.failureBreaker.check(),
+      new FeedFreshnessGate(
+        this.config.maxFeedStaleSlots ?? DEFAULT_MAX_FEED_STALE_SLOTS,
+        this.lastFeedMessageAt || Date.now()
+      ).check(Date.now()),
+      this.entryRateLimiter.check(Date.now()),
+    ]);
+    if (!guard.allowed) {
+      this.log('warn', `🛑 ENTRY BLOCKED for $${filterResult.tokenSymbol} — ${guard.reason}`, filterResult.mint);
+      // Counts as a screening rejection so the funnel accounts for it rather
+      // than the token silently vanishing between 'passed' and 'opened' — the
+      // exact blind spot that left 70 passed_no_buy rows with no reason.
+      reportService.recordScreened(false, `entry blocked: ${guard.reason}`);
+      return;
+    }
+    this.entryRateLimiter.record(Date.now());
+
     await this.executeBuy(filterResult, selectedPlay, unitSizeSol, be, launchData);
   }
 
@@ -2774,6 +2859,7 @@ export class SniperEngine {
     };
 
     this.activePositions.push(position);
+    this.persistPositions();
 
     /**
      * FILL SANITY — abandon an entry that filled far worse than it was decided at.
@@ -3134,6 +3220,62 @@ export class SniperEngine {
     this.statsCache = null;
     reportService.recordTrade(record);
     this.checkKillSwitch();
+  }
+
+  /**
+   * Writes the open book to disk after every mutation.
+   *
+   * On every mutation rather than on a timer, because a crash is not scheduled.
+   * Before this existed, `activePositions` was memory-only and nothing ever
+   * re-read a wallet's token balance — so a process death while holding a
+   * position orphaned that bag permanently, with no exit ever running against
+   * it. Silent and uncapped.
+   */
+  private persistPositions(cleanShutdown = false): void {
+    const snapshot: PersistedPosition[] = this.activePositions.map((p) => ({
+      id: p.id,
+      mint: p.mint,
+      tokenSymbol: p.tokenSymbol,
+      tokenName: p.tokenName,
+      entryTime: p.entryTime,
+      investedSol: p.investedSol,
+      investedUsd: p.investedUsd,
+      buyPriceUsd: p.buyPriceUsd,
+      tokensHeld: p.tokensHeld,
+      playbook: p.playbook,
+      venue: p.venue,
+      entryTxid: (p as any).entryTxid,
+      realizedPnlUsd: p.realizedPnlUsd,
+      legCount: p.legCount,
+    }));
+    const ok = this.positionStore.save(snapshot, {
+      walletAddress: this.wallet.getAddress(),
+      tradingMode: this.config.tradingMode,
+      cleanShutdown,
+    });
+    // A silent persistence failure would recreate the exact bug this replaces.
+    if (!ok) {
+      this.log('error', `⚠️ Could not write ${this.positionStore.getPath()} — if this process dies, ${snapshot.length} open position(s) will be invisible on restart.`);
+    }
+  }
+
+  /**
+   * A transaction that burned a fee without doing anything.
+   *
+   * Kept separate from the loss-based kill switch because the two see different
+   * failures: that one reads REALIZED P&L, and a wallet ground down by
+   * transactions that never land closes nothing, so its realized P&L never
+   * moves. This is the breaker that notices the wallet draining while the
+   * trade ledger stays empty.
+   */
+  private noteTxFailure(detail: string): void {
+    if (this.failureBreaker.recordFailure(detail)) {
+      const why = this.failureBreaker.check().reason ?? detail;
+      this.log('error', `🛑 TRANSACTION BREAKER TRIPPED: ${why}. New entries are blocked until the bot is restarted; open positions are retained and their exits still run.`);
+      this.toggleBot(false);
+    } else {
+      this.log('warn', `⚠️ Transaction failed (${detail}). ${this.failureBreaker.consecutiveFailures()} in a row; the breaker trips at ${this.config.maxConsecutiveTxFailures ?? DEFAULT_MAX_CONSECUTIVE_TX_FAILURES}.`);
+    }
   }
 
   /**
@@ -3689,6 +3831,7 @@ export class SniperEngine {
     const totalPositionPnlUsd = Number((pos.realizedPnlUsd + finalPnlUsd).toFixed(2));
 
     this.activePositions = this.activePositions.filter(p => p.id !== pos.id);
+    this.persistPositions();
     devSellMonitor.untrack(pos.mint);
     // Free the curve subscription slot unless the screening watchlist still
     // has a claim on this mint.
