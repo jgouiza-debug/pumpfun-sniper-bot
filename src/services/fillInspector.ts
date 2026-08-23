@@ -35,8 +35,11 @@ export async function inspectFill(
   mint: string,
   opts: { retries?: number; delayMs?: number } = {}
 ): Promise<ActualFill | null> {
-  const retries = opts.retries ?? 6;
-  const delayMs = opts.delayMs ?? 1500;
+  // 12 × 500ms rather than 6 × 1500ms: the same 6s window, but a fill that is
+  // readable 300ms after confirmation is booked in 500ms instead of 1.5s —
+  // and the copy trader's next queued order waits on exactly this.
+  const retries = opts.retries ?? 12;
+  const delayMs = opts.delayMs ?? 500;
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {

@@ -3498,7 +3498,7 @@ console.log('\n-- Copy trader: the on-chain wallet watcher owns its socket --');
     assert.ok(!/\.onLogs\(/.test(svc), 'Connection.onLogs reconnects only from close — a half-open socket stays deaf forever');
     assert.ok(/new WalletLogWatcher\(/.test(svc));
     assert.ok(!/if \(pos\.exitInFlight\) return;/.test(svc), 'the silent drop must stay gone');
-    assert.ok(/exitQueue\.run\(/.test(svc), 'exits are queued per position');
+    assert.ok(/tradeQueue\.run\(/.test(svc), 'exits are queued per mint, behind the buy they belong to');
     assert.ok(/attachKeepalive\(/.test(svc), 'the PumpPortal lane needs the watchdog too');
     assert.ok(/sellVenueCandidates\(/.test(svc) && !/pctParam, pos\.pool/.test(svc), 'the buy-time venue must never route the exit');
     assert.ok(/COPY_SELL_MAX_ATTEMPTS/.test(svc), 'a failed sell is retried');
@@ -3513,6 +3513,216 @@ console.log('\n-- Copy trader: the on-chain wallet watcher owns its socket --');
     const eng = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
     assert.ok(/external:\s*true/.test(eng) && /noteTradeFailure\(/.test(eng),
       "a copy sell failing on a venue the leader left must not trip the sniper's breaker");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Copy trader, 2026-08-23: "it buys and sells but not correctly". What the
+// on-chain watcher turned into buy and sell signals, and what it missed.
+// ---------------------------------------------------------------------------
+console.log('\n-- Copy trader: transfers are not trades, a flip inside our buy is not lost, paper exits print the leader price --');
+{
+  const { detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, TRADE_MIN_SOL_BUY } = require('../services/leaderTxClassifier');
+  const { ExitQueue } = require('../services/copyExitPolicy');
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const PUMP = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+  const PUMP_AMM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+
+  test('OLD BUG: tokens arriving with no SOL leaving read as a BUY, so an airdrop got copied', () => {
+    // The old classifier looked at the token delta alone: token up = buy.
+    const oldClassify = (tokenDelta: number) => (tokenDelta > 0 ? 'buy' : 'sell');
+    assert.strictEqual(oldClassify(+1_000_000), 'buy', 'an airdrop was a buy signal');
+    assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0, venueKnown: false, isTokenSwap: false }), 'transfer');
+  });
+
+  test('OLD BUG: tokens leaving with no SOL arriving read as a SELL, so a wallet-to-wallet move dumped our bag', () => {
+    assert.strictEqual(classifyFlow({ side: 'sell', tradeSol: 0, venueKnown: false, isTokenSwap: false }), 'transfer');
+    assert.strictEqual(classifyFlow({ side: 'sell', tradeSol: 0.4, venueKnown: false, isTokenSwap: false }), 'trade');
+  });
+
+  test('receiving tokens can cost rent and a fee without buying any — still a transfer', () => {
+    assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0.00204 + 0.000005, venueKnown: false, isTokenSwap: false }), 'transfer');
+    assert.ok(TRADE_MIN_SOL_BUY > 0.00204, 'the threshold must sit above ATA rent');
+    assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0.01, venueKnown: false, isTokenSwap: false }), 'trade');
+  });
+
+  test('a known venue program in the transaction proves a trade however small; a swap leg has no SOL by nature', () => {
+    assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0.0005, venueKnown: true, isTokenSwap: false }), 'trade');
+    assert.strictEqual(classifyFlow({ side: 'sell', tradeSol: 0, venueKnown: false, isTokenSwap: true }), 'trade');
+  });
+
+  test('the venue comes from the programs the transaction invoked, in PumpPortal vocabulary', () => {
+    assert.strictEqual(detectVenue(['11111111111111111111111111111111', PUMP]), 'pump');
+    assert.strictEqual(detectVenue([PUMP_AMM]), 'pump-amm');
+    assert.strictEqual(detectVenue(['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA']), undefined, 'a plain SPL transfer has no venue');
+  });
+
+  test('OLD BUG: the network fee was inside the "price" of a small buy', () => {
+    // A 0.05 SOL buy with a 0.0015 SOL fee, paid by the leader.
+    const pre = 1_000_000_000;
+    const post = pre - 50_000_000 - 1_500_000;
+    const oldFlow = (post - pre) / 1e9;
+    assert.ok(Math.abs(oldFlow) > 0.0514, 'old: 0.0515 SOL "spent" on a 0.05 SOL buy — 3% high');
+    assert.ok(Math.abs(netSolFlowSol(pre, post, 1_500_000, true) + 0.05) < 1e-9, 'fixed: exactly the trade');
+    assert.ok(Math.abs(netSolFlowSol(pre, post, 1_500_000, false) - oldFlow) < 1e-12, 'someone else paid the fee: nothing to add back');
+  });
+
+  test("OLD BUG: a paper sell filled at our stale price, so it booked -3% whatever the leader got", () => {
+    const entry = 1e-7;
+    const old = entry * (1 - 1.5 / 100); // currentPriceSol never left the entry on the free tier
+    assert.ok(old < entry);
+    const leaderSoldAt = 2e-7; // the leader doubled
+    const fixed = paperExitPrice(leaderSoldAt, entry, 1.5);
+    assert.ok(fixed > entry * 1.9, "the paper exit prints the leader's price, haircut");
+    assert.strictEqual(paperExitPrice(undefined, entry, 1.5), old, 'no leader price: the previous behaviour');
+    assert.strictEqual(paperExitPrice(0, entry, 1.5), old);
+  });
+
+  test('OLD BUG: a leader sell arriving while our buy was still landing found nothing and was dropped', async () => {
+    // onLeaderSell looked the position up immediately; our buy takes seconds.
+    const positions: string[] = [];
+    const oldOnLeaderSell = () => (positions.length ? 'sold' : 'skipped: nothing held');
+    const buy = (async () => { await sleep(30); positions.push('pos'); })();
+    const verdict = oldOnLeaderSell(); // the leader's sell lands 1ms after their buy
+    await buy;
+    assert.strictEqual(verdict, 'skipped: nothing held');
+    assert.strictEqual(positions.length, 1, 'and the bag landed anyway — orphaned, leader already out');
+  });
+
+  test('fixed: buys and sells share one queue per mint, so the sell waits for its bag', async () => {
+    const q = new ExitQueue();
+    const positions: string[] = [];
+    const events: string[] = [];
+    const buy = q.run('MINT', async () => { await sleep(30); positions.push('pos'); events.push('bought'); });
+    assert.strictEqual(q.isBusy('MINT'), true, 'the sell path can see the buy in flight');
+    const sell = q.run('MINT', async () => { events.push(positions.length ? 'sold' : 'nothing'); });
+    await Promise.all([buy, sell]);
+    assert.deepStrictEqual(events, ['bought', 'sold']);
+  });
+
+  test('the service is wired to all of this', () => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/kind === 'transfer'/.test(svc), 'transfers are surfaced, not copied');
+    assert.ok(/tradeQueue\.run\(mint,/.test(svc) && /tradeQueue\.run\(sig\.mint,/.test(svc) && /tradeQueue\.run\(pos\.mint,/.test(svc),
+      'buys, leader sells and manual sells all queue on the mint');
+    assert.ok(/paperExitPrice\(/.test(svc), 'paper exits print the leader price');
+    assert.ok(/bondingCurvePda\(mint\)/.test(svc), 'pump.fun trades are priced from the curve account');
+    assert.ok(/netSolFlowSol\(/.test(svc), 'the network fee is not part of the price');
+    assert.ok(!/exitQueue/.test(svc), 'the old per-position queue is gone');
+  });
+}
+
+console.log('\n-- Copy trader: pump.fun trades are read from the log lines at processed — no RPC on the hot path --');
+{
+  const {
+    decodeTradeEvent, tradeEventsFromLogs, tradeEventPriceSol, TRADE_EVENT_DISCRIMINATOR, PUMP_PROGRAM_ID,
+  } = require('../services/pumpEventDecoder');
+  const fixture = require('./fixtures/pump-trade-logs.json');
+  const { PublicKey: PK } = require('@solana/web3.js');
+  const MINT = fixture.expected.mint;
+  const USER = fixture.expected.user;
+
+  const eventLine = (f: { sol: number; tokens: number; isBuy: boolean }) => {
+    const b = Buffer.alloc(129);
+    TRADE_EVENT_DISCRIMINATOR.copy(b, 0);
+    new PK(MINT).toBuffer().copy(b, 8);
+    b.writeBigUInt64LE(BigInt(f.sol), 40);
+    b.writeBigUInt64LE(BigInt(f.tokens), 48);
+    b.writeUInt8(f.isBuy ? 1 : 0, 56);
+    new PK(USER).toBuffer().copy(b, 57);
+    b.writeBigInt64LE(BigInt(1_700_000_000), 89);
+    return `Program data: ${b.toString('base64')}`;
+  };
+
+  test('a real pump.fun buy decodes from its log lines exactly as the chain reports it', () => {
+    const events = tradeEventsFromLogs(fixture.logs);
+    assert.strictEqual(events.length, 1, 'one TradeEvent per trade');
+    const ev = events[0];
+    assert.strictEqual(ev.mint, MINT);
+    assert.strictEqual(ev.user, USER, 'the trader, so a wallet merely mentioned in the tx is not credited with the trade');
+    assert.strictEqual(ev.isBuy, fixture.expected.isBuy);
+    assert.ok(Math.abs(Number(ev.solLamports) / 1e9 - fixture.expected.sol) < 1e-12);
+    assert.ok(Math.abs(Number(ev.tokenRaw) / 1e6 - fixture.expected.tokens) < 1e-9);
+    assert.ok(tradeEventPriceSol(ev) > 0);
+  });
+
+  test('the discriminator is Anchor\'s for TradeEvent', () => {
+    assert.strictEqual(TRADE_EVENT_DISCRIMINATOR.toString('hex'), 'bddb7fd34ee661ee');
+  });
+
+  test('a sell event carries isBuy=false and its own amounts', () => {
+    const logs = [`Program ${PUMP_PROGRAM_ID} invoke [1]`, eventLine({ sol: 123_000_000, tokens: 5_000_000_000, isBuy: false }), `Program ${PUMP_PROGRAM_ID} success`];
+    const [ev] = tradeEventsFromLogs(logs);
+    assert.ok(ev);
+    assert.strictEqual(ev.isBuy, false);
+    assert.strictEqual(Number(ev.solLamports), 123_000_000);
+    assert.strictEqual(Number(ev.tokenRaw), 5_000_000_000);
+  });
+
+  test('an identical event emitted by some OTHER program is not a pump.fun trade', () => {
+    const other = 'SomeOtherProgram1111111111111111111111111111';
+    const logs = [`Program ${other} invoke [1]`, eventLine({ sol: 1, tokens: 1, isBuy: true }), `Program ${other} success`];
+    assert.deepStrictEqual(tradeEventsFromLogs(logs), []);
+  });
+
+  test('nested CPI: a pump.fun trade inside a router is still attributed to pump.fun', () => {
+    const router = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+    const logs = [
+      `Program ${router} invoke [1]`,
+      `Program ${PUMP_PROGRAM_ID} invoke [2]`,
+      'Program log: Instruction: Buy',
+      eventLine({ sol: 50_000_000, tokens: 1_000_000_000, isBuy: true }),
+      `Program ${PUMP_PROGRAM_ID} consumed 30000 of 200000 compute units`,
+      `Program ${PUMP_PROGRAM_ID} success`,
+      `Program ${router} success`,
+    ];
+    assert.strictEqual(tradeEventsFromLogs(logs).length, 1);
+  });
+
+  test('garbage and short payloads are ignored, never thrown', () => {
+    const logs = [`Program ${PUMP_PROGRAM_ID} invoke [1]`, 'Program data: AAAA', 'Program data: !!!', `Program ${PUMP_PROGRAM_ID} success`];
+    assert.deepStrictEqual(tradeEventsFromLogs(logs), []);
+    assert.strictEqual(decodeTradeEvent(Buffer.alloc(10)), null);
+  });
+
+  test('the service takes the fast lane first and reconciles its tally against the chain', () => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/if \(this\.handleFastLog\(ev\)\) return;/.test(svc), 'log lines before RPC');
+    assert.ok(/reconcileLeaderBalances\(/.test(svc));
+    assert.ok(/tracked \+ 1e-6 < tokens\) return false/.test(svc), 'a sell larger than the tally takes the exact path rather than being mis-sized');
+  });
+}
+
+console.log('\n-- Copy trader: stablecoin swaps and foreign venues are not memecoin buys --');
+{
+  const { isCopyableMint, isExecutableVenue, NON_MEME_MINTS } = require('../services/leaderTxClassifier');
+
+  test('MEASURED 2026-08-23: a tracked market-maker produced 210 copied "buys" of USDC in two minutes', () => {
+    assert.strictEqual(isCopyableMint('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'), false, 'USDC');
+    assert.strictEqual(isCopyableMint('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'), false, 'USDT');
+    assert.strictEqual(isCopyableMint('mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'), false, 'mSOL');
+    assert.strictEqual(isCopyableMint('5nGAK71Qc8D24Jg6mde2Hy9TWWHGuwv1X3ZYvmbEpump'), true, 'a pump.fun mint');
+    assert.ok(NON_MEME_MINTS.size >= 10);
+  });
+
+  test('a buy is copied only from a venue the executor can trade on', () => {
+    for (const v of ['pump', 'pump-amm', 'launchlab', 'raydium', 'raydium-cpmm']) assert.strictEqual(isExecutableVenue(v), true, v);
+    assert.strictEqual(isExecutableVenue(undefined), false, 'no known program in the tx (Orca, Meteora, a plain transfer)');
+    assert.strictEqual(isExecutableVenue('meteora'), false);
+  });
+
+  test('the service applies both before sizing a copy buy, and sells are NOT gated (we may hold the bag)', () => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/isCopyableMint\(mint\)/.test(svc));
+    assert.ok(/isExecutableVenue\(sig\.pool\)/.test(svc));
+    const sellSection = svc.slice(svc.indexOf('private async onLeaderSell('), svc.indexOf('private closePosition('));
+    assert.ok(!/isExecutableVenue|isCopyableMint/.test(sellSection), 'a leader exiting on any venue is still our exit signal');
   });
 }
 

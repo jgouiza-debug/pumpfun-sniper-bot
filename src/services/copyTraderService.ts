@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
-import { Connection, LAMPORTS_PER_SOL, PublicKey, type ParsedTransactionWithMeta } from '@solana/web3.js';
+import { Connection, LAMPORTS_PER_SOL, PublicKey, type ParsedTransactionWithMeta, type TokenBalance } from '@solana/web3.js';
 import {
   CopyFeedEvent,
   CopyPosition,
@@ -15,7 +15,12 @@ import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError } from '
 import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
 import { DexScreenerService } from './dexscreenerService';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
-import { WalletLogWatcher } from './walletLogWatcher';
+import { WalletLogWatcher, type WalletLogEvent } from './walletLogWatcher';
+import { tradeEventsFromLogs, tradeEventPriceSol, PUMP_TOKEN_DECIMALS } from './pumpEventDecoder';
+import { bondingCurvePda } from './curveWatcher';
+import {
+  detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, isCopyableMint, isExecutableVenue,
+} from './leaderTxClassifier';
 import {
   ExitQueue, leaderSellFraction, sellVenueCandidates, sellRetryDelayMs, copySellSlippagePct,
   COPY_SELL_MAX_ATTEMPTS,
@@ -108,6 +113,17 @@ interface LeaderSignal {
   via: 'pumpportal' | 'helius' | 'manual';
   /** True when this leg is half of a token→token swap (no SOL amount to scale from). */
   isTokenSwap?: boolean;
+  /** Leader's realized price in SOL per token for this leg, when the trade carried one. */
+  priceSol?: number;
+  /**
+   * 'transfer' = tokens moved with no SOL against them (airdrop, dust, a bag
+   * moved between the leader's own wallets). Surfaced in the feed, never
+   * copied — treating these as trades bought airdrops and sold positions the
+   * leader had only moved.
+   */
+  kind?: 'trade' | 'transfer';
+  /** Decoded from the log lines at 'processed' — no transaction fetch stood between the leader and our order. */
+  fast?: boolean;
 }
 
 interface TrackedWalletInternal extends TrackedWalletPublic {
@@ -178,16 +194,24 @@ export class CopyTraderService {
   private logWatcher: WalletLogWatcher | null = null;
   /** Signatures whose transaction is being fetched right now ('processed' logs can repeat). */
   private analyzingSigs = new Set<string>();
+  /**
+   * Running tally of each leader's token balance per mint (`address:mint`),
+   * so a pump.fun SELL decoded from the log lines can be sized as a fraction
+   * of their bag without waiting for the transaction. Reconciled against the
+   * chain's own balances as soon as each transaction is readable.
+   */
+  private leaderBalances = new Map<string, number>();
 
   /** Signatures already handled — the cross-feed dedup. FIFO-pruned. */
   private processedSigs = new Set<string>();
   private processedSigOrder: string[] = [];
 
   /**
-   * One exit at a time per position, in arrival order — never dropped. See
+   * One trade at a time per MINT — buys and exits alike — in arrival order,
+   * never dropped. A sell waits for the buy it belongs to. See
    * copyExitPolicy.ExitQueue for the bug this replaces.
    */
-  private exitQueue = new ExitQueue();
+  private tradeQueue = new ExitQueue();
   /** Position ids whose operator pressed SELL while an automatic retry was backing off. */
   private manualExitRequested = new Set<string>();
 
@@ -449,6 +473,10 @@ export class CopyTraderService {
         onLog: (ev) => {
           if (ev.err) return; // failed tx — nothing moved
           if (this.processedSigs.has(ev.signature) || this.analyzingSigs.has(ev.signature)) return;
+          // Fast lane: a pump.fun trade is fully described by the event in
+          // the log lines already in hand — no RPC, no wait for confirmation.
+          // Everything else takes the on-chain analysis path.
+          if (this.handleFastLog(ev)) return;
           void this.handleWalletLog(ev.address, ev.signature);
         },
         log: (level, msg) => (level === 'warn' ? console.warn : console.log)(`[CopyTrader] ${msg}`),
@@ -492,6 +520,94 @@ export class CopyTraderService {
   }
 
   /**
+   * FAST LANE for pump.fun trades. The TradeEvent in the notification's own
+   * log lines carries mint, side, SOL, tokens and trader, so the copy order
+   * leaves at 'processed' — typically 0.5–1.2s before the leader's
+   * transaction is even readable at 'confirmed', which is what the analysis
+   * path has to wait for. Returns false when the notification is not a
+   * pump.fun trade by this wallet (other venue, transfer), or when a SELL
+   * cannot be sized exactly without the transaction; those take the
+   * analysis path unchanged.
+   */
+  private handleFastLog(ev: WalletLogEvent): boolean {
+    const wallet = this.wallets.get(ev.address);
+    if (!wallet || !wallet.enabled || !this.config.enabled) return false;
+
+    const events = tradeEventsFromLogs(ev.logs).filter(e => e.user === ev.address);
+    if (!events.length) return false;
+
+    const signals: LeaderSignal[] = [];
+    const tallyUpdates: Array<[string, number]> = [];
+    for (const e of events) {
+      const tokens = Number(e.tokenRaw) / 10 ** PUMP_TOKEN_DECIMALS;
+      const sol = Number(e.solLamports) / LAMPORTS_PER_SOL;
+      const key = `${ev.address}:${e.mint}`;
+      const tracked = this.leaderBalances.get(key);
+      let remainingTokens: number | undefined;
+      if (e.isBuy) {
+        tallyUpdates.push([key, (tracked ?? 0) + tokens]);
+      } else {
+        // The mirror needs the leader's post-trade balance, which the event
+        // does not carry. Our running tally is exact once a transaction has
+        // been reconciled against the chain; until then — the first sell of a
+        // bag we never saw them buy, or one larger than we tracked — the
+        // analysis path sizes it from the real balances.
+        if (tracked === undefined || tracked + 1e-6 < tokens) return false;
+        remainingTokens = Math.max(0, tracked - tokens);
+        tallyUpdates.push([key, remainingTokens]);
+      }
+      signals.push({
+        signature: ev.signature,
+        mint: e.mint,
+        side: e.isBuy ? 'buy' : 'sell',
+        solAmount: round4(sol),
+        tokenAmount: tokens,
+        remainingTokens,
+        priceSol: tradeEventPriceSol(e) || undefined,
+        pool: 'pump',
+        via: 'helius',
+        kind: 'trade',
+        fast: true,
+      });
+    }
+    for (const [key, value] of tallyUpdates) this.leaderBalances.set(key, value);
+
+    this.markSigProcessed(ev.signature);
+    // Keep the tally honest against the chain without slowing the order: once
+    // the transaction is readable, the leader's real post-trade balances
+    // replace whatever was inferred here.
+    void this.reconcileLeaderBalances(ev.address, ev.signature);
+    void (async () => {
+      for (const sig of signals) await this.handleLeaderSignal(wallet, sig);
+    })();
+    return true;
+  }
+
+  private async reconcileLeaderBalances(leaderAddress: string, signature: string): Promise<void> {
+    const parsed = await this.fetchParsedTx(signature);
+    if (!parsed || !parsed.meta || parsed.meta.err) return;
+    this.recordLeaderBalances(leaderAddress, parsed.meta.preTokenBalances, parsed.meta.postTokenBalances);
+  }
+
+  /** The leader's post-transaction balance per mint, from the transaction's own token balance lists. */
+  private recordLeaderBalances(
+    leaderAddress: string,
+    pre: TokenBalance[] | null | undefined,
+    post: TokenBalance[] | null | undefined
+  ): void {
+    const balances = new Map<string, number>();
+    for (const tb of post ?? []) {
+      if (tb.owner !== leaderAddress || tb.mint === WSOL_MINT) continue;
+      balances.set(tb.mint, (balances.get(tb.mint) ?? 0) + (tb.uiTokenAmount?.uiAmount ?? 0));
+    }
+    for (const tb of pre ?? []) {
+      // Present before, absent after: the account was closed — balance is zero.
+      if (tb.owner === leaderAddress && tb.mint !== WSOL_MINT && !balances.has(tb.mint)) balances.set(tb.mint, 0);
+    }
+    for (const [mint, balance] of balances) this.leaderBalances.set(`${leaderAddress}:${mint}`, balance);
+  }
+
+  /**
    * Poll for the leader's transaction until the RPC can serve it at
    * 'confirmed'. The log arrives at 'processed', so the first polls are
    * expected to miss; a thrown 429 or socket reset is a reason to wait, not
@@ -523,20 +639,23 @@ export class CopyTraderService {
    * token up + SOL down = BUY; token down + SOL up = SELL; token down + other
    * token up = token→token swap (a sell leg and a buy leg). WSOL moves count
    * as SOL — aggregators route through wrapped SOL and unwrap in the same tx.
+   * Tokens that move with no SOL against them are a TRANSFER (airdrop, dust,
+   * wallet-to-wallet) — surfaced in the feed, never copied.
    */
   private async analyzeLeaderTx(leaderAddress: string, signature: string): Promise<LeaderSignal[]> {
-    if (!this.heliusConn) return [];
-
     const parsed = await this.fetchParsedTx(signature);
     if (!parsed || !parsed.meta || parsed.meta.err) return [];
 
     const meta = parsed.meta;
-    const keys = parsed.transaction.message.accountKeys;
-    const leaderIndex = keys.findIndex(k => k.pubkey.toBase58() === leaderAddress);
+    const keys = parsed.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
+    const leaderIndex = keys.indexOf(leaderAddress);
     if (leaderIndex < 0) return [];
 
-    // Native SOL delta for the leader account itself.
-    let effSolDelta = ((meta.postBalances[leaderIndex] ?? 0) - (meta.preBalances[leaderIndex] ?? 0)) / LAMPORTS_PER_SOL;
+    // Native SOL flow for the leader, with the network fee added back when
+    // they paid it (the fee payer is always account 0).
+    let effSolDelta = netSolFlowSol(
+      meta.preBalances[leaderIndex] ?? 0, meta.postBalances[leaderIndex] ?? 0, meta.fee ?? 0, leaderIndex === 0
+    );
 
     // Token deltas by mint, WSOL folded into the SOL side.
     const deltaByMint = new Map<string, number>();
@@ -555,6 +674,27 @@ export class CopyTraderService {
     };
     touch(meta.preTokenBalances, -1);
     touch(meta.postTokenBalances, 1);
+    if (!deltaByMint.size) return []; // plain SOL transfer / staking / rent
+    // Exact balances for the fast lane's tally, whichever path handled this tx.
+    this.recordLeaderBalances(leaderAddress, meta.preTokenBalances, meta.postTokenBalances);
+
+    // The venue, from the programs the transaction invoked. Routes our exit,
+    // and on its own proves a balance change was a trade and not a transfer.
+    const venue = detectVenue(keys);
+
+    // pump.fun curve trades: the curve PDA's own lamport delta is the exact
+    // SOL that crossed the curve — no network fee, no rent, no unrelated
+    // transfer riding in the same transaction.
+    const exactSolByMint = new Map<string, number>();
+    if (venue === 'pump') {
+      for (const mint of deltaByMint.keys()) {
+        let pda: string;
+        try { pda = bondingCurvePda(mint).toBase58(); } catch { continue; }
+        const idx = keys.indexOf(pda);
+        if (idx < 0) continue;
+        exactSolByMint.set(mint, Math.abs(((meta.postBalances[idx] ?? 0) - (meta.preBalances[idx] ?? 0)) / LAMPORTS_PER_SOL));
+      }
+    }
 
     const buys: Array<{ mint: string; tokens: number }> = [];
     const sells: Array<{ mint: string; tokens: number; remaining: number }> = [];
@@ -564,35 +704,44 @@ export class CopyTraderService {
         sells.push({ mint, tokens: -delta, remaining: Math.max(0, postByMint.get(mint) ?? 0) });
       }
     }
-    if (!buys.length && !sells.length) return []; // plain transfer / staking / rent
+    if (!buys.length && !sells.length) return [];
 
     const solSpent = Math.max(0, -effSolDelta);
     const solReceived = Math.max(0, effSolDelta);
     const isTokenSwap = buys.length > 0 && sells.length > 0;
+    const venueKnown = venue !== undefined;
 
     const signals: LeaderSignal[] = [];
     // Sells first so a token→token swap frees the old bag before the new buy.
     for (const s of sells) {
+      const tradeSol = exactSolByMint.get(s.mint) ?? solReceived / sells.length;
       signals.push({
         signature,
         mint: s.mint,
         side: 'sell',
-        solAmount: sells.length ? round4(solReceived / sells.length) : 0,
+        solAmount: round4(tradeSol),
         tokenAmount: s.tokens,
         remainingTokens: s.remaining,
+        priceSol: tradeSol > 0 && s.tokens > 0 ? tradeSol / s.tokens : undefined,
+        pool: venue,
         via: 'helius',
         isTokenSwap,
+        kind: classifyFlow({ side: 'sell', tradeSol, venueKnown, isTokenSwap }),
       });
     }
     for (const b of buys) {
+      const tradeSol = exactSolByMint.get(b.mint) ?? solSpent / buys.length;
       signals.push({
         signature,
         mint: b.mint,
         side: 'buy',
-        solAmount: buys.length ? round4(solSpent / buys.length) : 0,
+        solAmount: round4(tradeSol),
         tokenAmount: b.tokens,
+        priceSol: tradeSol > 0 && b.tokens > 0 ? tradeSol / b.tokens : undefined,
+        pool: venue,
         via: 'helius',
         isTokenSwap: isTokenSwap && solSpent <= TOKEN_DELTA_EPSILON,
+        kind: classifyFlow({ side: 'buy', tradeSol, venueKnown, isTokenSwap }),
       });
     }
     return signals;
@@ -744,7 +893,11 @@ export class CopyTraderService {
       remainingTokens: isFinite(Number(payload.newTokenBalance)) ? Math.max(0, Number(payload.newTokenBalance)) : undefined,
       pool: typeof payload.pool === 'string' ? payload.pool : undefined,
       symbol: typeof payload.symbol === 'string' ? payload.symbol : undefined,
+      priceSol: Number(payload.solAmount) > 0 && Number(payload.tokenAmount) > 0
+        ? Number(payload.solAmount) / Number(payload.tokenAmount)
+        : undefined,
       via: 'pumpportal',
+      kind: 'trade',
     });
   }
 
@@ -752,6 +905,29 @@ export class CopyTraderService {
 
   private async handleLeaderSignal(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
     wallet.lastSeenAt = Date.now();
+
+    if (sig.kind === 'transfer') {
+      // Tokens moved, SOL did not: an airdrop, a dust attack, or a bag moved
+      // between the leader's own wallets. Classifying by token delta alone is
+      // what made the copy trader buy airdrops and dump a position the leader
+      // had merely moved. Surfaced, so the operator can disagree by hand.
+      wallet.skippedSignals++;
+      this.pushFeed(wallet, sig, 'skipped', sig.side === 'buy'
+        ? 'Leader RECEIVED tokens with no SOL paid (airdrop / wallet-to-wallet) — not a buy, ignored.'
+        : 'Leader MOVED tokens out with no SOL received (wallet-to-wallet / deposit) — not a sell, ignored. Use SELL if you want out.');
+      return;
+    }
+
+    // Every leader trade on a held mint is a fresh price — on the free
+    // PumpPortal tier it is the only real-time price the copy trader gets.
+    if (sig.priceSol && sig.priceSol > 0) {
+      const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+      if (held) {
+        held.lastPriceAt = Date.now();
+        this.repricePosition(held, sig.priceSol);
+      }
+    }
+
     if (sig.side === 'buy') {
       wallet.buysSeen++;
       await this.onLeaderBuy(wallet, sig);
@@ -769,6 +945,15 @@ export class CopyTraderService {
       wallet.skippedSignals++;
       this.pushFeed(wallet, sig, 'skipped', detail);
     };
+
+    if (!isCopyableMint(mint)) {
+      // Measured 2026-08-23: a tracked wallet that also market-makes produced
+      // 210 copied "buys" of USDC in two minutes.
+      return skip(`$${symbol} is a stablecoin / wrapped major, not a memecoin — not copied.`);
+    }
+    if (sig.via === 'helius' && !isExecutableVenue(sig.pool)) {
+      return skip(`Leader bought on a venue this bot cannot execute on (${sig.pool ?? 'no pump.fun / PumpSwap / Raydium / LaunchLab program in the tx'}) — not copied.`);
+    }
 
     if (this.config.minLeaderBuySol > 0 && !sig.isTokenSwap && sig.solAmount < this.config.minLeaderBuySol) {
       return skip(`Leader buy ${sig.solAmount.toFixed(4)} SOL is below the ${this.config.minLeaderBuySol} SOL minimum.`);
@@ -830,73 +1015,88 @@ export class CopyTraderService {
       return skip('Computed copy size is 0 SOL — nothing deployable in the wallet.');
     }
 
-    // The leader's realized price, straight from their fill; DexScreener as
-    // the fallback when the trade carried no usable price (token→token legs).
-    let leaderPriceSol = sig.tokenAmount > 0 && sig.solAmount > 0 ? sig.solAmount / sig.tokenAmount : 0;
+    // The leader's realized price straight from their fill — exact for
+    // pump.fun curve trades; DexScreener as the fallback when the trade
+    // carried no usable price (token→token legs).
+    let leaderPriceSol = sig.priceSol && sig.priceSol > 0
+      ? sig.priceSol
+      : (sig.tokenAmount > 0 && sig.solAmount > 0 ? sig.solAmount / sig.tokenAmount : 0);
     if (leaderPriceSol <= 0) {
       leaderPriceSol = await this.quotePriceSol(mint);
     }
 
-    if (this.config.tradingMode === 'real') {
-      const blockers = sniperEngine.getWalletStatus().blockers;
-      if (blockers.length) {
-        wallet.skippedSignals++;
-        this.pushFeed(wallet, sig, 'failed', `Wallet not tradable: ${blockers.join(' ')}`);
-        return;
+    // Execution is serialised per mint together with the exits. A leader who
+    // flips inside a few seconds has their SELL arrive while this buy is
+    // still landing; it must wait for the bag to exist — not find nothing and
+    // walk away, which left the bag orphaned with the leader already out.
+    await this.tradeQueue.run(mint, async () => {
+      // Re-resolve at execution time: a second leader buy that queued behind
+      // this one must fold into the position this one opens, not open a twin.
+      const existingNow = this.positions.find(p => p.mint === mint && p.status !== 'CLOSED');
+
+      if (this.config.tradingMode === 'real') {
+        const blockers = sniperEngine.getWalletStatus().blockers;
+        if (blockers.length) {
+          wallet.skippedSignals++;
+          this.pushFeed(wallet, sig, 'failed', `Wallet not tradable: ${blockers.join(' ')}`);
+          return;
+        }
+
+        const result = await sniperEngine.executeExternalTrade(
+          'buy', mint, copySol, undefined, sig.pool, this.config.maxSlippagePct
+        );
+        if (!result) {
+          this.pushFeed(wallet, sig, 'failed', `Real BUY of ${copySol} SOL failed — see engine log.`);
+          return;
+        }
+
+        // Balance deltas are facts; quotes are opinions. Use the fill when the
+        // inspector could read it, estimates otherwise.
+        const fill = result.fill;
+        const tokensBought = fill && fill.tokenDelta > 0
+          ? fill.tokenDelta
+          : (leaderPriceSol > 0 ? copySol / leaderPriceSol : 0);
+        const solSpent = fill ? Math.abs(Math.min(0, fill.solDelta)) : copySol;
+        const entryPriceSol = tokensBought > 0 ? solSpent / tokensBought : leaderPriceSol;
+
+        this.recordBuy(wallet, sig, existingNow, {
+          tokens: tokensBought,
+          solSpent,
+          priceSol: entryPriceSol,
+          txid: result.txid,
+          fillVerified: Boolean(fill),
+        });
+        this.pushFeed(wallet, sig, 'copied',
+          `REAL BUY ${copySol} SOL of $${symbol}${existingNow ? ' (added to position)' : ''}${clampNote} @ ${fmtPrice(entryPriceSol)} SOL/token`,
+          copySol, result.txid);
+      } else {
+        // Paper: fill at the leader's realized price plus a slippage haircut —
+        // we would have landed AFTER them, never at a better price.
+        if (leaderPriceSol <= 0) {
+          wallet.skippedSignals++;
+          this.pushFeed(wallet, sig, 'skipped', 'No usable price for this mint (leader fill and DexScreener both silent) — cannot simulate.');
+          return;
+        }
+        const paperPriceSol = leaderPriceSol * (1 + PAPER_SLIPPAGE_PCT / 100);
+        const tokensBought = copySol / paperPriceSol;
+        const txid = `sim_copy_${Date.now()}_${++this.idCounter}`;
+
+        this.recordBuy(wallet, sig, existingNow, {
+          tokens: tokensBought,
+          solSpent: copySol,
+          priceSol: paperPriceSol,
+          txid,
+          fillVerified: false,
+        });
+        this.pushFeed(wallet, sig, 'copied',
+          `PAPER BUY ${copySol} SOL of $${symbol}${existingNow ? ' (added to position)' : ''} @ ${fmtPrice(paperPriceSol)} SOL/token`,
+          copySol, txid);
       }
 
-      const result = await sniperEngine.executeExternalTrade(
-        'buy', mint, copySol, undefined, sig.pool, this.config.maxSlippagePct
-      );
-      if (!result) {
-        this.pushFeed(wallet, sig, 'failed', `Real BUY of ${copySol} SOL failed — see engine log.`);
-        return;
-      }
-
-      // Balance deltas are facts; quotes are opinions. Use the fill when the
-      // inspector could read it, estimates otherwise.
-      const fill = result.fill;
-      const tokensBought = fill && fill.tokenDelta > 0
-        ? fill.tokenDelta
-        : (leaderPriceSol > 0 ? copySol / leaderPriceSol : 0);
-      const solSpent = fill ? Math.abs(Math.min(0, fill.solDelta)) : copySol;
-      const entryPriceSol = tokensBought > 0 ? solSpent / tokensBought : leaderPriceSol;
-
-      this.recordBuy(wallet, sig, existing, {
-        tokens: tokensBought,
-        solSpent,
-        priceSol: entryPriceSol,
-        txid: result.txid,
-        fillVerified: Boolean(fill),
-      });
-      this.pushFeed(wallet, sig, 'copied',
-        `REAL BUY ${copySol} SOL of $${symbol}${existing ? ' (added to position)' : ''}${clampNote} @ ${fmtPrice(entryPriceSol)} SOL/token`,
-        copySol, result.txid);
-    } else {
-      // Paper: fill at the leader's realized price plus a slippage haircut —
-      // we would have landed AFTER them, never at a better price.
-      if (leaderPriceSol <= 0) {
-        return skip('No usable price for this mint (leader fill and DexScreener both silent) — cannot simulate.');
-      }
-      const paperPriceSol = leaderPriceSol * (1 + PAPER_SLIPPAGE_PCT / 100);
-      const tokensBought = copySol / paperPriceSol;
-      const txid = `sim_copy_${Date.now()}_${++this.idCounter}`;
-
-      this.recordBuy(wallet, sig, existing, {
-        tokens: tokensBought,
-        solSpent: copySol,
-        priceSol: paperPriceSol,
-        txid,
-        fillVerified: false,
-      });
-      this.pushFeed(wallet, sig, 'copied',
-        `PAPER BUY ${copySol} SOL of $${symbol}${existing ? ' (added to position)' : ''} @ ${fmtPrice(paperPriceSol)} SOL/token`,
-        copySol, txid);
-    }
-
-    this.subscribeMint(mint);
-    this.persist();
-    this.emitChange();
+      this.subscribeMint(mint);
+      this.persist();
+      this.emitChange();
+    });
   }
 
   /** Open a new copy position, or fold a repeat buy into the existing one. */
@@ -986,11 +1186,17 @@ export class CopyTraderService {
    * it is not a stop-loss, and nothing here reacts to the price falling.
    *
    * `copySells: false` returns the previous behaviour exactly.
+   *
+   * The exit is queued per MINT behind whatever is already running for it —
+   * another exit, or the BUY this sell belongs to. A leader who flips inside
+   * a few seconds used to have their sell arrive while our buy was still
+   * landing, find no position, and be dropped as "nothing held".
    */
   private async onLeaderSell(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
-    const pos = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+    const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+    const buyInFlight = !held && this.tradeQueue.isBusy(sig.mint);
 
-    if (!pos) {
+    if (!held && !buyInFlight) {
       // Visible but cheap: the leader disposed of something we never copied
       // (bought before tracking, airdrop, transfer-in).
       this.pushFeed(wallet, sig, 'skipped', 'No copy position in this mint — nothing held.');
@@ -1021,25 +1227,30 @@ export class CopyTraderService {
       return;
     }
 
-    // An exit already running for this position does not swallow this one:
-    // the queue applies it to whatever is left once the in-flight sell lands.
-    // (The old exitInFlight guard returned silently here — a leader selling in
-    // two chunks had the second chunk logged as mirrored and never sold.)
-    const queued = this.exitQueue.isBusy(pos.id);
+    const pct = (sellFraction * 100).toFixed(0);
+    const queued = this.tradeQueue.isBusy(sig.mint);
     this.pushFeed(wallet, sig, queued ? 'pending' : 'copied',
-      queued
-        ? `${describeLeader} — ${(sellFraction * 100).toFixed(0)}% exit QUEUED behind the sell already in flight.`
-        : `${describeLeader} — mirroring ${(sellFraction * 100).toFixed(0)}% exit.`);
+      !queued
+        ? `${describeLeader} — mirroring ${pct}% exit.`
+        : buyInFlight
+          ? `${describeLeader} — our BUY is still landing; ${pct}% exit QUEUED behind it.`
+          : `${describeLeader} — ${pct}% exit QUEUED behind the sell already in flight.`);
 
-    await this.closePosition(
-      pos,
-      sellFraction,
-      exitedFully && this.config.sellMode !== 'full'
-        ? `leader ${wallet.nickname} exited fully`
-        : `leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}%`,
-      sig,
-      wallet
-    );
+    const reason = exitedFully && this.config.sellMode !== 'full'
+      ? `leader ${wallet.nickname} exited fully`
+      : `leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}%`;
+
+    await this.tradeQueue.run(sig.mint, async () => {
+      // Resolve the position NOW — it may have been opened by the buy this
+      // sell waited for, or emptied by an exit ahead of it in the queue.
+      const pos = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+      if (!pos) {
+        this.pushFeed(wallet, sig, 'skipped', `${describeLeader} — our buy did not land, nothing to sell.`);
+        return;
+      }
+      // runExit, not closePosition: this already runs inside the mint's queue.
+      await this.runExit(pos, sellFraction, reason, sig, wallet);
+    });
   }
 
   /**
@@ -1059,7 +1270,7 @@ export class CopyTraderService {
     leaderSig?: LeaderSignal,
     wallet?: TrackedWalletInternal
   ): Promise<void> {
-    return this.exitQueue.run(pos.id, () => this.runExit(pos, fraction, reason, leaderSig, wallet));
+    return this.tradeQueue.run(pos.mint, () => this.runExit(pos, fraction, reason, leaderSig, wallet));
   }
 
   private async runExit(
@@ -1104,8 +1315,17 @@ export class CopyTraderService {
           solReceived = tokensSold * pos.currentPriceSol;
         }
       } else {
-        // Paper exit at the freshest price we hold, haircut for slippage.
-        const exitPriceSol = pos.currentPriceSol * (1 - PAPER_SLIPPAGE_PCT / 100);
+        // Paper exit at the LEADER's realized exit price when the signal
+        // carried one — it is the price that actually printed — else the
+        // freshest price we hold. Haircut for slippage either way. Filling at
+        // our own price (often stale, often still the entry on the free tier)
+        // booked ≈ −3% on every paper sell regardless of what the leader got.
+        const leaderExit = leaderSig?.priceSol;
+        if (leaderExit && leaderExit > 0) {
+          pos.currentPriceSol = leaderExit;
+          pos.lastPriceAt = Date.now();
+        }
+        const exitPriceSol = paperExitPrice(leaderExit, pos.currentPriceSol, PAPER_SLIPPAGE_PCT);
         solReceived = tokensSold * exitPriceSol;
         txid = `sim_copy_${Date.now()}_${++this.idCounter}`;
       }
@@ -1351,7 +1571,7 @@ export class CopyTraderService {
       side: sig.side,
       leaderSolAmount: round4(sig.solAmount),
       action,
-      detail,
+      detail: sig.fast ? `⚡ ${detail}` : detail,
       copySol,
       txid,
       via: sig.via,
