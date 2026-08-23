@@ -1,6 +1,6 @@
 {
   "name": "pumpfun-token-screening-pipeline",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "main": "dist/index.js",
   "bin": "dist/server.js",
@@ -26,7 +26,7 @@
     "assets": [
       "dist/**/*"
     ],
-    "//targets": "Windows stays on node18 (its prebuilt base exists and the shipped exe is built from it). macOS uses node22 because there is NO prebuilt node18-macos-arm64 base \u2014 pkg 404s and then tries to compile from source. Only the win target is listed here so a bare `pkg .` keeps building the Windows exe; the mac binaries come from build:mac / build:mac-intel, and arm64 must be produced ON macOS (see .github/workflows/release.yml).",
+    "//targets": "Windows stays on node18 (its prebuilt base exists and the shipped exe is built from it). macOS uses node22 because there is NO prebuilt node18-macos-arm64 base — pkg 404s and then tries to compile from source. Only the win target is listed here so a bare `pkg .` keeps building the Windows exe; the mac binaries come from build:mac / build:mac-intel, and arm64 must be produced ON macOS (see .github/workflows/release.yml).",
     "targets": [
       "node18-win-x64"
     ],
