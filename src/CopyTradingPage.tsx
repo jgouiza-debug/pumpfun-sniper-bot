@@ -648,7 +648,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                   <label className="form-label">Auto-Clear Feed (min, 0 = keep)</label>
                   <input
                     type="number" className="form-input"
-                    value={configForm.feedAutoClearMinutes ?? 30}
+                    value={configForm.feedAutoClearMinutes ?? 2}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, feedAutoClearMinutes: Number(e.target.value) })}
                   />
                   <div className="form-help" style={{ fontSize: '8px' }}>

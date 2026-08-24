@@ -19,7 +19,7 @@ import { WalletLogWatcher, type WalletLogEvent } from './walletLogWatcher';
 import { tradeEventsFromLogs, tradeEventPriceSol, PUMP_TOKEN_DECIMALS } from './pumpEventDecoder';
 import { bondingCurvePda } from './curveWatcher';
 import {
-  detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, isCopyableMint, isExecutableVenue,
+  detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, isCopyableMint, resolveBuyPool,
 } from './leaderTxClassifier';
 import {
   ExitQueue, leaderSellFraction, sellVenueCandidates, sellRetryDelayMs, copySellSlippagePct,
@@ -165,9 +165,10 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   maxHoldSeconds: 0,
   takeProfitPct: 0,
   // Feed lines older than this fall off on their own; 0 keeps them until the
-  // CLEAR button. Receipts (history) are never auto-cleared — they are the
-  // audit trail of real money.
-  feedAutoClearMinutes: 30,
+  // CLEAR button. Two minutes, per the owner (2026-08-23): at leader-bot
+  // signal rates a longer feed is noise. Receipts (history) are never
+  // auto-cleared — they are the audit trail of real money.
+  feedAutoClearMinutes: 2,
 };
 
 export class CopyTraderService {
@@ -951,8 +952,17 @@ export class CopyTraderService {
       // 210 copied "buys" of USDC in two minutes.
       return skip(`$${symbol} is a stablecoin / wrapped major, not a memecoin — not copied.`);
     }
-    if (sig.via === 'helius' && !isExecutableVenue(sig.pool)) {
-      return skip(`Leader bought on a venue this bot cannot execute on (${sig.pool ?? 'no pump.fun / PumpSwap / Raydium / LaunchLab program in the tx'}) — not copied.`);
+    // Venue routing for the order. A known executable venue routes directly.
+    // An unknown one is NOT a reason to refuse by itself — measured
+    // 2026-08-23: 9 of 10 Jupiter-routed swaps expose none of our venue
+    // programs (the legs run through Orca / Meteora / private pools), which
+    // made v1.0.4 skip essentially every aggregator-using leader and "never
+    // buy". A launchpad mint ('pump' / 'bonk' suffix) is executable via
+    // PumpPortal's 'auto' wherever the leader happened to trade it; only a
+    // token that is neither on a known venue nor a launchpad mint is skipped.
+    const buyPool = sig.via === 'helius' ? resolveBuyPool(sig.pool, mint) : sig.pool;
+    if (sig.via === 'helius' && buyPool === undefined) {
+      return skip('Leader bought on a venue this bot cannot execute on (not pump.fun / PumpSwap / Raydium / LaunchLab, and not a pump/bonk mint) — not copied.');
     }
 
     if (this.config.minLeaderBuySol > 0 && !sig.isTokenSwap && sig.solAmount < this.config.minLeaderBuySol) {
@@ -967,7 +977,7 @@ export class CopyTraderService {
     if (!existing) {
       const openCount = this.positions.filter(p => p.status !== 'CLOSED').length;
       if (openCount >= this.config.maxOpenPositions) {
-        return skip(`Max open copy positions reached (${openCount}/${this.config.maxOpenPositions}).`);
+        return skip(`Max open copy positions reached (${openCount}/${this.config.maxOpenPositions}) — SELL a position to free a slot, or raise the limit in Copy Settings.`);
       }
     }
 
@@ -1043,7 +1053,7 @@ export class CopyTraderService {
         }
 
         const result = await sniperEngine.executeExternalTrade(
-          'buy', mint, copySol, undefined, sig.pool, this.config.maxSlippagePct
+          'buy', mint, copySol, undefined, buyPool, this.config.maxSlippagePct
         );
         if (!result) {
           this.pushFeed(wallet, sig, 'failed', `Real BUY of ${copySol} SOL failed — see engine log.`);
@@ -1698,8 +1708,18 @@ export class CopyTraderService {
       }
 
       if (Array.isArray(raw.positions)) {
-        this.positions = raw.positions
-          .filter((p: any) => p && typeof p.mint === 'string' && p.status !== 'CLOSED')
+        // Junk from before the classifier existed (v1.0.3 and earlier copied
+        // stablecoin legs): PAPER positions in non-copyable mints are fiction,
+        // and they were found permanently occupying every slot — the book read
+        // 10/10 and no buy could ever open again. Real positions are real
+        // tokens and are always kept.
+        const restorable = raw.positions.filter((p: any) => p && typeof p.mint === 'string' && p.status !== 'CLOSED');
+        const junk = restorable.filter((p: any) => !isCopyableMint(p.mint) && (!p.buyTxid || String(p.buyTxid).startsWith('sim_')));
+        if (junk.length) {
+          console.warn(`[CopyTrader] Dropped ${junk.length} paper position(s) in stablecoins/majors left by the pre-classifier copier — they were blocking the book.`);
+        }
+        this.positions = restorable
+          .filter((p: any) => !junk.includes(p))
           .map((p: any) => ({
             ...p,
             realizedPnlUsd: Number(p.realizedPnlUsd) || 0,

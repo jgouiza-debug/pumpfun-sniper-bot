@@ -3720,9 +3720,36 @@ console.log('\n-- Copy trader: stablecoin swaps and foreign venues are not memec
     const pathx = require('path');
     const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
     assert.ok(/isCopyableMint\(mint\)/.test(svc));
-    assert.ok(/isExecutableVenue\(sig\.pool\)/.test(svc));
+    assert.ok(/resolveBuyPool\(sig\.pool, mint\)/.test(svc));
     const sellSection = svc.slice(svc.indexOf('private async onLeaderSell('), svc.indexOf('private closePosition('));
     assert.ok(!/isExecutableVenue|isCopyableMint/.test(sellSection), 'a leader exiting on any venue is still our exit signal');
+  });
+}
+
+console.log('\n-- Copy trader v1.0.4 regression: the venue gate refused nearly every aggregator route --');
+{
+  const { resolveBuyPool } = require('../services/leaderTxClassifier');
+
+  test('MEASURED: 9 of 10 Jupiter routes expose no venue program — a launchpad mint still buys via auto', () => {
+    assert.strictEqual(resolveBuyPool(undefined, '5nGAK71Qc8D24Jg6mde2Hy9TWWHGuwv1X3ZYvmbEpump'), 'auto');
+    assert.strictEqual(resolveBuyPool(undefined, '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtbonk'), 'auto');
+  });
+
+  test('a known venue routes directly; unknown venue + unknown mint is the only refusal', () => {
+    assert.strictEqual(resolveBuyPool('pump-amm', '5nGAK71Qc8D24Jg6mde2Hy9TWWHGuwv1X3ZYvmbEpump'), 'pump-amm');
+    assert.strictEqual(resolveBuyPool('raydium', 'AnyMintAtAll1111111111111111111111111111111'), 'raydium');
+    assert.strictEqual(resolveBuyPool('meteora', 'AnyMintAtAll1111111111111111111111111111111'), undefined, 'detected but not executable');
+    assert.strictEqual(resolveBuyPool(undefined, 'AnyMintAtAll1111111111111111111111111111111'), undefined);
+    assert.strictEqual(resolveBuyPool(undefined, 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'), undefined, 'USDC is not rescued by the suffix fallback');
+  });
+
+  test('paper junk in stablecoins is purged on load so the book cannot stay wedged at 10/10', () => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/junk = restorable\.filter/.test(svc));
+    assert.ok(/startsWith\('sim_'\)/.test(svc), 'only PAPER positions are dropped — real tokens are never silently discarded');
+    assert.ok(/feedAutoClearMinutes: 2,/.test(svc), 'the feed clears itself every 2 minutes by default (owner request 2026-08-23)');
   });
 }
 

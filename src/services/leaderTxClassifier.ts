@@ -121,3 +121,18 @@ export const EXECUTABLE_VENUES: ReadonlySet<string> = new Set([
 export function isExecutableVenue(pool: string | undefined): boolean {
   return pool !== undefined && EXECUTABLE_VENUES.has(pool);
 }
+
+/**
+ * The pool a copy BUY should be sent with, or undefined when it should not be
+ * copied at all. A known executable venue routes directly. An unknown venue is
+ * not a refusal by itself — measured 2026-08-23, 9 of 10 Jupiter-routed swaps
+ * expose none of our venue programs because their legs run through Orca,
+ * Meteora or private pools, and refusing those made the copier "never buy" —
+ * so a launchpad mint ('pump' / 'bonk' suffix) still buys via PumpPortal's
+ * 'auto' routing, wherever the leader happened to trade it.
+ */
+export function resolveBuyPool(venue: string | undefined, mint: string): string | undefined {
+  if (isExecutableVenue(venue)) return venue;
+  if (mint.endsWith('pump') || mint.endsWith('bonk')) return 'auto';
+  return undefined;
+}
