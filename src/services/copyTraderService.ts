@@ -81,11 +81,11 @@ const PAPER_SLIPPAGE_PCT = 1.5;
 const TOKEN_DELTA_EPSILON = 1e-9;
 
 /** Reprice a held position from DexScreener when its last tick is older than this. */
-const PRICE_STALE_MS = 4000;
+const PRICE_STALE_MS = 1500;
 
 const FEED_LIMIT = 120;
 const HISTORY_LIMIT = 200;
-const MONITOR_INTERVAL_MS = 1000;
+const MONITOR_INTERVAL_MS = 250;
 const PROCESSED_SIG_LIMIT = 3000;
 
 /**
@@ -473,6 +473,24 @@ export class CopyTraderService {
         commitment: 'processed',
         onLog: (ev) => {
           if (ev.err) return; // failed tx — nothing moved
+          // Real-time curve price extraction for any held position straight from log lines
+          const allEvents = tradeEventsFromLogs(ev.logs);
+          for (const te of allEvents) {
+            const held = this.positions.find(p => p.mint === te.mint && p.status !== 'CLOSED');
+            if (held) {
+              let pSol = 0;
+              if (te.virtualSolReserves > 0n && te.virtualTokenReserves > 0n) {
+                pSol = Number(te.virtualSolReserves) / Number(te.virtualTokenReserves);
+              } else {
+                pSol = tradeEventPriceSol(te);
+              }
+              if (pSol > 0) {
+                held.lastPriceAt = Date.now();
+                this.repricePosition(held, pSol);
+                this.emitChange();
+              }
+            }
+          }
           if (this.processedSigs.has(ev.signature) || this.analyzingSigs.has(ev.signature)) return;
           // Fast lane: a pump.fun trade is fully described by the event in
           // the log lines already in hand — no RPC, no wait for confirmation.

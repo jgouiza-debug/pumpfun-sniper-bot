@@ -351,8 +351,8 @@ app.get('/api/timelines', (req, res) => {
 // Bursts are coalesced to one frame per SSE_MIN_GAP_MS so a busy screening
 // stream cannot flood the socket, and a slow heartbeat still refreshes
 // time-derived fields (runtime clock, log ageing) when nothing is happening.
-const SSE_MIN_GAP_MS = 100;
-const SSE_HEARTBEAT_MS = 1000;
+const SSE_MIN_GAP_MS = 25;
+const SSE_HEARTBEAT_MS = 250;
 
 app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

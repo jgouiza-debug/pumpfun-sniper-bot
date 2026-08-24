@@ -87,7 +87,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
         } catch { /* offline on this port */ }
       };
       fetchStatus();
-      pollTimer = setInterval(fetchStatus, 1000);
+      pollTimer = setInterval(fetchStatus, 250);
     };
 
     let sseFailures = 0;
@@ -413,7 +413,10 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                       <td className="num-col">{pos.investedSol} SOL (${pos.investedUsd})</td>
                       <td className="num-col">{qty(pos.tokensHeld)}</td>
                       <td className={`num-col ${pos.pnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
-                        {pos.pnlUsd >= 0 ? '+' : ''}${pos.pnlUsd.toFixed(2)} ({pos.pnlPct >= 0 ? '+' : ''}{pos.pnlPct}%)
+                        <div>{pos.pnlUsd >= 0 ? '+' : ''}${pos.pnlUsd.toFixed(2)} ({pos.pnlPct >= 0 ? '+' : ''}{pos.pnlPct}%)</div>
+                        <div style={{ fontSize: '9px', opacity: 0.8, fontFamily: 'var(--font-mono)' }}>
+                          {pos.pnlSol >= 0 ? '+' : ''}{pos.pnlSol.toFixed(4)} SOL
+                        </div>
                       </td>
                       <td>
                         <div style={{ display: 'inline-flex', flexDirection: 'column', gap: '3px' }}>
