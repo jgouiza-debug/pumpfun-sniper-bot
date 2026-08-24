@@ -686,6 +686,16 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     </select>
                   </div>
                 )}
+                {configForm.copySells === true && (
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+                    <input
+                      type="checkbox"
+                      checked={configForm.mirrorLeaderTokenMoves !== false}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, mirrorLeaderTokenMoves: e.target.checked })}
+                    />
+                    Treat a leader MOVING a held token out (no SOL back) as their exit
+                  </label>
+                )}
                 <div className="form-help" style={{ fontSize: '8px' }}>
                   {configForm.copySells === true
                     ? 'Fires on the leader\'s exit only — never on price. A sell that fails is retried (up to 6 attempts, alternating venue); one arriving while another is in flight is queued, not dropped. No take-profit, no stop-loss. The SELL button always works.'

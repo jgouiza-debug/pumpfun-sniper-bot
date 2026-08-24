@@ -102,6 +102,14 @@ const TX_REFETCH_DELAY_MS = 20_000;
 const UNSIGNED_COPY_DEDUP_MS = 90_000;
 
 /**
+ * A token MOVE below this fraction of the leader's bag is a shuffle, not an
+ * exit — mirroring it would burn a whole sell's fees on dust (measured
+ * 2026-08-23: a 0.4% move at 21:39:50 eleven minutes before the real full
+ * exit). A full exit (remaining 0) always mirrors regardless.
+ */
+const TOKEN_MOVE_MIN_FRACTION = 0.02;
+
+/**
  * SOL held back per open copy position so its eventual sell can pay its
  * priority fee and base fees and still leave the fee payer rent-exempt. The
  * engine's 0.005 gas float is one buffer for the whole wallet; every
@@ -169,6 +177,12 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // leader sell. Set copySells false to hold through their exit instead.
   copySells: true,
   sellMode: 'mirror',
+  // ON: some leaders' exit infra (measured 2026-08-23 on the tracked wallet)
+  // never sells from the tracked wallet at all — the bag MOVES out as a plain
+  // token transfer, no SOL back, and is disposed of elsewhere. For a mint we
+  // hold, that outflow is the exit. Only fires with an open copy position and
+  // copySells on; buys arriving as transfers (airdrops) are still ignored.
+  mirrorLeaderTokenMoves: true,
   // OFF: a leader adding to a bag adds to ours (DCA mirror) instead of being
   // skipped. Turn on to copy only the first entry per mint.
   blockRepeatBuys: false,
@@ -1045,7 +1059,36 @@ export class CopyTraderService {
       // Tokens moved, SOL did not: an airdrop, a dust attack, or a bag moved
       // between the leader's own wallets. Classifying by token delta alone is
       // what made the copy trader buy airdrops and dump a position the leader
-      // had merely moved. Surfaced, so the operator can disagree by hand.
+      // had merely moved.
+      //
+      // EXCEPT an outflow of a mint WE HOLD. On-chain verified 2026-08-23:
+      // the tracked leader's exit infra never sold from the tracked wallet —
+      // the entire 15,496,462-token 8jXp bag left at 21:51:05 as a plain
+      // transfer (no SOL back, no venue program) and was disposed of from
+      // another wallet, while this branch filed it under "not a sell" and
+      // the copy position sat stranded. For a held mint, the leader's bag
+      // leaving IS the exit signal; where they route the proceeds is their
+      // bookkeeping. Buys stay ignored (airdrop protection), un-held mints
+      // stay ignored (nothing to exit), and the copySells toggle still rules
+      // inside onLeaderSell.
+      if (sig.side === 'sell' && this.config.mirrorLeaderTokenMoves) {
+        const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+        const buyInFlight = !held && this.tradeQueue.isBusy(sig.mint);
+        if (held || buyInFlight) {
+          const fraction = leaderSellFraction(sig.tokenAmount, sig.remainingTokens);
+          if (fraction < TOKEN_MOVE_MIN_FRACTION && fraction < 0.999) {
+            wallet.skippedSignals++;
+            this.pushFeed(wallet, sig, 'skipped',
+              `Leader moved ${(fraction * 100).toFixed(1)}% of their bag out (no SOL back) — dust-level shuffle, HOLDING.`);
+            return;
+          }
+          this.pushFeed(wallet, sig, 'pending',
+            `Leader MOVED ${(fraction * 100).toFixed(0)}% of their bag out with no SOL received — their exit runs through another wallet. Treating it as an EXIT.`);
+          wallet.sellsSeen++;
+          await this.onLeaderSell(wallet, sig);
+          return;
+        }
+      }
       wallet.skippedSignals++;
       this.pushFeed(wallet, sig, 'skipped', sig.side === 'buy'
         ? 'Leader RECEIVED tokens with no SOL paid (airdrop / wallet-to-wallet) — not a buy, ignored.'
@@ -2020,6 +2063,7 @@ function sanitizeConfig(partial: Partial<CopyTraderConfig>): Partial<CopyTraderC
   if (isFiniteNum(partial.minLeaderBuySol)) out.minLeaderBuySol = clamp(partial.minLeaderBuySol!, 0, 100);
   if (typeof partial.copySells === 'boolean') out.copySells = partial.copySells;
   if (partial.sellMode === 'mirror' || partial.sellMode === 'full') out.sellMode = partial.sellMode;
+  if (typeof partial.mirrorLeaderTokenMoves === 'boolean') out.mirrorLeaderTokenMoves = partial.mirrorLeaderTokenMoves;
   if (isFiniteNum(partial.maxOpenPositions)) out.maxOpenPositions = Math.round(clamp(partial.maxOpenPositions!, 1, 50));
   if (isFiniteNum(partial.maxSlippagePct)) out.maxSlippagePct = clamp(partial.maxSlippagePct!, 1, 100);
   if (typeof partial.blockRepeatBuys === 'boolean') out.blockRepeatBuys = partial.blockRepeatBuys;

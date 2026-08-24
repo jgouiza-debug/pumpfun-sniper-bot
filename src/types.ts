@@ -783,6 +783,15 @@ export interface CopyTraderConfig {
   minLeaderBuySol: number;
   copySells: boolean;
   sellMode: CopySellMode;
+  /**
+   * Mirror a leader who MOVES a held mint out of the tracked wallet with no
+   * SOL coming back (their exit runs through another wallet). On-chain
+   * verified 2026-08-23: the tracked leader's entire 8jXp bag left as a plain
+   * token transfer at 21:51:05 and the classifier ignored it as a
+   * wallet-to-wallet move while the copy position sat stranded. Applies only
+   * to mints with an open copy position, only when copySells is on.
+   */
+  mirrorLeaderTokenMoves: boolean;
   maxOpenPositions: number;
   maxSlippagePct: number;
   /**

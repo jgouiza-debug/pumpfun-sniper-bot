@@ -127,15 +127,58 @@ async function main(): Promise<void> {
   check('the HOLDING line reached the feed', svc.feed.some((f: any) => /HOLDING/.test(f.detail)));
   svc.config.copySells = true;
 
-  console.log('\n-- 5. A transfer-classified move is NOT treated as a sell --');
+  console.log('\n-- 5. Token MOVES: a held bag leaving the leader wallet is an exit --');
+  // 5a. Dust shuffle (0.5% of the bag) — held, not mirrored.
+  await svc.handleLeaderSignal(wallet, {
+    signature: 'drill_move_dust', mint: MINT2, side: 'sell', solAmount: 0,
+    tokenAmount: 500, remainingTokens: 99_500, pool: undefined, via: 'helius', kind: 'transfer',
+  });
+  check('a dust-level move (0.5%) is HELD', svc.positions.find((p: any) => p.mint === MINT2)?.status === 'OPEN');
+  check('the dust hold reached the feed', svc.feed.some((f: any) => /dust-level shuffle/.test(f.detail)));
+
+  // 5b. The full bag leaves with no SOL back (the 2026-08-23 cupsey exit shape).
   const sellsSeenBefore = wallet.sellsSeen;
   await svc.handleLeaderSignal(wallet, {
-    signature: 'drill_transfer_1', mint: MINT2, side: 'sell', solAmount: 0,
+    signature: 'drill_move_full', mint: MINT2, side: 'sell', solAmount: 0,
     tokenAmount: 100_000, remainingTokens: 0, pool: undefined, via: 'helius', kind: 'transfer',
   });
-  check('transfer did not count as a sell', wallet.sellsSeen === sellsSeenBefore,
-    `sellsSeen went ${sellsSeenBefore} → ${wallet.sellsSeen}`);
-  check('transfer position still OPEN', svc.positions.find((p: any) => p.mint === MINT2)?.status === 'OPEN');
+  const pos2b = svc.positions.find((p: any) => p.mint === MINT2);
+  check('a full token move MIRRORS as an exit — position CLOSED', pos2b?.status === 'CLOSED',
+    `status=${pos2b?.status}`);
+  check('the move counted as a sell', wallet.sellsSeen === sellsSeenBefore + 1,
+    `sellsSeen ${sellsSeenBefore} → ${wallet.sellsSeen}`);
+  check('the EXIT explanation reached the feed', svc.feed.some((f: any) => /Treating it as an EXIT/.test(f.detail)));
+
+  // 5c. A transfer-sell of a mint we do NOT hold stays ignored.
+  const skippedBefore = wallet.skippedSignals;
+  await svc.handleLeaderSignal(wallet, {
+    signature: 'drill_move_unheld', mint: 'DrillMint444444444444444444444444444444pump', side: 'sell', solAmount: 0,
+    tokenAmount: 100_000, remainingTokens: 0, pool: undefined, via: 'helius', kind: 'transfer',
+  });
+  check('un-held token move stays ignored', wallet.skippedSignals === skippedBefore + 1);
+
+  // 5d. Tokens ARRIVING with no SOL (airdrop) stay ignored — never a buy.
+  const buysBefore = wallet.buysSeen;
+  await svc.handleLeaderSignal(wallet, {
+    signature: 'drill_airdrop', mint: 'DrillMint555555555555555555555555555555pump', side: 'buy', solAmount: 0,
+    tokenAmount: 100_000, pool: undefined, via: 'helius', kind: 'transfer',
+  });
+  check('airdrop-shaped inflow is never copied as a buy', wallet.buysSeen === buysBefore);
+
+  // 5e. The toggle restores the old behavior exactly.
+  const MINT6 = 'DrillMint666666666666666666666666666666pump';
+  await svc.handleLeaderSignal(wallet, {
+    signature: 'drill_buy_6', mint: MINT6, side: 'buy', solAmount: 0.5,
+    tokenAmount: 100_000, priceSol: 0.000005, pool: 'pump', via: 'helius', kind: 'trade',
+  });
+  svc.config.mirrorLeaderTokenMoves = false;
+  await svc.handleLeaderSignal(wallet, {
+    signature: 'drill_move_toggled_off', mint: MINT6, side: 'sell', solAmount: 0,
+    tokenAmount: 100_000, remainingTokens: 0, pool: undefined, via: 'helius', kind: 'transfer',
+  });
+  check('with the toggle OFF a full move is ignored (old behavior)',
+    svc.positions.find((p: any) => p.mint === MINT6)?.status === 'OPEN');
+  svc.config.mirrorLeaderTokenMoves = true;
 
   console.log('\n-- 6. A REAL position is never paper-exited in paper mode --');
   const MINT3 = 'DrillMint333333333333333333333333333333pump';
