@@ -28,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, affordableSellPriorityFeeSol, FEE_PAYER_RESERVE_SOL, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -60,6 +60,13 @@ export interface TradeResult {
   txid: string;
   /** Null when the fill could not be read back — callers keep estimates. */
   fill: ActualFill | null;
+  /**
+   * External sells only: submitted but unconfirmed at the 30s window. The
+   * transaction can STILL land until its blockhash expires (~60-90s) — the
+   * caller must resolve the outcome (resolveTimedOutSell) before any
+   * resubmit, or a percentage sell executes twice.
+   */
+  timedOut?: boolean;
 }
 
 export interface PriceTick {
@@ -650,6 +657,64 @@ export class SniperEngine {
     await this.wallet.refreshBalance(true);
     await this.syncLiveWalletBalance();
     return this.getWalletStatus();
+  }
+
+  /**
+   * Balance-only forced re-read — none of refreshWallet's sol-price fetch, so
+   * it is safe on latency-sensitive paths (copy-buy sizing, sell fee clamp).
+   * Failure keeps the cached value; callers bound it with a race timeout.
+   */
+  public async refreshWalletBalance(): Promise<void> {
+    try { await this.wallet.refreshBalance(true); } catch { /* cached value remains */ }
+  }
+
+  /**
+   * Worst-case per-trade priority fee for SIZING. With dynamicPriorityFee on,
+   * execution can pay up to maxPriorityFeeSol — budgeting the static value
+   * lets each buy eat the difference out of the gas float (the engine's own
+   * sizing already budgets this way; external sizers must match).
+   */
+  public getSizingPriorityFeeSol(): number {
+    return this.sizingPriorityFee();
+  }
+
+  /**
+   * All-in SOL the sniper's own in-flight entries have claimed but not yet
+   * spent on-chain. The copy trader shares this wallet and must subtract it
+   * when sizing, or the two engines jointly overdraft what each saw as free.
+   */
+  public getInFlightEntryReservedSol(): number {
+    return this.entriesInFlight.size * this.reservedPerEntrySol();
+  }
+
+  /**
+   * Resolve a timed-out external sell before any resubmit. The transaction
+   * stays landable until its blockhash expires; polling the signature tells
+   * us which world we are in: landed (returns the result with its inspected
+   * fill — book it, do NOT resubmit), 'failed' (definitive on-chain
+   * rejection — a resubmit is safe now), or 'expired' (it can no longer land
+   * — a resubmit is safe).
+   */
+  public async resolveTimedOutSell(txid: string, mint: string, maxWaitMs = 75_000): Promise<TradeResult | 'failed' | 'expired'> {
+    const started = Date.now();
+    while (Date.now() - started < maxWaitMs) {
+      try {
+        const status = await this.solanaConnection.getSignatureStatus(txid);
+        const value = status?.value;
+        if (value) {
+          if (value.err) return 'failed';
+          if (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized') {
+            const owner = this.wallet.getAddress();
+            const fill = owner ? await inspectFill(this.solanaConnection, txid, owner, mint) : null;
+            this.log('warn', `⏱️ Timed-out sell ${txid.slice(0, 8)}... LANDED late — booking it, no resubmit.`, mint);
+            void this.syncLiveWalletBalance();
+            return { txid, fill };
+          }
+        }
+      } catch { /* transient RPC noise — keep polling */ }
+      await new Promise(res => setTimeout(res, 3000));
+    }
+    return 'expired';
   }
 
   public unlinkWallet(deleteFile = false): WalletStatus {
@@ -1411,6 +1476,34 @@ export class SniperEngine {
         } catch { /* static fee remains */ }
       }
 
+      // A sell's priority fee must fit the wallet that pays it. Fees that
+      // would leave the payer below the rent-exempt minimum make validators
+      // skip the transaction entirely — it never fails, it just never lands
+      // (measured 2026-08-23: six copy-exit retries, six timeouts, on a
+      // 0.00162 SOL wallet with a 0.001 SOL configured fee). Clamping the fee
+      // is what turns "position stuck forever" into "exit lands, wallet
+      // refills from the proceeds".
+      if (action === 'sell') {
+        // The cache is stale in exactly the moments this clamp exists for —
+        // right after a draining buy (post-trade sync is fire-and-forget and
+        // TTL-gated) or during an RPC 429 storm (failed reads keep the old
+        // value). One bounded forced read keeps the clamp honest without
+        // letting a hung socket pin the exit — but only when the cache is
+        // actually suspect: a fresh, comfortable balance skips the round trip
+        // so the sniper's own measured exit latency is untouched.
+        const cacheAgeMs = Date.now() - this.wallet.getStatus(this.config.solPriceUsd).lastCheckedAt;
+        const comfortable = this.wallet.getSolBalance() >= priorityFeeSol + FEE_PAYER_RESERVE_SOL * 3;
+        if (cacheAgeMs > 1500 || !comfortable) {
+          await Promise.race([this.refreshWalletBalance(), new Promise(res => setTimeout(res, 1200))]);
+        }
+        const balanceSol = this.wallet.getSolBalance();
+        const clamped = affordableSellPriorityFeeSol(balanceSol, priorityFeeSol);
+        if (clamped < priorityFeeSol) {
+          this.log('warn', `⛽ Wallet gas is low (${balanceSol} SOL): sell priority fee reduced ${priorityFeeSol} → ${clamped} SOL so the exit can still land. Top up ~0.01 SOL for reliable exits.`, mint);
+          priorityFeeSol = clamped;
+        }
+      }
+
       // Local build (flag localTxBuild): only with structural parity proven by
       // shadow compare in this session, and only for bonding-curve buys — the
       // builder refuses migrated tokens and every failure falls back here.
@@ -1531,7 +1624,11 @@ export class SniperEngine {
         if (confirmed === 'timeout') {
           if (action === 'sell') {
             this.log('warn', `⚠️ Sell ${txid.slice(0, 8)}... not confirmed in time. Holdings left untouched.`, mint);
-            return null;
+            // External callers (copy exits) retry on null — but a timed-out
+            // tx can still land until its blockhash expires, and a blind
+            // resubmit of a percentage sell executes twice. Hand them the
+            // signature so they resolve the outcome first.
+            return opts.external ? { txid, fill: null, timedOut: true } : null;
           }
           // A buy that can't be confirmed: report the txid so the caller can
           // still open the position (funds may have moved), but with no fill.

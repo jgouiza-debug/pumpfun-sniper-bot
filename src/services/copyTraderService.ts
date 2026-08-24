@@ -13,6 +13,7 @@ import {
 import { sniperEngine, type TradeResult } from './sniperEngine';
 import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError } from './rpcHealth';
 import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
+import { appendBotLog } from './fileLogger';
 import { DexScreenerService } from './dexscreenerService';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
 import { WalletLogWatcher, type WalletLogEvent } from './walletLogWatcher';
@@ -95,6 +96,20 @@ const PROCESSED_SIG_LIMIT = 3000;
  */
 const TX_FETCH_DEADLINE_MS = 8000;
 const TX_FETCH_INTERVAL_MS = 250;
+/** One paced re-read of a leader tx that outlived the polling budget — long enough for an RPC 429 storm to pass. */
+const TX_REFETCH_DELAY_MS = 20_000;
+/** How long a signature-less PumpPortal copy blocks the delayed Helius re-read of the same mint+side. */
+const UNSIGNED_COPY_DEDUP_MS = 90_000;
+
+/**
+ * SOL held back per open copy position so its eventual sell can pay its
+ * priority fee and base fees and still leave the fee payer rent-exempt. The
+ * engine's 0.005 gas float is one buffer for the whole wallet; every
+ * position needs its own exit funded on top. Measured 2026-08-23: two copy
+ * buys left 0.00162 SOL in the wallet and the exit could not land at the
+ * configured fee — the position was stuck until a top-up.
+ */
+const COPY_EXIT_GAS_RESERVE_SOL = 0.002;
 
 /** A leader trade normalized from either feed into one shape. */
 interface LeaderSignal {
@@ -215,6 +230,29 @@ export class CopyTraderService {
   private tradeQueue = new ExitQueue();
   /** Position ids whose operator pressed SELL while an automatic retry was backing off. */
   private manualExitRequested = new Set<string>();
+
+  /**
+   * SOL claimed by real copy buys currently in flight, by mint. The queue only
+   * serializes per MINT — buys of two different mints size concurrently, and
+   * without this ledger both would size against the same balance snapshot and
+   * jointly overdraft the wallet (the cross-mint variant of the 2026-08-23
+   * drain). Same-mint repeats are already serialized by the queue itself.
+   */
+  private inFlightBuySol = new Map<string, number>();
+
+  /** Signatures with a scheduled 20s re-read — a redelivered 'processed' log must not start a second fetch loop. */
+  private pendingRetrySigs = new Set<string>();
+
+  /** Last observed watcher connectivity, to detect reconnects (which invalidate the fast-lane tallies). */
+  private watcherWasConnected = false;
+
+  /**
+   * `mint:side` → time of a copy executed from a SIGNATURE-LESS PumpPortal
+   * payload. Cross-lane dedup is by signature; when PumpPortal omits it, this
+   * is the fallback that stops the delayed Helius re-read of the same trade
+   * from copying it twice.
+   */
+  private unsignedCopies = new Map<string, number>();
 
   private monitorInterval: NodeJS.Timeout | null = null;
   private dexPollInFlight = false;
@@ -475,6 +513,7 @@ export class CopyTraderService {
           if (ev.err) return; // failed tx — nothing moved
           // Real-time curve price extraction for any held position straight from log lines
           const allEvents = tradeEventsFromLogs(ev.logs);
+          let repriced = false;
           for (const te of allEvents) {
             const held = this.positions.find(p => p.mint === te.mint && p.status !== 'CLOSED');
             if (held) {
@@ -487,10 +526,13 @@ export class CopyTraderService {
               if (pSol > 0) {
                 held.lastPriceAt = Date.now();
                 this.repricePosition(held, pSol);
-                this.emitChange();
+                repriced = true;
               }
             }
           }
+          // One push per notification, not one per decoded event — each emit
+          // serializes the whole status for every SSE client.
+          if (repriced) this.emitChange();
           if (this.processedSigs.has(ev.signature) || this.analyzingSigs.has(ev.signature)) return;
           // Fast lane: a pump.fun trade is fully described by the event in
           // the log lines already in hand — no RPC, no wait for confirmation.
@@ -499,7 +541,17 @@ export class CopyTraderService {
           void this.handleWalletLog(ev.address, ev.signature);
         },
         log: (level, msg) => (level === 'warn' ? console.warn : console.log)(`[CopyTrader] ${msg}`),
-        onStatusChange: () => this.emitChange(),
+        onStatusChange: () => {
+          // A reconnect means a gap: leader buys during the outage were never
+          // seen (logsSubscribe has no backfill), so every fast-lane tally
+          // may be stale-LOW and a partial sell sized from one would
+          // oversell. Clear them; the analysis path re-sizes from the
+          // chain's real balances until reconciliation repopulates.
+          const connected = this.logWatcher?.isConnected() ?? false;
+          if (connected && !this.watcherWasConnected) this.leaderBalances.clear();
+          this.watcherWasConnected = connected;
+          this.emitChange();
+        },
       });
     }
     this.logWatcher.setAddresses(addresses);
@@ -513,18 +565,51 @@ export class CopyTraderService {
     this.emitChange();
   }
 
-  private async handleWalletLog(leaderAddress: string, signature: string): Promise<void> {
+  private async handleWalletLog(leaderAddress: string, signature: string, isRetry = false): Promise<void> {
     const wallet = this.wallets.get(leaderAddress);
     if (!wallet || !wallet.enabled || !this.config.enabled || !this.heliusConn) return;
+    // The retry path re-enters here after a delay — the other lane may have
+    // claimed the signature in the meantime. And while a retry is pending,
+    // a redelivered copy of the same 'processed' log (fork, reconnect replay)
+    // must not burn a second 8s fetch loop against an already-limited RPC.
+    if (this.processedSigs.has(signature) || (isRetry && this.analyzingSigs.has(signature))) return;
+    if (!isRetry && this.pendingRetrySigs.has(signature)) return;
 
     // A 'processed' log can be delivered more than once (two forks, or a
     // reconnect replaying the slot); one fetch per signature at a time.
     this.analyzingSigs.add(signature);
-    let signals: LeaderSignal[];
+    let signals: LeaderSignal[] | 'fetch_failed';
     try {
       signals = await this.analyzeLeaderTx(leaderAddress, signature);
     } finally {
       this.analyzingSigs.delete(signature);
+    }
+    if (signals === 'fetch_failed') {
+      // An unreadable transaction is possibly a leader SELL about to be
+      // missed. This used to be a console-only drop — the one failure mode
+      // with zero trace in the UI. One paced retry, then a loud report.
+      const sigNote: LeaderSignal = { mint: '', symbol: `tx ${signature.slice(0, 8)}…`, side: 'sell', solAmount: 0, tokenAmount: 0, via: 'helius' };
+      if (!isRetry) {
+        this.pushFeed(wallet, sigNote, 'pending',
+          `Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s (RPC congested) — retrying once in ${TX_REFETCH_DELAY_MS / 1000}s.`);
+        this.pendingRetrySigs.add(signature);
+        setTimeout(() => {
+          this.pendingRetrySigs.delete(signature);
+          void this.handleWalletLog(leaderAddress, signature, true);
+        }, TX_REFETCH_DELAY_MS);
+      } else {
+        this.pushFeed(wallet, sigNote, 'failed',
+          `Could not read leader tx ${signature.slice(0, 8)}… after a retry — SIGNAL DROPPED. If the leader sold, mirror it manually with the SELL button.`);
+        // The dropped tx may have been a BUY: the fast-lane tally for this
+        // leader is now stale-LOW, and a partial sell sized from it would
+        // OVERSELL (50 of a stale 100 reads as 50%, not the true 5%). Drop
+        // the tally so sells route through the analysis path's real balances
+        // until reconciliation repopulates it.
+        for (const key of [...this.leaderBalances.keys()]) {
+          if (key.startsWith(`${leaderAddress}:`)) this.leaderBalances.delete(key);
+        }
+      }
+      return;
     }
     if (!signals.length) return;
 
@@ -534,6 +619,21 @@ export class CopyTraderService {
     this.markSigProcessed(signature);
 
     for (const sig of signals) {
+      // A trade recovered by the 20s re-read may have been copied already by
+      // a PumpPortal payload that carried no signature — the one case the
+      // signature dedup cannot see. Mirroring it twice sells (or buys) twice.
+      if (isRetry) {
+        const key = `${sig.mint}:${sig.side}`;
+        const unsignedAt = this.unsignedCopies.get(key);
+        if (unsignedAt && Date.now() - unsignedAt < UNSIGNED_COPY_DEDUP_MS) {
+          // One marker dedups exactly one recovered trade — a lingering
+          // marker would swallow the leader's REAL next trade in this mint.
+          this.unsignedCopies.delete(key);
+          this.pushFeed(wallet, sig, 'skipped',
+            'Recovered leader tx matches a trade already copied from the PumpPortal lane — not copied twice.');
+          continue;
+        }
+      }
       await this.handleLeaderSignal(wallet, sig);
     }
   }
@@ -649,7 +749,7 @@ export class CopyTraderService {
         await sleep(isRateLimitError(err) ? TX_FETCH_INTERVAL_MS * 4 : TX_FETCH_INTERVAL_MS);
       }
     }
-    console.warn(`[CopyTrader] Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s — signal dropped.`);
+    console.warn(`[CopyTrader] Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s.`);
     return null;
   }
 
@@ -661,9 +761,12 @@ export class CopyTraderService {
    * Tokens that move with no SOL against them are a TRANSFER (airdrop, dust,
    * wallet-to-wallet) — surfaced in the feed, never copied.
    */
-  private async analyzeLeaderTx(leaderAddress: string, signature: string): Promise<LeaderSignal[]> {
+  private async analyzeLeaderTx(leaderAddress: string, signature: string): Promise<LeaderSignal[] | 'fetch_failed'> {
     const parsed = await this.fetchParsedTx(signature);
-    if (!parsed || !parsed.meta || parsed.meta.err) return [];
+    // Unreadable and failed-on-chain are different verdicts: the first may be
+    // a trade we cannot see yet (the caller retries), the second moved nothing.
+    if (!parsed) return 'fetch_failed';
+    if (!parsed.meta || parsed.meta.err) return [];
 
     const meta = parsed.meta;
     const keys = parsed.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
@@ -901,6 +1004,19 @@ export class CopyTraderService {
     if (signature) {
       if (this.processedSigs.has(signature)) return; // Helius lane won the race
       this.markSigProcessed(signature);
+    } else {
+      // No signature — this trade CANNOT be deduped against the Helius lane,
+      // which delivers the same transaction with its signature moments later.
+      // Executing from both lanes copies the trade twice (a 50% mirror twice
+      // is 75% out). While the on-chain watcher is healthy it will drive the
+      // execution; this payload has already served as the price tick above.
+      // Only a dead Helius lane makes an unsigned payload the sole source.
+      if (this.logWatcher?.isHealthy() ?? false) return;
+      this.unsignedCopies.set(`${payload.mint}:${payload.txType}`, Date.now());
+      if (this.unsignedCopies.size > 50) {
+        const cutoff = Date.now() - UNSIGNED_COPY_DEDUP_MS;
+        for (const [k, t] of this.unsignedCopies) if (t < cutoff) this.unsignedCopies.delete(k);
+      }
     }
 
     await this.handleLeaderSignal(wallet!, {
@@ -954,6 +1070,15 @@ export class CopyTraderService {
       wallet.sellsSeen++;
       await this.onLeaderSell(wallet, sig);
     }
+  }
+
+  /** SOL claimed by in-flight real copy buys of OTHER mints (same-mint work is queue-serialized). */
+  private inFlightBuyReservedSol(excludeMint: string): number {
+    let sum = 0;
+    for (const [m, sol] of this.inFlightBuySol) {
+      if (m !== excludeMint) sum += sol;
+    }
+    return sum;
   }
 
   private async onLeaderBuy(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
@@ -1013,7 +1138,8 @@ export class CopyTraderService {
       }
     }
 
-    // Sizing.
+    // Sizing — the REQUESTED size only. Real mode clamps to the wallet at
+    // execution time, INSIDE the queue, against a freshly read balance.
     let copySol: number;
     if (this.config.buySizeMode === 'fixed') {
       copySol = this.config.fixedBuySol;
@@ -1024,23 +1150,8 @@ export class CopyTraderService {
       copySol = sig.solAmount * (this.config.proportionalPct / 100);
     }
     copySol = round4(Math.min(copySol, this.config.maxBuySol));
-
-    // Real mode: never refuse for size and never fail on-chain for size.
-    // Whatever the Photon wallet can actually fund caps the order, so even a
-    // near-empty wallet still copies the trade — just smaller.
-    let clampNote = '';
-    if (this.config.tradingMode === 'real') {
-      const deployableSol = sniperEngine.getWalletStatus().deployableSol;
-      const affordable = round4(affordableStakeSol(
-        copySol, deployableSol, this.config.maxSlippagePct, sniperEngine.getConfig().priorityFeeSol
-      ));
-      if (affordable < copySol && affordable > 0) {
-        clampNote = ` (clamped from ${copySol} SOL — all the wallet can fund)`;
-      }
-      copySol = affordable;
-    }
     if (copySol <= 0) {
-      return skip('Computed copy size is 0 SOL — nothing deployable in the wallet.');
+      return skip('Computed copy size is 0 SOL — check buy sizing in Copy Settings.');
     }
 
     // The leader's realized price straight from their fill — exact for
@@ -1049,18 +1160,38 @@ export class CopyTraderService {
     let leaderPriceSol = sig.priceSol && sig.priceSol > 0
       ? sig.priceSol
       : (sig.tokenAmount > 0 && sig.solAmount > 0 ? sig.solAmount / sig.tokenAmount : 0);
-    if (leaderPriceSol <= 0) {
-      leaderPriceSol = await this.quotePriceSol(mint);
-    }
 
     // Execution is serialised per mint together with the exits. A leader who
     // flips inside a few seconds has their SELL arrive while this buy is
     // still landing; it must wait for the bag to exist — not find nothing and
     // walk away, which left the bag orphaned with the leader already out.
     await this.tradeQueue.run(mint, async () => {
+      // The DexScreener price fallback runs INSIDE the queue: the claim
+      // happens synchronously at run(), so a leader flip-sell arriving during
+      // this HTTP hop queues behind the buy instead of finding no position
+      // and walking away — the exact drop the queue exists to prevent.
+      if (leaderPriceSol <= 0) {
+        leaderPriceSol = await this.quotePriceSol(mint);
+      }
+
       // Re-resolve at execution time: a second leader buy that queued behind
       // this one must fold into the position this one opens, not open a twin.
       const existingNow = this.positions.find(p => p.mint === mint && p.status !== 'CLOSED');
+
+      // Re-check the book cap HERE too: the arrival-time check cannot see
+      // buys of other mints that are still landing (positions are recorded
+      // only after confirmation), so N concurrent signals could all pass it.
+      if (!existingNow) {
+        const openNow = this.positions.filter(p => p.status !== 'CLOSED').length;
+        const landingNew = [...this.inFlightBuySol.keys()]
+          .filter(m => m !== mint && !this.positions.some(p => p.mint === m && p.status !== 'CLOSED')).length;
+        if (openNow + landingNew >= this.config.maxOpenPositions) {
+          wallet.skippedSignals++;
+          this.pushFeed(wallet, sig, 'skipped',
+            `Max open copy positions reached at execution time (${openNow} open + ${landingNew} landing) — not opened.`);
+          return;
+        }
+      }
 
       if (this.config.tradingMode === 'real') {
         const blockers = sniperEngine.getWalletStatus().blockers;
@@ -1070,9 +1201,64 @@ export class CopyTraderService {
           return;
         }
 
-        const result = await sniperEngine.executeExternalTrade(
-          'buy', mint, copySol, undefined, buyPool, this.config.maxSlippagePct
-        );
+        // Affordability is decided HERE, inside the queue, against a balance
+        // read AFTER whatever traded ahead of us settled. Sizing before the
+        // queue used the 8s-cached balance: two leader buys 4s apart were
+        // both sized from the same snapshot, the second overdrafted the gas
+        // float, and the wallet was left too poor to pay for its own exit
+        // (measured 2026-08-23 — the "bot did not sell" session).
+        //
+        // Exit gas is reserved per position that will need one: what a buy
+        // leaves behind must still fund every open position's sell. This
+        // TRIMS the order (never refuses a fundable one — owner posture);
+        // only a literal zero after the reserve is skipped, and it says why.
+        let clampNote = '';
+        // Balance-only forced read, bounded so a hung RPC socket cannot pin
+        // this mint's queue while a leader flip-sell waits behind the buy.
+        await Promise.race([sniperEngine.refreshWalletBalance(), sleep(1500)]);
+        const openAfterThisBuy = this.positions.filter(p => p.status !== 'CLOSED').length + (existingNow ? 0 : 1);
+        const reservedForExits = round4(COPY_EXIT_GAS_RESERVE_SOL * openAfterThisBuy);
+        // SOL claimed by concurrent buys of OTHER mints (they run in their
+        // own queues against the same snapshot) — without this, two leaders
+        // or one leader buying two tokens re-creates the drain cross-mint.
+        const reservedInFlight = this.inFlightBuyReservedSol(mint);
+        // The sniper signs with this same wallet — its in-flight entries have
+        // claimed SOL the raw balance still shows as free.
+        const reservedBySniper = sniperEngine.getInFlightEntryReservedSol();
+        // Worst-case fee: with dynamicPriorityFee on, execution can pay up
+        // to maxPriorityFeeSol — budgeting the static value eats the float.
+        const sizingFeeSol = sniperEngine.getSizingPriorityFeeSol();
+        const deployableSol = Math.max(0,
+          sniperEngine.getWalletStatus().deployableSol - reservedForExits - reservedInFlight - reservedBySniper);
+        const affordable = round4(affordableStakeSol(
+          copySol, deployableSol, this.config.maxSlippagePct, sizingFeeSol
+        ));
+        if (affordable <= 0) {
+          wallet.skippedSignals++;
+          this.pushFeed(wallet, sig, 'skipped',
+            `Copy size is 0 SOL after reserving exit gas (${reservedForExits} SOL for ${openAfterThisBuy} position${openAfterThisBuy === 1 ? '' : 's'}) — top up the wallet to keep copying.`);
+          return;
+        }
+        if (affordable < copySol) {
+          clampNote = ` (clamped from ${copySol} SOL — all the wallet can fund after the exit-gas reserve)`;
+        }
+        copySol = affordable;
+
+        // Claim the full worst-case outflow (stake + slippage reserve +
+        // protocol fees + priority fee + rent) for the duration of the order —
+        // plus the exit gas the NEW position will need, so a concurrent buy of
+        // another mint reserves for this position before it is recorded.
+        this.inFlightBuySol.set(mint,
+          copySol * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingFeeSol + 0.0025
+          + (existingNow ? 0 : COPY_EXIT_GAS_RESERVE_SOL));
+        let result: TradeResult | null;
+        try {
+          result = await sniperEngine.executeExternalTrade(
+            'buy', mint, copySol, undefined, buyPool, this.config.maxSlippagePct
+          );
+        } finally {
+          this.inFlightBuySol.delete(mint);
+        }
         if (!result) {
           this.pushFeed(wallet, sig, 'failed', `Real BUY of ${copySol} SOL failed — see engine log.`);
           return;
@@ -1320,6 +1506,19 @@ export class CopyTraderService {
       return;
     }
 
+    // Execution follows the POSITION's provenance, not the current mode. A
+    // real position exited while the mode is paper must be refused — booking
+    // a simulated fill would mark it CLOSED while the real tokens sit in the
+    // wallet with nothing watching them (the stranded-bag failure again).
+    const realPosition = !(pos.buyTxid ?? '').startsWith('sim_');
+    if (realPosition && this.config.tradingMode !== 'real') {
+      if (wallet) {
+        this.pushFeed(wallet, feedSig, 'failed',
+          `$${pos.tokenSymbol} is a REAL position but trading mode is PAPER — switch back to REAL mode to exit it. Position kept, tokens untouched.`);
+      }
+      return;
+    }
+
     pos.exitInFlight = true;
     try {
       fraction = Math.max(0, Math.min(1, fraction));
@@ -1330,7 +1529,11 @@ export class CopyTraderService {
       let txid: string | undefined;
       let fillVerified = false;
 
-      if (this.config.tradingMode === 'real' && pos.buyTxid && !pos.buyTxid.startsWith('sim_')) {
+      // Real positions sell for real; PAPER-bought bags (sim_ txid) simulate.
+      // Requiring a buyTxid to exist here booked a phantom "paper" sell for a
+      // real position whose txid was missing — history showed an exit that
+      // never happened while the tokens stayed in the wallet.
+      if (realPosition) {
         const result = await this.executeRealSell(pos, fraction, feedSig, wallet);
         if (!result) return; // the feed already carries the failure
         txid = result.txid;
@@ -1397,8 +1600,10 @@ export class CopyTraderService {
       });
 
       if (wallet) {
+        // Label from what EXECUTED, not from the mode: a paper-bought bag
+        // exited while the mode is real still simulated its fill.
         this.pushFeed(wallet, feedSig, 'copied',
-          `${this.config.tradingMode === 'real' ? 'REAL' : 'PAPER'} SELL ${(fraction * 100).toFixed(0)}% of $${pos.tokenSymbol} — ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${reason})`,
+          `${(txid ?? '').startsWith('sim_') ? 'PAPER' : 'REAL'} SELL ${(fraction * 100).toFixed(0)}% of $${pos.tokenSymbol} — ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${reason})`,
           round4(solReceived), txid);
       }
 
@@ -1462,12 +1667,29 @@ export class CopyTraderService {
         if (this.config.tradingMode !== 'real') return null;
       }
       const result = await sniperEngine.executeExternalTrade('sell', pos.mint, 0, pctParam, pool, slippage);
-      if (result) return result;
+      if (result && result.timedOut) {
+        // The submitted tx can still land until its blockhash expires. A
+        // blind resubmit of a percentage sell that then lands TWICE sells
+        // more than the mirror intended and corrupts the books — resolve the
+        // outcome first, retry only when it definitively failed or expired.
+        if (wallet) {
+          this.pushFeed(wallet, feedSig, 'pending',
+            `SELL ${pct}% of $${pos.tokenSymbol} submitted but unconfirmed — watching the transaction before any retry (a blind resubmit can sell twice).`);
+        }
+        const outcome = await sniperEngine.resolveTimedOutSell(result.txid, pos.mint);
+        if (outcome !== 'failed' && outcome !== 'expired') return outcome; // landed late — book it
+      } else if (result) {
+        return result;
+      }
     }
 
     if (wallet) {
+      const ws = sniperEngine.getWalletStatus();
+      const gasHint = ws.solBalance > 0 && ws.solBalance <= 0.005
+        ? ` Wallet gas is critically low (${ws.solBalance} SOL): sell fees are auto-reduced to fit, but top up ~0.01 SOL to make exits reliable.`
+        : '';
       this.pushFeed(wallet, feedSig, 'failed',
-        `Real SELL ${pct}% of $${pos.tokenSymbol} failed ${COPY_SELL_MAX_ATTEMPTS}x (venues tried: ${venues.join(', ')}) — position kept. The SELL button retries; the engine log has the on-chain errors.`);
+        `Real SELL ${pct}% of $${pos.tokenSymbol} failed ${COPY_SELL_MAX_ATTEMPTS}x (venues tried: ${venues.join(', ')}) — position kept. The SELL button retries; the engine log has the on-chain errors.${gasHint}`);
     }
     return null;
   }
@@ -1605,6 +1827,10 @@ export class CopyTraderService {
       via: sig.via,
     });
     if (this.feed.length > FEED_LIMIT) this.feed.length = FEED_LIMIT;
+    // The feed is memory-only and auto-clears; the durable copy is what makes
+    // a dead session diagnosable (2026-08-23: a stranded position left no
+    // trace on disk at all).
+    appendBotLog(`[copy-feed] ${action.toUpperCase()} ${sig.side} ${this.symbolFor(sig)} — ${detail}`);
     this.emitChange();
   }
 

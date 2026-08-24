@@ -15,6 +15,8 @@ import {
   realizedPnlInWindowUsd,
   computeEntrySizeSol,
   affordableStakeSol,
+  affordableSellPriorityFeeSol,
+  FEE_PAYER_RESERVE_SOL,
   maxAffordableBuySol,
 } from '../services/pipelineUtils';
 import { EntryGateV2 } from '../services/entryGateV2';
@@ -630,6 +632,30 @@ console.log('\n-- Fixed trade sizing (all-in removed 2026-08-09) --');
     assert.ok(be015 < 6, `expected <6%, got ${be015}%`);
     assert.ok(be0135 <= 6.1, `expected <=6.1%, got ${be0135}%`);
     assert.ok(be005 > 10, `expected >10%, got ${be005}%`);
+  });
+
+  test('a healthy wallet pays the configured sell priority fee unchanged', () => {
+    assert.strictEqual(affordableSellPriorityFeeSol(0.05, 0.001), 0.001);
+    assert.strictEqual(affordableSellPriorityFeeSol(0.002 + FEE_PAYER_RESERVE_SOL, 0.001), 0.001);
+  });
+
+  test('REGRESSION 2026-08-23: a drained wallet clamps the sell fee so the exit can land', () => {
+    // Measured: 0.00162 SOL wallet, 0.001 SOL configured fee — six sell
+    // attempts, six confirmation timeouts, because fees would leave the payer
+    // below the rent-exempt minimum and no validator includes such a tx.
+    const fee = affordableSellPriorityFeeSol(0.00162, 0.001);
+    assert.ok(fee < 0.001, `fee ${fee} was not reduced`);
+    assert.ok(fee > 0, 'a positive fee must remain');
+    assert.ok(0.00162 - fee >= FEE_PAYER_RESERVE_SOL - 1e-9,
+      `balance after fee ${0.00162 - fee} dips below the fee-payer reserve`);
+  });
+
+  test('the sell fee clamp floors instead of refusing, and never raises the fee', () => {
+    // Even a wallet below the reserve still attempts the exit at the floor —
+    // size economics warn, never refuse (owner decision 2026-08-12).
+    assert.strictEqual(affordableSellPriorityFeeSol(0.0005, 0.001), 0.00005);
+    assert.strictEqual(affordableSellPriorityFeeSol(0, 0.001), 0.001, 'an unknown/zero balance keeps the configured fee');
+    assert.strictEqual(affordableSellPriorityFeeSol(10, 0.0002), 0.0002, 'the clamp must never raise a fee');
   });
 
   test('the allInSizing flag exists and is enabled', () => {

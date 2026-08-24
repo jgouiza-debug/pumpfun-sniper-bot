@@ -185,6 +185,34 @@ export function affordableStakeSol(
 }
 
 /**
+ * What the fee payer must keep AFTER a sell's fees: the ~0.00089 SOL
+ * rent-exempt minimum for a system account, base signature fees, and a pad.
+ * A transaction whose fees would leave the payer below rent exemption is not
+ * rejected loudly — validators simply never include it, and the submitter
+ * sees an endless confirmation timeout.
+ */
+export const FEE_PAYER_RESERVE_SOL = 0.001;
+
+/**
+ * Largest sell priority fee this wallet can actually pay and still land.
+ *
+ * Measured 2026-08-23: a wallet drained to 0.00162 SOL retried a 100% exit six
+ * times at the configured 0.001 SOL priority fee, and every attempt timed out
+ * — 0.00162 − 0.001005 in fees leaves 0.000615, below the rent-exempt
+ * minimum, so no validator would include the transaction. The position was
+ * stuck purely because the fee was too big for the wallet, and a smaller fee
+ * would have landed. Never returns more than the configured fee; floors at
+ * 0.00005 so a desperate exit is still attempted rather than refused (size
+ * economics warn, never refuse — owner decision 2026-08-12).
+ */
+export function affordableSellPriorityFeeSol(balanceSol: number, configuredFeeSol: number): number {
+  if (!isFinite(balanceSol) || balanceSol <= 0) return configuredFeeSol;
+  const affordable = balanceSol - FEE_PAYER_RESERVE_SOL;
+  if (affordable >= configuredFeeSol) return configuredFeeSol;
+  return Math.max(0.00005, Math.floor(affordable * 1e6) / 1e6);
+}
+
+/**
  * Splits a run's deployable balance into N equal, independently survivable
  * slots — the owner's risk model: "if a trade goes to 0 it's fine", because a
  * dead slot costs 1/N of the run, never the wallet.

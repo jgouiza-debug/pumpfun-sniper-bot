@@ -1,6 +1,6 @@
 {
   "name": "pumpfun-token-screening-pipeline",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "main": "dist/index.js",
   "bin": "dist/server.js",
@@ -17,7 +17,8 @@
     "replay": "ts-node src/replay.ts",
     "test:filters": "ts-node src/tests/filterProofs.ts",
     "test:guardrails": "ts-node src/tests/guardrailProofs.ts",
-    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts"
+    "test:copy": "ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts",
+    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts"
   },
   "pkg": {
     "scripts": "dist/**/*.js",

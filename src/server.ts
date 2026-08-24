@@ -2,6 +2,10 @@
 // exe, and every service imported below reads its credentials at construction
 // time — the SniperEngine singleton included. See services/loadEnv.ts.
 import './services/loadEnv';
+// SECOND, before any service constructs: tee console.log/warn/error into
+// bot.log beside the exe. The 2026-08-23 stranded-position session was almost
+// undiagnosable because every log lived only in memory.
+import './services/installFileLog';
 import express from 'express';
 import http from 'http';
 import fs from 'fs';

@@ -385,7 +385,14 @@ export class WalletService {
       return this.solBalance;
     }
 
-    if (this.inflightBalance) return this.inflightBalance;
+    if (this.inflightBalance) {
+      if (!force) return this.inflightBalance;
+      // A FORCED read must observe the chain no earlier than now. The read in
+      // flight may have started before the state change the caller needs to
+      // see (a draining buy just confirmed) — handing back its result lets a
+      // sell fee clamp trust a pre-buy balance. Chain a fresh read behind it.
+      return this.inflightBalance.then(() => this.refreshBalance(true));
+    }
 
     const pubkey: PublicKey = this.keypair.publicKey;
     this.inflightBalance = (async () => {
