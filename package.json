@@ -1,6 +1,6 @@
 {
   "name": "pumpfun-token-screening-pipeline",
-  "version": "1.0.10",
+  "version": "1.1.0",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "main": "dist/index.js",
   "bin": "dist/server.js",
