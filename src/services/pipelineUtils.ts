@@ -291,11 +291,21 @@ export function minWalletForSlots(params: {
 export function classifyExitReason(reason: string): import('../types').ExitCode {
   const r = (reason || '').toLowerCase();
   if (r.includes('honeypot')) return 'HONEYPOT';
+  // Before every other bucket: a bad fill is an ENTRY failure, and filing it as
+  // a structural or price exit would hide the fact that the loss was locked in
+  // before the position ever traded.
+  if (r.includes('bad fill')) return 'BAD_FILL';
   if (r.includes('structural stop')) return 'STRUCTURAL';
   if (r.includes('manual')) return 'MANUAL';
   if (r.includes('no market data')) return 'NO_DATA_STOP';
   if (r.includes('time stop') || r.includes('max hold time')) return 'TIME_STOP';
-  if (r.includes('trailing stop')) return 'TRAILING_FULL';
+  // Before the trailing check: the trailing reason also mentions price, and a
+  // price stop misfiled as a profit exit would corrupt every exit-mix report.
+  if (r.includes('price stop')) return 'PRICE_STOP';
+  // 'trailing', not 'trailing stop': the engine writes "trailing profit stop",
+  // which this never matched — so every full trailing exit was filed UNKNOWN
+  // and the exit-mix in run reports understated the profit ladder entirely.
+  if (r.includes('trailing')) return 'TRAILING_FULL';
   if (r.includes('partial fill')) return 'PARTIAL_FILL';
   return 'UNKNOWN';
 }
@@ -303,11 +313,12 @@ export function classifyExitReason(reason: string): import('../types').ExitCode 
 // ---------------------------------------------------------------------------
 // Exit-policy predicates.
 //
-// This bot has NO price stop-loss (removed 2026-08-09). These helpers hold the
-// thresholds that replaced it, extracted from the engine so the exit ladder is
-// testable at all — before this it had zero coverage, which is how a trailing
-// stop that forced exits BELOW round-trip breakeven survived as the bot's
-// primary liquidator.
+// The price stop-loss is OFF by default (config.exitOnPriceStop, added
+// 2026-08-13 after being deleted outright on 2026-08-09). The loss side is
+// carried by the structural predicates below plus the time stop. They live out
+// here so the exit ladder is testable at all — before this it had zero
+// coverage, which is how a trailing stop that forced exits BELOW round-trip
+// breakeven survived as the bot's primary liquidator.
 // ---------------------------------------------------------------------------
 
 /**

@@ -51,6 +51,49 @@ export interface GateV2Config {
 
   /** If RugCheck has no holder data yet: true = reject (unknown is not safe), false = allow with unverified marker. */
   requireVerifiedConcentration: boolean;
+
+  /**
+   * How much holder data must exist before concentration counts as MEASURED.
+   *
+   * A single-row holder list makes "top 10 = 4%" arithmetically true and
+   * completely meaningless. These thresholds are what stop a thin sample from
+   * being read as a clean distribution.
+   */
+  minHolderSample: number;
+  minTotalHolders: number;
+
+  // --- Market context (migration entries) ---
+  /**
+   * MOMENTUM CEILING. Refuse a migration entry that is already vertical.
+   *
+   * Measured across gate-passed migrations: median +56% over the trailing 5
+   * minutes, p90 +648%, and 38% were already up more than 100%. KINGLON was
+   * +362% and 77 seconds old. Buying that candle means buying the exit of the
+   * same-block snipers who bought the launch — >50% of launches are sniped in
+   * their creation block, and in documented cases the deployer funded the
+   * sniper wallets. This is the single filter that refuses that whole class.
+   *
+   * 0 disables the ceiling.
+   */
+  maxMigrationPump5mPct: number;
+  /** The ceiling only applies to pairs younger than this — an old pair that moves is a different animal. */
+  youngPairSeconds: number;
+  /**
+   * Escape hatch: real volume behind the move means it is not just the snipers
+   * rotating out. 0 removes the exemption entirely.
+   */
+  pumpExemptVolume5mUsd: number;
+
+  /**
+   * Minimum linked socials, applied ONLY when the field was actually resolved.
+   *
+   * Tokens with a Telegram graduate 8.9x more often and with all three socials
+   * 17.4x (832,941-launch survival study). Unresolved is treated as unverified
+   * rather than unsafe on purpose: DexScreener needs minutes to index a fresh
+   * pool, so requiring socials outright at the migration moment would reject
+   * every candidate for a reason that is about indexing lag, not the token.
+   */
+  minSocialCount: number;
 }
 
 export const GATE_V2_DEFAULTS: GateV2Config = {
@@ -67,6 +110,12 @@ export const GATE_V2_DEFAULTS: GateV2Config = {
   maxInsiderPct: 35,
   maxRugcheckScore: 1000,
   requireVerifiedConcentration: true,
+  minHolderSample: 5,
+  minTotalHolders: 10,
+  maxMigrationPump5mPct: 100,
+  youngPairSeconds: 120,
+  pumpExemptVolume5mUsd: 25_000,
+  minSocialCount: 1,
 };
 
 export interface GateV2Result {
@@ -84,6 +133,10 @@ export interface GateV2Result {
     insiderPct: number | null;
     rugcheckScore: number | null;
     rugcheckIndexed: boolean;
+    /** Market context at the decision moment; null when DexScreener had not indexed. */
+    priceChange5mPct?: number | null;
+    pairAgeSeconds?: number | null;
+    socialCount?: number | null;
   };
 }
 
@@ -107,7 +160,23 @@ export class EntryGateV2 {
    * @param rug normalized RugCheck report, or null/inferred when not available
    * @param isMigration resolved by the caller (txType under strictMigrationDetect)
    */
-  public evaluate(payload: any, rug: RugCheckReport | null, isMigration: boolean): GateV2Result {
+  public evaluate(
+    payload: any,
+    rug: RugCheckReport | null,
+    isMigration: boolean,
+    /**
+     * Enriched market context (DexScreener). Optional so every existing caller
+     * — including replay and the shadow path — keeps working; when it is
+     * absent the market checks report themselves as unverified rather than
+     * silently passing.
+     */
+    market?: {
+      priceChange5mPct?: number;
+      pairAgeSeconds?: number;
+      volume5mUsd?: number;
+      socialCount?: number;
+    }
+  ): GateV2Result {
     const reasons: string[] = [];
     const unverified: string[] = [];
     const c = this.config;
@@ -181,7 +250,10 @@ export class EntryGateV2 {
       }
 
       const meta = rug.fileMeta || {};
-      if (typeof meta.top10Pct === 'number' && meta.holderSampleSize > 0) {
+      // `holderSampleSize > 0` was the old bar, which one holder cleared.
+      const sampleOk = (meta.holderSampleSize ?? 0) >= c.minHolderSample
+        && (typeof meta.totalHolders !== 'number' || meta.totalHolders >= c.minTotalHolders);
+      if (typeof meta.top10Pct === 'number' && sampleOk) {
         const measuredTop10: number = meta.top10Pct;
         top10Pct = measuredTop10;
         maxSingleHolderPct = typeof meta.maxSingleHolderPct === 'number' ? meta.maxSingleHolderPct : null;
@@ -208,6 +280,40 @@ export class EntryGateV2 {
       }
     }
 
+    // ---- Market context (migrations only) ----
+    //
+    // Everything above asks "is this token a scam". This asks the question the
+    // bot never asked: "is this a sane moment to buy it". A token can be
+    // perfectly clean and still be a terrible entry because the move already
+    // happened — which describes every buy this bot has ever made.
+    const pump5m = typeof market?.priceChange5mPct === 'number' ? market.priceChange5mPct : null;
+    const pairAge = typeof market?.pairAgeSeconds === 'number' ? market.pairAgeSeconds : null;
+    const vol5m = typeof market?.volume5mUsd === 'number' ? market.volume5mUsd : null;
+    const socials = typeof market?.socialCount === 'number' ? market.socialCount : null;
+
+    if (isMigration && c.maxMigrationPump5mPct > 0) {
+      if (pump5m === null) {
+        unverified.push('priceChange5m');
+      } else if (pump5m > c.maxMigrationPump5mPct) {
+        const young = pairAge === null || pairAge < c.youngPairSeconds;
+        const volumeConfirms = c.pumpExemptVolume5mUsd > 0 && vol5m !== null && vol5m >= c.pumpExemptVolume5mUsd;
+        if (young && !volumeConfirms) {
+          reasons.push(
+            `Already +${pump5m.toFixed(0)}% in 5m on a ${pairAge === null ? 'brand-new' : `${Math.round(pairAge)}s-old`} pair ` +
+            `(max +${c.maxMigrationPump5mPct}%${c.pumpExemptVolume5mUsd > 0 ? `, or $${c.pumpExemptVolume5mUsd.toLocaleString()} of 5m volume to confirm` : ''}) — buying the snipers' exit`
+          );
+        }
+      }
+    }
+
+    if (c.minSocialCount > 0) {
+      if (socials === null) {
+        unverified.push('socialCount');
+      } else if (socials < c.minSocialCount) {
+        reasons.push(`No linked socials (${socials} < ${c.minSocialCount}) — tokens with socials graduate 8.9-17.4x more often`);
+      }
+    }
+
     return {
       isSafe: reasons.length === 0,
       reasons,
@@ -223,6 +329,9 @@ export class EntryGateV2 {
         insiderPct,
         rugcheckScore,
         rugcheckIndexed: rugIndexed,
+        priceChange5mPct: pump5m,
+        pairAgeSeconds: pairAge,
+        socialCount: socials,
       },
     };
   }

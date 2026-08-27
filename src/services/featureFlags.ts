@@ -35,7 +35,11 @@ export interface FeatureFlagSet {
    * costs — it cannot predict live results. Affects PAPER MODE ONLY.
    */
   honestPaper: boolean;
-  /** Refuse entries whose round-trip cost exceeds maxBreakevenPct of position size. */
+  /**
+   * Warn on entries whose round-trip cost exceeds maxBreakevenPct of position
+   * size. ADVISORY since 2026-08-12 (owner decision: everything in the wallet
+   * is tradeable no matter the amount) — it used to refuse those entries.
+   */
   enforceTradeEconomics: boolean;
   /**
    * Route entries by measured curve phase (Plays 2/3/4) instead of the legacy
@@ -59,6 +63,15 @@ export interface FeatureFlagSet {
    * Spends 100% of available deployable balance on every trade entry without budget limits.
    */
   allInSizing: boolean;
+  /**
+   * Play 1: buy fresh creates inside the block-0 window the router otherwise
+   * bans, skipping the RugCheck/DexScreener screen entirely (it costs seconds
+   * and has no data for a seconds-old mint anyway). Tuned by the
+   * launchSnipe* fields on BotConfig. The honeypot sell-path check still runs
+   * post-fill. HIGH RISK BY DESIGN: this is the insider-dominated window with
+   * the highest rug density — opt-in, owner decision 2026-08-12.
+   */
+  launchSnipe: boolean;
 }
 
 /**
@@ -82,6 +95,7 @@ export const DEFAULTS: FeatureFlagSet = {
   honeypotChecks: false,
   devSellStop: false,
   allInSizing: true,
+  launchSnipe: false,
 };
 
 /**
@@ -109,7 +123,46 @@ export const PACKAGED_DEFAULTS: FeatureFlagSet = {
   honeypotChecks: true,
   devSellStop: true,
   allInSizing: false,
+  // 2026-08-13 promotions. Each of these was written, tested and left OFF,
+  // which meant the live path kept running the code they were built to replace.
+  //
+  // entryGateV2: refuses on measured data and treats unknown as unsafe, instead
+  //   of the legacy gate whose Gate 0 hardcoded ten of its own checks to true.
+  // dynamicPriorityFee: p75 of recent fees, clamped. A static 0.001 loses races
+  //   when the chain is busy and overpays when it is quiet.
+  // timelineSlotSampling: t5/t6/t7 have ZERO samples on record, so the build →
+  //   submit → land phase — where the 2.55x fill happened — is unmeasured.
+  // localTxShadowCompare: collects the parity evidence that localTxBuild
+  //   requires before it may be enabled. Costs nothing; runs after submission.
+  entryGateV2: true,
+  dynamicPriorityFee: true,
+  timelineSlotSampling: true,
+  localTxShadowCompare: true,
 };
+
+/**
+ * Flags that intentionally differ between a dev checkout and a packaged build.
+ *
+ * Pinned so drift has to be deliberate: add a flag to PACKAGED_DEFAULTS without
+ * listing it here and the test suite fails, which is the point. DEFAULTS is
+ * "legacy behaviour, everything off"; this list is every place the shipped
+ * product knowingly departs from it.
+ */
+export const INTENDED_PACKAGED_DIVERGENCE: Array<keyof FeatureFlagSet> = [
+  'shadowGateV2',
+  'strictMigrationDetect',
+  'killSwitch',
+  'honestPaper',
+  'enforceTradeEconomics',
+  'playbookRouting',
+  'honeypotChecks',
+  'devSellStop',
+  'allInSizing',
+  'entryGateV2',
+  'dynamicPriorityFee',
+  'timelineSlotSampling',
+  'localTxShadowCompare',
+];
 
 /** True when running from a pkg-built single-file executable. */
 const IS_PACKAGED = Boolean((process as any).pkg);

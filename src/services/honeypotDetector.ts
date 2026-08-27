@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { RugCheckReport } from '../types';
+import { withRpcRetry } from './rpcHealth';
 
 /**
  * Sell-path safety checks. Flag: honeypotChecks.
@@ -94,7 +95,32 @@ export async function inspectMintSafety(
 
   // --- The mint account itself ---
   try {
-    const info = await connection.getAccountInfo(new PublicKey(mint), 'confirmed');
+    const pk = new PublicKey(mint);
+
+    // One attempt used to decide this, and 70.9% of candidates on 2026-08-13
+    // failed it — which the gate then read as "unsafe". Retry on both throw and
+    // empty: a mint that is 400ms old frequently has not reached `confirmed`
+    // yet, and that null was costing entries on tokens that were perfectly fine.
+    let info = await withRpcRetry(() => connection.getAccountInfo(pk, 'confirmed'), {
+      attempts: 3,
+      baseDelayMs: 120,
+      maxDelayMs: 600,
+      retryOnEmpty: true,
+    });
+
+    // Still nothing: fall back to `processed`, which sees the account a slot or
+    // two earlier. A processed read can in principle be rolled back — but the
+    // dangerous finding here is an ACTIVE authority, and acting on that early
+    // errs toward refusing the trade. The alternative is not screening at all.
+    if (!info) {
+      info = await withRpcRetry(() => connection.getAccountInfo(pk, 'processed'), {
+        attempts: 2,
+        baseDelayMs: 100,
+        maxDelayMs: 300,
+        retryOnEmpty: true,
+      });
+    }
+
     if (!info) {
       unverified.push('mintAccount');
       return { safe: reasons.length === 0, reasons, unverified, details };

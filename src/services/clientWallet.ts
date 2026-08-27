@@ -1,22 +1,24 @@
-import { Keypair, Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 
-export const UNIVERSAL_HELIUS_KEY = 'c8547397-ee14-46c2-b10b-85a1eccbaa32';
-export const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${UNIVERSAL_HELIUS_KEY}`;
-
-export interface ClientWalletInfo {
-  linked: boolean;
-  address: string | null;
-  shortAddress: string | null;
-  solBalance: number;
-  usdBalance: number;
-  deployableSol: number;
-  rpcHealthy: boolean;
-  source: 'client_browser' | 'server' | 'none';
-  privateKey: string | null;
-}
-
-const STORAGE_KEY = 'photon_client_private_key_v1';
+/**
+ * Browser-side key handling — DELIBERATELY MINIMAL.
+ *
+ * This module used to (a) hardcode a Helius API key, (b) open its own RPC
+ * connection from the browser, and (c) persist the raw signing key in browser
+ * storage. All three are gone:
+ *
+ *  - The key is never written to disk or storage by the browser. It is typed
+ *    into the link form, POSTed once to the loopback server, and dropped. The
+ *    only at-rest copy is the server's `.photon-wallet.json`, written only when
+ *    the user ticks "save", and only the server ever signs.
+ *  - Balances come from the server's /api/wallet status, so no RPC credential
+ *    needs to exist in browser-shipped code.
+ *
+ * What remains is a pure, offline format check so the user gets an immediate
+ * "that key is malformed" instead of a round trip. It touches no network and no
+ * storage.
+ */
 
 /**
  * Universal browser-safe private key parser.
@@ -79,38 +81,11 @@ export function parseClientSecretKey(secret: string): Keypair | null {
   return null;
 }
 
-export function saveStoredClientKey(key: string): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, key.trim());
-  } catch { /* storage disabled */ }
-}
-
-export function getStoredClientKey(): string | null {
-  try {
-    return localStorage.getItem(STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function clearStoredClientKey(): void {
-  try {
-    localStorage.removeItem(STORAGE_KEY);
-  } catch { /* storage disabled */ }
-}
-
-export async function fetchOnChainWalletInfo(
-  keypair: Keypair,
-  solPriceUsd = 170
-): Promise<{ solBalance: number; usdBalance: number; deployableSol: number; rpcHealthy: boolean }> {
-  try {
-    const connection = new Connection(HELIUS_RPC_URL, 'confirmed');
-    const lamports = await connection.getBalance(keypair.publicKey, 'confirmed');
-    const solBalance = Number((lamports / LAMPORTS_PER_SOL).toFixed(5));
-    const usdBalance = Number((solBalance * solPriceUsd).toFixed(2));
-    const deployableSol = Number(Math.max(0, solBalance - 0.005).toFixed(4));
-    return { solBalance, usdBalance, deployableSol, rpcHealthy: true };
-  } catch {
-    return { solBalance: 0, usdBalance: 0, deployableSol: 0, rpcHealthy: false };
-  }
+/**
+ * Address preview for the link form. Returns only the public key — the caller
+ * gets no way to hold key material beyond the input string it already has.
+ */
+export function previewWalletAddress(secret: string): string | null {
+  const kp = parseClientSecretKey(secret);
+  return kp ? kp.publicKey.toBase58() : null;
 }

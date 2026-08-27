@@ -23,7 +23,30 @@ import { RugCheckReport } from '../types';
 let passed = 0;
 let failed = 0;
 
-function test(name: string, fn: () => void): void {
+/**
+ * Async tests settle here before the summary prints.
+ *
+ * WHY: `test()` called `fn()` inside a try/catch and incremented `passed`
+ * immediately. For an `async () => {...}` body that returns a promise, the
+ * catch can never fire — the assertions run after `test()` has already
+ * returned and recorded a pass. Every async test in this file was therefore
+ * self-certifying: `inspectMintSafety`, the sell simulation and the updater
+ * checks all reported ok whatever they actually did. A suite that cannot fail
+ * is not evidence, and this one is the thing standing between a config change
+ * and real money.
+ */
+const pendingTests: Array<{ name: string; fn: () => Promise<void> }> = [];
+
+function test(name: string, fn: () => void | Promise<void>): void {
+  // Queue async bodies WITHOUT starting them. Awaiting a batch that is already
+  // in flight would run them concurrently, and several share process-wide state
+  // (rpcHealth counters, feature flags) — concurrent mutation of that state
+  // makes assertions depend on scheduling order rather than on behaviour.
+  if (fn.constructor && fn.constructor.name === 'AsyncFunction') {
+    pendingTests.push({ name, fn: fn as () => Promise<void> });
+    return;
+  }
+
   try {
     fn();
     passed++;
@@ -987,18 +1010,21 @@ console.log('\n-- Exit policy: no price stop-loss --');
     }), undefined);
   });
 
-  test('a position down 60% has NO price exit — that is the point', () => {
-    // No stop-loss helper exists to call. Assert the config surface is gone so
-    // a future edit cannot quietly reintroduce a price floor.
+  test('a position down 60% has no price exit UNLESS the owner switched one on', () => {
+    // 2026-08-13: the price stop is a setting again, so the guard changed shape.
+    // What must hold is that it is opt-in and that nothing reads the threshold
+    // outside the switch — a price floor must never come back by accident.
     const engineSrc = require('fs').readFileSync(
       require('path').join(__dirname, '../services/sniperEngine.ts'), 'utf8');
-    assert.ok(!/config\.stopLossPct/.test(engineSrc),
-      'engine must not reference config.stopLossPct');
-    assert.ok(!/pnlPct\s*<=\s*-/.test(engineSrc),
-      'engine must not contain a negative-pnl price stop');
-    const typesSrc = require('fs').readFileSync(
-      require('path').join(__dirname, '../types.ts'), 'utf8');
-    assert.ok(!/\bstopLossPct\b/.test(typesSrc), 'BotConfig must not carry stopLossPct');
+    assert.ok(/exitOnPriceStop:\s*false/.test(engineSrc),
+      'the price stop must ship OFF');
+    const priceStopBlock = engineSrc.slice(
+      engineSrc.indexOf('if (this.config.exitOnPriceStop)'),
+      engineSrc.indexOf('// TAKE PROFIT'));
+    assert.ok(/pnlPct\s*<=\s*-/.test(priceStopBlock),
+      'the only negative-pnl comparison must live inside the switch');
+    assert.strictEqual(engineSrc.split(/pnlPct\s*<=\s*-/).length - 1, 1,
+      'exactly one negative-pnl price comparison may exist in the engine');
   });
 
   console.log('\n-- Exit policy: structural exits replace the price stop --');
@@ -1306,9 +1332,45 @@ console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit
   const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
   const typesSrc = fs.readFileSync(path.join(__dirname, '../types.ts'), 'utf8');
 
-  test('the price stop-loss is still gone (guard against regression)', () => {
-    assert.ok(!/config\.stopLossPct/.test(engineSrc));
-    assert.ok(!/\bstopLossPct\b/.test(typesSrc));
+  test('the price stop exists but is gated on a switch that ships OFF', () => {
+    // It came back on 2026-08-13 as an owner-controlled setting, not as policy.
+    // What must never regress is the DEFAULT: price alone does not sell.
+    assert.ok(/exitOnPriceStop/.test(typesSrc), 'the switch must be configurable');
+    assert.ok(/config\.exitOnPriceStop/.test(engineSrc), 'the engine must read the switch');
+    assert.ok(/exitOnPriceStop:\s*false/.test(engineSrc),
+      'the engine default for the price stop must be false');
+    // Every read of the threshold must sit behind the switch.
+    const stopIdx = engineSrc.indexOf('config.stopLossPct');
+    assert.ok(stopIdx > engineSrc.indexOf('config.exitOnPriceStop'),
+      'stopLossPct must only be read inside the exitOnPriceStop branch');
+  });
+
+  test('each loss-side exit has its own switch, and they default to owner policy', () => {
+    // Owner stance 2026-08-13: act on evidence and on time, never on price.
+    const defaults: Array<[string, boolean]> = [
+      ['exitOnPoolDrain', true],
+      ['exitOnSellFlowCollapse', true],
+      ['exitOnDevSell', true],
+      ['exitOnHoneypot', true],
+      ['exitOnMaxHold', true],
+      ['exitOnNoData', true],
+      ['exitOnPriceStop', false],
+    ];
+    for (const [key, expected] of defaults) {
+      assert.ok(new RegExp(`${key}\\?:\\s*boolean`).test(typesSrc), `${key} must be in BotConfig`);
+      assert.ok(new RegExp(`${key}:\\s*${expected}`).test(engineSrc),
+        `${key} must default to ${expected} in the engine`);
+      assert.ok(new RegExp(`config\\.${key}`).test(engineSrc), `${key} must gate real behaviour`);
+    }
+  });
+
+  test('every structural danger can still only WARN when its switch is off', () => {
+    // The warn-and-hold path is what makes these switches reversible, so it has
+    // to survive alongside the sells.
+    for (const marker of ['is OFF in Settings']) {
+      const hits = engineSrc.split(marker).length - 1;
+      assert.ok(hits >= 4, `expected the warn-only fallback on every exit family, saw ${hits}`);
+    }
   });
 
   test('#13: a no-data exit exists and is time-based, not price-based', () => {
@@ -1323,16 +1385,14 @@ console.log('\n-- Exit-path safety: no-data exit, retry cap, rung latches (audit
     assert.ok(!/pnlPct\s*<=/.test(block), 'must not compare against a P&L threshold');
   });
 
-  test('#5: forced exits are bounded, so an unsellable token stops burning fees', () => {
-    assert.ok(/maxForceExitAttempts/.test(engineSrc));
-    assert.ok(/forceExitAttempts/.test(engineSrc));
-    assert.ok(/STRANDED/.test(engineSrc), 'a stranded position must be reported, not retried silently');
-  });
-
-  test('#11: the profit rungs have independent latches', () => {
-    assert.ok(/pullbackRungTaken/.test(engineSrc), 'pullback rung needs its own latch');
-    assert.ok(/tp1Taken/.test(engineSrc), 'TP1 needs its own latch');
-    assert.ok(/pullbackRungTaken/.test(typesSrc) && /tp1Taken/.test(typesSrc));
+  test('Take Profit rungs are active and never fire in negative PnL', () => {
+    assert.ok(/pullbackRungTaken/.test(engineSrc) && /tp1Taken/.test(engineSrc),
+      'profit-rung triggers must exist in the engine');
+    // Scoped to the PROFIT rungs only. The loss side has its own switches; what
+    // this guards is that a take-profit rung can never be the thing that books
+    // a loss, which is how the trailing stop once became the main liquidator.
+    assert.ok(/pos\.pnlPct > 0/.test(engineSrc),
+      'take-profit rungs must be guarded to fire only when in positive PnL');
   });
 
   test('#11: neither rung is gated on the shared principalRecovered flag any more', () => {
@@ -1384,11 +1444,21 @@ console.log('\n-- Config clamps and circuit breakers (audit #15, #29) --');
 
   test('#14: entries are reserved before the first await', () => {
     assert.ok(/entriesInFlight/.test(engineSrc));
-    const guard = engineSrc.slice(engineSrc.indexOf('private async evaluatePlaybookTrigger('), engineSrc.indexOf('evaluatePlaybookTriggerInner('));
+    // The guard was extracted into withEntrySlot (2026-08-12) so the launch
+    // snipe and the router share ONE reservation discipline. The invariant is
+    // unchanged: the cap counts in-flight entries, claimed synchronously.
+    const guard = engineSrc.slice(engineSrc.indexOf('private async withEntrySlot('), engineSrc.indexOf('this.entriesInFlight.add'));
     assert.ok(/activePositions\.length \+ this\.entriesInFlight\.size/.test(guard),
       'the cap must count in-flight entries, not just confirmed positions');
     assert.ok(/finally/.test(engineSrc.slice(engineSrc.indexOf('this.entriesInFlight.add'), engineSrc.indexOf('this.entriesInFlight.add') + 400)),
       'the reservation must be released in a finally');
+  });
+
+  test('#14: every entry path goes through the shared slot guard', () => {
+    const trigger = engineSrc.slice(engineSrc.indexOf('private async evaluatePlaybookTrigger('), engineSrc.indexOf('private async withEntrySlot('));
+    assert.ok(/withEntrySlot\(/.test(trigger), 'router entries must claim a slot');
+    const snipe = engineSrc.slice(engineSrc.indexOf('private async fireLaunchSnipe('), engineSrc.indexOf('private releasePendingSnipe('));
+    assert.ok(/withEntrySlot\(/.test(snipe), 'launch snipes must claim a slot');
   });
 }
 
@@ -1556,9 +1626,10 @@ console.log('\n-- Creator resolution and the real sell simulation (audit #22, #4
     assert.ok(!/await this\.verifySellPath/.test(engineSrc), 'must never be awaited on the entry path');
   });
 
-  test('#4: a confirmed honeypot latches a forced exit', () => {
-    assert.ok(/honeypotConfirmed/.test(engineSrc));
-    assert.ok(/honeypot: sell simulation reverts/.test(engineSrc));
+  test('#4 updated: a confirmed honeypot is logged loudly but NOT auto-sold', () => {
+    assert.ok(/honeypotConfirmed/.test(engineSrc), 'the verdict must still latch on the position');
+    assert.ok(/HONEYPOT CONFIRMED/.test(engineSrc), 'the verdict must still be logged');
+    assert.ok(!/forceExitReason/.test(engineSrc), 'the verdict must not trigger an automatic exit');
   });
 
   test('#4: an inconclusive simulation does NOT exit the position', () => {
@@ -1958,13 +2029,979 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
     }
   });
 
-  test('experimental flags stay off even when packaged', () => {
-    // These change execution paths and need shadow validation first.
-    for (const k of ['localTxBuild', 'entryGateV2', 'dynamicPriorityFee']) {
-      assert.strictEqual(PACKAGED_DEFAULTS[k], false, `${k} must not auto-enable in a shipped build`);
+  test('localTxBuild stays off until a parity run proves it', () => {
+    // The one flag that still needs per-session evidence: it replaces the
+    // transaction PumpPortal would have built. entryGateV2, dynamicPriorityFee
+    // and timelineSlotSampling were promoted 2026-08-13 — they had been shadow-
+    // validated for days and shipping them off meant the live path kept using
+    // the code they exist to replace.
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxBuild, false,
+      'a locally built tx must never ship enabled without shadow parity');
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxShadowCompare, true,
+      'the parity evidence localTxBuild requires must be collected by default');
+  });
+
+  test('divergence from DEFAULTS is declared, not accidental', () => {
+    const { INTENDED_PACKAGED_DIVERGENCE } = require('../services/featureFlags');
+    const actual = Object.keys(DEFAULTS).filter(k => PACKAGED_DEFAULTS[k] !== DEFAULTS[k]).sort();
+    assert.deepStrictEqual(actual, [...INTENDED_PACKAGED_DIVERGENCE].sort(),
+      'a packaged build that silently differs from DEFAULTS is how a local experiment ships to users');
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Launch snipe (Play 1) — first-candle entry, owner opt-in 2026-08-12.
+// The router's BLOCK_0 ban made migrations/mid-curve the ONLY entries, which
+// is why every buy landed minutes after the wall of same-block snipers. The
+// fast lane trades that screen for speed; these pin its safety properties.
+// ---------------------------------------------------------------------------
+console.log('\n-- Launch snipe (Play 1): first-candle entry --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const { DEFAULTS, PACKAGED_DEFAULTS } = require('../services/featureFlags');
+
+  test('the lane is opt-in: launchSnipe ships OFF in dev AND packaged defaults', () => {
+    assert.strictEqual(DEFAULTS.launchSnipe, false, 'block-0 buying must never be a silent default');
+    assert.strictEqual(PACKAGED_DEFAULTS.launchSnipe, false, 'a shipped exe must not snipe launches out of the box');
+  });
+
+  test('the fast lane only intercepts creates, and only when the flag is on', () => {
+    const hook = engineSrc.slice(engineSrc.indexOf("payload.txType === 'create' && featureFlags.get('launchSnipe')"), engineSrc.indexOf('await this.processIncomingToken'));
+    assert.ok(/handleLaunchCreate/.test(hook), 'the lane must run before the slow screen');
+  });
+
+  test('a snipe routes at the bonding curve, never venue auto', () => {
+    const fire = engineSrc.slice(engineSrc.indexOf('private async fireLaunchSnipe('), engineSrc.indexOf('private releasePendingSnipe('));
+    assert.ok(/pool: 'pump'/.test(fire),
+      "'auto' resolves against an index that has never seen a seconds-old mint");
+    assert.ok(!/pool: 'auto'/.test(fire));
+  });
+
+  test('momentum is measured beyond the dev buy, not from zero', () => {
+    assert.ok(/u\.realSolInCurve - pending\.baselineRealSol/.test(engineSrc),
+      'counting the creator\'s own buy as inflow would let every dev self-trigger the snipe');
+  });
+
+  test('armed snipes die with the run', () => {
+    const stop = engineSrc.slice(engineSrc.indexOf('// Armed snipes die with the run'), engineSrc.indexOf('SMART SNIPER BOT PAUSED'));
+    assert.ok(/pendingSnipes\.clear\(\)/.test(stop),
+      'a wakeup must never fire a buy that was armed before the pause');
+  });
+
+  test('an unfired snipe falls back to the Play 2 path instead of vanishing', () => {
+    const arm = engineSrc.slice(engineSrc.indexOf('// Arm the momentum trigger'), engineSrc.indexOf('private async fireLaunchSnipe('));
+    assert.ok(/enrollInWatchlist/.test(arm));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Security batch, 2026-08-13. Each of these guards a hole that was live in a
+// process holding a signing key.
+// ---------------------------------------------------------------------------
+console.log('\n-- Security: API origin/auth, key handling, lock atomicity --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const crypto = require('crypto');
+  const src = (rel: string) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+  const { isLoopbackOrigin } = require('../services/apiAuth');
+
+  // Digest of the retired key, not the key. Spelling the literal out here would
+  // put it straight back into the public repo this test exists to keep it out
+  // of — the assertion would pass while the leak it guards against continued.
+  const RETIRED_KEY_SHA256 = '04ff24ca29fec5d41ddb983164f7ba95ca9aafc56c237ff998faa1bc73d0730e';
+  const UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+  const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
+
+  test('no Helius key is hardcoded anywhere in source', () => {
+    // It was in four places, in a public repo, so every distributed exe carried
+    // the builder's credential.
+    for (const rel of ['services/clientWallet.ts', 'services/sniperEngine.ts', 'server.ts']) {
+      const embedded = (src(rel).match(UUID_RE) ?? []) as string[];
+      assert.ok(
+        !embedded.some((u) => sha256(u.toLowerCase()) === RETIRED_KEY_SHA256),
+        `${rel} still embeds the key`,
+      );
+    }
+  });
+
+  test('the browser never persists key material', () => {
+    const client = src('services/clientWallet.ts');
+    assert.ok(!/localStorage/.test(client), 'the signing key must not touch browser storage');
+    assert.ok(!/helius-rpc\.com/.test(client), 'browser code must not carry an RPC credential');
+  });
+
+  test('cross-origin requests are refused, loopback ones on any port are not', () => {
+    assert.ok(isLoopbackOrigin('http://localhost:3001'));
+    assert.ok(isLoopbackOrigin('http://127.0.0.1:3002'), 'the instance switcher uses other ports');
+    assert.ok(isLoopbackOrigin('http://[::1]:3001'), 'Windows resolves localhost to ::1 first');
+    assert.ok(!isLoopbackOrigin('https://evil.com'), 'this is the attack the wildcard CORS allowed');
+    assert.ok(!isLoopbackOrigin('http://localhost.evil.com'), 'suffix must not be enough');
+    assert.ok(!isLoopbackOrigin('null'), 'sandboxed frames post Origin: null');
+    assert.ok(!isLoopbackOrigin('file://'), '');
+  });
+
+  test('every mutating API call requires the token, by method not by memory', () => {
+    const server = src('server.ts');
+    assert.ok(/app\.use\(originGuard\)/.test(server), 'the origin guard must run before any handler');
+    assert.ok(!/app\.use\(cors\(\)\)/.test(server), 'wildcard CORS must be gone');
+    const gate = server.slice(server.indexOf("app.use('/api'"), server.indexOf("app.use('/api'") + 400);
+    assert.ok(/requireApiToken/.test(gate) && /req\.method === 'GET'/.test(gate),
+      'non-GET /api traffic must be token-gated wholesale');
+  });
+
+  test('process faults are never swallowed silently', () => {
+    const server = src('server.ts');
+    const fn = server.slice(server.indexOf('function reportProcessFault'), server.indexOf('process.on(\'uncaughtException\''));
+    assert.ok(/console\.(warn|error)/.test(fn), 'a trading process must log its own faults');
+    assert.ok(!/if \(expected\) return;/.test(fn), 'the bare early return was the bug');
+  });
+
+  test('no untrusted value is interpolated into a shell command', () => {
+    const engine = src('services/sniperEngine.ts');
+    assert.ok(!/exec\(`cmd \/c start/.test(engine),
+      'mint arrives off a third-party websocket and used to land on a command line');
+  });
+
+  test('the real-mode lock is taken with an atomic exclusive create', () => {
+    const lock = src('services/realModeLock.ts');
+    assert.ok(/openSync\(LOCK_FILE, 'wx'/.test(lock),
+      "check-then-write let two instances arm against the same wallet");
+  });
+
+  test('base58 keys are decoded as base58, not silently as base64', () => {
+    const wallet = src('services/walletService.ts');
+    const b58 = wallet.indexOf('bs58.decode(trimmed)');
+    const b64 = wallet.indexOf("Buffer.from(trimmed, 'base64')");
+    assert.ok(b58 > 0 && b64 > 0 && b58 < b64,
+      'an 86-char base58 key base64-decodes to 64 bytes and derives the WRONG wallet');
+  });
+}
+
+console.log('\n-- Exit reasons classify to the right bucket --');
+{
+  const { classifyExitReason } = require('../services/pipelineUtils');
+
+  test('a price stop is not filed as a profit exit', () => {
+    assert.strictEqual(classifyExitReason('SOLD ALL — price stop: down 31% from fill (limit 30%)'), 'PRICE_STOP');
+    assert.strictEqual(classifyExitReason('TAKE PROFIT ALL — trailing profit stop: price pulled back 30% from peak'), 'TRAILING_FULL');
+  });
+
+  test('the new structural strings still classify as structural', () => {
+    assert.strictEqual(classifyExitReason('SOLD ALL — structural stop: pool drained 60% (from $12,000 to $4,800)'), 'STRUCTURAL');
+    assert.strictEqual(classifyExitReason('SOLD ALL — structural stop: buy pressure 12% for 3 consecutive ticks'), 'STRUCTURAL');
+  });
+}
+
+console.log('\n-- Self-updater: version identity, verification, restart safety --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const updaterSrc = fs.readFileSync(path.join(__dirname, '../services/updaterService.ts'), 'utf8');
+  const workflow = fs.readFileSync(path.join(__dirname, '../../.github/workflows/release.yml'), 'utf8');
+  const { updaterService } = require('../services/updaterService');
+
+  test('the build knows its own version, not a hardcoded 1.0.0', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf8'));
+    assert.strictEqual(updaterService.getCurrentVersion(), pkg.version,
+      'reading package.json from process.cwd() left every packaged exe on 1.0.0 forever');
+  });
+
+  test('version resolution does not depend on the working directory', () => {
+    assert.ok(/__dirname/.test(updaterSrc),
+      'a packaged exe has no package.json beside it, so cwd cannot be the source');
+  });
+
+  test('an unverified binary is never installed', () => {
+    assert.ok(/checksumUrl/.test(updaterSrc) && /sha256OfFile/.test(updaterSrc));
+    assert.ok(/refusing to install an unverified binary/.test(updaterSrc),
+      'a release with no published checksum must be refused, not installed anyway');
+    const applyIdx = updaterSrc.indexOf('public async applyUpdate');
+    const swapIdx = updaterSrc.indexOf('stage: \'swapping\'');
+    const verifyIdx = updaterSrc.indexOf('Checksum mismatch');
+    assert.ok(applyIdx < verifyIdx && verifyIdx < swapIdx,
+      'verification must happen before the swap, not after');
+  });
+
+  test('a failed swap restores the working build', () => {
+    const swap = updaterSrc.slice(updaterSrc.indexOf("stage: 'swapping'"), updaterSrc.indexOf("stage: 'restarting'"));
+    assert.ok(/renameSync\(oldPath, exePath\)/.test(swap),
+      'a half-finished swap must never leave the user with no exe');
+  });
+
+  test('an update cannot run mid-trade', () => {
+    assert.ok(/restartGuard/.test(updaterSrc));
+    const apply = updaterSrc.slice(updaterSrc.indexOf('public async applyUpdate'));
+    assert.strictEqual(apply.split('this.restartGuard()').length - 1, 2,
+      'the guard must be re-checked after the download, since a position can open during it');
+  });
+
+  test('the commit fallback no longer claims an update it cannot install', () => {
+    const fallback = updaterSrc.slice(updaterSrc.indexOf('private async checkForCommitUpdates'));
+    assert.ok(/commits\/master/.test(fallback), 'the default branch is master');
+    assert.ok(!/heads\/main\.zip/.test(fallback), 'it used to link a branch that does not exist');
+  });
+
+  test('the release workflow publishes the checksum the updater requires', () => {
+    assert.ok(/\.sha256/.test(workflow), 'without this asset every client refuses to update');
+    assert.ok(/npm version \$version/.test(workflow), 'the tag must be stamped into the build');
+    assert.ok(/npm test/.test(workflow), 'a release must not ship a failing build');
+  });
+}
+
+console.log('\n-- Phase 0/1: fill quality, slippage, and a gate that means something --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const engineSrc = fs.readFileSync(path.join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const riskSrc = fs.readFileSync(path.join(__dirname, '../filters/riskFilter.ts'), 'utf8');
+  const typesSrc = fs.readFileSync(path.join(__dirname, '../types.ts'), 'utf8');
+  const { classifyExitReason } = require('../services/pipelineUtils');
+
+  test('a fill far above the decision price abandons the entry', () => {
+    assert.ok(/decisionPriceUsd/.test(engineSrc), 'the decision price must be captured before the fill overwrites it');
+    assert.ok(/MAX_FILL_SLIPPAGE_MULTIPLE/.test(engineSrc));
+    assert.strictEqual(classifyExitReason('SOLD ALL — bad fill: entered at 2.55x the decision price'), 'BAD_FILL');
+  });
+
+  test('the abort is checked against the VERIFIED fill, not an estimate', () => {
+    const block = engineSrc.slice(engineSrc.indexOf('FILL SANITY'), engineSrc.indexOf('FILL SANITY') + 1600);
+    assert.ok(/fillVerified &&/.test(block),
+      'an estimated price cannot prove a bad fill, and acting on one would exit good entries');
+  });
+
+  test('buys never escalate slippage; sells get exactly one capped retry', () => {
+    const retry = engineSrc.slice(engineSrc.indexOf('due to Slippage (6004)'), engineSrc.indexOf('if (confirmed === \'failed\')'));
+    assert.ok(/action === 'sell' && retryCount < 1/.test(retry),
+      'the old path retried buys at 25 -> 42 -> 68%, which is the same as no tolerance at all');
+    assert.ok(!/Math\.min\(100,/.test(retry), 'nothing may escalate toward 100%');
+    assert.ok(/MAX_SELL_RETRY_SLIPPAGE_PCT/.test(retry));
+  });
+
+  test('the shipped slippage defaults are asymmetric and tight', () => {
+    const { sniperEngine } = require('../services/sniperEngine');
+    const cfg = sniperEngine.getConfig();
+    assert.strictEqual(cfg.maxSlippagePct, 10, 'buy tolerance');
+    assert.strictEqual(cfg.maxSellSlippagePct, 15, 'sell tolerance');
+    assert.ok(cfg.maxSellSlippagePct > cfg.maxSlippagePct,
+      'exits may pay more than entries: a missed buy costs nothing, a stuck bag has no ceiling');
+  });
+
+  test('a strategy score can no longer overrule a safety verdict', () => {
+    assert.ok(!/minScoreHalfUnit;\s*\n\s*if \(filterResult\.score >= halfUnitFloor\)/.test(engineSrc),
+      'the override that turned KINGLON from unsafe into a buy must be gone');
+    assert.ok(/THE SCORE OVERRIDE IS GONE/.test(engineSrc), 'and its removal must stay documented');
+  });
+
+  test('Gate 0 has no fields it does not compute', () => {
+    for (const dead of ['noToken2022Hooks', 'sellSimPassed', 'insiderPctClean', 'sniperHoldingsPctClean',
+                        'maxSingleHolderPctClean', 'devPriorRugRateClean', 'devSoldAnyClean',
+                        'buyPressureClean', 'notHoneypot', 'notDumping']) {
+      // Match code, not prose: the comment above allPassed names two of these
+      // deliberately, to record what was removed and why.
+      assert.ok(!new RegExp(`${dead}\\s*[,=:]`).test(riskSrc), `${dead} is still assigned or returned in riskFilter`);
+      assert.ok(!new RegExp(`${dead}\\??:\\s*boolean`).test(typesSrc), `${dead} must leave Gate0Result too`);
+    }
+  });
+
+  test('allPassed is a conjunction of measured terms only', () => {
+    const conj = riskSrc.slice(riskSrc.indexOf('const allPassed ='), riskSrc.indexOf('return {'));
+    for (const term of conj.split('&&').map((s: string) => s.replace(/const allPassed =/, '').trim()).filter(Boolean)) {
+      assert.ok(new RegExp(`(const|let)\\s+${term.replace(';', '')}\\s*=`).test(riskSrc),
+        `${term} is in allPassed but is not computed in this file`);
+    }
+  });
+
+  test('ALL-IN MODE is wired to sizing instead of only to a label', () => {
+    assert.ok(/deployedFractionPct\(\)/.test(engineSrc));
+    const fn = engineSrc.slice(engineSrc.indexOf('private deployedFractionPct'), engineSrc.indexOf('private deployedFractionPct') + 400);
+    assert.ok(/allInSizing/.test(fn), 'the flag must actually change the deployed fraction');
+  });
+
+  test('the default run commits half the wallet, not all of it', () => {
+    const { sniperEngine } = require('../services/sniperEngine');
+    assert.strictEqual(sniperEngine.getConfig().maxDeployedFractionPct, 50);
+  });
+}
+
+console.log('\n-- Entry gate: the momentum ceiling refuses the KINGLON shape --');
+{
+  const { EntryGateV2 } = require('../services/entryGateV2');
+  const gate = new EntryGateV2();
+
+  // A clean migration payload: nothing about the TOKEN is wrong. The only
+  // question these tests ask is whether the MOMENT is sane.
+  const cleanRug = {
+    isInferred: false,
+    score: 1,
+    token: { mintAuthority: null, freezeAuthority: null },
+    fileMeta: { top10Pct: 18, maxSingleHolderPct: 5, insiderPct: 10, holderSampleSize: 40, rugged: false },
+  };
+  const migratePayload = { txType: 'migrate', mint: 'k', marketCapSol: 410 };
+  const evalWith = (market: any) => gate.evaluate(migratePayload, cleanRug, true, market);
+
+  test('THE ACTUAL TRADE: +362% in 5m on a 77s-old pair is refused', () => {
+    const r = evalWith({ priceChange5mPct: 362, pairAgeSeconds: 77, volume5mUsd: 4000, socialCount: 1 });
+    assert.strictEqual(r.isSafe, false);
+    assert.ok(r.reasons.some((x: string) => /buying the snipers' exit/.test(x)),
+      `expected the momentum ceiling to fire, got: ${JSON.stringify(r.reasons)}`);
+  });
+
+  test('the same token at a sane moment passes', () => {
+    const r = evalWith({ priceChange5mPct: 20, pairAgeSeconds: 77, volume5mUsd: 4000, socialCount: 1 });
+    assert.strictEqual(r.isSafe, true, JSON.stringify(r.reasons));
+  });
+
+  test('real volume behind the move is an exemption, thin volume is not', () => {
+    const thin = evalWith({ priceChange5mPct: 300, pairAgeSeconds: 60, volume5mUsd: 900, socialCount: 1 });
+    const deep = evalWith({ priceChange5mPct: 300, pairAgeSeconds: 60, volume5mUsd: 80_000, socialCount: 1 });
+    assert.strictEqual(thin.isSafe, false);
+    assert.strictEqual(deep.isSafe, true, JSON.stringify(deep.reasons));
+  });
+
+  test('an older pair that moves is not the same animal', () => {
+    const r = evalWith({ priceChange5mPct: 300, pairAgeSeconds: 900, volume5mUsd: 900, socialCount: 1 });
+    assert.strictEqual(r.isSafe, true, JSON.stringify(r.reasons));
+  });
+
+  test('missing market data is unverified, not silently safe', () => {
+    const r = evalWith({ socialCount: 1 });
+    assert.ok(r.unverifiedFields.includes('priceChange5m'),
+      'an unindexed chart must be recorded as unknown rather than treated as flat');
+  });
+
+  test('socials are required when resolved and excused when not indexed', () => {
+    const none = evalWith({ priceChange5mPct: 5, pairAgeSeconds: 300, socialCount: 0 });
+    assert.strictEqual(none.isSafe, false);
+    assert.ok(none.reasons.some((x: string) => /socials/.test(x)));
+
+    // Not indexed yet is the norm at the migration moment — rejecting on it
+    // would be rejecting DexScreener's lag, not the token.
+    const unknown = evalWith({ priceChange5mPct: 5, pairAgeSeconds: 300 });
+    assert.strictEqual(unknown.isSafe, true, JSON.stringify(unknown.reasons));
+    assert.ok(unknown.unverifiedFields.includes('socialCount'));
+  });
+
+  test('the ceiling can be disabled without touching code', () => {
+    const off = new EntryGateV2({ maxMigrationPump5mPct: 0 });
+    const r = off.evaluate(migratePayload, cleanRug, true, { priceChange5mPct: 362, pairAgeSeconds: 77, socialCount: 1 });
+    assert.strictEqual(r.isSafe, true, JSON.stringify(r.reasons));
+  });
+}
+
+console.log('\n-- No decorative settings: every BotConfig field must drive behaviour --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.join(__dirname, '..');
+
+  const readAll = (dir: string): string => {
+    let out = '';
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'tests') continue;
+        out += readAll(full);
+      } else if (/\.tsx?$/.test(entry.name)) {
+        out += fs.readFileSync(full, 'utf8');
+      }
+    }
+    return out;
+  };
+
+  const typesSrc = fs.readFileSync(path.join(root, 'types.ts'), 'utf8');
+  const allSrc = readAll(root);
+
+  const body = typesSrc.match(/export interface BotConfig \{([\s\S]*?)\n\}/)![1];
+  const fields: string[] = (body.match(/^ {2}(\w+)\??:/gm) || [])
+    .map((m: string) => m.trim().replace(/\??:$/, ''));
+
+  // Fields that exist to CARRY information outward rather than to be read:
+  // status-only mirrors written by getStatus(), and the flag mirror that lives
+  // in featureFlags. Anything else must be consumed somewhere.
+  const OUTBOUND_ONLY = new Set([
+    'heliusApiKeySet', 'heliusApiKeyHint', 'heliusApiKeySource',
+    'pumpPortalApiKeySet', 'pumpPortalApiKeyHint',
+  ]);
+
+  // The mirror image: write-only commands, acted on at the moment the config
+  // POST is handled and deliberately never persisted onto this.config — so they
+  // cannot appear as `config.<field>` by construction. Exempting them from the
+  // scrape would let a dead command sit in the API forever, so the test below
+  // proves each one is actually consumed by the engine.
+  const INBOUND_ONLY = new Set(['forgetStoredKeys']);
+
+  test('BotConfig has fields at all (the scrape works)', () => {
+    assert.ok(fields.length > 30, `expected a real BotConfig, parsed ${fields.length} fields`);
+  });
+
+  test('write-only command fields are actually acted on', () => {
+    const engine = fs.readFileSync(path.join(root, 'services', 'sniperEngine.ts'), 'utf8');
+    for (const f of INBOUND_ONLY) {
+      assert.ok(new RegExp(`\\b${f}\\b`).test(engine),
+        `${f} is accepted by the config API but nothing in the engine acts on it`);
+    }
+  });
+
+  test('every setting is read by the code that claims to honour it', () => {
+    const inert = fields.filter(f => {
+      if (OUTBOUND_ONLY.has(f) || INBOUND_ONLY.has(f)) return false;
+      const readAsConfig = new RegExp(`(config|cfg)\\.${f}\\b`).test(allSrc);
+      const readAsFlag = new RegExp(`featureFlags\\.get\\('${f}'\\)`).test(allSrc);
+      return !readAsConfig && !readAsFlag;
+    });
+    assert.deepStrictEqual(inert, [],
+      'these settings are rendered, clamped and saved but never read — ' +
+      'a knob the operator can move that the bot cannot feel is worse than no knob');
+  });
+
+  test('the settings that were inert on 2026-08-13 are wired', () => {
+    // Regression pins for the specific five found by the audit.
+    assert.ok(/config\.maxRugcheckScore/.test(allSrc), 'the configured RugCheck ceiling must reach the filter');
+    assert.ok(/config\.maxForceExitAttempts/.test(allSrc), 'the retry cap must bound automatic sell attempts');
+    assert.ok(/config\.minHolderSample/.test(allSrc) && /config\.minTotalHolders/.test(allSrc),
+      'holder-sample floors must reach the gate');
+    assert.ok(/config\.minLpBurnedOrLockedPct/.test(allSrc), 'the LP floor must reach the risk filter');
+    assert.ok(!/jitoTipSol/.test(typesSrc), 'an unwired Jito tip field must not exist');
+  });
+
+  test('a thin holder sample cannot read as a clean distribution', () => {
+    const { EntryGateV2 } = require('../services/entryGateV2');
+    const gate = new EntryGateV2({ minHolderSample: 5, minTotalHolders: 10 });
+    const oneHolder = {
+      isInferred: false, score: 1,
+      token: { mintAuthority: null, freezeAuthority: null },
+      fileMeta: { top10Pct: 4, holderSampleSize: 1, totalHolders: 1, rugged: false },
+    };
+    const r = gate.evaluate({ txType: 'migrate' }, oneHolder, true, { priceChange5mPct: 5, pairAgeSeconds: 300, socialCount: 1 });
+    assert.strictEqual(r.isSafe, false, '"top 10 = 4%" off a single holder row is arithmetic, not evidence');
+    assert.ok(r.unverifiedFields.includes('holderConcentration'));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Feed liveness and RPC resilience, 2026-08-13. Both of these were measured
+// from a 17,538-candidate session that produced 4 buys.
+// ---------------------------------------------------------------------------
+console.log('\n-- Feed watchdog: a socket that dies without closing --');
+{
+  const { attachKeepalive, reconnectDelayMs } = require('../services/wsKeepalive');
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const fakeWs = () => {
+    const handlers: Record<string, Function[]> = {};
+    const ws: any = {
+      terminated: false,
+      pings: 0,
+      on(ev: string, fn: Function) {
+        if (!handlers[ev]) handlers[ev] = [];
+        handlers[ev].push(fn);
+        return ws;
+      },
+      emit(ev: string, ...args: any[]) { (handlers[ev] || []).forEach((f) => f(...args)); },
+      ping() { ws.pings++; },
+      terminate() { ws.terminated = true; },
+    };
+    return ws;
+  };
+
+  test('OLD BUG: reconnect hung off close alone, which a half-open socket never fires', () => {
+    // The 2026-08-13 13:16 failure: readyState stayed OPEN, no close event, no
+    // reconnect, no log line. The bot simply stopped hearing about launches.
+    const ws = fakeWs();
+    let closes = 0;
+    ws.on('close', () => closes++);
+    // Nothing arrives, nothing closes. Under the old code this was terminal.
+    assert.strictEqual(closes, 0, 'a half-open socket produces no close event by itself');
+  });
+
+  test('fixed: silence past staleMs terminates the socket so close (and reconnect) fire', async () => {
+    const ws = fakeWs();
+    let sawStale = 0;
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40, onStale: () => sawStale++ });
+    await sleep(120);
+    ka.stop();
+    assert.strictEqual(ws.terminated, true, 'a silent socket must be terminated, not trusted');
+    assert.strictEqual(sawStale, 1, 'the operator must be told, once');
+  });
+
+  test('a socket that keeps delivering is never terminated', async () => {
+    const ws = fakeWs();
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40 });
+    for (let i = 0; i < 8; i++) { ka.touch(); await sleep(15); }
+    ka.stop();
+    assert.strictEqual(ws.terminated, false, 'a live feed must not be killed by its own watchdog');
+  });
+
+  test('a pong counts as life, so an idle curve subscription survives', async () => {
+    // CurveWatcher subscribes to accounts that may legitimately go minutes
+    // without a trade. Data-staleness alone would kill those connections.
+    const ws = fakeWs();
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40 });
+    for (let i = 0; i < 8; i++) { ws.emit('pong'); await sleep(15); }
+    ka.stop();
+    assert.strictEqual(ws.terminated, false, 'pong is proof of life on a quiet feed');
+    assert.ok(ws.pings > 0, 'the watchdog must actually ping');
+  });
+
+  test('stop() ends the watchdog so a closed socket is not terminated later', async () => {
+    const ws = fakeWs();
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 30 });
+    ka.stop();
+    await sleep(80);
+    assert.strictEqual(ws.terminated, false);
+  });
+
+  test('reconnect backoff grows, stays capped, and is jittered', () => {
+    assert.ok(reconnectDelayMs(0) <= 2000, 'first retry is prompt');
+    assert.ok(reconnectDelayMs(10) <= 30000, 'backoff is capped');
+    assert.ok(reconnectDelayMs(10) >= 15000, 'a capped backoff still waits');
+    const samples = new Set(Array.from({ length: 24 }, () => reconnectDelayMs(4)));
+    assert.ok(samples.size > 1, 'jitter stops two feeds reconnecting in lockstep');
+  });
+}
+
+console.log('\n-- RPC: transient failure is not a honeypot verdict --');
+{
+  const {
+    withRpcRetry, isCredentialError, isRateLimitError,
+    rpcEndpoint, rpcWsEndpoint, isFallbackEndpoint, connectionConfig,
+    rpcHealth, resetRpcHealth,
+  } = require('../services/rpcHealth');
+
+  test('a transient failure is retried and then succeeds', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const v = await withRpcRetry(async () => {
+      calls++;
+      if (calls < 3) throw new Error('socket hang up');
+      return 'ok';
+    }, { attempts: 4, baseDelayMs: 1 });
+    assert.strictEqual(v, 'ok');
+    assert.strictEqual(calls, 3, 'it must actually retry, not just wrap the call');
+  });
+
+  test('a rejected credential fails fast instead of retrying pointlessly', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    await assert.rejects(async () => {
+      await withRpcRetry(async () => { calls++; throw new Error('Unauthorized: 401'); },
+        { attempts: 5, baseDelayMs: 1 });
+    });
+    assert.strictEqual(calls, 1, 'a dead key fails identically every time — retrying only adds latency');
+    assert.strictEqual(rpcHealth().credentialRejected, true,
+      'the operator must be told the KEY is dead, not that the token was unverifiable');
+  });
+
+  test('a not-yet-visible account is retried rather than read as absent', async () => {
+    // The case that cost entries: getAccountInfo returns null for a few hundred
+    // ms on a mint that is 400ms old, and null was treated as "unverifiable".
+    resetRpcHealth();
+    let calls = 0;
+    const v = await withRpcRetry(async () => { calls++; return calls < 3 ? null : { data: 'here' }; },
+      { attempts: 4, baseDelayMs: 1, retryOnEmpty: true });
+    assert.deepStrictEqual(v, { data: 'here' });
+    assert.strictEqual(calls, 3);
+  });
+
+  test('retryOnEmpty still gives up and returns empty rather than hanging', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const v = await withRpcRetry(async () => { calls++; return null; },
+      { attempts: 3, baseDelayMs: 1, retryOnEmpty: true });
+    assert.strictEqual(v, null);
+    assert.strictEqual(calls, 3, 'bounded, not infinite');
+  });
+
+  test('error classification distinguishes a dead key from a busy one', () => {
+    assert.ok(isCredentialError(new Error('Request failed with status 401')));
+    assert.ok(isCredentialError(new Error('invalid api key')));
+    assert.ok(!isCredentialError(new Error('429 Too Many Requests')));
+    assert.ok(isRateLimitError(new Error('429 Too Many Requests')));
+    assert.ok(!isRateLimitError(new Error('socket hang up')));
+  });
+
+  test('health counts successes and failures so "barely working" has a number', async () => {
+    resetRpcHealth();
+    await withRpcRetry(async () => 1, { attempts: 1 });
+    await assert.rejects(async () => withRpcRetry(async () => { throw new Error('boom'); }, { attempts: 1, baseDelayMs: 1 }));
+    const h = rpcHealth();
+    assert.strictEqual(h.ok, 1);
+    assert.strictEqual(h.failed, 1);
+    assert.strictEqual(h.successRate, 0.5);
+    assert.strictEqual(h.lastError, 'boom');
+  });
+
+  test('a missing key degrades to a usable endpoint instead of an unusable URL', () => {
+    const savedUrl = process.env.SOLANA_RPC_URL;
+    const savedFallback = process.env.SOLANA_RPC_FALLBACK_URL;
+    delete process.env.SOLANA_RPC_URL;
+    delete process.env.SOLANA_RPC_FALLBACK_URL;
+    try {
+      // The old expression produced ".../?api-key=" — every call fails, so the
+      // bot could not even price or exit an open position.
+      const url = rpcEndpoint('');
+      assert.ok(!/api-key=$/.test(url), 'never build a URL with an empty api-key');
+      assert.ok(/^https:\/\//.test(url));
+      assert.strictEqual(isFallbackEndpoint(''), true);
+      assert.ok(rpcWsEndpoint('').startsWith('ws'));
+    } finally {
+      if (savedUrl !== undefined) process.env.SOLANA_RPC_URL = savedUrl;
+      if (savedFallback !== undefined) process.env.SOLANA_RPC_FALLBACK_URL = savedFallback;
+    }
+  });
+
+  test('endpoint precedence: explicit override > key > fallback', () => {
+    const saved = process.env.SOLANA_RPC_URL;
+    try {
+      process.env.SOLANA_RPC_URL = 'https://my-node.example/rpc';
+      assert.strictEqual(rpcEndpoint('somekey'), 'https://my-node.example/rpc');
+      assert.strictEqual(isFallbackEndpoint('somekey'), false);
+      delete process.env.SOLANA_RPC_URL;
+      assert.ok(rpcEndpoint('somekey').includes('somekey'));
+    } finally {
+      if (saved !== undefined) process.env.SOLANA_RPC_URL = saved; else delete process.env.SOLANA_RPC_URL;
+    }
+  });
+
+  test('the connection is configured deliberately, not by default', () => {
+    const cfg = connectionConfig();
+    assert.strictEqual(cfg.commitment, 'confirmed');
+    assert.strictEqual(cfg.disableRetryOnRateLimit, false, 'honouring Retry-After is what keeps a shared key alive');
+    assert.ok((cfg.confirmTransactionInitialTimeout ?? 0) >= 30_000, 'sniping submits into congestion');
+  });
+}
+
+console.log('\n-- The 70.9%: one dropped RPC read no longer reads as unsafe --');
+{
+  const { inspectMintSafety } = require('../services/honeypotDetector');
+  const { resetRpcHealth } = require('../services/rpcHealth');
+  const SPL = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+  const MINT = 'So11111111111111111111111111111111111111112';
+  const renouncedMint = () => {
+    const d = Buffer.alloc(82);
+    d.writeUInt32LE(0, 0);
+    d.writeUInt32LE(0, 46);
+    d[45] = 1;
+    return d;
+  };
+
+  test('a mint that throws once is still verified, not written off as unverifiable', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const flaky = {
+      getAccountInfo: async () => {
+        calls++;
+        if (calls === 1) throw new Error('socket hang up');
+        return { owner: { toBase58: () => SPL }, data: renouncedMint() };
+      },
+    };
+    const v = await inspectMintSafety(flaky as any, MINT, null);
+    assert.ok(!v.unverified.includes('mintAccount'),
+      'this single retry is the difference for 70.9% of candidates on 2026-08-13');
+    assert.strictEqual(v.details.mintAuthorityActive, false);
+  });
+
+  test('a mint not yet propagated is retried, then read', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const slow = {
+      getAccountInfo: async () => {
+        calls++;
+        return calls < 2 ? null : { owner: { toBase58: () => SPL }, data: renouncedMint() };
+      },
+    };
+    const v = await inspectMintSafety(slow as any, MINT, null);
+    assert.ok(!v.unverified.includes('mintAccount'), 'a 400ms-old mint is late, not missing');
+  });
+
+  test('a genuinely absent account is STILL unverified — retry must not invent a pass', async () => {
+    resetRpcHealth();
+    const dead = { getAccountInfo: async () => null };
+    const v = await inspectMintSafety(dead as any, MINT, null);
+    assert.ok(v.unverified.includes('mintAccount'),
+      'unknown must stay unknown; retry buys evidence, it does not manufacture it');
+  });
+
+  test('a live mint authority is still caught after a retry', async () => {
+    resetRpcHealth();
+    let calls = 0;
+    const d = Buffer.alloc(82);
+    d.writeUInt32LE(1, 0);
+    d[45] = 1;
+    const flaky = {
+      getAccountInfo: async () => {
+        calls++;
+        if (calls === 1) throw new Error('ETIMEDOUT');
+        return { owner: { toBase58: () => SPL }, data: d };
+      },
+    };
+    const v = await inspectMintSafety(flaky as any, MINT, null);
+    assert.strictEqual(v.safe, false, 'resilience must not soften the verdict');
+    assert.ok(v.reasons.some((r: string) => /mint authority/i.test(r)));
+  });
+}
+
+console.log('\n-- Upgrade must not switch on selling for someone who never chose it --');
+{
+  // The migration is pure logic on the parsed file, so it is exercised
+  // directly rather than by booting the singleton (which owns sockets).
+  const COPY_CONFIG_VERSION = 2;
+  const migrate = (raw: any) => {
+    const cfg = { ...raw.config };
+    if (Number(raw.configVersion) < COPY_CONFIG_VERSION || raw.configVersion === undefined) {
+      if (cfg.copySells) cfg.copySells = false;
+    }
+    return cfg;
+  };
+
+  test('a pre-2026-08-13 config does NOT start auto-selling on upgrade', () => {
+    // copySells defaulted true for the whole period it did nothing, so the
+    // saved true is a default nobody acted on — not a decision to honour.
+    const old = { config: { copySells: true, sellMode: 'mirror', enabled: true, tradingMode: 'real' } };
+    assert.strictEqual(migrate(old).copySells, false,
+      'honouring this would switch a real account to automatic selling with no prompt');
+  });
+
+  test('the migration runs once and then leaves the toggle alone', () => {
+    const chosen = { configVersion: 2, config: { copySells: true, sellMode: 'mirror' } };
+    assert.strictEqual(migrate(chosen).copySells, true,
+      'once stamped, copySells means what the operator set');
+  });
+
+  test('someone who had it off stays off', () => {
+    const off = { config: { copySells: false } };
+    assert.strictEqual(migrate(off).copySells, false);
+  });
+
+  test('the persisted file stamps the version, or the migration repeats forever', () => {
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/configVersion:\s*COPY_CONFIG_VERSION/.test(src),
+      'without the stamp, every restart would re-disable a toggle the operator turned on');
+    assert.ok(/const COPY_CONFIG_VERSION = 2/.test(src));
+  });
+
+  test('the migration writes the stamp immediately instead of waiting for a change', () => {
+    // Measured on the first smoke test: the warning printed, the in-memory
+    // config was migrated, and nothing reached disk — because persist() only
+    // fires on a change. configVersion stayed unset and the migration re-ran
+    // on every boot.
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    const start = src.indexOf('MIGRATION to schema 2');
+    assert.ok(start > 0, 'migration block not found — this test is pinned to it');
+    const migrationBlock = src.slice(start, start + 2500);
+    assert.ok(/this\.persist\(\)/.test(migrationBlock),
+      'the migration must persist its own stamp, or it never converges');
+  });
+}
+
+console.log('\n-- macOS build: the updater must never install another platform\'s binary --');
+{
+  const { releaseAssetName } = require('../services/updaterService');
+  const fsm = require('fs');
+  const pathm = require('path');
+  const root = pathm.join(__dirname, '..', '..');
+
+  test('each platform resolves to its own asset', () => {
+    assert.strictEqual(releaseAssetName('win32', 'x64'), 'pumpfun-sniper-bot.exe');
+    assert.strictEqual(releaseAssetName('darwin', 'arm64'), 'pumpfun-sniper-bot-macos-arm64');
+    assert.strictEqual(releaseAssetName('darwin', 'x64'), 'pumpfun-sniper-bot-macos-x64');
+  });
+
+  test('a Mac build can never resolve to the .exe', () => {
+    // The updater overwrites the RUNNING binary with what it downloads, so a
+    // cross-platform match bricks the install rather than merely failing.
+    for (const arch of ['arm64', 'x64']) {
+      assert.ok(!releaseAssetName('darwin', arch).endsWith('.exe'),
+        'a Mac build resolving to the Windows exe would replace itself with an unrunnable file');
+    }
+    assert.notStrictEqual(releaseAssetName('darwin', 'arm64'), releaseAssetName('darwin', 'x64'));
+  });
+
+  test('the build scripts produce exactly the names the updater asks for', () => {
+    const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
+    const scripts = JSON.stringify(pkgJson.scripts);
+    for (const platform of [['darwin', 'arm64'], ['darwin', 'x64']] as Array<[string, string]>) {
+      const name = releaseAssetName(platform[0] as any, platform[1]);
+      assert.ok(scripts.includes(name),
+        `no build script outputs ${name}, so the updater would look for an asset nothing produces`);
+    }
+  });
+
+  test('macOS targets do not use the node18 base that has no prebuilt', () => {
+    // node18-macos-arm64 404s in the pkg remote cache and then falls back to
+    // building from source, which fails on a non-Mac host (measured 2026-08-13).
+    const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
+    const macScripts = [pkgJson.scripts['build:mac'], pkgJson.scripts['build:mac-intel']].join(' ');
+    assert.ok(!/node18-macos/.test(macScripts), 'node18 has no prebuilt macOS base');
+    assert.ok(/node22-macos-arm64/.test(macScripts) && /node22-macos-x64/.test(macScripts));
+  });
+
+  test('a multi-platform release leaves exactly one .sha256, for pre-1.0.1 clients', () => {
+    // Clients shipped before 1.0.1 find their checksum with
+    // assets.find(a => a.name.endsWith('.sha256')) — first match, no check that
+    // it describes the binary they just downloaded. GitHub returns assets
+    // alphabetically and '-macos' sorts before '.exe', so publishing macOS
+    // checksums as .sha256 made every existing Windows client verify its exe
+    // against the macOS arm64 hash and refuse to install. Observed on the real
+    // v1.0.1 release, 2026-08-13.
+    const published = [
+      'pumpfun-sniper-bot-macos-arm64',
+      'pumpfun-sniper-bot-macos-arm64.sha256sum',
+      'pumpfun-sniper-bot-macos-x64',
+      'pumpfun-sniper-bot-macos-x64.sha256sum',
+      'pumpfun-sniper-bot.exe',
+      'pumpfun-sniper-bot.exe.sha256',
+    ].sort();
+
+    const dotSha256 = published.filter(n => n.endsWith('.sha256'));
+    assert.strictEqual(dotSha256.length, 1,
+      'more than one .sha256 asset and the old matcher picks by luck of ordering');
+
+    // The legacy matcher, verbatim, must now land on the right pair.
+    const legacyBinary = published.find(n => n.endsWith('.exe'));
+    const legacyChecksum = published.find(n => n.endsWith('.sha256'));
+    assert.strictEqual(legacyChecksum, `${legacyBinary}.sha256`,
+      'an existing exe must verify against its OWN hash, not another platform\'s');
+  });
+
+  test('the workflow publishes macOS checksums as .sha256sum, not .sha256', () => {
+    const wf = fsm.readFileSync(pathm.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+    assert.ok(/macos-arm64\.sha256sum/.test(wf) && /macos-x64\.sha256sum/.test(wf));
+    assert.ok(!/macos-arm64\.sha256\b(?!sum)/.test(wf),
+      'a macOS .sha256 asset would break every pre-1.0.1 client again');
+  });
+
+  test('the release workflow ad-hoc signs arm64 and publishes a checksum per asset', () => {
+    const wf = fsm.readFileSync(pathm.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+    assert.ok(/runs-on:\s*macos/.test(wf), 'arm64 signing cannot run on a non-Mac runner');
+    assert.ok(/codesign --force/.test(wf),
+      'Apple Silicon refuses to execute an unsigned arm64 binary at all');
+    for (const name of ['pumpfun-sniper-bot-macos-arm64', 'pumpfun-sniper-bot-macos-x64']) {
+      assert.ok(wf.includes(`${name}.sha256`),
+        `${name} must ship a checksum — the updater refuses any release without one`);
     }
   });
 }
 
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+console.log('\n-- API keys entered in the UI survive a restart --');
+{
+  const os = require('os');
+  const fsx = require('fs');
+  const pathx = require('path');
+
+  // keyStore resolves its path from cwd (or the exe dir when packaged), so the
+  // test drives it from a scratch directory rather than writing into the repo.
+  const scratch = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'keystore-'));
+  const originalCwd = process.cwd();
+  const store = require('../services/keyStore');
+  const { resolveKey, storeKey, clearStoredKey, loadStoredKeys } = store;
+
+  const inScratch = (fn: () => void) => {
+    process.chdir(scratch);
+    try { fn(); } finally { process.chdir(originalCwd); }
+  };
+
+  test('OLD BUG reproduced: a UI key lived only in memory, so a restart lost it', () => {
+    inScratch(() => {
+      // The old constructor read exactly this and nothing else. With no .env,
+      // a key typed into Settings could not possibly come back.
+      const restarted = process.env.NOPE_UNSET_KEY || '';
+      assert.strictEqual(restarted, '', 'nothing on disk means nothing after a restart');
+    });
+  });
+
+  test('fixed: a key saved from Settings is read back on the next start', () => {
+    inScratch(() => {
+      assert.strictEqual(storeKey('heliusApiKey', 'key-from-ui'), true);
+      assert.strictEqual(loadStoredKeys().heliusApiKey, 'key-from-ui');
+      assert.strictEqual(resolveKey('heliusApiKey', undefined).value, 'key-from-ui');
+    });
+  });
+
+  test('the saved key outranks .env, so replacing a rotated key actually sticks', () => {
+    inScratch(() => {
+      storeKey('heliusApiKey', 'fresh-key');
+      const r = resolveKey('heliusApiKey', 'dead-key-from-env');
+      assert.strictEqual(r.value, 'fresh-key');
+      assert.strictEqual(r.source, 'stored',
+        'otherwise a dead .env key silently reclaims priority every restart');
+    });
+  });
+
+  test('.env is used when nothing has been saved', () => {
+    inScratch(() => {
+      clearStoredKey('heliusApiKey');
+      const r = resolveKey('heliusApiKey', 'from-env');
+      assert.strictEqual(r.value, 'from-env');
+      assert.strictEqual(r.source, 'env');
+    });
+  });
+
+  test('no key anywhere reports none rather than a blank that looks configured', () => {
+    inScratch(() => {
+      clearStoredKey('heliusApiKey');
+      const r = resolveKey('heliusApiKey', undefined);
+      assert.strictEqual(r.value, '');
+      assert.strictEqual(r.source, 'none');
+    });
+  });
+
+  test('forgetting one key leaves the other intact', () => {
+    inScratch(() => {
+      storeKey('heliusApiKey', 'helius-1');
+      storeKey('pumpPortalApiKey', 'pump-1');
+      clearStoredKey('heliusApiKey');
+      const left = loadStoredKeys();
+      assert.strictEqual(left.heliusApiKey, undefined);
+      assert.strictEqual(left.pumpPortalApiKey, 'pump-1');
+    });
+  });
+
+  test('an empty value is never written — a blank field must not erase a key', () => {
+    inScratch(() => {
+      storeKey('heliusApiKey', 'real-key');
+      assert.strictEqual(storeKey('heliusApiKey', '   '), false);
+      assert.strictEqual(loadStoredKeys().heliusApiKey, 'real-key',
+        'blank means keep; erasing goes through forgetStoredKeys');
+    });
+  });
+
+  test('a corrupt store degrades to empty instead of stopping the bot booting', () => {
+    inScratch(() => {
+      fsx.writeFileSync(pathx.join(scratch, '.api-keys.json'), '{ not json');
+      assert.deepStrictEqual(loadStoredKeys(), {});
+      assert.strictEqual(resolveKey('heliusApiKey', 'env-key').value, 'env-key');
+    });
+  });
+
+  test('the store never lands in the repo', () => {
+    const ignored = fsx.readFileSync(pathx.join(__dirname, '..', '..', '.gitignore'), 'utf8');
+    assert.ok(/^\.api-keys\.json$/m.test(ignored), '.api-keys.json must be gitignored — it holds credentials');
+  });
+}
+
+void (async () => {
+  // Async tests run here, one at a time. Before this existed they were counted
+  // as passed the instant they were called, so their assertions never ran
+  // against the result at all.
+  if (pendingTests.length) {
+    console.log(`\n-- Async tests (${pendingTests.length}, run sequentially) --`);
+  }
+  for (const t of pendingTests) {
+    try {
+      await t.fn();
+      passed++;
+      console.log(`  ok    ${t.name}`);
+    } catch (err: any) {
+      failed++;
+      console.error(`  FAIL  ${t.name}\n        ${err?.message ?? err}`);
+    }
+  }
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed > 0 ? 1 : 0);
+})();

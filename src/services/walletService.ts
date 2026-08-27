@@ -191,6 +191,20 @@ export class WalletService {
         return Keypair.fromSeed(Uint8Array.from(Buffer.from(trimmed, 'hex')));
       }
 
+      // Base58 FIRST — it is what Phantom / Solflare / Photon actually export,
+      // and the base64 branch below cannot be trusted to decline a base58 key.
+      // The base58 alphabet is a subset of the base64 one, so an 86-character
+      // base58 key matches the base64 regex and Buffer.from(x,'base64') decodes
+      // it to exactly 64 bytes of garbage. That produced a VALID-LOOKING keypair
+      // for a wallet the user does not own: the bot would link, show a 0 balance
+      // for an address they never heard of, and sign with it. Trying base58
+      // first makes the correct interpretation win whenever it is possible.
+      try {
+        const decoded = bs58.decode(trimmed);
+        if (decoded.length === 64) return Keypair.fromSecretKey(decoded);
+        if (decoded.length === 32) return Keypair.fromSeed(decoded);
+      } catch { /* not base58 — fall through to base64 */ }
+
       // Base64 string
       if (/^[A-Za-z0-9+/=]{44,88}$/.test(trimmed)) {
         try {
@@ -199,11 +213,6 @@ export class WalletService {
           if (decodedB64.length === 32) return Keypair.fromSeed(Uint8Array.from(decodedB64));
         } catch { /* proceed */ }
       }
-
-      // Base58 string (most common for Phantom / Solflare / Photon exports)
-      const decoded = bs58.decode(trimmed);
-      if (decoded.length === 64) return Keypair.fromSecretKey(decoded);
-      if (decoded.length === 32) return Keypair.fromSeed(decoded);
     } catch {
       return null;
     }
@@ -332,8 +341,13 @@ export class WalletService {
   /**
    * Everything that would stop this wallet from trading for real, as plain
    * sentences. Surfaced in the UI before live mode can be armed.
+   *
+   * Only physical impossibilities live here: no key, no RPC, nothing above the
+   * gas float to deploy. There is deliberately NO minimum-size blocker — owner
+   * decision 2026-08-12: whatever the wallet holds is tradeable, no matter the
+   * amount. Size economics surface as warnings, never as refusals.
    */
-  public getBlockers(minBuySol: number): string[] {
+  public getBlockers(): string[] {
     const blockers: string[] = [];
     if (!this.keypair) {
       blockers.push('No wallet linked.');
@@ -343,13 +357,11 @@ export class WalletService {
     if (this.solBalance <= 0) blockers.push('Wallet holds 0 SOL.');
     else if (this.solBalance <= this.gasFloatSol) {
       blockers.push(`Balance ${this.solBalance} SOL is at or below the ${this.gasFloatSol} SOL gas float — nothing deployable.`);
-    } else if (this.getDeployableSol() < minBuySol) {
-      blockers.push(`Deployable ${this.getDeployableSol()} SOL is below the ${minBuySol} SOL minimum buy size.`);
     }
     return blockers;
   }
 
-  public getStatus(solPriceUsd: number, minBuySol = 0.01): WalletStatus {
+  public getStatus(solPriceUsd: number): WalletStatus {
     const address = this.getAddress();
     return {
       linked: this.keypair !== null,
@@ -361,7 +373,7 @@ export class WalletService {
       deployableSol: this.getDeployableSol(),
       lastCheckedAt: this.lastCheckedAt,
       rpcHealthy: this.rpcHealthy,
-      blockers: this.getBlockers(minBuySol),
+      blockers: this.getBlockers(),
     };
   }
 }

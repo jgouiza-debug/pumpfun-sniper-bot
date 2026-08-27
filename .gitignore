@@ -3,6 +3,8 @@ dist/
 
 # Contains a Solana private key in plaintext. Never commit.
 .photon-wallet.json
+.api-keys.json
+.api-token
 .env
 
 # Local launcher — embeds the operator's Helius API key. Never commit.

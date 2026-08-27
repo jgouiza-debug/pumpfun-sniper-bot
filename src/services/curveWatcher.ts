@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { PublicKey } from '@solana/web3.js';
+import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
 
 /**
  * Bonding-curve progress tracker over the Helius WebSocket. Flag: playbookRouting.
@@ -83,12 +84,16 @@ export class CurveWatcher {
   private nextId = 1;
   private connecting = false;
   private closed = false;
+  private keepalive: KeepaliveHandle | null = null;
+  private reconnectAttempt = 0;
 
   constructor(
     private getWsUrl: () => string,
     private onUpdate: (u: CurveUpdate) => void,
     /** Cap concurrent subscriptions; each costs Helius credits on every update. */
-    private maxWatched = 40
+    private maxWatched = 40,
+    /** Injectable so the watchdog's reconnect is observable in tests. */
+    private log: (level: 'warn' | 'info', msg: string) => void = () => {}
   ) {}
 
   public size(): number {
@@ -106,6 +111,8 @@ export class CurveWatcher {
 
   public stop(): void {
     this.closed = true;
+    this.keepalive?.stop();
+    this.keepalive = null;
     try { this.ws?.close(); } catch { /* already gone */ }
     this.ws = null;
     this.entries.clear();
@@ -120,27 +127,45 @@ export class CurveWatcher {
       const ws = new WebSocket(this.getWsUrl());
       this.ws = ws;
 
+      // An idle account subscription is legitimately silent for minutes — a
+      // watched curve nobody is trading produces no notifications at all. So
+      // liveness here rests on the pong, not on data: attachKeepalive pings
+      // every 20s and counts the reply, which distinguishes "quiet" from
+      // "dead". Without this, a half-open socket leaves Play 1 armed forever,
+      // waiting for inflow updates that can no longer arrive.
+      this.keepalive = attachKeepalive(ws, {
+        onStale: (silentMs) => {
+          this.log('warn', `Curve feed unresponsive for ${(silentMs / 1000).toFixed(0)}s (no data and no pong) — forcing reconnect; ${this.entries.size} watched token(s) were blind.`);
+        },
+      });
+
       ws.on('open', () => {
         this.connecting = false;
+        this.reconnectAttempt = 0;
         // Re-subscribe everything: a reconnect otherwise leaves the watchlist
         // silently blind, which is exactly the failure this class exists to fix.
         for (const entry of this.entries.values()) this.sendSubscribe(entry);
       });
 
-      ws.on('message', (raw: WebSocket.Data) => this.handleMessage(raw));
+      ws.on('message', (raw: WebSocket.Data) => {
+        this.keepalive?.touch();
+        this.handleMessage(raw);
+      });
 
       ws.on('close', () => {
         this.connecting = false;
+        this.keepalive?.stop();
+        this.keepalive = null;
         this.ws = null;
         this.bySubId.clear();
         for (const e of this.entries.values()) e.subId = undefined;
-        if (!this.closed) setTimeout(() => this.connect(), 3000);
+        if (!this.closed) setTimeout(() => this.connect(), reconnectDelayMs(this.reconnectAttempt++));
       });
 
       ws.on('error', () => { /* close handler owns reconnect */ });
     } catch {
       this.connecting = false;
-      if (!this.closed) setTimeout(() => this.connect(), 5000);
+      if (!this.closed) setTimeout(() => this.connect(), reconnectDelayMs(this.reconnectAttempt++, 5_000));
     }
   }
 

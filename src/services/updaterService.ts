@@ -141,6 +141,18 @@ export class UpdaterService {
     return this.currentVersion;
   }
 
+  private githubAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'User-Agent': 'PumpfunSniperBot-AutoUpdater',
+      'Accept': 'application/vnd.github.v3+json',
+    };
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.SNIPER_GITHUB_TOKEN;
+    if (token && token.trim()) {
+      headers['Authorization'] = `token ${token.trim()}`;
+    }
+    return headers;
+  }
+
   public getProgress(): UpdateProgress {
     return { ...this.progress };
   }
@@ -158,18 +170,6 @@ export class UpdaterService {
       // Still running from the OS's perspective, or locked by AV. It is inert
       // either way and the next start tries again.
     }
-  }
-
-  private githubAuthHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {
-      'User-Agent': 'PumpfunSniperBot-AutoUpdater',
-      'Accept': 'application/vnd.github.v3+json',
-    };
-    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.SNIPER_GITHUB_TOKEN;
-    if (token && token.trim()) {
-      headers['Authorization'] = `token ${token.trim()}`;
-    }
-    return headers;
   }
 
   public async checkForUpdates(): Promise<UpdateCheckResult> {
@@ -259,7 +259,10 @@ export class UpdaterService {
     try {
       const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/commits/master`;
       const response = await axios.get(url, {
-        headers: this.githubAuthHeaders(),
+        headers: {
+          'User-Agent': 'PumpfunSniperBot-AutoUpdater',
+          'Accept': 'application/vnd.github.v3+json',
+        },
         timeout: 8000,
       });
 

@@ -53,6 +53,14 @@ export interface PumpTokenLaunch {
   socialCount?: number;
   isBoosted?: boolean;
   hasLiveMarketData?: boolean;
+  /**
+   * True when `liquidityUsd` is the ~158-SOL migration ASSERTION rather than a
+   * reading. DexScreener needs minutes to index a fresh pool, so at decision
+   * time this is asserted for roughly every migration — which makes it the most
+   * dangerous number in the payload if anything mistakes it for a measurement.
+   * Never let a threshold treat an asserted value as evidence.
+   */
+  liquidityIsAsserted?: boolean;
 }
 
 export interface RugCheckRisk {
@@ -123,25 +131,29 @@ export interface FilterConfig {
   maxDevHoldingsPct: number;
 }
 
+/**
+ * Gate 0 — MEASURED CHECKS ONLY.
+ *
+ * Ten fields used to live here that were assigned a literal `true` and never
+ * computed: noToken2022Hooks, sellSimPassed, insiderPctClean,
+ * sniperHoldingsPctClean, maxSingleHolderPctClean, devPriorRugRateClean,
+ * devSoldAnyClean, buyPressureClean, notHoneypot, notDumping. They rendered as
+ * ten green checkmarks in the dashboard and three of them were counted into
+ * `allPassed`, which is what made "Gate 0 all passed" mean nothing — and what
+ * let a score-based override treat that phrase as a safety verdict.
+ *
+ * They are gone rather than defaulted. A check that is not performed must not
+ * have a field, because a field invites a checkmark.
+ */
 export interface Gate0Result {
   mintAuthorityRevoked: boolean;
   freezeAuthorityRevoked: boolean;
-  noToken2022Hooks: boolean;
   lpBurnedOrLocked: boolean;
-  sellSimPassed: boolean;
   bundledSupplyPctClean: boolean;
-  insiderPctClean: boolean;
-  sniperHoldingsPctClean: boolean;
   top10PctClean: boolean;
-  maxSingleHolderPctClean: boolean;
   devHoldingsPctClean: boolean;
-  devPriorRugRateClean: boolean;
-  devSoldAnyClean: boolean;
   liquidityMinClean: boolean;
   washScoreClean: boolean;
-  buyPressureClean?: boolean;
-  notHoneypot?: boolean;
-  notDumping?: boolean;
   /** RugCheck's own aggregate risk score is within the configured ceiling. */
   rugcheckScoreClean?: boolean;
   marketRegimeValid: boolean;
@@ -242,6 +254,38 @@ export interface BotConfig {
    * structural exits blind and the only fallback is maxHoldSeconds.
    */
   noDataExitSeconds?: number;
+  // --- Exit policy: which automatic sells are allowed to fire ---
+  //
+  // Every loss-side exit is a switch the owner sets, not a policy baked into
+  // the engine. Between 2026-08-12 and 2026-08-13 all of them were deleted
+  // outright, which meant a position that rugged had exactly one exit — the
+  // owner noticing. The switches restore the choice without taking it back:
+  // turn any of these off and the bot goes back to warning and holding.
+  //
+  // The thresholds they act on are the existing fields above
+  // (poolDrainExitFraction, sellFlowExitTicks, maxHoldSeconds,
+  // noDataExitSeconds), which until now only tuned log lines.
+  /** Sell 100% when pool liquidity drains past poolDrainExitFraction of peak. */
+  exitOnPoolDrain?: boolean;
+  /** Sell 50%, then 100%, after sellFlowExitTicks ticks of collapsed buy pressure. */
+  exitOnSellFlowCollapse?: boolean;
+  /** Sell 100% when the creator dumps (needs the devSellStop flag for detection). */
+  exitOnDevSell?: boolean;
+  /** Sell 100% when the post-buy sell simulation reverts (needs honeypotChecks). */
+  exitOnHoneypot?: boolean;
+  /** Sell 100% once the position is older than maxHoldSeconds. */
+  exitOnMaxHold?: boolean;
+  /** Sell 100% when no market data has appeared noDataExitSeconds after entry. */
+  exitOnNoData?: boolean;
+  /**
+   * Sell 100% at a fixed drawdown from the verified fill price. OFF by owner
+   * decision: on pump.fun a 20-35% dip is noise, and a stop inside the entry
+   * band converts ordinary volatility into a realized loss. The structural
+   * exits above cut rugs on evidence instead of on price.
+   */
+  exitOnPriceStop?: boolean;
+  /** Drawdown percentage for the price stop. Only read when exitOnPriceStop. */
+  stopLossPct?: number;
   /** Give up automatic retries of a forced exit after this many attempts. */
   maxForceExitAttempts?: number;
   /**
@@ -275,20 +319,76 @@ export interface BotConfig {
   poolDrainExitFraction?: number;
   /** Exit after this many consecutive ticks of collapsed buy pressure. */
   sellFlowExitTicks?: number;
+  // --- Launch snipe (Play 1, flag launchSnipe) ---
+  /**
+   * Real SOL (beyond the creator's own initial buy) that must flow into a fresh
+   * curve before the snipe fires. 0 fires the instant the create event arrives —
+   * pure block-0 entry with no confirmation at all. Momentum confirmation costs
+   * a few seconds but skips the launches nobody else buys.
+   */
+  launchSnipeMinSolInflow?: number;
+  /** Seconds after creation the snipe stays armed. Past this the token falls back to the normal Play 2 watchlist path. */
+  launchSnipeWindowSeconds?: number;
+  /** Skip launches whose creator initial buy exceeds this (dev owns the curve — their dump is the exit). */
+  launchSnipeMaxDevBuySol?: number;
+  /** Skip launches whose creator initial buy is below this (zero-commitment spam). 0 disables. */
+  launchSnipeMinDevBuySol?: number;
   maxActivePositions: number;
   priorityFeeSol: number;
   /** Hard ceiling for the dynamic priority fee (flag dynamicPriorityFee). */
   maxPriorityFeeSol?: number;
+  /** Buy-side slippage tolerance. Deliberately tighter than the sell side. */
   maxSlippagePct: number;
-  /** Reserved for a future Jito bundle path — currently NOT wired to anything. */
-  jitoTipSol: number;
+  /**
+   * Sell-side tolerance, floored at maxSlippagePct. Exits may pay more than
+   * entries: a missed buy costs nothing, an unsellable bag has no upper bound.
+   * One capped retry on a 6004; buys never escalate at all.
+   */
+  maxSellSlippagePct?: number;
   /** Rolling-hour realized loss (USD) that trips the kill switch (flag killSwitch). */
   maxHourlyLossUsd?: number;
-  /** Max acceptable round-trip cost as % of position size (flag enforceTradeEconomics). */
+  /** Round-trip cost guideline as % of position size (flag enforceTradeEconomics). Advisory: entries above it warn but still trade. */
   maxBreakevenPct?: number;
   solPriceUsd: number;
   privateKey?: string;
   heliusApiKey?: string;
+  /**
+   * PumpPortal Data API key, per user, entered in Settings.
+   *
+   * Trading does NOT need this: `/api/trade-local` builds an unsigned
+   * transaction for anyone and charges 0.5% per side. What the key buys is the
+   * TRADE STREAM. Measured 2026-08-05, `subscribeTokenTrade` replies "only
+   * available when connecting with an API key funded with at least 0.02 SOL"
+   * and delivers zero events without one — which is why unique-buyer counts,
+   * buy-pressure, Play 2 (the only entry that buys before the crowd) and the
+   * creator-dump stops are all inert on the free tier.
+   *
+   * Per-user by design: it is funded with the holder's own SOL, so it must
+   * never be baked into a shared build.
+   */
+  pumpPortalApiKey?: string;
+  // --- Status-only mirrors. Never sent by the UI; set by getStatus() so the
+  // dashboard can show whether a key exists without the key itself being
+  // broadcast on every poll. ---
+  heliusApiKeySet?: boolean;
+  heliusApiKeyHint?: string;
+  /**
+   * Where the live key came from: 'stored' is the one saved from Settings
+   * (.api-keys.json), 'env' is HELIUS_API_KEY / .env, 'none' means the bot is
+   * on the rate-limited public endpoint. Reported because a stored key
+   * outranks .env, so an operator who edits .env and sees no change has to be
+   * able to see why.
+   */
+  heliusApiKeySource?: 'stored' | 'env' | 'none';
+  pumpPortalApiKeySet?: boolean;
+  pumpPortalApiKeyHint?: string;
+  /**
+   * Write-only signal from the UI: names credentials to erase from disk.
+   * Erasing needs its own field because a blank key input already means
+   * "leave it alone" — the status endpoint never returns a key, so every save
+   * posts the field empty.
+   */
+  forgetStoredKeys?: Array<'heliusApiKey' | 'pumpPortalApiKey'>;
   bankrollUsd: number;
   instanceName?: string;
   instancePort?: number;
@@ -364,6 +464,9 @@ export type ExitCode =
   | 'TRAILING_FULL'
   | 'TIME_STOP'
   | 'NO_DATA_STOP'
+  | 'PRICE_STOP'
+  /** Entry abandoned because the fill landed far above the decision price. */
+  | 'BAD_FILL'
   | 'STRUCTURAL'
   | 'HONEYPOT'
   | 'MANUAL'
@@ -565,12 +668,12 @@ export interface BotStatusResponse {
     /** Round-trip cost as a % of the position — what a trade must beat to profit. */
     breakevenPct: number;
     /**
-     * False when this stake would be refused by the economics gate, i.e. the
-     * bot would screen forever and buy nothing. `tradesAffordable` counts what
-     * the BALANCE funds; this says whether any of them would actually be taken.
+     * False when this stake's round trip exceeds the economics guideline —
+     * every entry starts that far underwater. Advisory: trades still happen,
+     * this only says whether they begin at a structural loss.
      */
     economicsOk?: boolean;
-    /** Why no trade can be placed at this balance, if that is the case. */
+    /** Set only when the balance physically cannot fund a single order. */
     blockedReason?: string;
     /** Slots actually in use this run, after fitting to the wallet. */
     slots?: number;
@@ -578,6 +681,32 @@ export interface BotStatusResponse {
     requestedSlots?: number;
     /** True when the balance forced fewer slots than requested. */
     slotsReducedForEconomics?: boolean;
+  };
+  /**
+   * RPC and feed liveness.
+   *
+   * Added because "RPC is barely working" and "the feed died an hour ago" both
+   * presented identically: a bot that logged nothing and bought nothing. On
+   * 2026-08-13, 70.9% of candidates were discarded on a failed RPC read and the
+   * launch feed went silent at 13:16 with no error — neither was visible
+   * anywhere in the UI.
+   */
+  health?: {
+    rpc: {
+      ok: number;
+      failed: number;
+      consecutiveFailures: number;
+      /** The provider is rejecting the key itself — retrying will not help. */
+      credentialRejected: boolean;
+      successRate: number;
+      lastError: string | null;
+    };
+    feed: {
+      connected: boolean;
+      /** Null before the first frame of the session. */
+      lastMessageAgoMs: number | null;
+      reconnectAttempts: number;
+    };
   };
 }
 
@@ -597,4 +726,175 @@ export interface PeriodicReportSummary {
   passedCount: number;
   failedCount: number;
   safeTokens: FilterResult[];
+}
+
+// ---------------- COPY TRADING ----------------
+
+/**
+ * How a copy buy is sized relative to the leader's buy.
+ *  - 'fixed': always stake `fixedBuySol`, regardless of the leader's size.
+ *  - 'proportional': stake `proportionalPct`% of the leader's SOL amount,
+ *    clamped to `maxBuySol`.
+ */
+export type CopyBuySizeMode = 'fixed' | 'proportional';
+
+/**
+ * What a leader sell does to the copied position.
+ *  - 'mirror': sell the same fraction of holdings the leader sold, measured
+ *    from the leader's post-trade balance in the stream payload (exact — the
+ *    payload carries `newTokenBalance`).
+ *  - 'full': any leader sell closes the whole copied position.
+ */
+export type CopySellMode = 'mirror' | 'full';
+
+export interface CopyTraderConfig {
+  /** Master switch — nothing is watched or traded while false. */
+  enabled: boolean;
+  tradingMode: 'paper' | 'real';
+  buySizeMode: CopyBuySizeMode;
+  fixedBuySol: number;
+  /** % of the leader's SOL amount to copy when buySizeMode='proportional'. */
+  proportionalPct: number;
+  /** Hard per-trade ceiling in SOL, applied in both sizing modes. */
+  maxBuySol: number;
+  /** Ignore leader buys below this size. 0 (the default) copies EVERY buy. */
+  minLeaderBuySol: number;
+  copySells: boolean;
+  sellMode: CopySellMode;
+  maxOpenPositions: number;
+  maxSlippagePct: number;
+  /**
+   * Skip a leader buy for a mint we already hold a copy position in. OFF by
+   * default: a repeat buy ADDS to the copy position (mirroring a leader who
+   * DCAs in), with the entry price re-averaged.
+   */
+  blockRepeatBuys: boolean;
+  /** Seconds after a copied buy from a wallet before its next buy is copied. 0 = off. */
+  perWalletCooldownSec: number;
+  /**
+   * Safety exits for copy positions, both OFF (0) by default: the copied
+   * wallet's own exit is the strategy. maxHoldSeconds is a structural
+   * abandon-ship timer, takeProfitPct an optional profit cap — deliberately
+   * no price stop-loss, consistent with the sniper engine.
+   */
+  maxHoldSeconds: number;
+  takeProfitPct: number;
+}
+
+/** A leader wallet being tracked, with per-wallet lifetime counters. */
+export interface TrackedWalletPublic {
+  address: string;
+  shortAddress: string;
+  nickname: string;
+  enabled: boolean;
+  addedAt: number;
+  lastSeenAt: number | null;
+  buysSeen: number;
+  sellsSeen: number;
+  copiedBuys: number;
+  copiedSells: number;
+  skippedSignals: number;
+  realizedPnlUsd: number;
+}
+
+export interface CopyPosition {
+  id: string;
+  mint: string;
+  tokenSymbol: string;
+  tokenName: string;
+  /** Leader wallet this position was copied from. */
+  leaderWallet: string;
+  leaderNickname: string;
+  /** Venue from the leader's trade payload, reused for our exit routing. */
+  pool?: string;
+  tokensHeld: number;
+  investedSol: number;
+  investedUsd: number;
+  entryPriceSol: number;
+  currentPriceSol: number;
+  pnlPct: number;
+  pnlUsd: number;
+  pnlSol: number;
+  entryTime: number;
+  buyTxid?: string;
+  fillVerified?: boolean;
+  status: 'OPEN' | 'PARTIAL' | 'CLOSED';
+  exitInFlight?: boolean;
+}
+
+/** One line in the live copy feed: every leader signal and what we did with it. */
+export interface CopyFeedEvent {
+  id: string;
+  timestamp: number;
+  leaderWallet: string;
+  leaderNickname: string;
+  mint: string;
+  tokenSymbol: string;
+  side: 'buy' | 'sell';
+  leaderSolAmount: number;
+  action: 'copied' | 'skipped' | 'failed';
+  detail: string;
+  copySol?: number;
+  txid?: string;
+  /**
+   * Which feed delivered the signal: 'pumpportal' (pump.fun fast lane) or
+   * 'helius' (on-chain wallet watcher — catches every venue).
+   */
+  via?: 'pumpportal' | 'helius';
+}
+
+/** A closed (or partially closed) copy leg — the copy page's receipt row. */
+export interface CopyTradeRecord {
+  id: string;
+  positionId: string;
+  mint: string;
+  tokenSymbol: string;
+  leaderWallet: string;
+  leaderNickname: string;
+  side: 'buy' | 'sell';
+  solAmount: number;
+  tokensMoved: number;
+  priceSol: number;
+  pnlUsd: number;
+  pnlSol: number;
+  pnlPct: number;
+  timestamp: number;
+  txid?: string;
+  fillVerified?: boolean;
+  exitReason: string;
+}
+
+export interface CopyStatusResponse {
+  enabled: boolean;
+  /** True while the PumpPortal account-trade stream is connected. */
+  streamConnected: boolean;
+  /**
+   * True while the Helius on-chain wallet watcher holds live log
+   * subscriptions for the tracked wallets. This is the feed that sees EVERY
+   * buy and sell the leader makes, on any venue — PumpPortal only carries
+   * pump.fun activity.
+   */
+  heliusConnected: boolean;
+  tradingMode: 'paper' | 'real';
+  config: CopyTraderConfig;
+  wallets: TrackedWalletPublic[];
+  positions: CopyPosition[];
+  history: CopyTradeRecord[];
+  feed: CopyFeedEvent[];
+  solPriceUsd: number;
+  /** Mirrors the engine wallet — copy real mode uses the same signer. */
+  wallet: WalletStatusPublic;
+  stats: {
+    signalsSeen: number;
+    copiedBuys: number;
+    copiedSells: number;
+    skippedSignals: number;
+    openPositions: number;
+    realizedPnlUsd: number;
+    realizedPnlSol: number;
+    unrealizedPnlUsd: number;
+    winCount: number;
+    lossCount: number;
+    winRatePct: number;
+  };
 }

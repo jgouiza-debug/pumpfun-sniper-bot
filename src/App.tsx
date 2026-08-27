@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BotConfig, BotInstanceInfo, BotStatusResponse, FilterResult, LeniencyMode, Position, TradeHistoryRecord } from './types';
-import { parseClientSecretKey, getStoredClientKey, saveStoredClientKey, clearStoredClientKey, fetchOnChainWalletInfo, ClientWalletInfo } from './services/clientWallet';
+import { previewWalletAddress } from './services/clientWallet';
+import { apiFetch } from './apiClient';
+import { CopyTradingPage } from './CopyTradingPage';
 
 // A txid proves execution only when it's a real signature — paper fills carry
 // a sim_ prefix and never touched the chain.
@@ -75,6 +77,10 @@ function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean })
 }
 
 export function App() {
+  // Page routing: the sniper terminal and the copy trading desk share the
+  // backend instance but render as separate full-screen pages.
+  const [activePage, setActivePage] = useState<'sniper' | 'copy'>('sniper');
+
   // Multi-Instance State
   const [instances, setInstances] = useState<BotInstanceInfo[]>([
     { id: 'bot-1', name: 'Bot #1 (Main)', port: 3001, status: 'active', tradingMode: 'paper', leniencyMode: 'strict' },
@@ -106,19 +112,40 @@ export function App() {
     walletSplitSizing: true,
     takeProfitPct: 100,
     takeProfitRung2Pct: 400,
-    // No stopLossPct: this bot has no price stop-loss by design.
     trailingArmMultiple: 3.0,
     useTrailingStop: true,
     trailingStopPct: 30,
     maxHoldSeconds: 1800,
+    // Exit policy — mirrors the engine defaults so the switches show the truth
+    // before the first status frame replaces this whole object. Act on evidence
+    // and on time; never on price alone (exitOnPriceStop off).
+    exitOnPoolDrain: true,
+    exitOnSellFlowCollapse: true,
+    exitOnDevSell: true,
+    exitOnHoneypot: true,
+    exitOnMaxHold: true,
+    exitOnNoData: true,
+    exitOnPriceStop: false,
+    stopLossPct: 30,
+    noDataExitSeconds: 180,
+    poolDrainExitFraction: 0.5,
+    sellFlowExitTicks: 3,
     // All-in at the current wallet size — see the engine defaults for why.
     maxActivePositions: 1,
     activePlaybook: 'ALL',
     tradingMode: 'paper',
     leniencyMode: 'strict',
+    // Launch snipe (Play 1, flag launchSnipe) — mirror the engine defaults.
+    launchSnipeMinSolInflow: 1,
+    launchSnipeWindowSeconds: 60,
+    launchSnipeMaxDevBuySol: 5,
+    launchSnipeMinDevBuySol: 0,
     privateKey: '',
-    // No baked-in key: the server supplies its configured key via /api/bot/status.
+    // Both key fields start blank and STAY blank on every status sync: the
+    // server never sends a key back, only whether one is stored. Saving with a
+    // blank field therefore keeps the stored key rather than clearing it.
     heliusApiKey: '',
+    pumpPortalApiKey: '',
   });
 
   // Photon wallet linking state. The key only ever lives in this input until
@@ -127,6 +154,13 @@ export function App() {
   const [walletPersist, setWalletPersist] = useState<boolean>(false);
   const [walletError, setWalletError] = useState<string>('');
   const [lastReport, setLastReport] = useState<any>(null);
+
+  // Auto-Updater State
+  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false);
+  const [applyingUpdate, setApplyingUpdate] = useState<boolean>(false);
+  const [updateProgress, setUpdateProgress] = useState<any>(null);
+  const [updateError, setUpdateError] = useState<string>('');
 
   // Feature Flags State
   const [featureFlags, setFeatureFlags] = useState<Record<string, boolean>>({
@@ -139,6 +173,7 @@ export function App() {
     localTxBuild: false,
     honeypotChecks: true,
     enforceTradeEconomics: false,
+    launchSnipe: true,
   });
 
   const fetchFlags = async (port: number) => {
@@ -154,7 +189,7 @@ export function App() {
   const handleToggleFlag = async (flagKey: string, newValue: boolean) => {
     setFeatureFlags(prev => ({ ...prev, [flagKey]: newValue }));
     try {
-      const res = await fetch(`http://localhost:${selectedPort}/api/flags`, {
+      const res = await apiFetch(`http://localhost:${selectedPort}/api/flags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ flag: flagKey, value: newValue }),
@@ -168,46 +203,10 @@ export function App() {
     }
   };
 
-  // Client-side browser wallet for multi-user web/exe execution
-  const [clientWallet, setClientWallet] = useState<ClientWalletInfo | null>(null);
-
-  useEffect(() => {
-    const savedKey = getStoredClientKey();
-    if (savedKey) {
-      const kp = parseClientSecretKey(savedKey);
-      if (kp) {
-        const pubkey = kp.publicKey.toBase58();
-        setClientWallet({
-          linked: true,
-          address: pubkey,
-          shortAddress: `${pubkey.slice(0, 4)}...${pubkey.slice(-4)}`,
-          solBalance: 0,
-          usdBalance: 0,
-          deployableSol: 0,
-          rpcHealthy: true,
-          source: 'client_browser',
-          privateKey: savedKey,
-        });
-        fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170).then(info => {
-          setClientWallet(prev => prev ? { ...prev, ...info } : null);
-        });
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!clientWallet?.privateKey) return;
-    const interval = setInterval(async () => {
-      const kp = parseClientSecretKey(clientWallet.privateKey!);
-      if (kp) {
-        const info = await fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170);
-        setClientWallet(prev => prev ? { ...prev, ...info } : null);
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [clientWallet?.privateKey, botStatus?.config?.solPriceUsd]);
-
-  const wallet = clientWallet || botStatus?.wallet;
+  // The server is the single source of wallet truth. The browser holds no key
+  // material and opens no RPC connection of its own: it POSTs the pasted key to
+  // the loopback server once and reads address/balance back off /api/bot/status.
+  const wallet = botStatus?.wallet;
   const run = botStatus?.run;
   const sizing = botStatus?.sizing;
 
@@ -241,66 +240,48 @@ export function App() {
       return;
     }
 
-    const kp = parseClientSecretKey(rawInput);
-    if (!kp) {
+    // Offline format check only, so a typo fails instantly instead of after a
+    // round trip. The browser keeps no copy: the key goes to the loopback
+    // server, which is the only thing that signs, and the input is cleared.
+    if (!previewWalletAddress(rawInput)) {
       setWalletError('Could not parse that key. Photon exports a base58 string; a JSON byte array or 128-char hex also work.');
       return;
     }
 
-    const pubkey = kp.publicKey.toBase58();
-    if (walletPersist) {
-      saveStoredClientKey(rawInput);
-    } else {
-      clearStoredClientKey();
-    }
-
-    const info = await fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170);
-    setClientWallet({
-      linked: true,
-      address: pubkey,
-      shortAddress: `${pubkey.slice(0, 4)}...${pubkey.slice(-4)}`,
-      solBalance: info.solBalance,
-      usdBalance: info.usdBalance,
-      deployableSol: info.deployableSol,
-      rpcHealthy: info.rpcHealthy,
-      source: 'client_browser',
-      privateKey: rawInput,
-    });
-    setWalletKeyInput('');
-
-    const portsToTry = [selectedPort, 3001, 3002];
-    for (const port of portsToTry) {
+    let linked = false;
+    for (const port of [selectedPort, 3001, 3002]) {
       try {
-        await fetch(`http://localhost:${port}/api/wallet/link`, {
+        const res = await apiFetch(`http://localhost:${port}/api/wallet/link`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ privateKey: rawInput, persist: walletPersist }),
         });
-      } catch { /* client mode active */ }
+        const data = await res.json().catch(() => null);
+        if (res.ok && data?.ok) {
+          linked = true;
+          break;
+        }
+        if (data?.error) setWalletError(data.error);
+      } catch { /* try the next instance */ }
+    }
+
+    setWalletKeyInput('');
+    if (!linked && !walletError) {
+      setWalletError('No bot instance accepted the wallet. Is the server running on this port?');
     }
   };
 
   const refreshWallet = async () => {
-    if (clientWallet?.privateKey) {
-      const kp = parseClientSecretKey(clientWallet.privateKey);
-      if (kp) {
-        const info = await fetchOnChainWalletInfo(kp, botStatus?.config?.solPriceUsd ?? 170);
-        setClientWallet(prev => prev ? { ...prev, ...info } : null);
-      }
-    }
     try {
-      await fetch(`${API_BASE}/api/wallet/refresh`, { method: 'POST' });
+      await apiFetch(`${API_BASE}/api/wallet/refresh`, { method: 'POST' });
     } catch { /* status poll covers us */ }
   };
 
   const unlinkWallet = async () => {
-    clearStoredClientKey();
-    setClientWallet(null);
     setWalletError('');
-    const portsToTry = [selectedPort, 3001, 3002];
-    for (const port of portsToTry) {
+    for (const port of [selectedPort, 3001, 3002]) {
       try {
-        await fetch(`http://localhost:${port}/api/wallet/unlink`, {
+        await apiFetch(`http://localhost:${port}/api/wallet/unlink`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ deleteFile: true }),
@@ -345,6 +326,72 @@ export function App() {
     }, 500);
     return () => clearInterval(iv);
   }, []);
+
+  const handleCheckUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      const res = await fetch(`http://localhost:${selectedPort}/api/updater/check`);
+      if (res.ok) {
+        const data = await res.json();
+        setUpdateInfo(data);
+      }
+    } catch {
+      /* ignore offline */
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  useEffect(() => {
+    handleCheckUpdate();
+    const interval = setInterval(handleCheckUpdate, 300000);
+    return () => clearInterval(interval);
+  }, [selectedPort]);
+
+  /**
+   * One-click self-update.
+   *
+   * The server downloads the release exe, verifies it against the published
+   * SHA256, swaps it in and relaunches — so the browser's job is only to start
+   * it, follow progress, and explain a refusal. It refuses while a position is
+   * open or the bot is armed; that message comes back in the response.
+   */
+  const handleApplyUpdate = async () => {
+    if (!window.confirm(
+      `Install version ${updateInfo?.latestVersion}?\n\n` +
+      'The bot will download the new build, verify its checksum, replace itself and restart. ' +
+      'Any open position must be closed first.'
+    )) return;
+
+    setUpdateError('');
+    setApplyingUpdate(true);
+
+    // Poll progress independently: the apply request does not return until the
+    // process is on its way out.
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`http://localhost:${selectedPort}/api/updater/progress`);
+        if (res.ok) setUpdateProgress(await res.json());
+      } catch { /* the server is mid-restart — expected near the end */ }
+    }, 500);
+
+    try {
+      const res = await apiFetch(`http://localhost:${selectedPort}/api/updater/apply`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        setUpdateError(data.error || 'The update could not be applied.');
+        setApplyingUpdate(false);
+      }
+      // On success the process exits and this page loses its backend until the
+      // new build binds the port again; the status poll reconnects on its own.
+    } catch {
+      // A dropped connection here usually means the swap succeeded and the old
+      // process is gone, so say what is actually happening.
+      setUpdateProgress({ stage: 'restarting', pct: 100, message: 'Restarting into the new version…' });
+    } finally {
+      setTimeout(() => clearInterval(poll), 15000);
+    }
+  };
 
   // Real-time status: the server pushes over SSE the moment anything changes
   // (order submitted, fill confirmed, price moved), coalesced to at most one
@@ -450,7 +497,7 @@ export function App() {
     const portsToTry = [selectedPort, 3001, 3002];
     for (const port of portsToTry) {
       try {
-        const res = await fetch(`http://localhost:${port}/api/bot/toggle`, {
+        const res = await apiFetch(`http://localhost:${port}/api/bot/toggle`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ active: targetState })
@@ -471,8 +518,8 @@ export function App() {
     const portsToTry = [selectedPort, 3001, 3002];
     for (const port of portsToTry) {
       try {
-        await fetch(`http://localhost:${port}/api/bot/kill`, { method: 'POST' }).catch(() => {});
-        await fetch(`http://localhost:${port}/api/bot/toggle`, {
+        await apiFetch(`http://localhost:${port}/api/bot/kill`, { method: 'POST' }).catch(() => {});
+        await apiFetch(`http://localhost:${port}/api/bot/toggle`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ active: false })
@@ -485,7 +532,7 @@ export function App() {
   const handleShutdownServer = async () => {
     if (!window.confirm("Are you sure you want to CLOSE and KILL the dev server process?")) return;
     try {
-      await fetch('/api/server/shutdown', { method: 'POST' });
+      await apiFetch('/api/server/shutdown', { method: 'POST' });
     } catch (err) {
       // Ignored - process exits
     }
@@ -496,14 +543,14 @@ export function App() {
   const handleClearHistory = async () => {
     if (!window.confirm("Are you sure you want to clear all execution receipts and closed trade history?")) return;
     try {
-      const res = await fetch('/api/bot/clear-history', { method: 'POST' });
+      const res = await apiFetch('/api/bot/clear-history', { method: 'POST' });
       const data = await res.json();
       if (data.success && botStatus) {
         setBotStatus({ ...botStatus, tradeHistory: [] });
       }
     } catch (err) {
       try {
-        const res = await fetch(`http://localhost:${selectedPort}/api/bot/clear-history`, { method: 'POST' });
+        const res = await apiFetch(`http://localhost:${selectedPort}/api/bot/clear-history`, { method: 'POST' });
         const data = await res.json();
         if (data.success && botStatus) {
           setBotStatus({ ...botStatus, tradeHistory: [] });
@@ -518,7 +565,7 @@ export function App() {
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const res = await fetch(`http://localhost:${selectedPort}/api/bot/config`, {
+      const res = await apiFetch(`http://localhost:${selectedPort}/api/bot/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...configForm, allInSizing: featureFlags.allInSizing })
@@ -529,6 +576,26 @@ export function App() {
       }
     } catch (err) {
       console.error("Save config error:", err);
+    }
+  };
+
+  /**
+   * Erase a credential saved from Settings.
+   *
+   * Needs its own call rather than clearing the input: a blank key field means
+   * "keep the stored one" (the status endpoint never returns a key, so every
+   * save posts it empty), so erasing has to be stated explicitly.
+   */
+  const handleForgetKey = async (field: 'heliusApiKey' | 'pumpPortalApiKey') => {
+    if (!window.confirm(`Forget the saved ${field === 'heliusApiKey' ? 'Helius' : 'PumpPortal'} key?\n\nThe bot will fall back to the .env value, or to no key at all.`)) return;
+    try {
+      await apiFetch(`http://localhost:${selectedPort}/api/bot/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forgetStoredKeys: [field] })
+      });
+    } catch (err) {
+      console.error('Forget key error:', err);
     }
   };
 
@@ -556,7 +623,7 @@ export function App() {
   // Manual Force Sell Override
   const forceSellPosition = async (positionId: string) => {
     try {
-      await fetch(`http://localhost:${selectedPort}/api/bot/sell-position`, {
+      await apiFetch(`http://localhost:${selectedPort}/api/bot/sell-position`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ positionId })
@@ -580,13 +647,85 @@ export function App() {
   const secondsToWipe = Math.max(0, Math.ceil((logClearedAt + LOG_WIPE_INTERVAL_MS - wipeTick) / 1000));
   const stats = botStatus?.stats || { totalTrades: 0, winCount: 0, lossCount: 0, winRatePct: 0, totalNetPnlUsd: 0, totalNetPnlSol: 0 };
 
+  // Shared page switcher — rendered in both headers so either desk is one
+  // click away. Styled like the instance buttons for visual continuity.
+  const pageTabs = (
+    <div style={{ display: 'flex', gap: '4px', marginTop: '4px' }}>
+      <button
+        className={`btn-instance ${activePage === 'sniper' ? 'active' : ''}`}
+        onClick={() => setActivePage('sniper')}
+      >
+        🎯 SNIPER TERMINAL
+      </button>
+      <button
+        className={`btn-instance ${activePage === 'copy' ? 'active' : ''}`}
+        onClick={() => setActivePage('copy')}
+      >
+        👥 COPY TRADING
+      </button>
+    </div>
+  );
+
+  if (activePage === 'copy') {
+    return (
+      <div>
+        <header className="header">
+          <div>
+            <div className="brand-title">PUMPPORTAL TERMINAL — MEME COIN WALLET COPY TRADING DESK</div>
+            <div className="brand-subtitle">PORT {selectedPort} / HELIUS ON-CHAIN WALLET WATCHER + PUMPPORTAL FAST LANE / PHOTON MAINNET SIGNER</div>
+            {pageTabs}
+          </div>
+          {/* Right side deliberately empty: CopyTradingPage pins its START/STOP
+              and settings controls to this corner. */}
+          <div style={{ minWidth: '380px' }} />
+        </header>
+        <CopyTradingPage apiBase={API_BASE} />
+      </div>
+    );
+  }
+
   return (
     <div>
+      {/* Auto-Update banner. A packaged exe installs in place; a dev checkout
+          is told to git pull instead of being offered a swap it cannot do. */}
+      {updateInfo?.hasUpdate && (
+        <div style={{ background: '#16a34a', color: '#ffffff', padding: '10px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', fontSize: '13px', fontWeight: 600, borderBottom: '1px solid #15803d' }}>
+          <span style={{ minWidth: 0 }}>
+            🚀 UPDATE AVAILABLE: {updateInfo.latestVersion} (you have {updateInfo.currentVersion})
+            {updateError && <span style={{ display: 'block', fontWeight: 400, fontSize: '11px', color: '#fecaca' }}>⚠️ {updateError}</span>}
+            {applyingUpdate && updateProgress && (
+              <span style={{ display: 'block', fontWeight: 400, fontSize: '11px' }}>
+                {updateProgress.message}
+                {updateProgress.stage === 'downloading' && updateProgress.totalBytes > 0 && ` — ${updateProgress.pct}%`}
+              </span>
+            )}
+          </span>
+
+          <div style={{ display: 'flex', gap: '10px', flexShrink: 0 }}>
+            {updateInfo.canSelfUpdate ? (
+              <button
+                onClick={handleApplyUpdate}
+                disabled={applyingUpdate}
+                style={{ background: '#ffffff', color: '#16a34a', padding: '6px 14px', border: 'none', borderRadius: '4px', fontWeight: 700, cursor: applyingUpdate ? 'wait' : 'pointer', opacity: applyingUpdate ? 0.7 : 1 }}
+              >
+                {applyingUpdate ? '⏳ UPDATING…' : '⬇ UPDATE NOW'}
+              </button>
+            ) : (
+              <span style={{ fontSize: '11px', fontWeight: 400 }}>Dev checkout — run <code>git pull</code></span>
+            )}
+            <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer" style={{ background: 'rgba(255,255,255,0.15)', color: '#ffffff', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}>
+              NOTES
+            </a>
+          </div>
+        </div>
+      )}
+
       {/* Editorial Bloomberg Header */}
       <header className="header">
         <div>
           <div className="brand-title">PUMPPORTAL TERMINAL — MULTI-INSTANCE ALGORITHMIC SNIPER</div>
           <div className="brand-subtitle">PORT {selectedPort} / HELIUS RPC / PHOTON MAINNET SIGNER / PLAYBOOK V1.0</div>
+          {pageTabs}
         </div>
 
         {/* Multi-Instance Switcher Bar */}
@@ -829,12 +968,17 @@ export function App() {
               MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (sizing.slots || botStatus?.config?.maxActivePositions || 3))}% OF RUN)
             </div>
           )}
-          {/* The balance can fund N orders while every one of them would be
-              refused by the economics gate. Say so here rather than letting the
-              bot look armed and buy nothing. */}
-          {sizing && sizing.economicsOk === false && sizing.blockedReason && (
+          {/* blockedReason now only means the balance physically cannot fund
+              an order. Bad economics no longer block — every amount trades —
+              so they get an advisory line, not a stop sign. */}
+          {sizing && sizing.blockedReason && (
             <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(239,68,68,0.08)' }}>
               ⛔ NO TRADES POSSIBLE — {sizing.blockedReason}
+            </div>
+          )}
+          {sizing && !sizing.blockedReason && sizing.economicsOk === false && (
+            <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
+              ⚠️ ROUND-TRIP COST {sizing.breakevenPct}% — EVERY ENTRY STARTS THAT FAR UNDERWATER. TRADING ANYWAY.
             </div>
           )}
           {sizing && sizing.slotsReducedForEconomics && (
@@ -1203,18 +1347,159 @@ export function App() {
                 </div>
               </div>
 
-              {/* Helius Dedicated RPC API Key Input */}
+              {/* Software update — ALWAYS VISIBLE.
+                  Previously the only update UI was a banner gated on
+                  hasUpdate, so with no published release the entire feature was
+                  invisible and there was no way to tell it existed, let alone
+                  whether it worked. A version and a Check button belong on
+                  screen permanently; "nothing to see" is itself information. */}
+              <div className="form-group" style={{ marginTop: '4px', padding: '10px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', borderRadius: '4px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                  <div>
+                    <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                      ⬇ Software Update
+                    </div>
+                    <div style={{ fontSize: '8.5px', color: 'var(--ink-muted)', marginTop: '3px', fontFamily: 'var(--font-mono)' }}>
+                      Installed: <strong>v{updateInfo?.currentVersion ?? '—'}</strong>
+                      {updateInfo?.latestVersion && updateInfo.latestVersion !== updateInfo.currentVersion && (
+                        <> · Available: <strong>{updateInfo.latestVersion}</strong></>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <button
+                      type="button"
+                      className="btn-instance"
+                      onClick={handleCheckUpdate}
+                      disabled={checkingUpdate || applyingUpdate}
+                    >
+                      {checkingUpdate ? 'CHECKING…' : 'CHECK NOW'}
+                    </button>
+                    {updateInfo?.hasUpdate && updateInfo?.canSelfUpdate && (
+                      <button
+                        type="button"
+                        className="btn-instance"
+                        style={{ borderColor: '#00e676', color: '#00e676' }}
+                        onClick={handleApplyUpdate}
+                        disabled={applyingUpdate}
+                      >
+                        {applyingUpdate ? 'UPDATING…' : 'UPDATE NOW'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ fontSize: '8px', marginTop: '6px', lineHeight: 1.55, color: 'var(--ink-muted)' }}>
+                  {updateError && <div style={{ color: '#ff1744' }}>⚠️ {updateError}</div>}
+
+                  {applyingUpdate && updateProgress && (
+                    <div style={{ color: '#00e676' }}>
+                      {updateProgress.message}
+                      {updateProgress.stage === 'downloading' && updateProgress.totalBytes > 0 && ` — ${updateProgress.pct}%`}
+                    </div>
+                  )}
+
+                  {!applyingUpdate && updateInfo?.hasUpdate && (
+                    <div style={{ color: '#00e676' }}>
+                      A newer release is published.
+                      {!updateInfo.canSelfUpdate && ' This is a dev checkout — run git pull instead of installing.'}
+                    </div>
+                  )}
+
+                  {!applyingUpdate && updateInfo && !updateInfo.hasUpdate && !updateInfo.error && (
+                    <div>You are on the latest published release.</div>
+                  )}
+
+                  {/* The state this repo is ACTUALLY in: the updater works, but
+                      there is nothing on the other end to install yet. Say that
+                      plainly rather than showing an empty panel. */}
+                  {!applyingUpdate && updateInfo?.error && (
+                    <div style={{ color: '#ffab00' }}>
+                      {updateInfo.error}
+                      {/No published release/.test(String(updateInfo.error)) && (
+                        <> Tag a release (<code>git tag v1.1.0 &amp;&amp; git push --tags</code>) — the workflow builds the exe
+                        and publishes it with a SHA256, and this button installs it from then on.</>
+                      )}
+                    </div>
+                  )}
+
+                  {updateInfo && !updateInfo.canSelfUpdate && !updateInfo.hasUpdate && (
+                    <div style={{ marginTop: '2px' }}>
+                      Running from source, so in-place install is unavailable — only the packaged .exe can replace itself.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* API keys. Both are per-user and neither is ever sent back by
+                  the status endpoint — the field stays blank and shows whether
+                  a key is stored, so saving with it empty keeps the existing
+                  one instead of wiping it. */}
               <div className="form-group" style={{ marginTop: '10px' }}>
-                <label className="form-label">Helius Dedicated RPC Key</label>
+                <label className="form-label">
+                  Helius RPC Key{' '}
+                  {botStatus?.config?.heliusApiKeySet
+                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.heliusApiKeyHint}</span>
+                    : <span style={{ color: '#ff1744' }}>— NOT SET (the bot cannot reach the chain)</span>}
+                </label>
                 <input
-                  type="text"
+                  type="password"
                   className="form-input"
-                  placeholder="Paste your Helius API Key (Leave empty for universal default)"
+                  placeholder={botStatus?.config?.heliusApiKeySet ? 'Leave blank to keep the stored key' : 'Paste your Helius API key'}
                   value={configForm.heliusApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, heliusApiKey: e.target.value })}
                 />
                 <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px' }}>
-                  Your personal Helius API key for dedicated RPC transaction landing. Universal key active by default.
+                  Free tier at helius.dev. Used for every RPC call, position pricing and transaction submission.
+                  There is no built-in key — each user supplies their own.
+                  {' '}Keys entered here are saved to <code>.api-keys.json</code> beside the app and reused on the next start.
+                </div>
+                {/* Which source won matters: a saved key outranks .env, so
+                    editing .env and seeing no change needs an explanation. */}
+                {botStatus?.config?.heliusApiKeySet && (
+                  <div style={{ fontSize: '8px', marginTop: '3px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span style={{ color: 'var(--ink-muted)' }}>
+                      source: {botStatus.config.heliusApiKeySource === 'stored'
+                        ? 'saved in Settings (takes precedence over .env)'
+                        : 'environment / .env'}
+                    </span>
+                    {botStatus.config.heliusApiKeySource === 'stored' && (
+                      <button type="button" className="btn-ghost" style={{ fontSize: '8px', padding: '1px 5px' }}
+                        onClick={() => void handleForgetKey('heliusApiKey')}>
+                        Forget saved key
+                      </button>
+                    )}
+                  </div>
+                )}
+                {!botStatus?.config?.heliusApiKeySet && (
+                  <div style={{ fontSize: '8px', marginTop: '3px', color: '#ff9100' }}>
+                    Running on the public RPC endpoint — heavily rate limited. Positions can still be priced and sold, but snipes will lose races.
+                  </div>
+                )}
+              </div>
+
+              <div className="form-group" style={{ marginTop: '10px' }}>
+                <label className="form-label">
+                  PumpPortal Data Key{' '}
+                  {botStatus?.config?.pumpPortalApiKeySet
+                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.pumpPortalApiKeyHint}</span>
+                    : <span style={{ color: '#ffab00' }}>— not set (free tier)</span>}
+                </label>
+                <input
+                  type="password"
+                  className="form-input"
+                  placeholder={botStatus?.config?.pumpPortalApiKeySet ? 'Leave blank to keep the stored key' : 'Paste your PumpPortal API key (optional)'}
+                  value={configForm.pumpPortalApiKey || ''}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, pumpPortalApiKey: e.target.value })}
+                />
+                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
+                  <strong>Not needed to trade</strong> — buys and sells go through the free trade-local endpoint.
+                  What it unlocks is PER-TRADE DATA, which requires a key funded with at least 0.02 SOL (~$1.50).
+                  Without it <code>subscribeTokenTrade</code> returns nothing, so unique-buyer counts read 0,
+                  Play 2 (mid-curve entry) can never trigger, the creator-dump exit can never fire, and copy
+                  trading mirrors nothing. Get one at pumpportal.fun and fund it with your own SOL — it is never
+                  shared between users.
                 </div>
               </div>
 
@@ -1290,32 +1575,6 @@ export function App() {
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Take Profit Target (%)</label>
-                    <input
-                      type="number"
-                      className="form-input"
-                      value={configForm.takeProfitPct}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
-                    />
-                  </div>
-
-                  <div className="form-group">
-                    <label className="form-label">Trailing Arm (x peak)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      className="form-input"
-                      value={configForm.trailingArmMultiple}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingArmMultiple: Number(e.target.value) })}
-                    />
-                    <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginTop: '3px' }}>
-                      No price stop-loss. The trailing stop is a moonbag ratchet — it
-                      arms only above this multiple, then gives back {configForm.trailingStopPct}%.
-                      Losses are cut by structural exits, not by a price floor.
-                    </div>
-                  </div>
-
-                  <div className="form-group">
                     <label className="form-label">Max Concurrent Positions</label>
                     <input
                       type="number"
@@ -1323,6 +1582,156 @@ export function App() {
                       value={configForm.maxActivePositions}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxActivePositions: Number(e.target.value) })}
                     />
+                  </div>
+                </div>
+
+                {/* Take-profit Automation Controls (positive P&L only). The
+                    loss side lives in its own Exit Policy block below. */}
+                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(0,230,118,0.05)', border: '1px solid rgba(0,230,118,0.2)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#00e676', marginBottom: '6px' }}>
+                    💰 Take-Profit Automation (Positive P&L Only)
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div className="form-group">
+                      <label className="form-label">Take Profit 1 Target (+%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.takeProfitPct ?? 100}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitPct: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Take Profit 2 Target (+%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.takeProfitRung2Pct ?? 400}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, takeProfitRung2Pct: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Trailing Profit Arm Multiple (x)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.trailingArmMultiple ?? 3.0}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingArmMultiple: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Trailing Profit Distance (%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.trailingStopPct ?? 30}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, trailingStopPct: Number(e.target.value) })}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Exit Policy. Every automatic sell on the loss side is a
+                    switch, not a hardcoded rule. All off = the bot never sells
+                    on its own; dangers are still detected and logged. */}
+                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(255,171,0,0.05)', border: '1px solid rgba(255,171,0,0.25)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#ffab00', marginBottom: '4px' }}>
+                    🛡️ Exit Policy — which automatic sells may fire
+                  </div>
+                  <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginBottom: '8px', lineHeight: 1.5 }}>
+                    Turn every switch off and the bot never sells on its own — dangers are still detected and
+                    logged, and LIQUIDATE stays the only exit. Take-profit rungs above are unaffected.
+                  </div>
+
+                  {([
+                    ['exitOnPoolDrain', 'Pool drained',
+                      `Sell 100% when liquidity falls ${Math.round((configForm.poolDrainExitFraction ?? 0.5) * 100)}% from its peak. This is the event that makes a bag unsellable, so it outranks every other exit.`],
+                    ['exitOnDevSell', 'Creator dumps',
+                      'Sell 100% when the creator sells their own bag. Needs the Dev-Sell Stop feature flag for detection.'],
+                    ['exitOnHoneypot', 'Honeypot confirmed',
+                      'Sell 100% when the post-buy sell simulation reverts. Needs the Honeypot Checks flag, and real mode.'],
+                    ['exitOnSellFlowCollapse', 'Buy pressure collapses',
+                      `Sell 50%, then the rest on a second collapse, after ${configForm.sellFlowExitTicks ?? 3} consecutive ticks under 25% buy pressure.`],
+                    ['exitOnNoData', 'Never got a market',
+                      `Sell 100% if no market data has appeared ${configForm.noDataExitSeconds ?? 180}s after entry. Reads no price — only whether a market exists.`],
+                    ['exitOnMaxHold', 'Time stop',
+                      `Sell 100% once the position is older than ${Math.round((configForm.maxHoldSeconds ?? 1800) / 60)} min, whatever the P&L. Dead tokens release the capital.`],
+                    ['exitOnPriceStop', 'Price stop',
+                      `Sell 100% at −${configForm.stopLossPct ?? 30}% from the VERIFIED FILL price. Off by default: a 20–35% drawdown here is noise, and a stop inside the entry band just realises it.`],
+                  ] as Array<[keyof BotConfig, string, string]>).map(([key, title, detail]) => (
+                    <div
+                      key={String(key)}
+                      style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', padding: '5px 0', borderTop: '1px solid var(--border-hairline)' }}
+                    >
+                      <div>
+                        <div style={{ fontSize: '8.5px', fontWeight: 700 }}>{title}</div>
+                        <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', lineHeight: 1.45 }}>{detail}</div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={!!configForm[key]}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                          setConfigForm({ ...configForm, [key]: e.target.checked } as Partial<BotConfig>)
+                        }
+                      />
+                    </div>
+                  ))}
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginTop: '8px' }}>
+                    <div className="form-group">
+                      <label className="form-label">Time Stop (minutes)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={Math.round((configForm.maxHoldSeconds ?? 1800) / 60)}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxHoldSeconds: Math.round(Number(e.target.value) * 60) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">No-Market Exit (seconds)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.noDataExitSeconds ?? 180}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, noDataExitSeconds: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Pool Drain Trigger (% of peak)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={Math.round((configForm.poolDrainExitFraction ?? 0.5) * 100)}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, poolDrainExitFraction: Number(e.target.value) / 100 })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Sell-Flow Ticks</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.sellFlowExitTicks ?? 3}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, sellFlowExitTicks: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Price Stop (−%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        disabled={!configForm.exitOnPriceStop}
+                        value={configForm.stopLossPct ?? 30}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, stopLossPct: Number(e.target.value) })}
+                      />
+                    </div>
                   </div>
                 </div>
 
@@ -1343,6 +1752,63 @@ export function App() {
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, walletSplitSizing: e.target.checked })}
                   />
                 </div>
+
+                {/* Launch snipe (Play 1): enabled by the 🚀 Launch Snipe flag
+                    below; these tune WHEN it pulls the trigger. */}
+                <div style={{ marginTop: '10px' }}>
+                  <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                    🚀 Launch Snipe (Play 1)
+                  </div>
+                  <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginBottom: '6px' }}>
+                    Buys fresh launches in their first candle, next to the other snipers, skipping the
+                    slow screening entirely. Inflow 0 = buy the instant the create event arrives; otherwise
+                    wait until that much SOL from other buyers hits the curve inside the window.
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div className="form-group">
+                      <label className="form-label">Confirm Inflow (SOL, 0 = instant)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.launchSnipeMinSolInflow}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinSolInflow: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Snipe Window (seconds)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.launchSnipeWindowSeconds}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeWindowSeconds: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Max Dev Buy (SOL)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.launchSnipeMaxDevBuySol}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMaxDevBuySol: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Min Dev Buy (SOL, 0 = off)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        className="form-input"
+                        value={configForm.launchSnipeMinDevBuySol}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinDevBuySol: Number(e.target.value) })}
+                      />
+                    </div>
+                  </div>
+                </div>
               </div>
 
               {/* Feature Flags Matrix */}
@@ -1351,6 +1817,14 @@ export function App() {
                   Engine Feature Flags &amp; Guards
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                  <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🚀 Launch Snipe</div>
+                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Play 1: first-candle entry, screens skipped</div>
+                    </div>
+                    <input type="checkbox" checked={!!featureFlags.launchSnipe} onChange={e => handleToggleFlag('launchSnipe', e.target.checked)} />
+                  </div>
+
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
                       <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🛑 Dev Sell Stop</div>
