@@ -120,7 +120,7 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // 'mirror' sells the same fraction they did; 'full' exits completely on any
   // leader sell. Set copySells false to hold through their exit instead.
   copySells: true,
-  sellMode: 'mirror',
+  sellMode: 'full',
   // OFF: a leader adding to a bag adds to ours (DCA mirror) instead of being
   // skipped. Turn on to copy only the first entry per mint.
   blockRepeatBuys: false,
@@ -903,9 +903,9 @@ export class CopyTraderService {
    * `copySells: false` returns the previous behaviour exactly.
    */
   private async onLeaderSell(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
-    const pos = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+    const matchingPositions = this.positions.filter(p => p.mint === sig.mint && p.status !== 'CLOSED');
 
-    if (!pos) {
+    if (!matchingPositions.length) {
       // Visible but cheap: the leader disposed of something we never copied
       // (bought before tracking, airdrop, transfer-in).
       this.pushFeed(wallet, sig, 'skipped', 'No copy position in this mint — nothing held.');
@@ -921,7 +921,7 @@ export class CopyTraderService {
       fraction = sold / (sold + remaining);
     }
 
-    const exitedFully = fraction >= 0.999;
+    const exitedFully = fraction >= 0.75 || remaining === 0;
     const describeLeader = exitedFully
       ? `Leader ${wallet.nickname} EXITED FULLY`
       : `Leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}% of their bag`;
@@ -933,26 +933,27 @@ export class CopyTraderService {
       return;
     }
 
-    // 'mirror' matches their exit proportionally; 'full' treats any leader sell
-    // as the exit signal and closes the whole position.
-    const sellFraction = this.config.sellMode === 'full' ? 1 : fraction;
+    // 'full' mode OR leader selling >= 75% OR leader exiting means FULL 100% EXIT!
+    const sellFraction = (this.config.sellMode === 'full' || exitedFully) ? 1 : fraction;
     if (sellFraction <= 0) {
       this.pushFeed(wallet, sig, 'skipped', `${describeLeader} — no measurable fraction to mirror.`);
       return;
     }
 
     this.pushFeed(wallet, sig, 'copied',
-      `${describeLeader} — mirroring ${(sellFraction * 100).toFixed(0)}% exit.`);
+      `${describeLeader} — exiting ${(sellFraction * 100).toFixed(0)}% across ${matchingPositions.length} position(s).`);
 
-    await this.closePosition(
-      pos,
-      sellFraction,
-      exitedFully && this.config.sellMode !== 'full'
-        ? `leader ${wallet.nickname} exited fully`
-        : `leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}%`,
-      sig,
-      wallet
-    );
+    for (const pos of matchingPositions) {
+      await this.closePosition(
+        pos,
+        sellFraction,
+        (exitedFully || sellFraction === 1)
+          ? `leader ${wallet.nickname} exited`
+          : `leader ${wallet.nickname} sold ${(fraction * 100).toFixed(0)}%`,
+        sig,
+        wallet
+      );
+    }
   }
 
   /**
