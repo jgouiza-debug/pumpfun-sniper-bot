@@ -1,0 +1,175 @@
+﻿name: Build and Release Executable
+
+# Two distinct jobs share one file:
+#  - every push to master builds the exe as a smoke test and publishes nothing;
+#  - a v* tag builds, checksums and publishes the release the in-app updater
+#    installs from.
+#
+# The updater REFUSES to install a release with no .sha256 asset, so the
+# checksum step below is not optional decoration â€” drop it and every client
+# silently loses the ability to update.
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # npm ci VALIDATES the lock rather than resolving it, and npm 10 and 11
+      # disagree about ws's optional peers (utf-8-validate, bufferutil): a lock
+      # written by 11 makes 10 abort with "Missing: utf-8-validate from lock
+      # file". Every run in this repo's history failed here, which is why no
+      # release was ever published and no client could ever auto-update.
+      # Pinning the major to the one that writes the lock keeps ci strict
+      # instead of loosening it to npm install.
+      - name: Install Dependencies
+        run: |
+          npm i -g npm@11
+          npm ci
+
+      # The exe reports the version baked into the package.json inside its pkg
+      # snapshot. Without this the tag and the shipped build disagree, the
+      # updater compares against a stale number, and clients either never see
+      # the update or re-install one they already have.
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          Write-Host "Stamping version $version"
+          npm version $version --no-git-tag-version --allow-same-version
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Build Executable
+        run: npm run build:exe
+
+      - name: Generate SHA256
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $exe = "dist-exe/pumpfun-sniper-bot.exe"
+          $hash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  pumpfun-sniper-bot.exe" | Out-File -FilePath "dist-exe/pumpfun-sniper-bot.exe.sha256" -Encoding ascii -NoNewline
+          Write-Host "SHA256: $hash"
+
+      - name: Create Release and Upload Assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist-exe/pumpfun-sniper-bot.exe
+            dist-exe/pumpfun-sniper-bot.exe.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # macOS has to build ON macOS. pkg can fetch a prebuilt x64 base from any
+  # host, but an arm64 Mach-O will not execute on Apple Silicon without at
+  # least an ad-hoc code signature, and that signing step cannot run on a
+  # Windows or Linux runner â€” attempting it produces a 0-byte file (measured
+  # 2026-08-13). Hence a separate macos runner rather than extra targets above.
+  build-and-release-macos:
+    runs-on: macos-14   # Apple Silicon runner: builds arm64 natively, x64 via pkg
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # npm ci VALIDATES the lock rather than resolving it, and npm 10 and 11
+      # disagree about ws's optional peers (utf-8-validate, bufferutil): a lock
+      # written by 11 makes 10 abort with "Missing: utf-8-validate from lock
+      # file". Every run in this repo's history failed here, which is why no
+      # release was ever published and no client could ever auto-update.
+      # Pinning the major to the one that writes the lock keeps ci strict
+      # instead of loosening it to npm install.
+      - name: Install Dependencies
+        run: |
+          npm i -g npm@11
+          npm ci
+
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Stamping version $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Build macOS binaries
+        run: |
+          npm run build:mac
+          npm run build:mac-intel
+
+      # Ad-hoc signature. Apple Silicon refuses to execute an unsigned arm64
+      # binary outright â€” this is not the same thing as notarisation, which
+      # only affects the Gatekeeper prompt on first open.
+      - name: Ad-hoc codesign (arm64)
+        run: |
+          codesign --force --deep --sign - dist-exe/pumpfun-sniper-bot-macos-arm64
+          codesign --verify --verbose dist-exe/pumpfun-sniper-bot-macos-arm64
+
+      - name: Generate SHA256
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd dist-exe
+          for f in pumpfun-sniper-bot-macos-arm64 pumpfun-sniper-bot-macos-x64; do
+            # .sha256sum, NOT .sha256, and the extension is load-bearing.
+            #
+            # Every client shipped before 1.0.1 finds its checksum with
+            # `assets.find(a => a.name.endsWith('.sha256'))` — the FIRST match in
+            # the array, with no check that it belongs to the binary it just
+            # downloaded. GitHub returns assets alphabetically and '-macos'
+            # sorts before '.exe', so publishing these as .sha256 made every
+            # existing Windows client verify its exe against the macOS arm64
+            # hash and abort with "the download was corrupt or tampered with".
+            # Measured against the real v1.0.1 release on 2026-08-13.
+            #
+            # Keeping exactly one .sha256 asset in the release makes that old
+            # matcher correct by construction. Remove this only when no 1.0.0
+            # clients remain in the wild.
+            shasum -a 256 "$f" | awk '{printf "%s  '"$f"'", $1}' > "$f.sha256sum"
+            cat "$f.sha256sum"; echo
+          done
+
+      - name: Upload macOS assets to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist-exe/pumpfun-sniper-bot-macos-arm64
+            dist-exe/pumpfun-sniper-bot-macos-arm64.sha256sum
+            dist-exe/pumpfun-sniper-bot-macos-x64
+            dist-exe/pumpfun-sniper-bot-macos-x64.sha256sum
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

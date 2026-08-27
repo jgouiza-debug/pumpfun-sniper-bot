@@ -1,18 +1,24 @@
 {
   "name": "pumpfun-token-screening-pipeline",
-  "version": "1.0.0",
+  "version": "1.0.10",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "main": "dist/index.js",
   "bin": "dist/server.js",
   "scripts": {
     "build": "vite build && tsc",
     "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets host --output dist-exe/pumpfun-sniper-bot.exe",
+    "build:mac": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-arm64 --output dist-exe/pumpfun-sniper-bot-macos-arm64",
+    "build:mac-intel": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-x64 --output dist-exe/pumpfun-sniper-bot-macos-x64",
     "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
     "server": "tsc && node --use-system-ca --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
     "dev": "node --use-system-ca --env-file-if-exists=.env -r ts-node/register src/server.ts",
     "test": "ts-node src/tests/run.ts",
-    "replay": "ts-node src/replay.ts"
+    "replay": "ts-node src/replay.ts",
+    "test:filters": "ts-node src/tests/filterProofs.ts",
+    "test:guardrails": "ts-node src/tests/guardrailProofs.ts",
+    "test:copy": "ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts",
+    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts"
   },
   "pkg": {
     "scripts": "dist/**/*.js",

@@ -137,6 +137,7 @@ export class UpdaterService {
   }
 
   public getCurrentVersion(): string {
+    this.readLocalVersion();
     return this.currentVersion;
   }
 
