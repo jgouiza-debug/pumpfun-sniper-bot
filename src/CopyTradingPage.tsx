@@ -167,6 +167,11 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
     await post('/api/copy/sell', { positionId });
   };
 
+  const discardCopyPosition = async (positionId: string) => {
+    if (!window.confirm('Force-close and discard this stuck copy position from dashboard?')) return;
+    await post('/api/copy/discard', { positionId });
+  };
+
   const clearHistory = async () => {
     if (!window.confirm('Clear the copy feed and receipts? Open positions are kept.')) return;
     await post('/api/copy/clear-history');
@@ -443,6 +448,14 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                           </a>
                           <button className="btn-cell-action" onClick={() => forceSell(pos.id)}>
                             LIQUIDATE
+                          </button>
+                          <button
+                            className="btn-terminal-outline"
+                            style={{ padding: '2px 6px', fontSize: '9px', color: '#ff1744', borderColor: 'rgba(255,23,68,0.4)' }}
+                            onClick={() => discardCopyPosition(pos.id)}
+                            title="Force-close and remove stuck/unsellable copy position"
+                          >
+                            DISCARD
                           </button>
                         </div>
                       </td>

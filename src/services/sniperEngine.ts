@@ -3856,6 +3856,27 @@ export class SniperEngine {
     // A human clicking LIQUIDATE overrides the automatic-retry backoff.
     pos.sellRetryAfterMs = undefined;
     await this.executeSell(pos, 'Manual User Force Sell Override', true);
+
+    // Fallback: If position remains open after a manual force sell attempt (e.g. sell failed on-chain),
+    // register as force closed so it doesn't stay stuck on the dashboard.
+    if (this.activePositions.some(p => p.id === pos.id)) {
+      this.log('warn', `⚠️ [FORCE SELL FALLBACK] On-chain sell for $${pos.tokenSymbol} failed or was un-executable. Registering position as force closed.`, pos.mint);
+      await this.registerManualOnChainExit(pos, 'Force Closed — Un-sellable on-chain');
+      this.emitChange();
+    }
+
+    return true;
+  }
+
+  /**
+   * Explicitly force close and discard an un-sellable/stuck position from activePositions.
+   */
+  public async discardPosition(positionId: string): Promise<boolean> {
+    const pos = this.activePositions.find(p => p.id === positionId);
+    if (!pos) return false;
+    this.log('warn', `🗑️ [DISCARD] Manually discarding stuck position $${pos.tokenSymbol}.`, pos.mint);
+    await this.registerManualOnChainExit(pos, 'Discarded Stuck Position');
+    this.emitChange();
     return true;
   }
 

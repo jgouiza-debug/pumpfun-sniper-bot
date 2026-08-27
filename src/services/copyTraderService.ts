@@ -319,6 +319,19 @@ export class CopyTraderService {
     }
 
     await this.closePosition(pos, 1, 'Manual force sell from copy page');
+
+    // Fallback: If position remains open after force sell attempt (e.g. sell tx failed on-chain),
+    // register as force closed cleanly so it doesn't stay stuck!
+    if (this.positions.some(p => p.id === pos.id && p.status !== 'CLOSED')) {
+      await this.closePosition(pos, 1, 'Force Closed — Un-sellable on-chain', undefined, undefined, true);
+    }
+    return true;
+  }
+
+  public async discardPosition(positionId: string): Promise<boolean> {
+    const pos = this.positions.find(p => p.id === positionId && p.status !== 'CLOSED');
+    if (!pos) return false;
+    await this.closePosition(pos, 1, 'Discarded Stuck Position', undefined, undefined, true);
     return true;
   }
 
@@ -1016,7 +1029,10 @@ export class CopyTraderService {
       pos.realizedPnlSol += pnlSol;
       pos.realizedPnlUsd += pnlUsd;
       pos.status = isFull || pos.tokensHeld <= 1e-9 ? 'CLOSED' : 'PARTIAL';
-      if (pos.status === 'CLOSED') pos.tokensHeld = 0;
+      if (pos.status === 'CLOSED') {
+        pos.tokensHeld = 0;
+        this.positions = this.positions.filter(p => p.id !== pos.id);
+      }
       this.repricePosition(pos, pos.currentPriceSol);
 
       const owner = wallet ?? this.wallets.get(pos.leaderWallet);

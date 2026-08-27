@@ -633,6 +633,19 @@ export function App() {
     }
   };
 
+  const discardPosition = async (positionId: string) => {
+    if (!window.confirm('Force-close and discard this stuck position from open positions?')) return;
+    try {
+      await apiFetch(`http://localhost:${selectedPort}/api/bot/discard-position`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ positionId })
+      });
+    } catch (err) {
+      console.error("Discard error:", err);
+    }
+  };
+
   const isBotActive = botStatus?.isBotActive || false;
   const currentLeniency = botStatus?.config?.leniencyMode || 'strict';
   const activePositions = botStatus?.activePositions || [];
@@ -1165,6 +1178,14 @@ export function App() {
                           </a>
                           <button className="btn-cell-action" onClick={() => forceSellPosition(pos.id)}>
                             LIQUIDATE
+                          </button>
+                          <button
+                            className="btn-terminal-outline"
+                            style={{ padding: '2px 6px', fontSize: '9px', color: '#ff1744', borderColor: 'rgba(255,23,68,0.4)' }}
+                            onClick={() => discardPosition(pos.id)}
+                            title="Force-close and remove stuck/unsellable position from dashboard"
+                          >
+                            DISCARD
                           </button>
                         </div>
                       </td>

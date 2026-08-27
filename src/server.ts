@@ -237,6 +237,15 @@ app.post('/api/bot/sync-balances', async (req, res) => {
   res.json({ success: true, status: sniperEngine.getStatus() });
 });
 
+// POST Force-close and discard a stuck position
+app.post('/api/bot/discard-position', async (req, res) => {
+  const { positionId } = req.body;
+  if (!positionId) return res.status(400).json({ error: 'positionId is required' });
+
+  const success = await sniperEngine.discardPosition(positionId);
+  res.json({ success, message: success ? 'Position discarded' : 'Position not found' });
+});
+
 // POST Clear Trade History
 app.post('/api/bot/clear-history', (req, res) => {
   sniperEngine.clearTradeHistory();
@@ -460,6 +469,15 @@ app.post('/api/copy/sell', async (req, res) => {
 app.post('/api/copy/sync-balances', async (req, res) => {
   await copyTrader.syncPositionsWithOnChainBalances();
   res.json({ success: true, status: copyTrader.getStatus() });
+});
+
+// POST Force-close and discard a stuck copy position
+app.post('/api/copy/discard', async (req, res) => {
+  const { positionId } = req.body || {};
+  if (!positionId) return res.status(400).json({ error: 'positionId is required' });
+
+  const success = await copyTrader.discardPosition(String(positionId));
+  res.json({ success });
 });
 
 // POST wipe feed + receipts (open positions are kept)
