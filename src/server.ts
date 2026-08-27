@@ -331,14 +331,32 @@ app.post('/api/bot/kill', (req, res) => {
   res.json(sniperEngine.emergencyStop());
 });
 
-// POST shutdown dev server process completely
-app.post('/api/server/shutdown', (req, res) => {
+// POST/GET shutdown dev server process completely
+app.all('/api/server/shutdown', (req, res) => {
   res.json({ success: true, message: 'Dev server process is shutting down.' });
-  console.log('🛑 Dev server shutdown requested via UI. Terminating process...');
+  console.log('🛑 Dev server shutdown requested (browser tab closed). Terminating process...');
   setTimeout(() => {
     process.exit(0);
-  }, 500);
+  }, 200);
 });
+
+// Tab Heartbeat & Auto-Shutdown Failsafe
+let lastTabHeartbeatAt = Date.now();
+let receivedFirstTabHeartbeat = false;
+
+app.post('/api/heartbeat', (req, res) => {
+  lastTabHeartbeatAt = Date.now();
+  receivedFirstTabHeartbeat = true;
+  res.json({ success: true });
+});
+
+// Auto-shutdown if browser tab was closed abruptly without unload event
+setInterval(() => {
+  if (receivedFirstTabHeartbeat && (Date.now() - lastTabHeartbeatAt > 12000)) {
+    console.log('🛑 All UI tabs closed (heartbeat timeout). Terminating dev server...');
+    process.exit(0);
+  }
+}, 3000);
 
 // GET recent T0-T7 candidate timelines with per-stage durations
 app.get('/api/timelines', (req, res) => {
