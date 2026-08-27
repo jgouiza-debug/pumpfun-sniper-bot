@@ -675,8 +675,8 @@ app.get('/api/report/last', (req, res) => {
  * the old headless-server behaviour.
  */
 function launchAppWindow(url: string, server: http.Server): void {
-  if (parseBoolish(process.env.SNIPER_NO_WINDOW)) {
-    console.log('🖥️  SNIPER_NO_WINDOW set — running headless. Open the URL above yourself.');
+  if (parseBoolish(process.env.HEADLESS) || parseBoolish(process.env.NO_OPEN) || parseBoolish(process.env.SNIPER_NO_WINDOW)) {
+    console.log(`🖥️  Running in headless mode — open ${url} in your browser.`);
     return;
   }
 
