@@ -121,9 +121,8 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // leader sell. Set copySells false to hold through their exit instead.
   copySells: true,
   sellMode: 'full',
-  // OFF: a leader adding to a bag adds to ours (DCA mirror) instead of being
-  // skipped. Turn on to copy only the first entry per mint.
-  blockRepeatBuys: false,
+  // ON: copy only the first entry per mint (1 buy per token limit).
+  blockRepeatBuys: true,
   maxOpenPositions: 10,
   maxSlippagePct: 25,
   perWalletCooldownSec: 0,
@@ -690,8 +689,9 @@ export class CopyTraderService {
     }
 
     const existing = this.positions.find(p => p.mint === mint && p.status !== 'CLOSED');
-    if (existing && this.config.blockRepeatBuys) {
-      return skip('Already holding this mint and repeat buys are blocked.');
+    const previouslyTraded = this.history.some(h => h.mint === mint && h.side === 'buy');
+    if (this.config.blockRepeatBuys && (existing || previouslyTraded)) {
+      return skip(`Already ${existing ? 'holding' : 'previously copied'} $${symbol} — repeat buys are blocked (1 buy per token).`);
     }
 
     if (!existing) {
