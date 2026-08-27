@@ -1066,7 +1066,19 @@ export function App() {
           {/* Positions Matrix Table */}
           <div className="section-header">
             <div className="section-title">Positions Matrix — Bot Instance Port {selectedPort}</div>
-            <div className="section-count">{activePositions.length} OPEN ENGAGEMENTS</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <button
+                className="btn-terminal-outline"
+                style={{ padding: '2px 8px', fontSize: '9px' }}
+                onClick={async () => {
+                  await apiFetch(`http://localhost:${selectedPort}/api/bot/sync-balances`, { method: 'POST' });
+                }}
+                title="Query on-chain SPL token balances to sync manually sold tokens"
+              >
+                🔄 SYNC BALANCES
+              </button>
+              <div className="section-count">{activePositions.length} OPEN ENGAGEMENTS</div>
+            </div>
           </div>
 
           <div className="matrix-container flex-matrix">

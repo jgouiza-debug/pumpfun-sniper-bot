@@ -374,7 +374,19 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
           <div className="section-header" style={{ marginTop: '8px' }}>
             <div className="section-title">Open Copy Positions</div>
-            <div className="section-count">{positions.length} OPEN</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <button
+                className="btn-terminal-outline"
+                style={{ padding: '2px 8px', fontSize: '9px' }}
+                onClick={async () => {
+                  await post('/api/copy/sync-balances');
+                }}
+                title="Query on-chain SPL token balances to sync manually sold tokens"
+              >
+                🔄 SYNC BALANCES
+              </button>
+              <div className="section-count">{positions.length} OPEN</div>
+            </div>
           </div>
 
           <div className="matrix-container flex-matrix">

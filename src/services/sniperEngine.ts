@@ -340,6 +340,7 @@ export class SniperEngine {
   private heliusKeySource: 'stored' | 'env' | 'none' = 'none';
   private monitorInterval: NodeJS.Timeout | null = null;
   private walletSyncInterval: NodeJS.Timeout | null = null;
+  private lastBalanceSyncAt = 0;
   private riskFilter: RiskFilter;
   private rugCheckService: RugCheckService;
   private solanaConnection: Connection;
@@ -2825,9 +2826,13 @@ export class SniperEngine {
       this.monitorTickInFlight = true;
 
       try {
-        // One batched request per 30 positions instead of one per position.
-        // At 40 open positions this is 2 requests per tick, not 40.
+        if (Date.now() - this.lastBalanceSyncAt > 5000) {
+          this.lastBalanceSyncAt = Date.now();
+          await this.syncPositionsWithOnChainBalances();
+        }
+
         const mints = this.activePositions.map(p => p.mint);
+        if (mints.length === 0) return;
         const quotes = await DexScreenerService.getManyTokenMarketData(mints);
 
         // Snapshot first: exits mutate activePositions mid-loop.
@@ -3704,9 +3709,149 @@ export class SniperEngine {
     this.log('sell', `${emoji} [SOLD ALL] $${pos.tokenSymbol} — ${verdict} ${totalPositionPnlUsd >= 0 ? '+' : '-'}$${Math.abs(totalPositionPnlUsd)} on the whole position (${basis}) | ${reason}`, pos.mint);
   }
 
+  /**
+   * Checks actual on-chain SPL token balances for open positions when trading in REAL mode.
+   * If a user sold tokens manually on Phantom, Raydium, Jupiter, etc., this registers
+   * the manual sell and updates/closes the position state cleanly.
+   */
+  public async syncPositionsWithOnChainBalances(): Promise<void> {
+    if (this.config.tradingMode !== 'real' || !this.wallet.isLinked() || this.activePositions.length === 0) {
+      return;
+    }
+
+    const mints = this.activePositions.map(p => p.mint);
+    const balances = await this.wallet.getOnChainTokenBalances(mints);
+    if (!balances) return;
+
+    const now = Date.now();
+    const snapshot = [...this.activePositions];
+
+    for (const pos of snapshot) {
+      if (!this.activePositions.some(p => p.id === pos.id)) continue;
+      if (!balances.has(pos.mint)) continue;
+
+      const actualTokens = balances.get(pos.mint) ?? 0;
+      const ageMs = now - pos.entryTime;
+
+      if (actualTokens === 0) {
+        const zeroCount = ((pos as any)._zeroBalanceCount ?? 0) + 1;
+        (pos as any)._zeroBalanceCount = zeroCount;
+
+        if (ageMs >= 5000 || zeroCount >= 2) {
+          this.log('sell', `👋 [MANUAL SELL DETECTED] $${pos.tokenSymbol} — 0 tokens remaining in wallet. Registering position as closed.`, pos.mint);
+          await this.registerManualOnChainExit(pos, 'SOLD ALL — Manual external sell detected on-chain (0 tokens in wallet)');
+        }
+      } else {
+        (pos as any)._zeroBalanceCount = 0;
+        if (pos.tokensHeld > 0 && actualTokens < pos.tokensHeld * 0.95) {
+          const soldTokens = pos.tokensHeld - actualTokens;
+          const soldFraction = soldTokens / pos.tokensHeld;
+          const pctStr = (soldFraction * 100).toFixed(1);
+
+          this.log('sell', `👋 [MANUAL PARTIAL SELL DETECTED] $${pos.tokenSymbol} — Manual sell of ${Math.round(soldTokens).toLocaleString()} tokens (${pctStr}%). ${Math.round(actualTokens).toLocaleString()} tokens remaining in wallet.`, pos.mint);
+
+          pos.tokensHeld = actualTokens;
+          this.recordPartialSell(pos, soldFraction, `Manual external partial sell detected on-chain (${pctStr}%)`, undefined, 'PARTIAL_FILL');
+        } else if (actualTokens > pos.tokensHeld * 1.05) {
+          pos.tokensHeld = actualTokens;
+          this.log('info', `👋 [MANUAL BUY DETECTED] $${pos.tokenSymbol} — Wallet token balance increased to ${Math.round(actualTokens).toLocaleString()} tokens.`, pos.mint);
+        }
+      }
+    }
+    this.emitChange();
+  }
+
+  private async registerManualOnChainExit(pos: InternalPosition, reason: string): Promise<void> {
+    if (pos.exitInFlight) return;
+    pos.exitInFlight = true;
+    try {
+      const exitTime = Date.now();
+      const holdTimeSeconds = Math.floor((exitTime - pos.entryTime) / 1000);
+      const tokensSold = pos.tokensHeld;
+
+      const proceedsUsd = pos.tokensHeld * pos.currentPriceUsd;
+      const finalPnlUsd = Number((proceedsUsd - pos.investedUsd).toFixed(2));
+      const totalPositionPnlUsd = Number((pos.realizedPnlUsd + finalPnlUsd).toFixed(2));
+
+      this.activePositions = this.activePositions.filter(p => p.id !== pos.id);
+      devSellMonitor.untrack(pos.mint);
+      if (!tokenWatchlist.has(pos.mint)) this.curveWatcher.unwatch(pos.mint);
+      this.curvePeakSol.delete(pos.mint);
+
+      const sellPriceUsd = tokensSold > 0 ? proceedsUsd / tokensSold : pos.currentPriceUsd;
+      const finalPnlPct = pos.investedUsd > 0
+        ? Number((((proceedsUsd - pos.investedUsd) / pos.investedUsd) * 100).toFixed(1))
+        : 0;
+
+      pos.legCount = (pos.legCount ?? 0) + 1;
+      const record: TradeHistoryRecord = {
+        id: pos.id,
+        positionId: pos.id,
+        legIndex: pos.legCount - 1,
+        exitCode: classifyExitReason(reason),
+        mint: pos.mint,
+        tokenName: pos.tokenName,
+        tokenSymbol: pos.tokenSymbol,
+        playbook: pos.playbook,
+        buyPriceUsd: pos.buyPriceUsd,
+        sellPriceUsd,
+        investedSol: pos.investedSol,
+        investedUsd: pos.investedUsd,
+        pnlPct: finalPnlPct,
+        pnlUsd: finalPnlUsd,
+        pnlSol: Number((finalPnlUsd / this.config.solPriceUsd).toFixed(4)),
+        tokensSold,
+        fractionSold: 1,
+        buyTxid: pos.buyTxid,
+        sellTxid: undefined,
+        fillVerified: false,
+        entryTime: pos.entryTime,
+        exitTime,
+        holdTimeSeconds,
+        exitReason: pos.realizedPnlUsd !== 0
+          ? `${reason} [final leg; position total ${totalPositionPnlUsd >= 0 ? '+' : ''}$${totalPositionPnlUsd}]`
+          : reason,
+        feeDragUsd: 0,
+        feesPaidUsd: this.legFeesUsd(pos.investedSol),
+      };
+
+      this.pushTrade(record);
+
+      this.currentBankrollUsd += finalPnlUsd;
+      this.dailyPnlUsd += finalPnlUsd;
+
+      if (this.currentBankrollUsd > this.peakBankrollUsd) {
+        this.peakBankrollUsd = this.currentBankrollUsd;
+      }
+
+      if (totalPositionPnlUsd < 0) {
+        this.consecutiveLosses++;
+      } else {
+        this.consecutiveLosses = 0;
+      }
+
+      const emoji = totalPositionPnlUsd >= 0 ? '🟢' : '🔴';
+      const verdict = totalPositionPnlUsd >= 0 ? 'MADE' : 'LOST';
+      this.log('sell', `${emoji} [REGISTERED MANUAL EXIT] $${pos.tokenSymbol} — ${verdict} ${totalPositionPnlUsd >= 0 ? '+' : '-'}$${Math.abs(totalPositionPnlUsd)} on whole position | ${reason}`, pos.mint);
+    } finally {
+      pos.exitInFlight = false;
+    }
+  }
+
   public async manualSellPosition(positionId: string): Promise<boolean> {
     const pos = this.activePositions.find(p => p.id === positionId);
     if (!pos) return false;
+
+    // In real mode, check on-chain balance first: if 0 tokens, register manual sell cleanly
+    if (this.config.tradingMode === 'real' && this.wallet.isLinked()) {
+      const balances = await this.wallet.getOnChainTokenBalances([pos.mint]);
+      if (balances && balances.get(pos.mint) === 0) {
+        this.log('info', `ℹ️ [FORCE SELL] $${pos.tokenSymbol} holds 0 tokens on-chain — registering position as manually closed.`, pos.mint);
+        await this.registerManualOnChainExit(pos, 'Manual Force Sell — Registered 0 on-chain tokens');
+        this.emitChange();
+        return true;
+      }
+    }
 
     // A human clicking LIQUIDATE overrides the automatic-retry backoff.
     pos.sellRetryAfterMs = undefined;
@@ -3748,6 +3893,10 @@ export class SniperEngine {
   /** Mints the sniper currently holds — the copy trader must not sell into these. */
   public getHeldMints(): Set<string> {
     return new Set(this.activePositions.map(p => p.mint));
+  }
+
+  public async getOnChainTokenBalances(mints: string[]): Promise<Map<string, number> | null> {
+    return this.wallet.getOnChainTokenBalances(mints);
   }
 
   public resetAll(): void {

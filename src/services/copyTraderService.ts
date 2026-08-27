@@ -161,6 +161,7 @@ export class CopyTraderService {
   private dexPollInFlight = false;
   private changeListeners = new Set<() => void>();
   private persistTimer: NodeJS.Timeout | null = null;
+  private lastBalanceSyncAt = 0;
   private idCounter = 0;
 
   constructor() {
@@ -309,6 +310,15 @@ export class CopyTraderService {
   public async manualSellPosition(positionId: string): Promise<boolean> {
     const pos = this.positions.find(p => p.id === positionId && p.status !== 'CLOSED');
     if (!pos) return false;
+
+    if (this.config.tradingMode === 'real') {
+      const balances = await sniperEngine.getOnChainTokenBalances([pos.mint]);
+      if (balances && balances.get(pos.mint) === 0) {
+        await this.closePosition(pos, 1, 'Manual Force Sell — Registered 0 on-chain tokens', undefined, undefined, true);
+        return true;
+      }
+    }
+
     await this.closePosition(pos, 1, 'Manual force sell from copy page');
     return true;
   }
@@ -955,7 +965,8 @@ export class CopyTraderService {
     fraction: number,
     reason: string,
     leaderSig?: LeaderSignal,
-    wallet?: TrackedWalletInternal
+    wallet?: TrackedWalletInternal,
+    isManualRegistration = false
   ): Promise<void> {
     if (pos.exitInFlight) return;
     pos.exitInFlight = true;
@@ -969,7 +980,7 @@ export class CopyTraderService {
       let txid: string | undefined;
       let fillVerified = false;
 
-      if (this.config.tradingMode === 'real' && pos.buyTxid && !pos.buyTxid.startsWith('sim_')) {
+      if (!isManualRegistration && this.config.tradingMode === 'real' && pos.buyTxid && !pos.buyTxid.startsWith('sim_')) {
         const pctParam = sellAmountParam(fraction * 100);
         const result = await sniperEngine.executeExternalTrade(
           'sell', pos.mint, 0, pctParam, pos.pool, this.config.maxSlippagePct
@@ -989,10 +1000,10 @@ export class CopyTraderService {
           solReceived = tokensSold * pos.currentPriceSol;
         }
       } else {
-        // Paper exit at the freshest price we hold, haircut for slippage.
+        // Paper exit or manual registration exit using estimates
         const exitPriceSol = pos.currentPriceSol * (1 - PAPER_SLIPPAGE_PCT / 100);
         solReceived = tokensSold * exitPriceSol;
-        txid = `sim_copy_${Date.now()}_${++this.idCounter}`;
+        txid = isManualRegistration ? undefined : `sim_copy_${Date.now()}_${++this.idCounter}`;
       }
 
       const costBasisSol = pos.entryPriceSol * tokensSold;
@@ -1101,9 +1112,38 @@ export class CopyTraderService {
    * (non-pump venues). PRICING ONLY — the take-profit and max-hold exits that
    * lived here were removed 2026-08-12 (no automatic sells, owner decision).
    */
+  public async syncPositionsWithOnChainBalances(): Promise<void> {
+    if (this.config.tradingMode !== 'real' || !this.config.enabled) return;
+
+    const openPositions = this.positions.filter(p => p.status !== 'CLOSED');
+    if (openPositions.length === 0) return;
+
+    const mints = openPositions.map(p => p.mint);
+    const balances = await sniperEngine.getOnChainTokenBalances(mints);
+    if (!balances) return;
+
+    for (const pos of openPositions) {
+      if (pos.status === 'CLOSED' || !balances.has(pos.mint)) continue;
+      const actualTokens = balances.get(pos.mint) ?? 0;
+
+      if (actualTokens === 0) {
+        await this.closePosition(pos, 1, 'SOLD ALL — Manual external sell detected on-chain (0 tokens in wallet)', undefined, undefined, true);
+      } else if (pos.tokensHeld > 0 && actualTokens < pos.tokensHeld * 0.95) {
+        const soldFraction = (pos.tokensHeld - actualTokens) / pos.tokensHeld;
+        await this.closePosition(pos, soldFraction, `Manual external partial sell detected on-chain (${(soldFraction * 100).toFixed(1)}%)`, undefined, undefined, true);
+      }
+    }
+    this.emitChange();
+  }
+
   private startMonitor(): void {
     if (this.monitorInterval) return;
     this.monitorInterval = setInterval(() => {
+      if (Date.now() - this.lastBalanceSyncAt > 5000) {
+        this.lastBalanceSyncAt = Date.now();
+        void this.syncPositionsWithOnChainBalances();
+      }
+
       const open = this.positions.filter(p => p.status !== 'CLOSED' && !p.exitInFlight);
 
       // Batch-reprice stale positions. PumpPortal ticks cover pump.fun mints;

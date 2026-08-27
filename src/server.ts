@@ -231,6 +231,12 @@ app.post('/api/bot/sell-position', async (req, res) => {
   res.json({ success, message: success ? 'Position sold successfully' : 'Position not found' });
 });
 
+// POST Sync On-Chain Token Balances for Active Positions
+app.post('/api/bot/sync-balances', async (req, res) => {
+  await sniperEngine.syncPositionsWithOnChainBalances();
+  res.json({ success: true, status: sniperEngine.getStatus() });
+});
+
 // POST Clear Trade History
 app.post('/api/bot/clear-history', (req, res) => {
   sniperEngine.clearTradeHistory();
@@ -448,6 +454,12 @@ app.post('/api/copy/sell', async (req, res) => {
   if (!positionId) return res.status(400).json({ error: 'positionId is required' });
   const success = await copyTrader.manualSellPosition(String(positionId));
   res.json({ success });
+});
+
+// POST Sync On-Chain Token Balances for Copy Positions
+app.post('/api/copy/sync-balances', async (req, res) => {
+  await copyTrader.syncPositionsWithOnChainBalances();
+  res.json({ success: true, status: copyTrader.getStatus() });
 });
 
 // POST wipe feed + receipts (open positions are kept)
