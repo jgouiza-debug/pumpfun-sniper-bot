@@ -253,6 +253,44 @@ async function main(): Promise<void> {
   delete svc.getOwnedTokenAmount;
   svc.config.tradingMode = 'paper';
 
+  console.log('\n-- 8. H3: unsigned PumpPortal copies dedup against the Helius lane per-leader --');
+  svc.logWatcher = null; // no on-chain lane for this leader → unsigned payload is sole source
+
+  // 8a. An unsigned PumpPortal BUY copies once and leaves a dedup marker.
+  const MINT9 = 'DrillMint999999999999999999999999999999pump';
+  const copiedBefore = wallet.copiedBuys;
+  await svc.handlePumpPortalMessage({
+    mint: MINT9, txType: 'buy', traderPublicKey: LEADER,
+    solAmount: 0.5, tokenAmount: 100_000, pool: 'pump',
+  });
+  check('an unsigned PumpPortal buy is copied when the leader has no live Helius sub',
+    wallet.copiedBuys === copiedBefore + 1 && svc.positions.some((p: any) => p.mint === MINT9 && p.status !== 'CLOSED'),
+    `copiedBuys ${copiedBefore} → ${wallet.copiedBuys}`);
+  check('it left an unsigned-copy dedup marker',
+    svc.unsignedCopies.has(`${MINT9}:buy`));
+
+  // 8b. The Helius redelivery of that same trade is dropped — and the marker is
+  // consumed, so a genuine NEXT buy of the same mint would still copy.
+  check('OLD BUG: the marker now dedups exactly one Helius delivery',
+    svc.alreadyCopiedUnsigned(MINT9, 'buy') === true);
+  check('the marker is consumed after one match', svc.alreadyCopiedUnsigned(MINT9, 'buy') === false);
+
+  // 8c. Per-leader gate: when THIS leader's Helius sub IS live, an unsigned
+  // payload is NOT copied (Helius drives it) and leaves no marker — even though
+  // a global isHealthy() would have been false with another wallet mid-ack.
+  const MINT10 = 'DrillMintAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApump';
+  svc.logWatcher = { isAddressLive: (a: string) => a === LEADER };
+  const copiedBefore10 = wallet.copiedBuys;
+  await svc.handlePumpPortalMessage({
+    mint: MINT10, txType: 'buy', traderPublicKey: LEADER,
+    solAmount: 0.5, tokenAmount: 100_000, pool: 'pump',
+  });
+  check('an unsigned payload is NOT copied when the leader sub is live',
+    wallet.copiedBuys === copiedBefore10 && !svc.positions.some((p: any) => p.mint === MINT10),
+    `copiedBuys ${copiedBefore10} → ${wallet.copiedBuys}`);
+  check('and leaves no dedup marker (Helius will drive it)', !svc.unsignedCopies.has(`${MINT10}:buy`));
+  svc.logWatcher = null;
+
   console.log(`\n==== COPY-SELL DRILL: ${passed} passed, ${failed} failed ====`);
   console.log(`(state written under ${drillDir})`);
   process.exit(failed > 0 ? 1 : 0);

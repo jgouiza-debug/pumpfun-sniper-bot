@@ -706,23 +706,34 @@ export class CopyTraderService {
     this.markSigProcessed(signature);
 
     for (const sig of signals) {
-      // A trade recovered by the 20s re-read may have been copied already by
-      // a PumpPortal payload that carried no signature — the one case the
-      // signature dedup cannot see. Mirroring it twice sells (or buys) twice.
-      if (isRetry) {
-        const key = `${sig.mint}:${sig.side}`;
-        const unsignedAt = this.unsignedCopies.get(key);
-        if (unsignedAt && Date.now() - unsignedAt < UNSIGNED_COPY_DEDUP_MS) {
-          // One marker dedups exactly one recovered trade — a lingering
-          // marker would swallow the leader's REAL next trade in this mint.
-          this.unsignedCopies.delete(key);
-          this.pushFeed(wallet, sig, 'skipped',
-            'Recovered leader tx matches a trade already copied from the PumpPortal lane — not copied twice.');
-          continue;
-        }
+      // A Helius delivery — fast lane, this analysis path, or the 20s re-read —
+      // may match a trade already copied from a PumpPortal payload that carried
+      // no signature, the one case signature dedup cannot see. Mirroring it
+      // twice sells (or buys) twice. This must run on EVERY Helius path, not
+      // only the retry branch it used to live in.
+      if (this.alreadyCopiedUnsigned(sig.mint, sig.side)) {
+        this.pushFeed(wallet, sig, 'skipped',
+          'Leader tx matches a trade already copied from the PumpPortal lane — not copied twice.');
+        continue;
       }
       await this.handleLeaderSignal(wallet, sig);
     }
+  }
+
+  /**
+   * True when this mint+side was already copied from a signature-less PumpPortal
+   * payload within the dedup window — and consumes the marker so exactly one
+   * Helius delivery is dropped, letting the leader's genuine NEXT trade in the
+   * same mint through. See handlePumpPortalMessage for why the marker exists.
+   */
+  private alreadyCopiedUnsigned(mint: string, side: 'buy' | 'sell'): boolean {
+    const key = `${mint}:${side}`;
+    const at = this.unsignedCopies.get(key);
+    if (at !== undefined && Date.now() - at < UNSIGNED_COPY_DEDUP_MS) {
+      this.unsignedCopies.delete(key);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -784,7 +795,17 @@ export class CopyTraderService {
     // replace whatever was inferred here.
     void this.reconcileLeaderBalances(ev.address, ev.signature);
     void (async () => {
-      for (const sig of signals) await this.handleLeaderSignal(wallet, sig);
+      for (const sig of signals) {
+        // The tally above is already updated (the leader's balance is real
+        // regardless of whether we copy); only the COPY is skipped when this
+        // trade was already mirrored from a signature-less PumpPortal payload.
+        if (this.alreadyCopiedUnsigned(sig.mint, sig.side)) {
+          this.pushFeed(wallet, sig, 'skipped',
+            'Leader tx matches a trade already copied from the PumpPortal lane — not copied twice.');
+          continue;
+        }
+        await this.handleLeaderSignal(wallet, sig);
+      }
     })();
     return true;
   }
@@ -1132,10 +1153,14 @@ export class CopyTraderService {
       // No signature — this trade CANNOT be deduped against the Helius lane,
       // which delivers the same transaction with its signature moments later.
       // Executing from both lanes copies the trade twice (a 50% mirror twice
-      // is 75% out). While the on-chain watcher is healthy it will drive the
-      // execution; this payload has already served as the price tick above.
-      // Only a dead Helius lane makes an unsigned payload the sole source.
-      if (this.logWatcher?.isHealthy() ?? false) return;
+      // is 75% out). If THIS leader's Helius subscription is live it will drive
+      // the execution; this payload has already served as the price tick above.
+      // Only when this leader's on-chain lane is down does the unsigned payload
+      // become the sole source. Keyed per-leader, not on global isHealthy():
+      // isHealthy() is false whenever ANY other tracked wallet is mid-ack (e.g.
+      // just after add-wallet), which used to let an unsigned copy fire for a
+      // leader whose own subscription was live — and Helius then copied it AGAIN.
+      if (this.logWatcher?.isAddressLive(trader!) ?? false) return;
       this.unsignedCopies.set(`${payload.mint}:${payload.txType}`, Date.now());
       if (this.unsignedCopies.size > 50) {
         const cutoff = Date.now() - UNSIGNED_COPY_DEDUP_MS;

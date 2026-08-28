@@ -148,6 +148,19 @@ export class WalletLogWatcher {
     return true;
   }
 
+  /**
+   * Open socket AND THIS address's subscription acknowledged. Unlike isHealthy()
+   * (which is false whenever ANY other tracked wallet is mid-acknowledgement,
+   * e.g. right after add-wallet), this answers only whether the Helius lane is
+   * live for the specific leader in hand — the correct question when deciding
+   * whether an unsigned PumpPortal payload for that leader is the sole source.
+   */
+  public isAddressLive(address: string): boolean {
+    if (!this.isConnected()) return false;
+    const sub = this.subs.get(address);
+    return Boolean(sub && sub.subId !== undefined);
+  }
+
   public trackedCount(): number {
     return this.subs.size;
   }
