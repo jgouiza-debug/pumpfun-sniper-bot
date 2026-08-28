@@ -454,6 +454,14 @@ app.post('/api/copy/sell', async (req, res) => {
   res.json({ success });
 });
 
+// POST force-close / dismiss one copy position: { positionId }
+app.post('/api/copy/positions/close', (req, res) => {
+  const { positionId } = req.body || {};
+  if (!positionId) return res.status(400).json({ error: 'positionId is required' });
+  const success = copyTrader.forceClosePosition(String(positionId));
+  res.status(success ? 200 : 404).json({ success });
+});
+
 // POST wipe feed + receipts (open positions are kept)
 app.post('/api/copy/clear-history', (req, res) => {
   copyTrader.clearHistory();

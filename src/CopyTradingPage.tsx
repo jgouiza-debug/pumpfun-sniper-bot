@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { CopyFeedEvent, CopyPosition, CopyStatusResponse, CopyTradeRecord, CopyTraderConfig, TrackedWalletPublic } from './types';
 import { apiFetch } from './apiClient';
 
+const LOG_WIPE_INTERVAL_MS = 5_000;
+
 const isOnChainTxid = (txid?: string): boolean => Boolean(txid && !txid.startsWith('sim_'));
 
 const qty = (n?: number): string => {
@@ -47,6 +49,19 @@ function ExecBadge({ txid, fillVerified }: { txid?: string; fillVerified?: boole
 export function CopyTradingPage({ apiBase }: { apiBase: string }) {
   const [status, setStatus] = useState<CopyStatusResponse | null>(null);
   const [streamLive, setStreamLive] = useState<boolean>(false);
+
+  // Console wipe cycle. `logClearedAt` is the cutoff every rendered line must
+  // beat; `wipeTick` just drives the countdown display.
+  const [logClearedAt, setLogClearedAt] = useState<number>(() => Date.now());
+  const [wipeTick, setWipeTick] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const now = Date.now();
+      setWipeTick(now);
+      setLogClearedAt(prev => (now - prev >= LOG_WIPE_INTERVAL_MS ? now : prev));
+    }, 500);
+    return () => clearInterval(iv);
+  }, []);
 
   // Add-wallet form
   const [addrInput, setAddrInput] = useState<string>('');
@@ -122,7 +137,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
   useEffect(() => {
     feedEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [status?.feed?.length]);
+  }, [status?.feed?.length, logClearedAt]);
 
   const post = async (url: string, body?: object): Promise<any> => {
     try {
@@ -167,6 +182,11 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
     await post('/api/copy/sell', { positionId });
   };
 
+  const dismissPosition = async (positionId: string, symbol: string) => {
+    if (!window.confirm(`Remove $${symbol} from open copy positions? (Use this if you already liquidated it on Photon or Dex)`)) return;
+    await post('/api/copy/positions/close', { positionId });
+  };
+
   const clearHistory = async () => {
     if (!window.confirm('Clear the copy feed and receipts? Open positions are kept.')) return;
     await post('/api/copy/clear-history');
@@ -189,6 +209,8 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
   const positions: CopyPosition[] = status?.positions || [];
   const history: CopyTradeRecord[] = status?.history || [];
   const feed: CopyFeedEvent[] = status?.feed || [];
+  const visibleFeed = feed.filter(ev => ev.timestamp >= logClearedAt);
+  const secondsToWipe = Math.max(0, Math.ceil((logClearedAt + LOG_WIPE_INTERVAL_MS - wipeTick) / 1000));
   const stats = status?.stats;
   const engineWallet = status?.wallet;
   const sellsLabel = status?.config?.copySells ? (status.config.sellMode === 'full' ? 'FULL' : 'MIRROR') : 'OFF';
@@ -438,6 +460,14 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                           <button className="btn-cell-action" onClick={() => forceSell(pos.id)}>
                             LIQUIDATE
                           </button>
+                          <button
+                            className="btn-terminal-outline"
+                            style={{ padding: '2px 6px', fontSize: '9px', color: 'var(--ink-muted)' }}
+                            title="Remove/dismiss from open positions if already liquidated on Photon"
+                            onClick={() => dismissPosition(pos.id, pos.tokenSymbol)}
+                          >
+                            ✕
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -517,17 +547,17 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           <div className="section-header">
             <div className="section-title">Leader Signal Feed — Live Copy Decisions</div>
             <div className="section-count">
-              {feed.length} EVENTS{autoClearMin > 0 ? ` · AUTO-CLEAR ${autoClearMin}M` : ''}
+              {visibleFeed.length} EVENTS · AUTO-CLEAR {secondsToWipe}S
             </div>
           </div>
 
           <div className="console-container">
-            {feed.length === 0 ? (
+            {visibleFeed.length === 0 ? (
               <div style={{ color: 'var(--ink-muted)' }}>
                 Every leader buy/sell appears here with the copy verdict: COPIED, SKIPPED (with the reason), or FAILED.
               </div>
             ) : (
-              [...feed].reverse().map(ev => (
+              [...visibleFeed].reverse().map(ev => (
                 <div key={ev.id} className="log-line">
                   <span className="log-time">[{new Date(ev.timestamp).toLocaleTimeString()}]</span>
                   <span className={feedColor(ev)}>

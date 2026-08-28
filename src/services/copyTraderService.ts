@@ -254,6 +254,28 @@ export class CopyTraderService {
    */
   private inFlightBuySol = new Map<string, number>();
 
+  /** Limit concurrent getParsedTransaction RPC calls so bursts of logs do not trigger 429 storms. */
+  private txFetchInFlight = 0;
+  private static readonly MAX_CONCURRENT_TX_FETCH = 2;
+  private txFetchQueue: Array<() => void> = [];
+  /** Throttle feed congestion warnings per leader wallet to avoid spamming the UI feed. */
+  private lastFeedWarnAt = new Map<string, number>();
+
+  private async acquireTxFetchSlot(): Promise<() => void> {
+    while (this.txFetchInFlight >= CopyTraderService.MAX_CONCURRENT_TX_FETCH) {
+      await new Promise<void>((resolve) => this.txFetchQueue.push(resolve));
+    }
+    this.txFetchInFlight++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.txFetchInFlight--;
+      const next = this.txFetchQueue.shift();
+      if (next) next();
+    };
+  }
+
   /** Signatures with a scheduled 20s re-read — a redelivered 'processed' log must not start a second fetch loop. */
   private pendingRetrySigs = new Set<string>();
 
@@ -431,6 +453,36 @@ export class CopyTraderService {
     return true;
   }
 
+  public forceClosePosition(positionId: string, reason = 'Liquidated / dismissed by operator'): boolean {
+    const pos = this.positions.find(p => p.id === positionId && p.status !== 'CLOSED');
+    if (!pos) return false;
+    pos.status = 'CLOSED';
+    pos.tokensHeld = 0;
+    this.unsubscribeMintIfIdle(pos.mint);
+    this.pushHistory({
+      id: `ct_${Date.now()}_${++this.idCounter}`,
+      positionId: pos.id,
+      mint: pos.mint,
+      tokenSymbol: pos.tokenSymbol,
+      leaderWallet: pos.leaderWallet,
+      leaderNickname: pos.leaderNickname,
+      side: 'sell',
+      solAmount: 0,
+      tokensMoved: 0,
+      priceSol: pos.currentPriceSol || pos.entryPriceSol,
+      pnlUsd: round2(pos.pnlUsd),
+      pnlSol: round4(pos.pnlSol),
+      pnlPct: Math.round(pos.pnlPct * 10) / 10,
+      timestamp: Date.now(),
+      txid: pos.buyTxid,
+      fillVerified: false,
+      exitReason: reason,
+    });
+    this.persist();
+    this.emitChange();
+    return true;
+  }
+
   public clearHistory(): void {
     this.history = [];
     this.feed = [];
@@ -547,6 +599,8 @@ export class CopyTraderService {
           // One push per notification, not one per decoded event — each emit
           // serializes the whole status for every SSE client.
           if (repriced) this.emitChange();
+          // Failed on-chain transactions never change token balances or make trades
+          if (ev.err) return;
           if (this.processedSigs.has(ev.signature) || this.analyzingSigs.has(ev.signature)) return;
           // Fast lane: a pump.fun trade is fully described by the event in
           // the log lines already in hand — no RPC, no wait for confirmation.
@@ -599,21 +653,40 @@ export class CopyTraderService {
       this.analyzingSigs.delete(signature);
     }
     if (signals === 'fetch_failed') {
-      // An unreadable transaction is possibly a leader SELL about to be
-      // missed. This used to be a console-only drop — the one failure mode
-      // with zero trace in the UI. One paced retry, then a loud report.
-      const sigNote: LeaderSignal = { mint: '', symbol: `tx ${signature.slice(0, 8)}…`, side: 'sell', solAmount: 0, tokenAmount: 0, via: 'helius' };
+      const hasOpenPos = this.positions.some(p => p.leaderWallet === leaderAddress && p.status !== 'CLOSED');
+      const sigNote: LeaderSignal = {
+        mint: '',
+        symbol: `tx ${signature.slice(0, 8)}…`,
+        side: hasOpenPos ? 'sell' : 'buy',
+        solAmount: 0,
+        tokenAmount: 0,
+        via: 'helius',
+      };
+      const now = Date.now();
+      const lastWarn = this.lastFeedWarnAt.get(leaderAddress) ?? 0;
+      const shouldPushFeed = (now - lastWarn > 6000) || hasOpenPos;
+
       if (!isRetry) {
-        this.pushFeed(wallet, sigNote, 'pending',
-          `Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s (RPC congested) — retrying once in ${TX_REFETCH_DELAY_MS / 1000}s.`);
+        if (shouldPushFeed) {
+          this.lastFeedWarnAt.set(leaderAddress, now);
+          this.pushFeed(wallet, sigNote, 'pending',
+            hasOpenPos
+              ? `Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s (RPC congested) — retrying once in ${TX_REFETCH_DELAY_MS / 1000}s.`
+              : `Leader tx ${signature.slice(0, 8)}… unreadable within ${TX_FETCH_DEADLINE_MS / 1000}s (RPC congested) — retrying once in ${TX_REFETCH_DELAY_MS / 1000}s.`);
+        }
         this.pendingRetrySigs.add(signature);
         setTimeout(() => {
           this.pendingRetrySigs.delete(signature);
           void this.handleWalletLog(leaderAddress, signature, true);
         }, TX_REFETCH_DELAY_MS);
       } else {
-        this.pushFeed(wallet, sigNote, 'failed',
-          `Could not read leader tx ${signature.slice(0, 8)}… after a retry — SIGNAL DROPPED. If the leader sold, mirror it manually with the SELL button.`);
+        if (shouldPushFeed) {
+          this.lastFeedWarnAt.set(leaderAddress, now);
+          this.pushFeed(wallet, sigNote, 'failed',
+            hasOpenPos
+              ? `Could not read leader tx ${signature.slice(0, 8)}… after a retry — SIGNAL DROPPED. If the leader sold, mirror it manually with the SELL button.`
+              : `Leader tx ${signature.slice(0, 8)}… unreadable after retry — signal dropped.`);
+        }
         // The dropped tx may have been a BUY: the fast-lane tally for this
         // leader is now stale-LOW, and a partial sell sized from it would
         // OVERSELL (50 of a stale 100 reads as 50%, not the true 5%). Drop
@@ -717,6 +790,7 @@ export class CopyTraderService {
   }
 
   private async reconcileLeaderBalances(leaderAddress: string, signature: string): Promise<void> {
+    if (this.txFetchQueue.length > 4) return;
     const parsed = await this.fetchParsedTx(signature);
     if (!parsed || !parsed.meta || parsed.meta.err) return;
     this.recordLeaderBalances(leaderAddress, parsed.meta.preTokenBalances, parsed.meta.postTokenBalances);
@@ -750,21 +824,30 @@ export class CopyTraderService {
    */
   private async fetchParsedTx(signature: string): Promise<ParsedTransactionWithMeta | null> {
     if (!this.heliusConn) return null;
-    const deadline = Date.now() + TX_FETCH_DEADLINE_MS;
-    while (Date.now() < deadline) {
-      try {
-        const parsed = await this.heliusConn.getParsedTransaction(signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-        if (parsed) return parsed;
-        await sleep(TX_FETCH_INTERVAL_MS);
-      } catch (err) {
-        await sleep(isRateLimitError(err) ? TX_FETCH_INTERVAL_MS * 4 : TX_FETCH_INTERVAL_MS);
+    const release = await this.acquireTxFetchSlot();
+    try {
+      const deadline = Date.now() + TX_FETCH_DEADLINE_MS;
+      await sleep(350);
+      let pollDelay = TX_FETCH_INTERVAL_MS;
+      while (Date.now() < deadline) {
+        try {
+          const parsed = await this.heliusConn.getParsedTransaction(signature, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          });
+          if (parsed) return parsed;
+          await sleep(pollDelay);
+          pollDelay = Math.min(1000, pollDelay + 150);
+        } catch (err) {
+          const is429 = isRateLimitError(err);
+          await sleep(is429 ? 2000 : 500);
+        }
       }
+      console.warn(`[CopyTrader] Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s.`);
+      return null;
+    } finally {
+      release();
     }
-    console.warn(`[CopyTrader] Could not read leader tx ${signature.slice(0, 8)}… within ${TX_FETCH_DEADLINE_MS / 1000}s.`);
-    return null;
   }
 
   /**
@@ -1578,7 +1661,38 @@ export class CopyTraderService {
       // never happened while the tokens stayed in the wallet.
       if (realPosition) {
         const result = await this.executeRealSell(pos, fraction, feedSig, wallet);
-        if (!result) return; // the feed already carries the failure
+        if (!result) {
+          if (isManual) {
+            // A manual liquidation where on-chain execution could not complete
+            // (e.g. tokens already liquidated externally on Photon/Dex, zero token balance, or pool closed):
+            // close the position record so it does not stay wedged in open positions forever.
+            pos.status = 'CLOSED';
+            pos.tokensHeld = 0;
+            this.unsubscribeMintIfIdle(pos.mint);
+            this.pushHistory({
+              id: `ct_${Date.now()}_${++this.idCounter}`,
+              positionId: pos.id,
+              mint: pos.mint,
+              tokenSymbol: pos.tokenSymbol,
+              leaderWallet: pos.leaderWallet,
+              leaderNickname: pos.leaderNickname,
+              side: 'sell',
+              solAmount: 0,
+              tokensMoved: 0,
+              priceSol: pos.currentPriceSol || pos.entryPriceSol,
+              pnlUsd: round2(pos.pnlUsd),
+              pnlSol: round4(pos.pnlSol),
+              pnlPct: Math.round(pos.pnlPct * 10) / 10,
+              timestamp: Date.now(),
+              txid: pos.buyTxid,
+              fillVerified: false,
+              exitReason: 'Manual liquidation (closed after external exit)',
+            });
+            this.persist();
+            this.emitChange();
+          }
+          return;
+        }
         txid = result.txid;
         const fill = result.fill;
         if (fill) {
