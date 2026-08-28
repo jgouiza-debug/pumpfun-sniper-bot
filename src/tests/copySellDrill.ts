@@ -202,6 +202,57 @@ async function main(): Promise<void> {
   check('the refusal reached the feed', svc.feed.some((f: any) => /REAL position but trading mode is PAPER/.test(f.detail)));
   check('no phantom sell was booked', !svc.history.some((h: any) => h.mint === MINT3 && h.side === 'sell'));
 
+  console.log('\n-- 7. H2: a FAILED manual liquidation must not orphan a real bag --');
+  // Real mode, and make the on-chain sell always fail to land.
+  svc.config.tradingMode = 'real';
+  const origExecuteRealSell = svc.executeRealSell;
+  svc.executeRealSell = async () => null; // every attempt fails — tokens stay put
+
+  // 7a. OLD BUG: a failed manual sell with the bag STILL on-chain used to be
+  // marked CLOSED with tokensHeld zeroed, stranding the real tokens unwatched.
+  const MINT7 = 'DrillMint777777777777777777777777777777pump';
+  svc.positions.unshift({
+    id: 'cp_h2_held', mint: MINT7, tokenSymbol: 'HELDBAG', tokenName: 'Held Bag',
+    leaderWallet: LEADER, leaderNickname: 'drill-leader', pool: 'pump',
+    tokensHeld: 1000, investedSol: 0.01, investedUsd: 1, entryPriceSol: 0.00001,
+    currentPriceSol: 0.00001, pnlPct: 0, pnlUsd: 0, pnlSol: 0, entryTime: Date.now(),
+    buyTxid: '5RealTxidH2Held11111111111111111111111111111111111111111111111111111111111111111111111',
+    fillVerified: true, status: 'OPEN', realizedPnlUsd: 0, realizedPnlSol: 0,
+    lastPriceAt: Date.now(), exitInFlight: false,
+  });
+  svc.getOwnedTokenAmount = async () => 1000; // wallet STILL holds the full bag
+  await svc.manualSellPosition('cp_h2_held');
+  const h2held = svc.positions.find((p: any) => p.id === 'cp_h2_held');
+  check('failed manual sell with tokens still on-chain KEEPS the position open',
+    h2held?.status === 'OPEN' && h2held?.tokensHeld === 1000,
+    `status=${h2held?.status} tokensHeld=${h2held?.tokensHeld}`);
+  check('the KEPT explanation reached the feed',
+    svc.feed.some((f: any) => /position KEPT/.test(f.detail)));
+  check('no phantom "external exit" sell was booked',
+    !svc.history.some((h: any) => h.mint === MINT7 && /external exit/i.test(String(h.exitReason))));
+
+  // 7b. The genuine case: wallet no longer holds it (sold on Photon/Dex) → close.
+  const MINT8 = 'DrillMint888888888888888888888888888888pump';
+  svc.positions.unshift({
+    id: 'cp_h2_gone', mint: MINT8, tokenSymbol: 'GONEBAG', tokenName: 'Gone Bag',
+    leaderWallet: LEADER, leaderNickname: 'drill-leader', pool: 'pump',
+    tokensHeld: 1000, investedSol: 0.01, investedUsd: 1, entryPriceSol: 0.00001,
+    currentPriceSol: 0.00001, pnlPct: 0, pnlUsd: 0, pnlSol: 0, entryTime: Date.now(),
+    buyTxid: '5RealTxidH2Gone11111111111111111111111111111111111111111111111111111111111111111111111',
+    fillVerified: true, status: 'OPEN', realizedPnlUsd: 0, realizedPnlSol: 0,
+    lastPriceAt: Date.now(), exitInFlight: false,
+  });
+  svc.getOwnedTokenAmount = async () => 0; // confirmed gone on-chain
+  await svc.manualSellPosition('cp_h2_gone');
+  const h2gone = svc.positions.find((p: any) => p.id === 'cp_h2_gone');
+  check('failed manual sell with an EMPTY wallet closes as an external exit',
+    h2gone?.status === 'CLOSED' && h2gone?.tokensHeld === 0,
+    `status=${h2gone?.status} tokensHeld=${h2gone?.tokensHeld}`);
+
+  svc.executeRealSell = origExecuteRealSell;
+  delete svc.getOwnedTokenAmount;
+  svc.config.tradingMode = 'paper';
+
   console.log(`\n==== COPY-SELL DRILL: ${passed} passed, ${failed} failed ====`);
   console.log(`(state written under ${drillDir})`);
   process.exit(failed > 0 ? 1 : 0);

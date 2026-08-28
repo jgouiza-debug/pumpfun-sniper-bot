@@ -815,6 +815,33 @@ export class CopyTraderService {
   }
 
   /**
+   * Read OUR wallet's current on-chain balance of `mint`, in UI (human) units,
+   * summed across all token accounts for that mint. Returns null when it cannot
+   * be determined (no connection, no wallet, RPC error) — callers MUST treat
+   * null as "unknown", never as zero. Used to decide whether a bag a failed
+   * sell left behind is actually gone before closing the position.
+   */
+  private async getOwnedTokenAmount(mint: string): Promise<number | null> {
+    const address = sniperEngine.getWalletStatus().address;
+    if (!this.heliusConn || !address) return null;
+    try {
+      const res = await this.heliusConn.getParsedTokenAccountsByOwner(
+        new PublicKey(address),
+        { mint: new PublicKey(mint) },
+        'confirmed',
+      );
+      let total = 0;
+      for (const { account } of res.value) {
+        const amt = (account.data as any)?.parsed?.info?.tokenAmount?.uiAmount;
+        if (typeof amt === 'number' && isFinite(amt)) total += amt;
+      }
+      return total;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Poll for the leader's transaction until the RPC can serve it at
    * 'confirmed'. The log arrives at 'processed', so the first polls are
    * expected to miss; a thrown 429 or socket reset is a reason to wait, not
@@ -1594,6 +1621,39 @@ export class CopyTraderService {
   }
 
   /**
+   * Mark a real position closed because the wallet no longer holds the bag —
+   * the tokens were exited outside the bot (manually on Photon/Dex) or there was
+   * nothing left to sell. Call ONLY after getOwnedTokenAmount has confirmed the
+   * balance is effectively zero; a blind close strands a real bag (H2).
+   */
+  private closeAsExternallyExited(pos: CopyPositionInternal): void {
+    pos.status = 'CLOSED';
+    pos.tokensHeld = 0;
+    this.unsubscribeMintIfIdle(pos.mint);
+    this.pushHistory({
+      id: `ct_${Date.now()}_${++this.idCounter}`,
+      positionId: pos.id,
+      mint: pos.mint,
+      tokenSymbol: pos.tokenSymbol,
+      leaderWallet: pos.leaderWallet,
+      leaderNickname: pos.leaderNickname,
+      side: 'sell',
+      solAmount: 0,
+      tokensMoved: 0,
+      priceSol: pos.currentPriceSol || pos.entryPriceSol,
+      pnlUsd: round2(pos.pnlUsd),
+      pnlSol: round4(pos.pnlSol),
+      pnlPct: Math.round(pos.pnlPct * 10) / 10,
+      timestamp: Date.now(),
+      txid: pos.buyTxid,
+      fillVerified: false,
+      exitReason: 'Closed after confirmed external exit (wallet no longer holds the bag)',
+    });
+    this.persist();
+    this.emitChange();
+  }
+
+  /**
    * Sell `fraction` (0-1] of a copy position. Real mode routes through the
    * engine's execution path as a percentage-of-holdings order; paper mode
    * fills at the last observed price with the same slippage haircut as entry.
@@ -1662,34 +1722,26 @@ export class CopyTraderService {
       if (realPosition) {
         const result = await this.executeRealSell(pos, fraction, feedSig, wallet);
         if (!result) {
+          // executeRealSell already kept the position and surfaced the failure.
+          // A null result is a FAILED sell (illiquid venue, RPC storm, tight
+          // slippage) far more often than an already-completed external exit —
+          // so the bag is almost always STILL in the wallet. Only close when the
+          // wallet on-chain no longer holds it; otherwise leave the position open
+          // for the SELL button to retry. Closing blind here zeroed tokensHeld
+          // and dropped a real bag from tracking to ride to zero unwatched (H2).
           if (isManual) {
-            // A manual liquidation where on-chain execution could not complete
-            // (e.g. tokens already liquidated externally on Photon/Dex, zero token balance, or pool closed):
-            // close the position record so it does not stay wedged in open positions forever.
-            pos.status = 'CLOSED';
-            pos.tokensHeld = 0;
-            this.unsubscribeMintIfIdle(pos.mint);
-            this.pushHistory({
-              id: `ct_${Date.now()}_${++this.idCounter}`,
-              positionId: pos.id,
-              mint: pos.mint,
-              tokenSymbol: pos.tokenSymbol,
-              leaderWallet: pos.leaderWallet,
-              leaderNickname: pos.leaderNickname,
-              side: 'sell',
-              solAmount: 0,
-              tokensMoved: 0,
-              priceSol: pos.currentPriceSol || pos.entryPriceSol,
-              pnlUsd: round2(pos.pnlUsd),
-              pnlSol: round4(pos.pnlSol),
-              pnlPct: Math.round(pos.pnlPct * 10) / 10,
-              timestamp: Date.now(),
-              txid: pos.buyTxid,
-              fillVerified: false,
-              exitReason: 'Manual liquidation (closed after external exit)',
-            });
-            this.persist();
-            this.emitChange();
+            const held = await this.getOwnedTokenAmount(pos.mint);
+            const expected = pos.tokensHeld || 0;
+            const effectivelyGone = held !== null && held <= Math.max(0, expected * 0.05);
+            if (effectivelyGone) {
+              this.closeAsExternallyExited(pos);
+            } else if (wallet) {
+              const note = held === null
+                ? 'on-chain balance could not be read'
+                : `${held} tokens are still in the wallet`;
+              this.pushFeed(wallet, feedSig, 'failed',
+                `$${pos.tokenSymbol}: liquidation did not complete and ${note} — position KEPT. Retry with SELL; use the ✕ dismiss only if you already sold this elsewhere.`);
+            }
           }
           return;
         }
