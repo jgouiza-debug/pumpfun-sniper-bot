@@ -2691,6 +2691,47 @@ console.log('\n-- RPC: transient failure is not a honeypot verdict --');
       'the operator must be told the KEY is dead, not that the token was unverifiable');
   });
 
+  test('sec-rpc-tx-4/sniper-correctness-4: a rejected credential fails over to the backup RPC and back', async () => {
+    const { sniperEngine } = require('../services/sniperEngine');
+    const { resolveRpcEndpoint } = require('../services/rpcHealth');
+    const eng = sniperEngine as any;
+    const savedFallback = process.env.SOLANA_RPC_FALLBACK_URL;
+    const savedKey = eng.config.heliusApiKey;
+    const savedOverride = process.env.SOLANA_RPC_URL;
+    try {
+      delete process.env.SOLANA_RPC_URL;                       // so the key is the primary
+      eng.config.heliusApiKey = 'k'.repeat(20);                // primary = helius
+      process.env.SOLANA_RPC_FALLBACK_URL = 'https://backup.example.com';
+      eng.onFallbackRpc = false;
+
+      // Primary healthy → no failover.
+      resetRpcHealth();
+      eng.maybeFailoverRpc();
+      assert.strictEqual(eng.onFallbackRpc, false, 'a healthy primary does not fail over');
+
+      // Reject the credential → the next tick switches to the backup.
+      await assert.rejects(async () => {
+        await withRpcRetry(async () => { throw new Error('Unauthorized: 401'); }, { attempts: 3, baseDelayMs: 1 });
+      });
+      assert.strictEqual(rpcHealth().credentialRejected, true);
+      eng.maybeFailoverRpc();
+      assert.strictEqual(eng.onFallbackRpc, true, 'a rejected credential must fail over');
+      assert.ok(/backup\.example\.com/.test(eng.solanaConnection.rpcEndpoint), 'the live connection now points at the backup');
+
+      // Retry timer elapsed → give the primary another chance.
+      eng.lastPrimaryRetryAt = 0;
+      eng.maybeFailoverRpc();
+      assert.strictEqual(eng.onFallbackRpc, false, 'after the retry window it probes the primary again');
+    } finally {
+      if (savedFallback === undefined) delete process.env.SOLANA_RPC_FALLBACK_URL; else process.env.SOLANA_RPC_FALLBACK_URL = savedFallback;
+      if (savedOverride === undefined) delete process.env.SOLANA_RPC_URL; else process.env.SOLANA_RPC_URL = savedOverride;
+      eng.config.heliusApiKey = savedKey;
+      eng.onFallbackRpc = false;
+      resetRpcHealth();
+      eng.rebindConnection(resolveRpcEndpoint(savedKey).url);
+    }
+  });
+
   test('a not-yet-visible account is retried rather than read as absent', async () => {
     // The case that cost entries: getAccountInfo returns null for a few hundred
     // ms on a mint that is 400ms old, and null was treated as "unverifiable".

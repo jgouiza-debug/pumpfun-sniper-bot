@@ -141,6 +141,10 @@ const DEFAULT_DEPLOYED_FRACTION_PCT = 50;
  */
 const DEFAULT_MAX_ENTRIES_PER_HOUR = 30;
 const DEFAULT_MAX_CONSECUTIVE_TX_FAILURES = 5;
+/** Consecutive hot-path RPC failures before failing over to the backup endpoint. */
+const RPC_FAILOVER_FAILURE_THRESHOLD = 5;
+/** How long to stay on the fallback before giving the primary another chance. */
+const RPC_PRIMARY_RETRY_MS = 120_000;
 /** ~150 slots at ~400ms. Past this the feed's state is of unknown age. */
 const DEFAULT_MAX_FEED_STALE_SLOTS = 150;
 
@@ -410,6 +414,11 @@ export class SniperEngine {
 
   // Guards against overlapping monitor ticks when a batch fetch runs long.
   private monitorTickInFlight = false;
+
+  // Runtime RPC failover state: true while running on the backup endpoint
+  // because the primary went hard-down mid-run.
+  private onFallbackRpc = false;
+  private lastPrimaryRetryAt = 0;
 
   private priorityFeeService: PriorityFeeService;
   // One kill-switch trip per pause: reset when the bot is (re)started.
@@ -987,14 +996,11 @@ export class SniperEngine {
 
     if (newConfig.heliusApiKey) {
       const endpoint = resolveRpcEndpoint(this.config.heliusApiKey);
-      this.solanaConnection = new Connection(endpoint.url, connectionConfig());
-      this.wallet.setConnection(this.solanaConnection);
+      this.rebindConnection(endpoint.url);
       // A new credential clears the "this key is rejected" latch, so a fixed key
-      // stops the bot reporting a dead one.
+      // stops the bot reporting a dead one; and it cancels any active failover.
       resetRpcHealth();
-      if (featureFlags.get('localTxBuild') || featureFlags.get('localTxShadowCompare')) {
-        localTxBuilder.start(this.solanaConnection);
-      }
+      this.onFallbackRpc = false;
       // The key is a credential: log the host, never the query string.
       this.log('info', `🚀 RPC endpoint updated: ${endpoint.host} (source: ${endpoint.source})`);
       // The failure this exists to end: a new key is accepted, the endpoint
@@ -3058,10 +3064,61 @@ export class SniperEngine {
     this.log('snipe', `🎯 [BOUGHT] $${filterResult.tokenSymbol} (${filterResult.mint.slice(0,6)}...) | Spent ${investedSol.toFixed(4)} SOL ($${investedUsd}) | Got ${Math.round(tokensHeld).toLocaleString()} tokens @ $${buyPriceUsd.toFixed(8)} | Needs +${breakevenPctValue}% to break even | ${this.config.tradingMode.toUpperCase()}`, filterResult.mint);
   }
 
+  /** (Re)build the Solana connection and rebind everything that holds one. */
+  private rebindConnection(url: string): void {
+    this.solanaConnection = new Connection(url, connectionConfig());
+    this.wallet.setConnection(this.solanaConnection);
+    // priorityFeeService reads this.solanaConnection through a closure, so it
+    // needs no rebind; localTxBuilder holds its own reference.
+    if (featureFlags.get('localTxBuild') || featureFlags.get('localTxShadowCompare')) {
+      localTxBuilder.start(this.solanaConnection);
+    }
+  }
+
+  /**
+   * Runtime RPC failover. The endpoint is resolved once at connect time; if the
+   * primary goes hard-down mid-run (rejected credential, or a run of consecutive
+   * failures) the bot could no longer price or exit open positions — the "RPC
+   * stays down" failure. When a backup is available (SOLANA_RPC_FALLBACK_URL,
+   * else the public endpoint) switch to it so exits keep working, and retry the
+   * primary on a timer so a transient outage self-heals. Called every tick.
+   */
+  private maybeFailoverRpc(): void {
+    const primary = resolveRpcEndpoint(this.config.heliusApiKey);
+    const health = rpcHealth();
+    const primaryDown = health.credentialRejected || health.consecutiveFailures >= RPC_FAILOVER_FAILURE_THRESHOLD;
+
+    if (!this.onFallbackRpc) {
+      if (!primaryDown) return;
+      const fbUrl = (process.env.SOLANA_RPC_FALLBACK_URL || '').trim() || 'https://api.mainnet-beta.solana.com';
+      if (fbUrl === primary.url) return; // no distinct backup to switch to
+      let fbHost = fbUrl;
+      try { fbHost = new URL(fbUrl).host; } catch { /* keep the raw string */ }
+      this.rebindConnection(fbUrl);
+      this.onFallbackRpc = true;
+      this.lastPrimaryRetryAt = Date.now();
+      resetRpcHealth();
+      this.log('warn', `🔀 Primary RPC (${primary.host}) is down (${health.credentialRejected ? 'credential rejected' : health.consecutiveFailures + ' consecutive failures'}) — switched to fallback ${fbHost}. Open positions can still be priced and exited; retrying the primary every ${RPC_PRIMARY_RETRY_MS / 1000}s.`);
+      return;
+    }
+
+    // On the fallback: give the primary another chance on a timer. If it fails
+    // again, the next tick fails back over to the fallback.
+    if (Date.now() - this.lastPrimaryRetryAt < RPC_PRIMARY_RETRY_MS) return;
+    this.lastPrimaryRetryAt = Date.now();
+    this.rebindConnection(primary.url);
+    this.onFallbackRpc = false;
+    resetRpcHealth();
+    this.log('info', `↩️ Retrying primary RPC ${primary.host}; the fallback re-engages on the next tick if it is still down.`);
+  }
+
   private startPositionMonitoring(): void {
     if (this.monitorInterval) clearInterval(this.monitorInterval);
 
     this.monitorInterval = setInterval(async () => {
+      // Runs every tick, even with no open positions, so a downed RPC recovers
+      // (and the next entry / the copy lane benefit) rather than staying dead.
+      this.maybeFailoverRpc();
       if (this.activePositions.length === 0 || this.monitorTickInFlight) return;
       this.monitorTickInFlight = true;
 

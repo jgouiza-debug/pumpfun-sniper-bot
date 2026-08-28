@@ -323,10 +323,20 @@ export function rpcEndpoint(heliusKey: string | undefined | null): string {
   return resolveRpcEndpoint(heliusKey).url;
 }
 
-/** WebSocket peer of {@link rpcEndpoint}, for accountSubscribe. */
+/**
+ * WebSocket peer of {@link rpcEndpoint}, for accountSubscribe. Must follow the
+ * SAME precedence as resolveRpcEndpoint, or an operator who sets SOLANA_RPC_URL
+ * to a non-Helius HTTP endpoint would still get their WS traffic (and the Helius
+ * key) routed to Helius — split across two providers.
+ */
 export function rpcWsEndpoint(heliusKey: string | undefined | null): string {
-  const explicit = (process.env.SOLANA_RPC_WS_URL || '').trim();
-  if (explicit) return explicit;
+  const explicitWs = (process.env.SOLANA_RPC_WS_URL || '').trim();
+  if (explicitWs) return explicitWs;
+
+  // Honor an HTTP override as the WS source too (http->ws), matching
+  // resolveRpcEndpoint's env-override precedence over the Helius key.
+  const httpOverride = (process.env.SOLANA_RPC_URL || '').trim();
+  if (httpOverride) return httpOverride.replace(/^http/, 'ws');
 
   const key = normalizeHeliusKey(heliusKey).key;
   if (key) return `wss://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
