@@ -27,9 +27,9 @@
     "assets": [
       "dist/**/*"
     ],
-    "//targets": "Windows stays on node18 (its prebuilt base exists and the shipped exe is built from it). macOS uses node22 because there is NO prebuilt node18-macos-arm64 base — pkg 404s and then tries to compile from source. Only the win target is listed here so a bare `pkg .` keeps building the Windows exe; the mac binaries come from build:mac / build:mac-intel, and arm64 must be produced ON macOS (see .github/workflows/release.yml).",
+    "//targets": "build:exe uses `--targets host`, so the SHIPPED Windows exe embeds whatever Node the CI runner uses (currently Node 22 — see release.yml). This `targets` entry only governs a bare `pkg .` fallback; it is pinned to node22-win-x64 to MATCH the host build rather than the old node18 (which is EOL and would ship an unsupported runtime). macOS binaries come from build:mac / build:mac-intel (node22) and arm64 must be produced ON macOS.",
     "targets": [
-      "node18-win-x64"
+      "node22-win-x64"
     ],
     "outputPath": "dist-exe"
   },

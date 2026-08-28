@@ -1406,33 +1406,6 @@ export class SniperEngine {
     };
   }
 
-  private getKeypairFromPrivateKey(pkStr: string): Keypair | null {
-    try {
-      const trimmed = pkStr.trim();
-      if (!trimmed) return null;
-
-      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-        const arr = Uint8Array.from(JSON.parse(trimmed));
-        return Keypair.fromSecretKey(arr);
-      }
-
-      if (/^[0-9a-fA-F]{128}$/.test(trimmed)) {
-        const arr = Uint8Array.from(Buffer.from(trimmed, 'hex'));
-        return Keypair.fromSecretKey(arr);
-      }
-
-      const decoded = bs58.decode(trimmed);
-      if (decoded.length === 64) {
-        return Keypair.fromSecretKey(decoded);
-      } else if (decoded.length === 32) {
-        return Keypair.fromSeed(decoded);
-      }
-    } catch (e) {
-      return null;
-    }
-    return null;
-  }
-
   private async executeRealMainnetTrade(
     action: 'buy' | 'sell',
     mint: string,

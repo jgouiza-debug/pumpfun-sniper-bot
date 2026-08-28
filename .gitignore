@@ -11,6 +11,11 @@ dist/
 # Generated run reports
 reports/
 
+# Console tee of all runtime output — may contain wallet addresses, RPC hosts,
+# and operational detail. Never commit (this is a public repo).
+bot.log
+bot.log.*
+
 # Live-trading mutex (transient)
 .real-mode.lock
 
