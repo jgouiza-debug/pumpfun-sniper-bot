@@ -38,6 +38,8 @@ export interface UpdateCheckResult {
   publishedAt?: string;
   /** True when this build can replace itself in place (packaged exe only). */
   canSelfUpdate: boolean;
+  /** pkg | electron | dev — decides which update instruction the UI shows. */
+  installKind?: 'pkg' | 'electron' | 'dev';
   error?: string;
 }
 
@@ -192,6 +194,25 @@ export class UpdaterService {
     return Boolean((process as any).pkg);
   }
 
+  /**
+   * How this build was installed, which decides what an update even MEANS:
+   *
+   *  - 'pkg'      a single-file exe. applyUpdate can rename-and-swap it in place.
+   *  - 'electron' an installed desktop app (a directory of files). Swapping one
+   *               exe would CORRUPT it, so the app must send the operator to the
+   *               platform installer instead of ever self-updating.
+   *  - 'dev'      a source checkout: `git pull`.
+   *
+   * Before this existed the check was `process.pkg` alone, which is undefined
+   * under Electron — so the packaged desktop app reported itself as a dev
+   * checkout and told the operator to run git pull.
+   */
+  public installKind(): 'pkg' | 'electron' | 'dev' {
+    if (this.isPackaged()) return 'pkg';
+    if (process.env.SNIPER_PACKAGED === '1') return 'electron';
+    return 'dev';
+  }
+
   public getCurrentVersion(): string {
     // Re-read at call time: a just-applied update swapped the binary and its
     // embedded package.json, so a value cached at construction goes stale.
@@ -225,6 +246,7 @@ export class UpdaterService {
       hasUpdate: false,
       releaseUrl: `https://github.com/${this.repoOwner}/${this.repoName}`,
       canSelfUpdate: this.isPackaged(),
+      installKind: this.installKind(),
     };
 
     try {
@@ -420,7 +442,12 @@ export class UpdaterService {
     }
 
     if (!this.isPackaged()) {
-      return { ok: false, error: 'Self-update only applies to the packaged .exe. In a dev checkout, use git pull.' };
+      return {
+        ok: false,
+        error: this.installKind() === 'electron'
+          ? 'The desktop app updates by installer, not by self-swap: download the new installer from the release page and run it. Your settings and positions live in the app-data folder and are kept.'
+          : 'Self-update only applies to the packaged .exe. In a dev checkout, use git pull.',
+      };
     }
 
     const guard = this.restartGuard();

@@ -718,6 +718,17 @@ export function App() {
               >
                 {applyingUpdate ? '⏳ UPDATING…' : '⬇ UPDATE NOW'}
               </button>
+            ) : updateInfo.installKind === 'electron' ? (
+              // The desktop app is a DIRECTORY of files: swapping one exe would
+              // corrupt it, so it never self-updates — it sends you to the installer.
+              <a
+                href={updateInfo.releaseUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ background: '#ffffff', color: '#16a34a', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}
+              >
+                ⬇ GET THE INSTALLER
+              </a>
             ) : (
               <span style={{ fontSize: '11px', fontWeight: 400 }}>Dev checkout — run <code>git pull</code></span>
             )}
@@ -1462,7 +1473,9 @@ export function App() {
                   {!applyingUpdate && updateInfo?.hasUpdate && (
                     <div style={{ color: '#00e676' }}>
                       A newer release is published.
-                      {!updateInfo.canSelfUpdate && ' This is a dev checkout — run git pull instead of installing.'}
+                      {!updateInfo.canSelfUpdate && (updateInfo.installKind === 'electron'
+                        ? ' This is the installed desktop app — download the new installer from the release page and run it. Your settings and positions are kept (they live in the app-data folder, not next to the app).'
+                        : ' This is a dev checkout — run git pull instead of installing.')}
                     </div>
                   )}
 
