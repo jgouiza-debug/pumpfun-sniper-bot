@@ -122,6 +122,15 @@ const TOKEN_MOVE_MIN_FRACTION = 0.02;
  */
 const COPY_EXIT_GAS_RESERVE_SOL = 0.002;
 
+/**
+ * Ceiling on the slippage a copy BUY will accept. maxSlippagePct is clamped to
+ * 1..100 for config, but a buy at 100% accepts paying double — a footgun on an
+ * entry we can simply decline. Sells stay at the full configured tolerance
+ * (copySellSlippagePct): exiting a bag we already hold is worth more slippage
+ * than opening a new one.
+ */
+const COPY_BUY_MAX_SLIPPAGE_PCT = 30;
+
 /** A leader trade normalized from either feed into one shape. */
 interface LeaderSignal {
   signature?: string;
@@ -1435,7 +1444,8 @@ export class CopyTraderService {
         let result: TradeResult | null;
         try {
           result = await sniperEngine.executeExternalTrade(
-            'buy', mint, copySol, undefined, buyPool, this.config.maxSlippagePct
+            'buy', mint, copySol, undefined, buyPool,
+            Math.min(this.config.maxSlippagePct, COPY_BUY_MAX_SLIPPAGE_PCT)
           );
         } finally {
           this.inFlightBuySol.delete(mint);

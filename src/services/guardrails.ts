@@ -119,6 +119,17 @@ export class FailureBreaker {
 
   constructor(private maxConsecutive: number) {}
 
+  /**
+   * Re-point the breaker at the operator's configured limit. Called before each
+   * entry so a Settings change takes effect on the next trade — without this the
+   * breaker was frozen on the constructor default and maxConsecutiveTxFailures
+   * was a decorative config field. Never lowers below 1 while already counting
+   * in a way that would retroactively trip; the check runs on the next failure.
+   */
+  public setMax(max: number): void {
+    if (Number.isFinite(max) && max > 0) this.maxConsecutive = Math.floor(max);
+  }
+
   public recordSuccess(): void {
     this.consecutive = 0;
   }

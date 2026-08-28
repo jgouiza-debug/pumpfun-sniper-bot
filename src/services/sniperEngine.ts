@@ -2842,6 +2842,7 @@ export class SniperEngine {
     // Re-read the operator's caps before checking, so a Settings change takes
     // effect on the next entry rather than on the next restart.
     this.entryRateLimiter.setMaxPerWindow(this.config.maxEntriesPerHour ?? DEFAULT_MAX_ENTRIES_PER_HOUR);
+    this.failureBreaker.setMax(this.config.maxConsecutiveTxFailures ?? DEFAULT_MAX_CONSECUTIVE_TX_FAILURES);
     const guard = evaluateGuardrails([
       this.failureBreaker.check(),
       new FeedFreshnessGate(

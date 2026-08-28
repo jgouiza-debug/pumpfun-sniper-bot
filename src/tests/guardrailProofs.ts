@@ -101,6 +101,21 @@ proof('TRIPS on the Nth consecutive failure', () => {
   console.log(`        FIRED: "${d.reason}"`);
 });
 
+proof('quality-tests-1: setMax makes maxConsecutiveTxFailures actually drive the trip', () => {
+  // Constructed with the default 5, then re-pointed at the operator's config 3.
+  const b = new FailureBreaker(5);
+  b.setMax(3);
+  assert.strictEqual(b.recordFailure('6002'), false, '1st failure allowed');
+  assert.strictEqual(b.recordFailure('6002'), false, '2nd failure allowed');
+  assert.strictEqual(b.recordFailure('6002'), true, 'the 3rd trips at the CONFIGURED limit, not the default 5');
+  // A junk value never widens the breaker to "never trip".
+  const c = new FailureBreaker(3);
+  c.setMax(0); c.setMax(-1); c.setMax(NaN as unknown as number);
+  assert.strictEqual(c.recordFailure(), false);
+  assert.strictEqual(c.recordFailure(), false);
+  assert.strictEqual(c.recordFailure(), true, 'still trips at 3 — bad setMax values are ignored');
+});
+
 proof('stays tripped — no automatic recovery at 3am', () => {
   const b = new FailureBreaker(2);
   b.recordFailure();
