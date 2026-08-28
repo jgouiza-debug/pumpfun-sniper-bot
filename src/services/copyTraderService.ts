@@ -359,7 +359,9 @@ export class CopyTraderService {
     const solPriceUsd = sniperEngine.getSolPriceUsd();
     const open = this.positions.filter(p => p.status !== 'CLOSED');
     const unrealizedPnlUsd = open.reduce((sum, p) => sum + p.pnlUsd, 0);
-    const sells = this.history.filter(h => h.side === 'sell');
+    // Synthetic dismiss / external-exit legs are not real sells — excluding them
+    // keeps the win rate honest (quality-tests-4).
+    const sells = this.history.filter(h => h.side === 'sell' && !h.dismissed);
     const winCount = sells.filter(h => h.pnlUsd > 0).length;
     const lossCount = sells.filter(h => h.pnlUsd <= 0).length;
     const walletList = [...this.wallets.values()].sort((a, b) => b.addedAt - a.addedAt);
@@ -502,9 +504,21 @@ export class CopyTraderService {
     return true;
   }
 
-  public forceClosePosition(positionId: string, reason = 'Liquidated / dismissed by operator'): boolean {
+  public async forceClosePosition(positionId: string, reason = 'Liquidated / dismissed by operator'): Promise<boolean> {
     const pos = this.positions.find(p => p.id === positionId && p.status !== 'CLOSED');
     if (!pos) return false;
+    const isReal = !(pos.buyTxid ?? '').startsWith('sim_');
+    // The ✕ dismiss means "I already sold this elsewhere". Respect that explicit
+    // override, but if the wallet still holds a substantial bag, say so loudly —
+    // dismissing a bag that is really still there strands it (copy-correctness-4).
+    if (isReal) {
+      const held = await this.getOwnedTokenAmount(pos.mint);
+      if (held !== null && held > Math.max(0, (pos.tokensHeld || 0) * 0.05)) {
+        const wallet = this.wallets.get(pos.leaderWallet) ?? this.standInWallet(pos);
+        this.pushFeed(wallet, { mint: pos.mint, side: 'sell', solAmount: 0, tokenAmount: 0, symbol: pos.tokenSymbol, via: 'manual' }, 'failed',
+          `⚠️ Dismissing $${pos.tokenSymbol} but the wallet STILL holds ~${held} tokens on-chain — if you have not sold it elsewhere, use LIQUIDATE instead. Dismissed as requested.`);
+      }
+    }
     pos.status = 'CLOSED';
     pos.tokensHeld = 0;
     this.unsubscribeMintIfIdle(pos.mint);
@@ -526,6 +540,7 @@ export class CopyTraderService {
       txid: pos.buyTxid,
       fillVerified: false,
       exitReason: reason,
+      dismissed: true,
     });
     this.persist();
     this.emitChange();
@@ -1732,6 +1747,7 @@ export class CopyTraderService {
       txid: pos.buyTxid,
       fillVerified: false,
       exitReason: 'Closed after confirmed external exit (wallet no longer holds the bag)',
+      dismissed: true,
     });
     this.persist();
     this.emitChange();

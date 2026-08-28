@@ -466,10 +466,10 @@ app.post('/api/copy/sell', async (req, res) => {
 });
 
 // POST force-close / dismiss one copy position: { positionId }
-app.post('/api/copy/positions/close', (req, res) => {
+app.post('/api/copy/positions/close', async (req, res) => {
   const { positionId } = req.body || {};
   if (!positionId) return res.status(400).json({ error: 'positionId is required' });
-  const success = copyTrader.forceClosePosition(String(positionId));
+  const success = await copyTrader.forceClosePosition(String(positionId));
   res.status(success ? 200 : 404).json({ success });
 });
 

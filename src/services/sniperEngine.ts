@@ -859,6 +859,12 @@ export class SniperEngine {
       ['launchSnipeWindowSeconds', 3, 600],
       ['launchSnipeMaxDevBuySol', 0, 85],
       ['launchSnipeMinDevBuySol', 0, 85],
+      // Guardrail caps: a POST could otherwise disable the breaker (0), remove
+      // the entry rate limit (huge), or blind the freshness gate (huge) —
+      // these ARE risk-bearing fields the docstring claims to clamp (quality-tests-3).
+      ['maxConsecutiveTxFailures', 1, 100],
+      ['maxEntriesPerHour', 1, 1000],
+      ['maxFeedStaleSlots', 10, 1500],
     ];
     for (const [key, lo, hi] of bands) {
       const raw = out[key];

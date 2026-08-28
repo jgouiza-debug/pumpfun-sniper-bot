@@ -900,6 +900,12 @@ export interface CopyTradeRecord {
   txid?: string;
   fillVerified?: boolean;
   exitReason: string;
+  /**
+   * A synthetic exit leg booked by the operator dismissing (✕) or an external
+   * exit — no real sell happened here. Excluded from win/loss stats so a manual
+   * dismiss cannot pollute the copy win rate (quality-tests-4).
+   */
+  dismissed?: boolean;
 }
 
 export interface CopyStatusResponse {
