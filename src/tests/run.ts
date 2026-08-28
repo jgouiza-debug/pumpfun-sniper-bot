@@ -21,6 +21,16 @@ import {
 } from '../services/pipelineUtils';
 import { EntryGateV2 } from '../services/entryGateV2';
 import { RugCheckReport } from '../types';
+import { assertOutboundTradeTx } from '../services/txIntentGuard';
+import {
+  ComputeBudgetProgram,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js';
 
 let passed = 0;
 let failed = 0;
@@ -3776,6 +3786,116 @@ console.log('\n-- Copy trader v1.0.4 regression: the venue gate refused nearly e
     assert.ok(/junk = restorable\.filter/.test(svc));
     assert.ok(/startsWith\('sim_'\)/.test(svc), 'only PAPER positions are dropped — real tokens are never silently discarded');
     assert.ok(/feedAutoClearMinutes: 2,/.test(svc), 'the feed clears itself every 2 minutes by default (owner request 2026-08-23)');
+  });
+}
+
+{
+  // ---- H1: pre-sign intent guard (txIntentGuard) ----
+  // Every real trade signs bytes returned by PumpPortal. These prove the guard
+  // allows a normal trade and refuses the drain shapes a hostile response could
+  // carry. Reproduces the OLD behaviour: before the guard, all of these signed.
+  const PUMP = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+  const TOKEN = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+  const owner = Keypair.generate().publicKey;
+  const attacker = Keypair.generate().publicKey;
+  const mint = Keypair.generate().publicKey;
+
+  const mkTx = (payer: PublicKey, ixs: TransactionInstruction[]): VersionedTransaction => {
+    const msg = new TransactionMessage({
+      payerKey: payer,
+      recentBlockhash: '11111111111111111111111111111111',
+      instructions: ixs,
+    }).compileToV0Message();
+    return new VersionedTransaction(msg);
+  };
+
+  test('H1 guard: a normal pump trade for us is allowed', () => {
+    const legit = mkTx(owner, [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+      new TransactionInstruction({
+        programId: PUMP,
+        keys: [
+          { pubkey: owner, isSigner: true, isWritable: true },
+          { pubkey: mint, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([0, 1, 2, 3, 4, 5, 6, 7]),
+      }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(legit, owner).ok, true);
+  });
+
+  test('H1 guard: a SOL wrap to our own trade account is allowed', () => {
+    const wsolAta = Keypair.generate().publicKey;
+    const wrap = mkTx(owner, [
+      SystemProgram.transfer({ fromPubkey: owner, toPubkey: wsolAta, lamports: 5e8 }),
+      new TransactionInstruction({
+        programId: TOKEN,
+        keys: [
+          { pubkey: wsolAta, isSigner: false, isWritable: true },
+          { pubkey: owner, isSigner: true, isWritable: true },
+        ],
+        data: Buffer.from([17]), // SyncNative — not an authority/allowance op
+      }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(wrap, owner).ok, true, 'wrap to a trade-referenced ATA is legitimate');
+  });
+
+  test('H1 guard: OLD DRAIN — a System transfer to an unrelated wallet is refused', () => {
+    const drain = mkTx(owner, [
+      SystemProgram.transfer({ fromPubkey: owner, toPubkey: attacker, lamports: 1_000_000_000 }),
+    ]);
+    const v = assertOutboundTradeTx(drain, owner);
+    assert.strictEqual(v.ok, false);
+    assert.ok(/transfer/i.test(v.reason || ''), v.reason);
+  });
+
+  test('H1 guard: a token SetAuthority is refused (reassigns our account)', () => {
+    const setAuth = mkTx(owner, [
+      new TransactionInstruction({
+        programId: TOKEN,
+        keys: [{ pubkey: owner, isSigner: true, isWritable: true }],
+        data: Buffer.from([6, 2, 1, ...new Array(32).fill(9)]), // tag 6 = SetAuthority
+      }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(setAuth, owner).ok, false);
+  });
+
+  test('H1 guard: a token Approve (delegate) is refused', () => {
+    const approve = mkTx(owner, [
+      new TransactionInstruction({
+        programId: TOKEN,
+        keys: [
+          { pubkey: owner, isSigner: false, isWritable: true },
+          { pubkey: attacker, isSigner: false, isWritable: false },
+          { pubkey: owner, isSigner: true, isWritable: false },
+        ],
+        data: Buffer.from([4, 0, 0, 0, 0, 0, 0, 0, 255]), // tag 4 = Approve
+      }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(approve, owner).ok, false);
+  });
+
+  test('H1 guard: a tx whose fee payer is not our wallet is refused', () => {
+    const foreignPayer = mkTx(attacker, [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+    ]);
+    const v = assertOutboundTradeTx(foreignPayer, owner);
+    assert.strictEqual(v.ok, false);
+    assert.ok(/fee payer/i.test(v.reason || ''), v.reason);
+  });
+
+  test('H1 guard: a tx invoking an unexpected program is refused', () => {
+    const evilProgram = Keypair.generate().publicKey;
+    const tx = mkTx(owner, [
+      new TransactionInstruction({
+        programId: evilProgram,
+        keys: [{ pubkey: owner, isSigner: true, isWritable: true }],
+        data: Buffer.from([0]),
+      }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner);
+    assert.strictEqual(v.ok, false);
+    assert.ok(/unexpected program/i.test(v.reason || ''), v.reason);
   });
 }
 

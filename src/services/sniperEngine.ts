@@ -28,6 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
+import { assertOutboundTradeTx } from './txIntentGuard';
 import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, affordableSellPriorityFeeSol, FEE_PAYER_RESERVE_SOL, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
@@ -1569,6 +1570,16 @@ export class SniperEngine {
       }
 
       {
+        // Never sign a transaction whose contents we have not verified against
+        // intent. The trade-local bytes come from a third party; a hostile
+        // response could carry a balance transfer or an authority reassignment.
+        // Our own local build passes the same gate. Fail closed.
+        const intent = assertOutboundTradeTx(tx, keypair.publicKey);
+        if (!intent.ok) {
+          this.log('error', `⛔ Refusing to sign ${action} for ${mint.slice(0, 8)}… — ${intent.reason} (source: ${buildSource}). No transaction was sent.`, mint);
+          return null;
+        }
+
         tx.sign([keypair]);
         latencyTimeline.stamp(mint, 't5BuiltSignedMs');
 
