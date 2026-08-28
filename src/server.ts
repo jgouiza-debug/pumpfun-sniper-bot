@@ -74,6 +74,16 @@ const PORT = Number(process.env.PORT) || 3001;
 // exists for the vite dev server on :3010 and for cross-instance calls, where
 // the token injected into the served HTML is not the target instance's.
 app.get('/api/session-token', (req, res) => {
+  // Defense-in-depth (sec-keys-3): a packaged build serves its own UI with the
+  // token already injected into index.html, so nothing legitimate fetches this
+  // endpoint there — only a third-party page served from another loopback port
+  // would. Disable it in the packaged app so that exposure is gone; dev keeps it
+  // for the vite server on another port. The instance switcher in a packaged
+  // build takes the target token explicitly instead of reading it here.
+  if (Boolean((process as any).pkg)) {
+    res.status(404).json({ error: 'session-token is not served by the packaged app; the UI is served with its token embedded.' });
+    return;
+  }
   res.json({ token: apiToken() });
 });
 

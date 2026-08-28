@@ -297,13 +297,20 @@ export class CopyTraderService {
   /** Limit concurrent getParsedTransaction RPC calls so bursts of logs do not trigger 429 storms. */
   private txFetchInFlight = 0;
   private static readonly MAX_CONCURRENT_TX_FETCH = 2;
-  private txFetchQueue: Array<() => void> = [];
+  /** Live trade-classification fetches (an entry/exit is riding on them) jump ahead of
+   * fire-and-forget reconcile bookkeeping so they are never head-of-line-blocked (perf-latency-4). */
+  private txFetchPriorityQueue: Array<() => void> = [];
+  private txFetchNormalQueue: Array<() => void> = [];
+  /** Priority fetches waiting OR in flight — reconcile yields entirely while any is outstanding. */
+  private priorityFetchOutstanding = 0;
   /** Throttle feed congestion warnings per leader wallet to avoid spamming the UI feed. */
   private lastFeedWarnAt = new Map<string, number>();
 
-  private async acquireTxFetchSlot(): Promise<() => void> {
+  private async acquireTxFetchSlot(priority = false): Promise<() => void> {
+    if (priority) this.priorityFetchOutstanding++;
     while (this.txFetchInFlight >= CopyTraderService.MAX_CONCURRENT_TX_FETCH) {
-      await new Promise<void>((resolve) => this.txFetchQueue.push(resolve));
+      await new Promise<void>((resolve) =>
+        (priority ? this.txFetchPriorityQueue : this.txFetchNormalQueue).push(resolve));
     }
     this.txFetchInFlight++;
     let released = false;
@@ -311,7 +318,9 @@ export class CopyTraderService {
       if (released) return;
       released = true;
       this.txFetchInFlight--;
-      const next = this.txFetchQueue.shift();
+      if (priority) this.priorityFetchOutstanding = Math.max(0, this.priorityFetchOutstanding - 1);
+      // Priority waiters are always served before normal ones.
+      const next = this.txFetchPriorityQueue.shift() ?? this.txFetchNormalQueue.shift();
       if (next) next();
     };
   }
@@ -851,8 +860,10 @@ export class CopyTraderService {
   }
 
   private async reconcileLeaderBalances(leaderAddress: string, signature: string): Promise<void> {
-    if (this.txFetchQueue.length > 4) return;
-    const parsed = await this.fetchParsedTx(signature);
+    // Reconcile is bookkeeping; yield the fetch slots to any live trade
+    // classification rather than head-of-line-block it (perf-latency-4).
+    if (this.priorityFetchOutstanding > 0 || this.txFetchNormalQueue.length > 4) return;
+    const parsed = await this.fetchParsedTx(signature, false);
     if (!parsed || !parsed.meta || parsed.meta.err) return;
     this.recordLeaderBalances(leaderAddress, parsed.meta.preTokenBalances, parsed.meta.postTokenBalances, parsed.slot ?? 0);
   }
@@ -916,9 +927,9 @@ export class CopyTraderService {
    * code made one fetch, one 700ms retry, and dropped the signal on any
    * exception.)
    */
-  private async fetchParsedTx(signature: string): Promise<ParsedTransactionWithMeta | null> {
+  private async fetchParsedTx(signature: string, priority = false): Promise<ParsedTransactionWithMeta | null> {
     if (!this.heliusConn) return null;
-    const release = await this.acquireTxFetchSlot();
+    const release = await this.acquireTxFetchSlot(priority);
     try {
       const deadline = Date.now() + TX_FETCH_DEADLINE_MS;
       await sleep(350);
@@ -953,7 +964,8 @@ export class CopyTraderService {
    * wallet-to-wallet) — surfaced in the feed, never copied.
    */
   private async analyzeLeaderTx(leaderAddress: string, signature: string): Promise<LeaderSignal[] | 'fetch_failed'> {
-    const parsed = await this.fetchParsedTx(signature);
+    // Priority fetch: an entry or exit is riding on this classification.
+    const parsed = await this.fetchParsedTx(signature, true);
     // Unreadable and failed-on-chain are different verdicts: the first may be
     // a trade we cannot see yet (the caller retries), the second moved nothing.
     if (!parsed) return 'fetch_failed';
