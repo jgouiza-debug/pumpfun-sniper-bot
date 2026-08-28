@@ -2724,6 +2724,7 @@ export class SniperEngine {
         score,
         marketCapUsd: filterResult.marketCapUsd,
         liquidityUsd: filterResult.liquidityUsd,
+        liquidityIsAsserted: launchData.liquidityIsAsserted,
         uniqueBuyers5m: launchData.uniqueBuyers5m,
         buyPressurePct: launchData.buyPressurePct,
         volume5mUsd: filterResult.volume5mUsd,
@@ -2973,6 +2974,15 @@ export class SniperEngine {
       realizedPnlUsd: 0,
       pool,
       simulatedFeesSol,
+      // Seed the pool-drain baseline from the MEASURED liquidity at entry so the
+      // POOL_DRAINED stop is armed from the first tick — not left undefined until
+      // DexScreener happens to report, which let a pre-index LP pull record its
+      // drained value as the "peak" and disarmed the stop entirely (H5). Never
+      // seed from an asserted constant; a real reading only, or leave it to the
+      // monitor's first genuine tick.
+      peakLiquidityUsd: (!launchData?.liquidityIsAsserted && (filterResult.liquidityUsd ?? 0) > 0)
+        ? filterResult.liquidityUsd
+        : undefined,
     };
 
     this.activePositions.push(position);

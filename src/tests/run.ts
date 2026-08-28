@@ -300,6 +300,23 @@ console.log('\n-- Playbook routing (owner report: only buys end-of-life tokens) 
     assert.strictEqual(d.eligible, true, d.reasons.join('; '));
   });
 
+  test('H4: a migration whose liquidity is ASSERTED is refused even above the floor', () => {
+    // Same inputs as the eligible case, but the ~$12.5k liquidity is the
+    // fabricated migration constant, not a measured pool. OLD BUG: it passed
+    // the floor and the bot bought into a pool it never verified.
+    const asserted = routePlay({ isMigrationEvent: true, secondsSinceMigration: 20, ageSeconds: 9000,
+      score: 80, marketCapUsd: 69000, liquidityUsd: 12500, liquidityIsAsserted: true, solPriceUsd: 107 });
+    assert.strictEqual(asserted.play, 'PLAY_3');
+    assert.strictEqual(asserted.eligible, false, 'asserted liquidity must never satisfy the floor');
+    assert.ok(asserted.reasons.some((r: string) => /asserted/i.test(r)), asserted.reasons.join('; '));
+
+    // The identical value, MEASURED, still passes — the gate keys on verified-ness,
+    // not on the number.
+    const measured = routePlay({ isMigrationEvent: true, secondsSinceMigration: 20, ageSeconds: 9000,
+      score: 80, marketCapUsd: 69000, liquidityUsd: 12500, liquidityIsAsserted: false, solPriceUsd: 107 });
+    assert.strictEqual(measured.eligible, true, measured.reasons.join('; '));
+  });
+
   test('OLD BUG reproduced: a $8k USD floor rejects every graduation at SOL=$74', () => {
     // A pump.fun token graduates holding ~85 SOL. At $74 that pool is $6,290.
     const graduationLiquidityUsd = 85 * 74;

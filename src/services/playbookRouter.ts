@@ -98,6 +98,14 @@ export interface RouteInput extends PhaseInput {
   score: number;
   marketCapUsd: number;
   liquidityUsd: number;
+  /**
+   * True when liquidityUsd is the fabricated ~2*79-SOL migration constant rather
+   * than a measured pool depth (DexScreener not yet indexed). An asserted value
+   * must NEVER satisfy a liquidity floor — otherwise a spoofed migration, or a
+   * real graduation whose LP is pulled before indexing, passes the gate on a
+   * number nobody measured. See sniperEngine's liquidityIsAsserted.
+   */
+  liquidityIsAsserted?: boolean;
   uniqueBuyers5m?: number;
   buyPressurePct?: number;
   volume5mUsd?: number;
@@ -268,7 +276,12 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
         reasons.push(`MC $${Math.round(input.marketCapUsd).toLocaleString()} > $${config.play3MaxMarketCapUsd.toLocaleString()} — past the discovery window`);
       }
       const minLiqUsd = config.minLiquiditySol * solPrice;
-      if (input.liquidityUsd < minLiqUsd) {
+      if (input.liquidityIsAsserted) {
+        // The pool has not been measured yet; the only "liquidity" we have is the
+        // program-constant assumption. Refuse to enter on it — a pre-index LP pull
+        // is invisible here, and there is no on-chain pool read on this path.
+        reasons.push(`Liquidity is asserted (pool not yet indexed/verified) — refusing to size a migration entry on an unmeasured pool`);
+      } else if (input.liquidityUsd < minLiqUsd) {
         reasons.push(`Liquidity $${Math.round(input.liquidityUsd).toLocaleString()} < ${config.minLiquiditySol} SOL ($${Math.round(minLiqUsd).toLocaleString()})`);
       }
       const ok3 = reasons.length === 0 && scoreTier > 0;
@@ -281,7 +294,9 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
         reasons.push(`MC $${Math.round(input.marketCapUsd).toLocaleString()} > $${config.play4MaxMarketCapUsd.toLocaleString()}`);
       }
       const minLiq4Usd = config.play4MinLiquiditySol * solPrice;
-      if (input.liquidityUsd < minLiq4Usd) {
+      if (input.liquidityIsAsserted) {
+        reasons.push(`Liquidity is asserted (pool not yet indexed/verified) — refusing to size a post-migration entry on an unmeasured pool`);
+      } else if (input.liquidityUsd < minLiq4Usd) {
         reasons.push(`Liquidity $${Math.round(input.liquidityUsd).toLocaleString()} < ${config.play4MinLiquiditySol} SOL ($${Math.round(minLiq4Usd).toLocaleString()})`);
       }
       // Post-migration demand: real unique buyers when attributed, otherwise
