@@ -32,6 +32,7 @@ flags.json
 
 # Copy-trader runtime state (tracked wallets, open copy positions)
 .copy-trader.json
+.open-positions.json
 meme-coin-finder-app/
 .vercel
 dist-exe/
