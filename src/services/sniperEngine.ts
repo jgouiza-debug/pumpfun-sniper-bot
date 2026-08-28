@@ -1641,11 +1641,13 @@ export class SniperEngine {
         if (confirmed === 'timeout') {
           if (action === 'sell') {
             this.log('warn', `⚠️ Sell ${txid.slice(0, 8)}... not confirmed in time. Holdings left untouched.`, mint);
-            // External callers (copy exits) retry on null — but a timed-out
-            // tx can still land until its blockhash expires, and a blind
-            // resubmit of a percentage sell executes twice. Hand them the
-            // signature so they resolve the outcome first.
-            return opts.external ? { txid, fill: null, timedOut: true } : null;
+            // A timed-out sell can still land until its blockhash expires, and a
+            // blind resubmit of a percentage sell executes twice. Hand the
+            // signature back — to external callers (copy exits) AND to the
+            // sniper's own executeSell — so the outcome is resolved before any
+            // retry (sniper-correctness-5). Previously only external callers got
+            // this; the sniper's own path returned null and retried blind.
+            return { txid, fill: null, timedOut: true };
           }
           // A buy that can't be confirmed: report the txid so the caller can
           // still open the position (funds may have moved), but with no fill.
@@ -3303,7 +3305,16 @@ export class SniperEngine {
     pos.sellBlockedByBackoff = false;
 
     // Exit on the same venue the entry filled on, for the same reason.
-    const result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`, pos.venue);
+    let result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`, pos.venue);
+    // A timed-out sell may still land. Resolve its real on-chain outcome before
+    // deciding to retry — resubmitting a percentage sell that actually landed
+    // sells the bag twice and corrupts the accounting (sniper-correctness-5).
+    if (result && result.timedOut && result.txid) {
+      // Hold off any concurrent exit trigger for this position while resolving.
+      pos.sellRetryAfterMs = now + 90_000;
+      const outcome = await this.resolveTimedOutSell(result.txid, pos.mint);
+      result = (outcome === 'failed' || outcome === 'expired') ? null : outcome;
+    }
     if (!result) {
       pos.sellFailCount = (pos.sellFailCount ?? 0) + 1;
 

@@ -2351,6 +2351,23 @@ console.log('\n-- Phase 0/1: fill quality, slippage, and a gate that means somet
       'an estimated price cannot prove a bad fill, and acting on one would exit good entries');
   });
 
+  test('sniper-correctness-5: a timed-out sell is resolved before any retry (no double-sell)', () => {
+    // The mainnet path must hand back the timed-out signature for the sniper's
+    // OWN sells, not only external ones — a return of `null` there let executeSell
+    // count it a failure and resubmit while the tx could still land.
+    const timeoutBlock = engineSrc.slice(engineSrc.indexOf('Holdings left untouched'), engineSrc.indexOf('Holdings left untouched') + 900);
+    assert.ok(/return \{ txid, fill: null, timedOut: true \}/.test(timeoutBlock),
+      'a sell timeout must return the signature, not null, so the caller can resolve it');
+    assert.ok(!/opts\.external \? \{ txid, fill: null, timedOut: true \} : null/.test(timeoutBlock),
+      'the old code only handed the signature to external callers');
+    // executeSell must resolve that timedOut result before the failure/retry path.
+    const sellBody = engineSrc.slice(engineSrc.indexOf("let result = await this.executeRealMainnetTrade('sell'"));
+    const resolveIdx = sellBody.indexOf('resolveTimedOutSell');
+    const failIdx = sellBody.indexOf('if (!result)');
+    assert.ok(resolveIdx > 0 && resolveIdx < failIdx,
+      'resolveTimedOutSell must run before the null/failure retry path');
+  });
+
   test('buys never escalate slippage; sells get exactly one capped retry', () => {
     const retry = engineSrc.slice(engineSrc.indexOf('due to Slippage (6004)'), engineSrc.indexOf('if (confirmed === \'failed\')'));
     assert.ok(/action === 'sell' && retryCount < 1/.test(retry),
