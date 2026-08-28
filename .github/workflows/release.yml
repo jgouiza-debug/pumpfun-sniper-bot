@@ -39,10 +39,15 @@ jobs:
       # release was ever published and no client could ever auto-update.
       # Pinning the major to the one that writes the lock keeps ci strict
       # instead of loosening it to npm install.
+      # --ignore-scripts: do not run dependency install/postinstall scripts on
+      # the release runner. A single malicious postinstall in the tree would
+      # otherwise execute with the token that publishes the release. Verified
+      # safe: ws's optional native addons (bufferutil, utf-8-validate) fall back
+      # to JS, and esbuild runs from its prebuilt platform package.
       - name: Install Dependencies
         run: |
           npm i -g npm@11
-          npm ci
+          npm ci --ignore-scripts
 
       # The exe reports the version baked into the package.json inside its pkg
       # snapshot. Without this the tag and the shipped build disagree, the
@@ -108,10 +113,15 @@ jobs:
       # release was ever published and no client could ever auto-update.
       # Pinning the major to the one that writes the lock keeps ci strict
       # instead of loosening it to npm install.
+      # --ignore-scripts: do not run dependency install/postinstall scripts on
+      # the release runner. A single malicious postinstall in the tree would
+      # otherwise execute with the token that publishes the release. Verified
+      # safe: ws's optional native addons (bufferutil, utf-8-validate) fall back
+      # to JS, and esbuild runs from its prebuilt platform package.
       - name: Install Dependencies
         run: |
           npm i -g npm@11
-          npm ci
+          npm ci --ignore-scripts
 
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/')
