@@ -73,7 +73,8 @@
       {
         "provider": "github",
         "owner": "jgouiza-debug",
-        "repo": "pumpfun-sniper-bot"
+        "repo": "pumpfun-sniper-bot",
+        "releaseType": "release"
       }
     ]
   },

@@ -66,13 +66,19 @@ jobs:
       # are used; otherwise electron-builder produces an UNSIGNED installer (the
       # local dev/testing case). Do not force-sign, so a fork without certs can
       # still build.
+      # CSC_LINK / CSC_KEY_PASSWORD are deliberately NOT set here. Passing
+      # `${{ secrets.CSC_LINK }}` when the secret does not exist sets it to an
+      # EMPTY STRING, and electron-builder then treats "" as a certificate path
+      # and dies with "<repo root> not a file" on macOS. Unsigned builds must
+      # leave the vars undefined entirely.
+      #
+      # To sign later: add the CSC_LINK (base64 .pfx / .p12) and CSC_KEY_PASSWORD
+      # secrets and re-add them to this env block, plus APPLE_ID,
+      # APPLE_APP_SPECIFIC_PASSWORD and APPLE_TEAM_ID for macOS notarization.
       - name: Build & publish installers
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Windows Authenticode (optional): CSC_LINK (base64 .pfx) + CSC_KEY_PASSWORD
-          # macOS Developer ID (optional): CSC_LINK + CSC_KEY_PASSWORD + APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: >
           npx electron-builder ${{ matrix.args }}
           ${{ startsWith(github.ref, 'refs/tags/') && '--publish always' || '--publish never' }}
