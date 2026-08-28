@@ -12,7 +12,8 @@ import {
 } from '../types';
 import { sniperEngine, type TradeResult } from './sniperEngine';
 import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError } from './rpcHealth';
-import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
+import { affordableStakeSol, sellAmountParam, splitWalletIntoSlots } from './pipelineUtils';
+import { breakevenPct } from './paperSimulator';
 import { installPath } from './installPaths';
 import { appendBotLog } from './fileLogger';
 import { DexScreenerService } from './dexscreenerService';
@@ -175,7 +176,11 @@ interface CopyPositionInternal extends CopyPosition {
 const DEFAULT_CONFIG: CopyTraderConfig = {
   enabled: false,
   tradingMode: 'paper',
-  buySizeMode: 'fixed',
+  // SPLIT by default: a small wallet following a leader who takes many trades
+  // must get a slice per trade. The old default staked a flat 0.05 SOL, which
+  // is HALF of a 0.1 SOL wallet on the first copy and the whole wallet by the
+  // second. Split divides the wallet across maxOpenPositions instead.
+  buySizeMode: 'split',
   fixedBuySol: 0.05,
   proportionalPct: 10,
   maxBuySol: 0.5,
@@ -198,7 +203,12 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // OFF: a leader adding to a bag adds to ours (DCA mirror) instead of being
   // skipped. Turn on to copy only the first entry per mint.
   blockRepeatBuys: false,
-  maxOpenPositions: 10,
+  // Also the SPLIT divisor: the wallet is cut this many ways. 5 rather than 10
+  // because fixed round-trip costs (ATA rent ~0.002 + fees) do not shrink with
+  // the slice — on a 0.1 SOL wallet, 10 slots is ~0.01 a trade and the
+  // breakeven is worse than 30%. Raise it only as the wallet grows; the feed
+  // prints the per-slot breakeven so the number is never a surprise.
+  maxOpenPositions: 5,
   maxSlippagePct: 25,
   perWalletCooldownSec: 0,
   // INERT since 2026-08-12 — no time- or price-based exits. Leader sells
@@ -305,6 +315,8 @@ export class CopyTraderService {
   private priorityFetchOutstanding = 0;
   /** Throttle feed congestion warnings per leader wallet to avoid spamming the UI feed. */
   private lastFeedWarnAt = new Map<string, number>();
+  /** Throttle the "this slice is uneconomic" warning — it would otherwise fire on every copy. */
+  private lastBreakevenWarnAt = 0;
 
   private async acquireTxFetchSlot(priority = false): Promise<() => void> {
     if (priority) this.priorityFetchOutstanding++;
@@ -1345,6 +1357,42 @@ export class CopyTraderService {
     return sum;
   }
 
+  /**
+   * SPLIT sizing: one slice of the wallet per concurrent copy.
+   *
+   * `maxOpenPositions` is the divisor — it is already "how many copies do I
+   * carry at once", so it is also "how many ways is the wallet cut". Dividing
+   * by the FREE slots (not the total) keeps the stake stable as positions open:
+   * 0.1 SOL over 5 slots stakes 0.02, and after that buy 0.08 over 4 free slots
+   * still stakes 0.02. It is self-correcting rather than a budget carved once —
+   * a position closing green raises the next stake, a red one lowers it, so the
+   * wallet is never over-committed and never strands unused SOL.
+   *
+   * `deployableSol` must already have the exit-gas reserve and every in-flight
+   * claim subtracted by the caller.
+   *
+   * The slot BUDGET is deployable/freeSlots, but the STAKE is smaller than the
+   * budget: a buy also reserves its slippage headroom, ~1.5% protocol fees, the
+   * priority fee and token-account rent. Staking the raw budget therefore eats
+   * the next slot's money — measured, slices decayed 0.0186 → 0.0069 and the
+   * last of five could not be funded at all. maxAffordableBuySol (via
+   * splitWalletIntoSlots) backs those costs out, which is what makes the slice
+   * hold steady across the whole set.
+   */
+  private splitStakeSol(deployableSol: number, openPositionCount: number, priorityFeeSol: number): number {
+    const slots = Math.max(1, Math.floor(this.config.maxOpenPositions));
+    // Never divide by zero, and never size a slot we could not open anyway:
+    // the book cap is enforced separately, so this floor is only a guard.
+    const freeSlots = Math.max(1, slots - Math.max(0, openPositionCount));
+    const { stakePerSlotSol } = splitWalletIntoSlots({
+      deployableSol: Math.max(0, deployableSol),
+      slots: freeSlots,
+      maxSlippagePct: this.config.maxSlippagePct,
+      priorityFeeSol,
+    });
+    return stakePerSlotSol;
+  }
+
   private async onLeaderBuy(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
     const mint = sig.mint;
     const symbol = this.symbolFor(sig);
@@ -1407,6 +1455,12 @@ export class CopyTraderService {
     let copySol: number;
     if (this.config.buySizeMode === 'fixed') {
       copySol = this.config.fixedBuySol;
+    } else if (this.config.buySizeMode === 'split') {
+      // Provisional only — real mode re-slices against a freshly read balance
+      // inside the queue, where the exit-gas and in-flight reserves are known.
+      const openNow = this.positions.filter(p => p.status !== 'CLOSED').length;
+      copySol = this.splitStakeSol(
+        sniperEngine.getWalletStatus().deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol());
     } else {
       if (sig.solAmount <= 0) {
         return skip('Token→token swap carries no SOL size to scale from — switch to fixed sizing to copy these.');
@@ -1415,7 +1469,9 @@ export class CopyTraderService {
     }
     copySol = round4(Math.min(copySol, this.config.maxBuySol));
     if (copySol <= 0) {
-      return skip('Computed copy size is 0 SOL — check buy sizing in Copy Settings.');
+      return skip(this.config.buySizeMode === 'split'
+        ? 'Split sizing has nothing to stake — the wallet is empty after the exit-gas reserve.'
+        : 'Computed copy size is 0 SOL — check buy sizing in Copy Settings.');
     }
 
     // The leader's realized price straight from their fill — exact for
@@ -1494,6 +1550,14 @@ export class CopyTraderService {
         const sizingFeeSol = sniperEngine.getSizingPriorityFeeSol();
         const deployableSol = Math.max(0,
           sniperEngine.getWalletStatus().deployableSol - reservedForExits - reservedInFlight - reservedBySniper);
+        // SPLIT re-slices HERE, against the balance that actually exists now
+        // (post-reserves, post-settlement) rather than the pre-queue snapshot.
+        if (this.config.buySizeMode === 'split') {
+          copySol = round4(Math.min(
+            this.splitStakeSol(deployableSol, openAfterThisBuy - (existingNow ? 0 : 1), sizingFeeSol),
+            this.config.maxBuySol
+          ));
+        }
         const affordable = round4(affordableStakeSol(
           copySol, deployableSol, this.config.maxSlippagePct, sizingFeeSol
         ));
@@ -1507,6 +1571,25 @@ export class CopyTraderService {
           clampNote = ` (clamped from ${copySol} SOL — all the wallet can fund after the exit-gas reserve)`;
         }
         copySol = affordable;
+
+        // Say what this slice actually has to make back. Fixed round-trip costs
+        // (ATA rent + base fees + two priority fees) do NOT shrink with the
+        // stake, so a wallet split too many ways needs an implausible move just
+        // to break even. Printing it per trade keeps that visible instead of
+        // letting it quietly eat the run. Advisory only — never a refusal.
+        const beSlot = breakevenPct(copySol, sizingFeeSol);
+        if (this.config.buySizeMode === 'split') {
+          clampNote += ` · slice ${copySol} SOL of ${this.config.maxOpenPositions} · needs +${beSlot}% to break even`;
+        }
+        // Loud only when the split is genuinely uneconomic (measured: 10 ways on
+        // a 0.1 SOL wallet is ~57%). The per-trade number is already in the buy
+        // line above; a warning that fires on every copy is wallpaper, so this
+        // one is throttled to once every 10 minutes.
+        if (beSlot >= 30 && Date.now() - this.lastBreakevenWarnAt > 600_000) {
+          this.lastBreakevenWarnAt = Date.now();
+          this.pushFeed(wallet, sig, 'pending',
+            `⚠️ A ${copySol} SOL slice needs +${beSlot}% just to break even — fixed costs (token-account rent + fees) do not shrink with the slice. Lower "Max Open Copy Positions" or add SOL.`);
+        }
 
         // Claim the full worst-case outflow (stake + slippage reserve +
         // protocol fees + priority fee + rent) for the duration of the order —
@@ -2335,7 +2418,9 @@ function sanitizeConfig(partial: Partial<CopyTraderConfig>): Partial<CopyTraderC
   const out: Partial<CopyTraderConfig> = {};
   if (typeof partial.enabled === 'boolean') out.enabled = partial.enabled;
   if (partial.tradingMode === 'paper' || partial.tradingMode === 'real') out.tradingMode = partial.tradingMode;
-  if (partial.buySizeMode === 'fixed' || partial.buySizeMode === 'proportional') out.buySizeMode = partial.buySizeMode;
+  if (partial.buySizeMode === 'fixed' || partial.buySizeMode === 'proportional' || partial.buySizeMode === 'split') {
+    out.buySizeMode = partial.buySizeMode;
+  }
   if (isFiniteNum(partial.fixedBuySol)) out.fixedBuySol = clamp(partial.fixedBuySol!, 0.001, 100);
   if (isFiniteNum(partial.proportionalPct)) out.proportionalPct = clamp(partial.proportionalPct!, 1, 200);
   if (isFiniteNum(partial.maxBuySol)) out.maxBuySol = clamp(partial.maxBuySol!, 0.001, 100);

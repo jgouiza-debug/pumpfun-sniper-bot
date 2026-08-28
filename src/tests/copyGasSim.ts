@@ -23,7 +23,9 @@
 import {
   affordableStakeSol,
   affordableSellPriorityFeeSol,
+  splitWalletIntoSlots,
 } from '../services/pipelineUtils';
+import { breakevenPct } from '../services/paperSimulator';
 
 const GAS_FLOAT_SOL = 0.005;          // walletService holdback
 const EXIT_RESERVE_PER_POS = 0.002;   // COPY_EXIT_GAS_RESERVE_SOL
@@ -144,6 +146,67 @@ console.log('\n-- Forward: a 0.1 SOL wallet DCAing three copy buys into one toke
   check('the position stays exitable', r.sellLands);
   check('the wallet never dips below the gas float after buys',
     r.balanceAfterBuys >= GAS_FLOAT_SOL - 1e-9, `left ${r.balanceAfterBuys.toFixed(5)}`);
+}
+
+console.log('\n-- SPLIT sizing: a 0.1 SOL wallet following a leader who takes many trades --');
+{
+  // Mirrors CopyTraderService.splitStakeSol: the slot BUDGET is deployable /
+  // FREE slots, and the STAKE is what actually fits inside that budget once
+  // slippage headroom, protocol fees, the priority fee and rent are backed out
+  // (splitWalletIntoSlots). Staking the raw budget instead eats the next slot.
+  const splitStake = (deployable: number, open: number, slots: number) =>
+    splitWalletIntoSlots({
+      deployableSol: Math.max(0, deployable),
+      slots: Math.max(1, slots - Math.max(0, open)),
+      maxSlippagePct: SLIPPAGE_PCT,
+      priorityFeeSol: PRIORITY_FEE,
+    }).stakePerSlotSol;
+
+  const WALLET = 0.1;
+  const SLOTS = 5;
+
+  // OLD default: a flat 0.05 SOL per copy is half this wallet on the first buy.
+  const oldFirst = affordableStakeSol(0.05, WALLET - GAS_FLOAT_SOL - EXIT_RESERVE_PER_POS, SLIPPAGE_PCT, PRIORITY_FEE);
+  check('OLD default (fixed 0.05) takes ~half the wallet on copy #1',
+    oldFirst > 0.03, `staked ${oldFirst.toFixed(4)} of ${WALLET} SOL`);
+
+  // NEW default: five slices, each re-sliced against what is actually left.
+  let deployable = WALLET - GAS_FLOAT_SOL;
+  const stakes: number[] = [];
+  for (let open = 0; open < SLOTS; open++) {
+    const reserve = EXIT_RESERVE_PER_POS * (open + 1);
+    const want = splitStake(deployable - reserve, open, SLOTS);
+    const got = affordableStakeSol(want, deployable - reserve, SLIPPAGE_PCT, PRIORITY_FEE);
+    if (got <= 0) break;
+    stakes.push(got);
+    // Worst-case outflow for this buy, as the service reserves it.
+    deployable -= got * (1 + SLIPPAGE_PCT / 100 + PROTOCOL_FEE_FRACTION) + PRIORITY_FEE + 0.0025;
+  }
+  console.log(`    slices: ${stakes.map(s => s.toFixed(4)).join(' + ')} SOL`);
+  check(`all ${SLOTS} copies are fundable from ${WALLET} SOL`, stakes.length === SLOTS,
+    `only ${stakes.length} of ${SLOTS} could be funded`);
+  check('no single slice takes more than a third of the wallet',
+    stakes.every(s => s < WALLET / 3), `largest ${Math.max(...stakes).toFixed(4)}`);
+  check('the slice stays stable rather than shrinking away',
+    stakes[stakes.length - 1] > stakes[0] * 0.5,
+    `first ${stakes[0].toFixed(4)}, last ${stakes[stakes.length - 1].toFixed(4)}`);
+  check('the wallet still holds its gas float after all of them',
+    deployable + GAS_FLOAT_SOL >= GAS_FLOAT_SOL - 1e-9);
+
+  // The honest part: fixed costs do not shrink with the slice, so more slots
+  // means a worse breakeven. Printed so the number is never a surprise.
+  console.log('    breakeven by slot count (0.1 SOL wallet, 0.001 fee):');
+  for (const n of [1, 2, 3, 5, 10]) {
+    const slice = affordableStakeSol((WALLET - GAS_FLOAT_SOL - EXIT_RESERVE_PER_POS * n) / n, WALLET, SLIPPAGE_PCT, PRIORITY_FEE);
+    console.log(`      ${String(n).padStart(2)} slots → ${slice.toFixed(4)} SOL/trade, needs +${breakevenPct(slice, PRIORITY_FEE).toFixed(1)}%`);
+  }
+  check('splitting 10 ways is measurably uneconomic (breakeven > 25%)',
+    breakevenPct(affordableStakeSol((WALLET - GAS_FLOAT_SOL - EXIT_RESERVE_PER_POS * 10) / 10, WALLET, SLIPPAGE_PCT, PRIORITY_FEE), PRIORITY_FEE) > 25);
+
+  // The fee is pinned: floor == ceiling means a congested slot cannot bid it up.
+  check('a pinned 0.001 fee is 5% of a 0.02 SOL slice, not 25%',
+    (PRIORITY_FEE * 2) / 0.02 <= 0.10,
+    `two-way fee ${(PRIORITY_FEE * 2).toFixed(4)} on a 0.02 slice`);
 }
 
 console.log(`\n==== COPY GAS SIM: ${passed} passed, ${failed} failed ====`);

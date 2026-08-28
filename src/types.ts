@@ -758,7 +758,18 @@ export interface PeriodicReportSummary {
  *  - 'proportional': stake `proportionalPct`% of the leader's SOL amount,
  *    clamped to `maxBuySol`.
  */
-export type CopyBuySizeMode = 'fixed' | 'proportional';
+/**
+ * How a copy buy is sized.
+ *  - 'fixed'        — the same SOL amount every time (fixedBuySol).
+ *  - 'proportional' — a % of the leader's own SOL size (proportionalPct).
+ *  - 'split'        — divide the wallet across maxOpenPositions concurrent
+ *                     copies: each buy stakes (deployable / free slots). A
+ *                     small wallet following a leader who takes many trades
+ *                     gets a slice per trade instead of spending itself on the
+ *                     first one or two. Self-correcting: the stake tracks the
+ *                     wallet up when a position closes green and down when red.
+ */
+export type CopyBuySizeMode = 'fixed' | 'proportional' | 'split';
 
 /**
  * What a leader sell does to the copied position.

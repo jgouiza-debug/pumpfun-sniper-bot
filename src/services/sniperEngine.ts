@@ -283,7 +283,13 @@ export class SniperEngine {
     // and migrations are the only entry type this bot produces. Cheaper fills
     // mean fewer fills. Raise this once the stake is large enough to absorb it.
     priorityFeeSol: 0.001,
-    maxPriorityFeeSol: 0.005,
+    // Ceiling == floor, so the fee is PINNED at 0.001 unless the operator
+    // raises this. With dynamicPriorityFee on, the old 0.005 ceiling let a
+    // congested slot bid up to 5x — which on a 0.02 SOL slice is a quarter of
+    // the position in fees, each way. Small wallets cannot pay a variable fee.
+    // Raise it (Settings) if fills start missing: a fee too low simply does not
+    // land, and a failed send still burns its base fee.
+    maxPriorityFeeSol: 0.001,
     maxSlippagePct: DEFAULT_BUY_SLIPPAGE_PCT,
     maxSellSlippagePct: DEFAULT_SELL_SLIPPAGE_PCT,
     // jitoTipSol is GONE (2026-08-13). It was a number in the config, a field

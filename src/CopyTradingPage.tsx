@@ -216,6 +216,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
   const sellsLabel = status?.config?.copySells ? (status.config.sellMode === 'full' ? 'FULL' : 'MIRROR') : 'OFF';
   const autoClearMin = status?.config?.feedAutoClearMinutes ?? 0;
 
+  // configForm holds only the fields the operator has EDITED this session, so
+  // reading it directly makes an untouched field read `undefined` — the select
+  // would fall back for display while every `=== 'split'` branch stayed false.
+  // Resolve edit -> live config -> default once, and use these everywhere.
+  const sizeMode = configForm.buySizeMode ?? status?.config?.buySizeMode ?? 'split';
+  const slotCount = configForm.maxOpenPositions ?? status?.config?.maxOpenPositions ?? 5;
+
   const feedColor = (ev: CopyFeedEvent): string => {
     if (ev.action === 'failed') return 'log-level-error';
     if (ev.action === 'pending') return 'log-level-warn';
@@ -601,15 +608,31 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                   <label className="form-label">Buy Sizing Mode</label>
                   <select
                     className="form-select"
-                    value={configForm.buySizeMode || 'fixed'}
-                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, buySizeMode: e.target.value as 'fixed' | 'proportional' })}
+                    value={sizeMode}
+                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, buySizeMode: e.target.value as 'fixed' | 'proportional' | 'split' })}
                   >
+                    <option value="split">Split wallet across open slots</option>
                     <option value="fixed">Fixed SOL per copy</option>
                     <option value="proportional">% of leader's buy size</option>
                   </select>
                 </div>
 
-                {configForm.buySizeMode === 'proportional' ? (
+                {sizeMode === 'split' ? (
+                  <div className="form-group">
+                    <div className="form-help" style={{ fontSize: '8px' }}>
+                      Each copy stakes your deployable balance divided by the FREE slots below,
+                      so a small wallet gets a slice per trade instead of spending itself on the
+                      first one. The slice tracks the wallet: up when a position closes green,
+                      down when red.
+                      {engineWallet?.deployableSol ? (
+                        <div style={{ marginTop: '4px', color: 'var(--accent)' }}>
+                          Now: {engineWallet.deployableSol.toFixed(4)} SOL ÷ {slotCount} ={' '}
+                          <strong>~{(engineWallet.deployableSol / Math.max(1, slotCount)).toFixed(4)} SOL</strong> per copy
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : sizeMode === 'proportional' ? (
                   <div className="form-group">
                     <label className="form-label">Copy % of Leader Size</label>
                     <input
@@ -651,12 +674,23 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 </div>
 
                 <div className="form-group">
-                  <label className="form-label">Max Open Copy Positions</label>
+                  <label className="form-label">
+                    Max Open Copy Positions{sizeMode === 'split' ? ' (= split divisor)' : ''}
+                  </label>
                   <input
                     type="number" className="form-input"
-                    value={configForm.maxOpenPositions ?? 3}
+                    value={slotCount}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxOpenPositions: Number(e.target.value) })}
                   />
+                  {sizeMode === 'split' ? (
+                    <div className="form-help" style={{ fontSize: '8px' }}>
+                      This is also how many ways the wallet is cut. More slots = more
+                      diversification but a smaller slice, and fixed costs (token-account rent
+                      ~0.002 SOL + fees) do not shrink with it — so past a point every trade
+                      needs an implausible move just to break even. The feed prints the
+                      breakeven for each slice.
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="form-group">
