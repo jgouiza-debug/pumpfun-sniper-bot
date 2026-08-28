@@ -43,12 +43,18 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
+      # npm@11 is pinned for the same reason release.yml pins it: `npm ci`
+      # VALIDATES the lockfile rather than resolving it, and npm 10 rejects a
+      # lock written by 11 with "Missing: utf-8-validate from lock file" (ws's
+      # optional peers). Without this pin every runner aborts before building.
       # --ignore-scripts: never run dependency install scripts on the runner
       # (a malicious postinstall would run with the release token). The uuid
       # override (package.json) keeps @solana/web3.js's rpc-websockets working
       # under Electron's Node without native builds.
       - name: Install dependencies
-        run: npm ci --ignore-scripts
+        run: |
+          npm i -g npm@11
+          npm ci --ignore-scripts
 
       - name: Build engine + UI
         run: npm run build

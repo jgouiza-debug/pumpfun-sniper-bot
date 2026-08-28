@@ -145,10 +145,15 @@ jobs:
       - name: Run Tests
         run: npm test
 
+      # build:pkg-mac*, NOT build:mac. Since v2.0.0 the plain build:mac name
+      # belongs to the Electron/electron-builder .dmg build (see desktop.yml);
+      # calling it here ran electron-builder, which tried to publish to GitHub
+      # with no token and failed the whole job. These two scripts are the pkg
+      # single-file binaries this workflow actually ships.
       - name: Build macOS binaries
         run: |
-          npm run build:mac
-          npm run build:mac-intel
+          npm run build:pkg-mac
+          npm run build:pkg-mac-intel
 
       # Ad-hoc signature. Apple Silicon refuses to execute an unsigned arm64
       # binary outright â€” this is not the same thing as notarisation, which
