@@ -740,6 +740,31 @@ export class SniperEngine {
   }
 
   /**
+   * The config shape safe to hand to any API caller: the private key and both
+   * API keys are blanked and replaced with set/last-4-hint fields. getStatus
+   * and POST /api/bot/config both serve this, so there is exactly ONE
+   * sanitization path — the previous bug was getConfig() drifting from
+   * getStatus() and echoing raw keys. A funded PumpPortal key can spend SOL,
+   * and the token guarding these endpoints is readable by any loopback page,
+   * so a raw key in this payload is a real exfiltration route.
+   */
+  public getPublicConfig(): BotConfig {
+    const { privateKey, heliusApiKey, pumpPortalApiKey, ...safeConfig } = this.config;
+    const hint = (k?: string) => (k && k.length >= 4 ? `••••${k.slice(-4)}` : '');
+    return {
+      ...safeConfig,
+      allInSizing: featureFlags.get('allInSizing'),
+      heliusApiKey: '',
+      pumpPortalApiKey: '',
+      heliusApiKeySet: Boolean(heliusApiKey),
+      heliusApiKeyHint: hint(heliusApiKey),
+      heliusApiKeySource: this.heliusKeySource,
+      pumpPortalApiKeySet: Boolean(pumpPortalApiKey),
+      pumpPortalApiKeyHint: hint(pumpPortalApiKey),
+    } as BotConfig;
+  }
+
+  /**
    * Push BotConfig values into the sub-services that own the actual checks.
    *
    * These settings were declared, defaulted, clamped on save and rendered in
@@ -1270,18 +1295,6 @@ export class SniperEngine {
     // UI never reads.
     const publicPositions = this.activePositions.map(({ priceTicks, realizedPnlUsd, ...pos }) => pos);
 
-    // The private key is deliberately never held on config, but strip it
-    // defensively so no future edit can leak one through this endpoint.
-    //
-    // The two API keys are stripped too, and replaced with "is one set" plus a
-    // last-4 hint. This endpoint is polled continuously and its payload is the
-    // easiest thing in the system to end up in a screenshot or a log; a funded
-    // PumpPortal key in particular can spend SOL. The UI needs to know whether
-    // a key exists, never what it is — entering a new one overwrites, and an
-    // empty field leaves the stored key untouched.
-    const { privateKey, heliusApiKey, pumpPortalApiKey, ...safeConfig } = this.config;
-    const hint = (k?: string) => (k && k.length >= 4 ? `••••${k.slice(-4)}` : '');
-
     return {
       isBotActive: this.config.isBotActive,
       tradingMode: this.config.tradingMode,
@@ -1292,16 +1305,9 @@ export class SniperEngine {
       activePositions: publicPositions,
       tradeHistory: this.tradeHistory.slice(0, 100),
       logs: this.logs,
-      config: {
-        ...safeConfig,
-        heliusApiKey: '',
-        pumpPortalApiKey: '',
-        heliusApiKeySet: Boolean(heliusApiKey),
-        heliusApiKeyHint: hint(heliusApiKey),
-        heliusApiKeySource: this.heliusKeySource,
-        pumpPortalApiKeySet: Boolean(pumpPortalApiKey),
-        pumpPortalApiKeyHint: hint(pumpPortalApiKey),
-      } as BotConfig,
+      // Keys blanked + set/hint only. Shared with POST /api/bot/config through
+      // getPublicConfig() so the two payloads can never diverge again.
+      config: this.getPublicConfig(),
       wallet: this.getWalletStatus(),
       run: this.getLiveRunSummary(),
       stats: this.computeStats(),

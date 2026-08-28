@@ -223,7 +223,9 @@ app.post('/api/bot/toggle', (req, res) => {
 // POST Update Bot Strategy Config
 app.post('/api/bot/config', (req, res) => {
   sniperEngine.updateConfig(req.body);
-  res.json({ success: true, config: sniperEngine.getConfig() });
+  // getPublicConfig(), not getConfig(): the latter carries the raw Helius and
+  // PumpPortal keys, and this response is readable by any loopback-origin page.
+  res.json({ success: true, config: sniperEngine.getPublicConfig() });
 });
 
 // POST Manual Sell Position Override
