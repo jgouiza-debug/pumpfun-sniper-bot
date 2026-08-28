@@ -1,7 +1,13 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-const LOCK_FILE = path.resolve(process.cwd(), '.real-mode.lock');
+// Machine-global, NOT cwd- or install-relative. The lock's whole job is to stop
+// two instances arming live trading on the same wallet at once; keyed on cwd,
+// two processes launched from different directories (or one from Task Scheduler)
+// each acquired their OWN lock and both armed. os.tmpdir() is one shared path
+// for every instance run by this user on this machine.
+const LOCK_FILE = path.join(os.tmpdir(), 'pumpfun-sniper-real-mode.lock');
 
 export interface LockHolder {
   pid: number;

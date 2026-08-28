@@ -1,8 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import { BotConfig, RunReport, RunReportOpenPosition, TradeHistoryRecord } from '../types';
+import { installPath } from './installPaths';
 
-const REPORTS_DIR = path.resolve(process.cwd(), 'reports');
+// Install-relative, not cwd-relative: a foreign cwd (Task Scheduler, a shortcut)
+// otherwise scatters run reports into unrelated directories or fails to write.
+const REPORTS_DIR = installPath('reports');
 
 /**
  * Tracks a single bot run (start -> stop) and produces the end-of-run report.

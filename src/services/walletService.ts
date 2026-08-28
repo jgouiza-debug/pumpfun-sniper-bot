@@ -3,6 +3,7 @@ import path from 'path';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { withRpcRetry } from './rpcHealth';
+import { installPath } from './installPaths';
 
 export type WalletSource = 'none' | 'runtime' | 'env' | 'file';
 
@@ -23,7 +24,14 @@ export interface WalletStatus {
   blockers: string[];
 }
 
-const WALLET_FILE = path.resolve(process.cwd(), '.photon-wallet.json');
+// Next to the exe when packaged, per installPaths — NOT process.cwd(). A
+// Task Scheduler / shortcut launch has cwd = C:\Windows\System32, and writing
+// the plaintext signing key there both leaks it outside the install and makes
+// the wallet silently unloadable on the next normal launch.
+const WALLET_FILE = installPath('.photon-wallet.json');
+// The location earlier builds used. Read once at startup so an operator who
+// already linked a wallet does not lose it when the path is corrected.
+const LEGACY_WALLET_FILE = path.resolve(process.cwd(), '.photon-wallet.json');
 
 /**
  * Holds the signing key for live execution.
@@ -181,6 +189,16 @@ export class WalletService {
       }
       console.warn('[Wallet] PHOTON_PRIVATE_KEY is set but could not be parsed. Ignoring it.');
     }
+
+    // One-time migration: an earlier build wrote the wallet at process.cwd().
+    // If the install-dir file is absent but a legacy one exists, move it so the
+    // operator's linked wallet survives the path correction.
+    try {
+      if (WALLET_FILE !== LEGACY_WALLET_FILE && !fs.existsSync(WALLET_FILE) && fs.existsSync(LEGACY_WALLET_FILE)) {
+        fs.renameSync(LEGACY_WALLET_FILE, WALLET_FILE);
+        console.log('[Wallet] Migrated .photon-wallet.json from the working directory to the install directory.');
+      }
+    } catch { /* fall through to the load; a failed migration is not fatal */ }
 
     try {
       if (fs.existsSync(WALLET_FILE)) {

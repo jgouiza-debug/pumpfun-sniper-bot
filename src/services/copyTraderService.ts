@@ -13,6 +13,7 @@ import {
 import { sniperEngine, type TradeResult } from './sniperEngine';
 import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError } from './rpcHealth';
 import { affordableStakeSol, sellAmountParam } from './pipelineUtils';
+import { installPath } from './installPaths';
 import { appendBotLog } from './fileLogger';
 import { DexScreenerService } from './dexscreenerService';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
@@ -61,7 +62,9 @@ import {
  * off, and copy trading must keep working when the sniper is idle.
  */
 
-const STATE_FILE = path.resolve(process.cwd(), '.copy-trader.json');
+// Install-relative when packaged (installPaths), cwd otherwise — a foreign cwd
+// must not split this state file away from the rest of the per-install files.
+const STATE_FILE = installPath('.copy-trader.json');
 
 /**
  * Schema version of `.copy-trader.json`.
