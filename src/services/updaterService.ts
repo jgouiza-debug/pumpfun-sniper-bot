@@ -63,10 +63,32 @@ export interface UpdateProgress {
 const OLD_SUFFIX = '.old';
 const NEW_SUFFIX = '.new';
 
+/**
+ * Decide whether a candidate release may replace the running build, from the
+ * GitHub compare status of (runningCommit ... releaseCommit):
+ *   'ahead' / 'identical' → the release CONTAINS our commit → safe forward move.
+ *   'behind'  → the release is older than us → a downgrade → refuse.
+ *   'diverged' → a different lineage that does NOT contain our commit → refuse.
+ * This is the guard against the divergent-lineage clobber: a v1.1.0 built from a
+ * branch that never had this build's fixes compares 'diverged', not 'ahead', so
+ * it is refused even though 1.1.0 > 1.0.8 numerically. Pure function so it is
+ * unit-tested without the network.
+ */
+export function releaseLineageIsSafe(compareStatus: string | undefined): boolean {
+  return compareStatus === 'ahead' || compareStatus === 'identical';
+}
+
 export class UpdaterService {
   private repoOwner = 'jgouiza-debug';
   private repoName = 'pumpfun-sniper-bot';
   private currentVersion = '0.0.0';
+  /**
+   * The git commit this build was compiled from, baked in by the release
+   * workflow (package.json `buildCommit`, or SNIPER_BUILD_COMMIT). Empty when
+   * unknown (dev checkout, or a build predating the baking) — in which case the
+   * lineage guard cannot run and self-update falls back to the version compare.
+   */
+  private buildCommit = '';
 
   private progress: UpdateProgress = {
     stage: 'idle',
@@ -121,13 +143,47 @@ export class UpdaterService {
       try {
         if (!fs.existsSync(pkgPath)) continue;
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        if (pkg?.buildCommit && !this.buildCommit) this.buildCommit = String(pkg.buildCommit);
         if (pkg?.version) {
           this.currentVersion = String(pkg.version);
+          if (!this.buildCommit) this.buildCommit = (process.env.SNIPER_BUILD_COMMIT || '').trim();
           return;
         }
       } catch {
         // try the next candidate
       }
+    }
+    if (!this.buildCommit) this.buildCommit = (process.env.SNIPER_BUILD_COMMIT || '').trim();
+  }
+
+  /** Auth + UA headers for GitHub API calls; adds a token when one is in env. */
+  private githubAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'User-Agent': 'PumpfunSniperBot-AutoUpdater',
+      'Accept': 'application/vnd.github.v3+json',
+    };
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.SNIPER_GITHUB_TOKEN;
+    if (token && token.trim()) headers['Authorization'] = `token ${token.trim()}`;
+    return headers;
+  }
+
+  /**
+   * Ask GitHub whether `releaseRef` (a tag or commit) descends from the running
+   * build's commit. Returns 'safe' when it does, 'refuse' when it is a downgrade
+   * or a divergent lineage, and 'unknown' when the lineage cannot be determined
+   * (no baked commit, or the API call failed) — the caller decides how to treat
+   * unknown. Never throws.
+   */
+  private async classifyReleaseLineage(releaseRef: string): Promise<'safe' | 'refuse' | 'unknown'> {
+    if (!this.buildCommit || !releaseRef) return 'unknown';
+    try {
+      const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/compare/${this.buildCommit}...${releaseRef}`;
+      const res = await axios.get(url, { headers: this.githubAuthHeaders(), timeout: 8000 });
+      const status: string | undefined = res.data?.status;
+      if (!status) return 'unknown';
+      return releaseLineageIsSafe(status) ? 'safe' : 'refuse';
+    } catch {
+      return 'unknown';
     }
   }
 
@@ -137,6 +193,9 @@ export class UpdaterService {
   }
 
   public getCurrentVersion(): string {
+    // Re-read at call time: a just-applied update swapped the binary and its
+    // embedded package.json, so a value cached at construction goes stale.
+    this.readLocalVersion();
     return this.currentVersion;
   }
 
@@ -171,10 +230,7 @@ export class UpdaterService {
     try {
       const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/releases/latest`;
       const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'PumpfunSniperBot-AutoUpdater',
-          'Accept': 'application/vnd.github.v3+json',
-        },
+        headers: this.githubAuthHeaders(),
         timeout: 8000,
       });
 
@@ -224,6 +280,15 @@ export class UpdaterService {
       };
     } catch (err: any) {
       if (err?.response?.status === 404) return this.checkForCommitUpdates(base);
+      if (err?.response?.status === 403) {
+        const isRateLimit = err?.response?.headers?.['x-ratelimit-remaining'] === '0';
+        return {
+          ...base,
+          error: isRateLimit
+            ? 'GitHub API rate limit reached. Set GITHUB_TOKEN to raise it; will retry automatically.'
+            : 'Access to GitHub releases restricted (403 Forbidden).',
+        };
+      }
       return { ...base, error: `Could not check for updates: ${err?.message || 'Network error'}` };
     }
   }
@@ -240,10 +305,7 @@ export class UpdaterService {
     try {
       const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/commits/master`;
       const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'PumpfunSniperBot-AutoUpdater',
-          'Accept': 'application/vnd.github.v3+json',
-        },
+        headers: this.githubAuthHeaders(),
         timeout: 8000,
       });
 
@@ -341,9 +403,13 @@ export class UpdaterService {
    * RENAMED. So the sequence is rename-self-aside, move the new build into the
    * original path, launch it, exit. The next start deletes the `.old` file.
    *
-   * Two refusals are deliberate and fail closed:
-   *  - No published SHA256 means no update. An unverified binary that replaces
-   *    the process holding the signing key is not worth the convenience.
+   * Three refusals are deliberate and fail closed:
+   *  - No published SHA256 means no update. The checksum proves integrity of the
+   *    transfer, not provenance of the publisher, but a build with no checksum at
+   *    all is not worth installing over the process holding the signing key.
+   *  - Wrong lineage. A release whose commit does not descend from this build is
+   *    refused (classifyReleaseLineage) so a divergent branch cannot masquerade
+   *    as an upgrade and remove fixes this build already has.
    *  - Never mid-trade. Restarting with an open position would strand it
    *    between processes, and the real-mode lock would be held by a PID that is
    *    about to disappear.
@@ -376,6 +442,20 @@ export class UpdaterService {
       return { ok: false, error: 'That release publishes no .sha256 checksum — refusing to install an unverified binary.' };
     }
 
+    // Lineage guard against the divergent-release clobber: a release whose commit
+    // does not descend from THIS build's commit would silently swap in a binary
+    // built from a branch that never had this build's fixes (e.g. a v1.1.0 cut
+    // from a lineage missing the copy-trade hardening). 'refuse' blocks it;
+    // 'unknown' (no baked commit, or the compare API is unreachable) falls back
+    // to the version check rather than blocking a legitimate update.
+    const lineage = await this.classifyReleaseLineage(check.latestVersion ? `v${check.latestVersion}` : '');
+    if (lineage === 'refuse') {
+      return {
+        ok: false,
+        error: `Refusing to install ${check.latestVersion}: its code does not descend from this build (different or older lineage). This protects against a release that would remove fixes present in your current version.`,
+      };
+    }
+
     const exePath = process.execPath;
     const newPath = exePath + NEW_SUFFIX;
     const oldPath = exePath + OLD_SUFFIX;
@@ -392,7 +472,11 @@ export class UpdaterService {
       try { if (fs.existsSync(newPath)) fs.unlinkSync(newPath); } catch { /* replaced below */ }
       await this.downloadTo(check.downloadUrl, newPath);
 
-      this.setProgress({ stage: 'verifying', message: 'Verifying signature…' });
+      // "Checksum", not "signature": this proves the download matches the hash
+      // the SAME release published (integrity vs a corrupt/MITM'd transfer), NOT
+      // that the publisher is trusted. Provenance is enforced by the lineage
+      // guard above and, in the packaged app going forward, by code signing.
+      this.setProgress({ stage: 'verifying', message: 'Verifying checksum…' });
       const expected = await this.fetchExpectedSha256(check.checksumUrl);
       if (!expected) {
         throw new Error('Could not read the published checksum.');

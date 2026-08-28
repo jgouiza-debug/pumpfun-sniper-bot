@@ -2302,6 +2302,32 @@ console.log('\n-- Self-updater: version identity, verification, restart safety -
     assert.ok(/npm version \$version/.test(workflow), 'the tag must be stamped into the build');
     assert.ok(/npm test/.test(workflow), 'a release must not ship a failing build');
   });
+
+  test('C1/H6: the checksum step is no longer mislabeled as a signature check', () => {
+    assert.ok(/Verifying checksum/.test(updaterSrc), 'the SHA256 check proves integrity, not provenance');
+    assert.ok(!/Verifying signature/.test(updaterSrc),
+      'calling a hash-equality check "Verifying signature" misrepresents provenance');
+  });
+
+  test('C1/H6: the lineage guard only accepts a release that CONTAINS this build', () => {
+    const { releaseLineageIsSafe } = require('../services/updaterService');
+    // GitHub compare(base=ourCommit ... head=releaseCommit):
+    assert.strictEqual(releaseLineageIsSafe('ahead'), true, 'release is ahead of us — a real forward move');
+    assert.strictEqual(releaseLineageIsSafe('identical'), true, 'same commit');
+    assert.strictEqual(releaseLineageIsSafe('diverged'), false, 'DIVERGENT lineage (the v1.1.0 clobber) must be refused');
+    assert.strictEqual(releaseLineageIsSafe('behind'), false, 'an older commit is a downgrade');
+    assert.strictEqual(releaseLineageIsSafe(undefined), false, 'unknown status is not "safe"');
+  });
+
+  test('C1/H6: the release workflow bakes the build commit for the lineage guard', () => {
+    assert.ok(/buildCommit/.test(workflow), 'the updater needs the build commit to verify lineage');
+    assert.ok(/ignore-scripts/.test(workflow), 'release install must not run dependency scripts (sec-deps-1)');
+  });
+
+  test('divergence-5: getCurrentVersion re-reads so it is fresh after a swap', () => {
+    const g = updaterSrc.slice(updaterSrc.indexOf('public getCurrentVersion'), updaterSrc.indexOf('public getCurrentVersion') + 320);
+    assert.ok(/readLocalVersion\(\)/.test(g), 'a value cached at construction goes stale after an update swaps the binary');
+  });
 }
 
 console.log('\n-- Phase 0/1: fill quality, slippage, and a gate that means something --');

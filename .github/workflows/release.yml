@@ -61,6 +61,18 @@ jobs:
           Write-Host "Stamping version $version"
           npm version $version --no-git-tag-version --allow-same-version
 
+      # Bake the commit this build was compiled from into package.json so the
+      # updater's lineage guard can ask GitHub whether a candidate release
+      # descends from this build before installing it (refuses a divergent
+      # lineage that would remove fixes). pkg embeds package.json in the snapshot.
+      - name: Stamp build commit
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}"
+          Write-Host "Stamping buildCommit $sha"
+          npm pkg set buildCommit=$sha
+
       - name: Run Tests
         run: npm test
 
