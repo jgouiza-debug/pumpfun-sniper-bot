@@ -1,0 +1,796 @@
+=== PHASE 0 BASELINE Thu Aug 27 22:02:29 EST 2026 ===
+node v24.16.0 npm 11.13.0
+branch: master @ 0b19fc5
+
+=== npm run build ===
+
+> pumpfun-token-screening-pipeline@1.0.8 build
+> vite build && tsc
+
+[36mvite v6.4.3 [32mbuilding for production...[36m[39m
+transforming...
+[32m✓[39m 108 modules transformed.
+rendering chunks...
+computing gzip size...
+[2mdist/[22m[32mindex.html                 [39m[1m[2m  0.86 kB[22m[1m[22m[2m │ gzip:   0.50 kB[22m
+[2mdist/[22m[35massets/index-CL8CMEFB.css  [39m[1m[2m  7.87 kB[22m[1m[22m[2m │ gzip:   1.90 kB[22m
+[2mdist/[22m[36massets/index-BfB8sB_s.js   [39m[1m[2m474.54 kB[22m[1m[22m[2m │ gzip: 143.99 kB[22m
+[32m✓ built in 1.01s[39m
+npm notice
+npm notice New major version of npm available! 11.13.0 -> 12.0.2
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.0.2
+npm notice To update run: npm install -g npm@12.0.2
+npm notice
+BUILD EXIT: 0
+=== npm run test:all ===
+
+> pumpfun-token-screening-pipeline@1.0.8 test:all
+> ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts
+
+
+-- B1: ageSeconds fabrication --
+  ok    OLD BUG reproduced: missing timestamp aged a fresh token to 120s
+  ok    OLD BUG reproduced: even a real 0s-old timestamp became 120s
+  ok    fixed: missing timestamp -> 0s (just born, DexScreener lookup skipped)
+  ok    fixed: 0s-old token -> 0s
+  ok    fixed: 90s-old ms timestamp -> 90
+  ok    fixed: seconds-epoch timestamps are normalized
+
+-- B3: migration mislabeling --
+  ok    OLD BUG reproduced: legacy mode calls a big-dev-buy create a migration
+  ok    fixed (strict): only txType=migrate counts
+
+-- Gate V2: no fabricated inputs --
+  ok    passes a healthy fresh create on REAL data
+  ok    unknown is not safe: unindexed RugCheck -> reject, field marked unverified
+  ok    rejects oversized dev initial buy (8% > 6% cap)
+  ok    rejects zero-skin-in-the-game deploys
+  ok    rejects REAL top10 concentration (not the fabricated 12% the legacy gate graded)
+  ok    rejects a token RugCheck marks as rugged
+  ok    active mint authority on an indexed report -> reject
+
+-- Bonding curve math (BigInt) --
+  ok    known case: 1 SOL into fresh curve (30 vSOL / 1.073B vTokens)
+  ok    monotonic: more SOL in -> more tokens out
+  ok    diminishing returns: 2x input yields < 2x output
+  ok    zero / invalid input -> 0 tokens, never throws
+
+-- Priority fee clamp --
+  ok    never below the static floor
+  ok    capped by the hard ceiling
+  ok    capped at 5% of position size
+
+-- percentile --
+  ok    p75 nearest-rank
+
+-- Kill switch window --
+  ok    only trades inside the window count
+
+-- Ticker/name resolution (owner report: everything showed as $PUMP) --
+  ok    OLD BUG reproduced: placeholder name/symbol shadow the real metadata
+  ok    fixed: undefined placeholders let RugCheck metadata through
+
+-- Playbook routing (owner report: only buys end-of-life tokens) --
+  ok    bonding progress is measured from virtual reserves
+  ok    OLD BUG quantified: legacy vSol>=70 "migration" is only ~47% up the curve
+  ok    block-0 window is never tradeable
+  ok    late curve is refused (this is what the bot used to buy)
+  ok    mid-curve with real demand is eligible for Play 2 — the early entry
+  ok    mid-curve without unique buyers is refused (volume alone is gameable)
+  ok    migration past the 90s window is no longer a Play 3 snipe
+  ok    migration snipe above the MC cap is refused
+  ok    fresh migration inside window and MC cap is eligible
+  ok    OLD BUG reproduced: a $8k USD floor rejects every graduation at SOL=$74
+  ok    fixed: a real graduation passes on a SOL-denominated floor
+  ok    fixed floor still rejects a genuinely thin graduation pool
+  ok    the floor tracks SOL: same 30 SOL pool passes at any SOL price
+  ok    boosted tokens are refused (paid visibility, -48% average returns)
+
+-- Paper simulator (owner report: profitable on paper, losing live) --
+  ok    paper buys now cost more than the naive quote (fees + curve impact)
+  ok    a paper round trip with no price move LOSES money (as in real life)
+  ok    selling a large bag suffers more impact than a small one
+  ok    breakeven cost falls as position size rises (the fixed-cost tax)
+
+-- Structural stop: creator sells (was hardcoded devSoldAnyClean = true) --
+  ok    creator selling fires DEV_SOLD immediately
+  ok    a random wallet selling does NOT fire the structural stop
+  ok    creator alert fires only once, not on every subsequent sell
+  ok    three distinct wallets dumping within 60s = coordinated exit
+  ok    sells spread beyond 60s do not count as a cluster
+  ok    untracked mints are ignored entirely
+
+-- Holder concentration: per-owner aggregation --
+  ok    OLD BUG reproduced: one owner across many accounts double-counts past 100%
+  ok    owners are merged, so the largest holder is the true largest
+  ok    clean distribution is unflagged
+
+-- Liquidity floor: unsatisfiable on a bonding curve --
+  ok    OLD BUG reproduced: $8k floor rejects a healthy mid-curve token
+  ok    OLD BUG quantified: $8k needs more SOL than the curve can ever hold
+  ok    fixed: a SOL-denominated curve floor admits the same token
+  ok    fixed floor still rejects a near-empty curve
+  ok    post-migration tokens keep the full $8,000 pool requirement
+
+-- Migration demand credit (owner report: clean graduations died at the score gate) --
+  ok    OLD BUG reproduced: without the credit, a clean graduation scores below 62
+  ok    fixed: with curve-demand credit a clean graduation clears the router half-unit band
+  ok    credit never overrides measured demand (indexed volume present -> no credit)
+  ok    credit cannot rescue a concentration rug (Gate 0 still rules)
+
+-- Gate V2: create-window MC band must not judge migrations --
+  ok    OLD BUG reproduced: a ~410 SOL graduation MC fails the create band
+  ok    fixed: the same MC on a real migration is not judged by the create band
+
+-- NORMAL risk tier (owner-selected looser profile) --
+  ok    normal tier widens bands but keeps Play 1 disabled
+  ok    a 3-minute-old migration is refused strict but eligible normal
+  ok    score 52 clears normal half-unit band, not strict
+
+-- Fixed trade sizing (all-in removed 2026-08-09) --
+  ok    entry size is the configured stake scaled by conviction
+  ok    the stake is used as-is when the balance can fund it
+  ok    the stake is clamped when the balance cannot fund it
+  ok    REGRESSION 2026-08-09: a stake must fit its own on-chain transfer
+  ok    maxAffordableBuySol returns 0 when balance cannot cover fixed costs
+  ok    an empty wallet stakes nothing
+  ok    breakeven percent floors for sizing
+  ok    a healthy wallet pays the configured sell priority fee unchanged
+  ok    REGRESSION 2026-08-23: a drained wallet clamps the sell fee so the exit can land
+  ok    the sell fee clamp floors instead of refusing, and never raises the fee
+[Flags] Enabled: entryGateV2, shadowGateV2, strictMigrationDetect, dynamicPriorityFee, localTxBuild, localTxShadowCompare, concurrentExits, killSwitch, timelineSlotSampling, honestPaper, enforceTradeEconomics, playbookRouting, honeypotChecks, devSellStop, allInSizing, launchSnipe
+  ok    the allInSizing flag exists and is enabled
+
+-- Sell order sizing (2026-08-09 $GREEN partial-exit incident) --
+  ok    OLD BUG reproduced: stripping the % turns "sell 100%" into "sell 100 tokens"
+  ok    fixed: a full exit keeps its percent marker
+  ok    partial exits stay percentages too
+  ok    malformed or out-of-range input falls back to a full exit, never a token count
+
+-- Gate 0: unknown concentration is not safe (2026-08-09 $GREEN rug buy) --
+  ok    OLD BUG reproduced: concentration read as 0% passes every cap
+  ok    OLD BUG reproduced: zero-filled concentration also scored maximum distribution points
+  ok    fixed: unverified concentration fails Gate 0 under requireVerifiedConcentration
+  ok    fixed: unverified concentration scores below the half-unit floor
+  ok    measured concentration still passes when genuinely clean
+  ok    measured concentration over the cap still rejects
+  ok    Play 3 score ceiling: a PERFECT migration cannot reach full conviction pre-indexing
+  ok    the same token reaches full conviction once demand is indexed
+  ok    an UNVERIFIED token still scores far below the half-unit floor
+  ok    REGRESSION: zero insiders is measured data, not missing data
+  ok    REGRESSION: the concentrated tokens from the same run are still refused
+  ok    REGRESSION: an untrustworthy reading (sums past 100%) counts as unverified
+  ok    REGRESSION $TNOS: a one-row holder sample is not a distribution
+  ok    REGRESSION $TNOS: RugCheck risk score is enforced by Gate 0
+  ok    legacy path (flag off) ignores the RugCheck score, as before
+  ok    legacy path (flag off) is unchanged — placeholders still evaluated as before
+
+-- Exit policy: no price stop-loss --
+  ok    OLD BUG reproduced: at the 1.3x arm / 20% trail the stop exited BELOW breakeven
+  ok    fixed: a 1.5x peak never arms the trailing stop
+  ok    fixed: a 2.9x peak still does not arm (below the 3x ratchet)
+  ok    fixed: a 3.5x peak arms at 2.45x — comfortably above breakeven
+  ok    fixed: the armed level always clears round-trip cost at the 3x arm
+  ok    useTrailingStop=false never arms
+  ok    a position down 60% has no price exit UNLESS the owner switched one on
+
+-- Exit policy: structural exits replace the price stop --
+  ok    pool drain fires at half the peak
+  ok    pool drain does NOT fire on an ordinary 30% dip
+  ok    a thin pool cannot trip the drain exit on noise
+  ok    an unindexed pool (liquidity 0) is not a drain signal
+
+-- Exit policy: peak integrity across price sources --
+  ok    a normal new high raises the peak
+  ok    a price below the peak never lowers it
+  ok    OLD BUG reproduced: a 2x source switch would have anchored the peak forever
+  ok    a 3x single-tick move is still accepted (real launches do move)
+  ok    the first tick (no previous price) is accepted
+
+-- Entry economics: the half-unit stake must clear the breakeven gate --
+  ok    OLD BUG reproduced: buyAmountSol 0.3 sized a half unit that the gate refused
+  ok    OLD BUG reproduced: at a 0.2 SOL wallet NO buyAmountSol could clear the gate
+  ok    fixed: buyAmountSol 0.6 sizes a 0.3 SOL half unit that clears the gate
+  ok    fixed: ~1.2 SOL funds three concurrent 0.3 SOL stakes
+  ok    a full unit (score >= minScoreFullUnit) is also economic
+
+-- Wallet-split sizing: one dead slot costs 1/N, never the wallet --
+  ok    a 1.2 SOL wallet splits into 3 fundable slots
+  ok    all 3 slots actually fit inside the balance (no overdraft)
+  ok    OLD BUG reproduced: naive balance/3 as the stake overdrafts
+  ok    the slot stake clears the breakeven gate at 1.2 SOL
+  ok    a slot going to zero costs exactly 1/N — the other slots keep full size
+  ok    more slots means a smaller, still-equal share
+  ok    an underfunded wallet yields a zero stake rather than a bad order
+  ok    a zero or negative balance is not sliceable
+  ok    one slot degenerates to the whole affordable balance
+
+-- Router reads its tier config (audit #1) --
+  ok    NORMAL tier declares looser Play 2 triggers than STRICT
+  ok    the fixture actually reaches the Play 2 branch
+  ok    OLD BUG reproduced: bare literals meant NORMAL behaved exactly like STRICT
+  ok    fixed: STRICT still rejects these inputs
+  ok    fixed: NORMAL now accepts them — its config finally has an effect
+  ok    the rejection message quotes the configured number, not a literal
+  ok    playbookConfigFor maps modes to the right tier
+
+-- Bankroll cap and slot budget (audit #16) --
+  ok    OLD BUG reproduced: with no cap the run commits ~100% of the wallet
+  ok    fixed: a 60% cap holds back 40% of the wallet
+  ok    the cap shrinks the per-slot stake proportionally
+  ok    a capped slot is still large enough to trade at a 2 SOL wallet
+
+-- Exit-path safety: no-data exit, retry cap, rung latches (audit #5, #6, #11, #12, #13) --
+  ok    the price stop exists but is gated on a switch that ships OFF
+  ok    each loss-side exit has its own switch, and they default to owner policy
+  ok    every structural danger can still only WARN when its switch is off
+  ok    #13: a no-data exit exists and is time-based, not price-based
+  ok    #13: the no-data exit is gated on market EXISTENCE, never on a price level
+  ok    Take Profit rungs are active and never fire in negative PnL
+  ok    #11: neither rung is gated on the shared principalRecovered flag any more
+  ok    #12: trailingTriggerCount resets when the stop re-anchors
+
+-- Config clamps and circuit breakers (audit #15, #29) --
+  ok    #15: updateConfig clamps incoming values
+  ok    #15: the 99999 unlimited-positions sentinel is gone
+  ok    #29: all three circuit breakers are read, not just written
+  ok    #29: tripping pauses entries but never closes positions
+  ok    #14: entries are reserved before the first await
+  ok    #14: every entry path goes through the shared slot guard
+
+-- Mint authority is read on-chain, not asserted (audit #20) --
+  ok    OLD BUG reproduced: an inferred RugCheck report ASSERTS both authorities are null
+
+-- Unknown is not safe: unverified blocks the trade (audit #21) --
+  ok    OLD BUG reproduced: verdict.unverified was computed and discarded
+  ok    rugcheckRisks alone does not block (it is covered by concentration rules)
+
+-- Liquidity vs market cap (audit #33) --
+  ok    OLD BUG reproduced: only absolute floors existed, so 33:1 passed everything
+  ok    fixed: 33:1 is rejected at the default 20x limit
+  ok    a genuine graduation (~5:1) passes
+  ok    the check is disabled at 0 rather than rejecting everything
+  ok    the ratio is never computed against ASSERTED liquidity
+
+-- Creator resolution and the real sell simulation (audit #22, #4) --
+  ok    OLD BUG reproduced: an Unknown creator silently disables all three creator stops
+  ok    fixed: the engine falls back to the curve-decoded creator
+  ok    fixed: a missing creator is reported loudly instead of failing silently
+  ok    a real creator is tracked and alerts on its sell
+  ok    #4: simulateSellPath now has a call site
+  ok    #4: the sell simulation runs off the entry hot path
+  ok    #4 updated: a confirmed honeypot is logged loudly but NOT auto-sold
+  ok    #4: an inconclusive simulation does NOT exit the position
+
+-- Rug fixtures from recorded live data (audit #38) --
+  ok    REAL RUG roar: top10 100%, RugCheck score 21601 — must be refused
+  ok    REAL RUG TOAD: top10 100%, RugCheck score 29532 — must be refused
+  ok    REAL RUG $STICK: top10 100%, RugCheck score 58701 — must be refused
+  ok    REAL RUG SEACAT: top10 89.66%, RugCheck score 25953 — must be refused
+  ok    REAL RUG $HALVES: top10 89.66%, RugCheck score 17811 — must be refused
+  ok    REAL RUG ROGRAP: top10 89.66%, RugCheck score 31423 — must be refused
+  ok    REAL RUG TT 2.0: top10 89.66%, RugCheck score 18819 — must be refused
+  ok    REAL RUG ICT: top10 89.66%, RugCheck score 27405 — must be refused
+  ok    a clean distribution from the same corpus is still accepted
+
+-- Win rate is per position, not per leg (audit #9) --
+  ok    OLD BUG reproduced: a winner exits in more legs, inflating a leg-based rate
+
+[Report] Saved to reports/run_2026-08-28T02-02-43-740Z.json and .md
+  ok    fixed: the report groups legs into positions
+
+[Report] Saved to reports/run_2026-08-28T02-02-43-745Z.json and .md
+  ok    a position is a WIN on its summed P&L, not on any single leg
+
+[Report] Saved to reports/run_2026-08-28T02-02-43-747Z.json and .md
+  ok    avg P&L per position is reported
+
+[Report] Saved to reports/run_2026-08-28T02-02-43-748Z.json and .md
+  ok    #8: fees are reported from feesPaidUsd, not the P&L adjustment
+  ok    OLD BUG reproduced: summing feeDragUsd on real fills reports $0.00
+
+[Report] Saved to reports/run_2026-08-28T02-02-43-749Z.json and .md
+  ok    #10/#27: exit reasons bucket on the code, not the interpolated string
+  ok    OLD BUG reproduced: the raw string fragments into one bucket per trade
+
+[Report] Saved to reports/run_2026-08-28T02-02-43-750Z.json and .md
+  ok    legacy records with no exitCode still aggregate after numeral collapsing
+  ok    classifyExitReason maps the full-exit strings
+  ok    the no-data stop is classified before the generic time stop
+
+-- Slot count fits the wallet (0.2 SOL reality check) --
+  ok    THE PROBLEM: 0.2 SOL split 3 ways is uneconomic at any priority fee
+  ok    THE PROBLEM: at the 0.003 priority fee, 0.2 SOL cannot trade at ALL
+  ok    fixed: at pf 0.001 the wallet supports exactly ONE slot
+  ok    the fitter prefers MORE slots when the wallet can afford them
+  ok    it steps down one slot at a time, not straight to 1
+  ok    it never returns a slot count whose stake fails the gate
+  ok    a wallet too small for even one slot returns 0, so the caller refuses to arm
+  ok    never returns more slots than requested
+
+-- Sizing reads the linked Photon wallet in BOTH modes --
+  ok    OLD BUG reproduced: paper sized off the typed bankroll, not the wallet
+  ok    fixed: deployableForSizing prefers the linked wallet regardless of mode
+  ok    the bankroll fallback survives for an unlinked machine
+  ok    a reduced slot count is surfaced as a concentration change, not silently
+  ok    autoFitSlotsToWallet can be turned off
+
+-- Minimum viable wallet is computed, not guessed --
+  ok    the returned minimum actually clears the gate
+  ok    a hair under the minimum does NOT clear it
+  ok    THE CURRENT WALLET: 0.1 SOL is below the floor at any slot count
+  ok    0.2 SOL clears it for one slot, which is why that was the earlier floor
+  ok    more slots costs proportionally more wallet
+  ok    a cheaper priority fee lowers the floor
+  ok    a breakeven limit at or below the 3% variable cost is unreachable at any size
+
+-- A packaged exe must not ship with every safety flag off --
+  ok    OLD BUG reproduced: the dev DEFAULTS have every guard off
+  ok    OLD BUG reproduced: DEFAULTS also turn all-in sizing ON
+  ok    fixed: a packaged build enables honeypotChecks
+  ok    fixed: a packaged build enables devSellStop
+  ok    fixed: a packaged build enables enforceTradeEconomics
+  ok    fixed: a packaged build enables killSwitch
+  ok    fixed: a packaged build enables honestPaper
+  ok    fixed: a packaged build enables playbookRouting
+  ok    fixed: a packaged build does NOT default to all-in sizing
+  ok    PACKAGED_DEFAULTS covers every declared flag
+  ok    localTxBuild stays off until a parity run proves it
+  ok    divergence from DEFAULTS is declared, not accidental
+
+-- Launch snipe (Play 1): first-candle entry --
+  ok    the lane is opt-in: launchSnipe ships OFF in dev AND packaged defaults
+  ok    the fast lane only intercepts creates, and only when the flag is on
+  ok    a snipe routes at the bonding curve, never venue auto
+  ok    momentum is measured beyond the dev buy, not from zero
+  ok    armed snipes die with the run
+  ok    an unfired snipe falls back to the Play 2 path instead of vanishing
+
+-- Security: API origin/auth, key handling, lock atomicity --
+  ok    no Helius key is hardcoded anywhere in source
+  ok    the browser never persists key material
+  ok    cross-origin requests are refused, loopback ones on any port are not
+  ok    every mutating API call requires the token, by method not by memory
+  ok    process faults are never swallowed silently
+  ok    no untrusted value is interpolated into a shell command
+  ok    the real-mode lock is taken with an atomic exclusive create
+  ok    base58 keys are decoded as base58, not silently as base64
+
+-- Exit reasons classify to the right bucket --
+  ok    a price stop is not filed as a profit exit
+  ok    the new structural strings still classify as structural
+
+-- Self-updater: version identity, verification, restart safety --
+  ok    the build knows its own version, not a hardcoded 1.0.0
+  ok    version resolution does not depend on the working directory
+  ok    an unverified binary is never installed
+  ok    a failed swap restores the working build
+  ok    an update cannot run mid-trade
+  ok    the commit fallback no longer claims an update it cannot install
+  ok    the release workflow publishes the checksum the updater requires
+
+-- Phase 0/1: fill quality, slippage, and a gate that means something --
+  ok    a fill far above the decision price abandons the entry
+  ok    the abort is checked against the VERIFIED fill, not an estimate
+  ok    buys never escalate slippage; sells get exactly one capped retry
+⚠️ No Helius API key. Enter one in UI Settings — it is saved to .api-keys.json and reused on the next start — or set HELIUS_API_KEY in the .env beside the exe.
+⚠️ Falling back to https://api.mainnet-beta.solana.com — heavily rate limited. Open positions can still be priced and sold, but do NOT expect to win snipes on it.
+🌐 RPC endpoint: api.mainnet-beta.solana.com (source: public)
+[10:02:44 PM] [INFO] ⚡ Smart Sniper Engine Initialized (STRICT Mode Active)
+  ok    the shipped slippage defaults are asymmetric and tight
+  ok    a strategy score can no longer overrule a safety verdict
+  ok    Gate 0 has no fields it does not compute
+  ok    allPassed is a conjunction of measured terms only
+  ok    ALL-IN MODE is wired to sizing instead of only to a label
+  ok    the default run commits half the wallet, not all of it
+
+-- Entry gate: the momentum ceiling refuses the KINGLON shape --
+  ok    THE ACTUAL TRADE: +362% in 5m on a 77s-old pair is refused
+  ok    the same token at a sane moment passes
+  ok    real volume behind the move is an exemption, thin volume is not
+  ok    an older pair that moves is not the same animal
+  ok    missing market data is unverified, not silently safe
+  ok    socials are required when resolved and excused when not indexed
+  ok    the ceiling can be disabled without touching code
+
+-- No decorative settings: every BotConfig field must drive behaviour --
+  ok    BotConfig has fields at all (the scrape works)
+  ok    write-only command fields are actually acted on
+  ok    every setting is read by the code that claims to honour it
+  ok    the settings that were inert on 2026-08-13 are wired
+  ok    a thin holder sample cannot read as a clean distribution
+
+-- Feed watchdog: a socket that dies without closing --
+  ok    OLD BUG: reconnect hung off close alone, which a half-open socket never fires
+  ok    reconnect backoff grows, stays capped, and is jittered
+
+-- RPC: transient failure is not a honeypot verdict --
+  ok    error classification distinguishes a dead key from a busy one
+  ok    a missing key degrades to a usable endpoint instead of an unusable URL
+  ok    endpoint precedence: explicit override > key > fallback
+  ok    the connection is configured deliberately, not by default
+
+-- The 70.9%: one dropped RPC read no longer reads as unsafe --
+
+-- Upgrade must not switch on selling for someone who never chose it --
+  ok    a pre-2026-08-13 config does NOT start auto-selling on upgrade
+  ok    the migration runs once and then leaves the toggle alone
+  ok    someone who had it off stays off
+  ok    the persisted file stamps the version, or the migration repeats forever
+  ok    the migration writes the stamp immediately instead of waiting for a change
+
+-- macOS build: the updater must never install another platform's binary --
+  ok    each platform resolves to its own asset
+  ok    a Mac build can never resolve to the .exe
+  ok    the build scripts produce exactly the names the updater asks for
+  ok    macOS targets do not use the node18 base that has no prebuilt
+  ok    a multi-platform release leaves exactly one .sha256, for pre-1.0.1 clients
+  ok    the workflow publishes macOS checksums as .sha256sum, not .sha256
+  ok    the release workflow ad-hoc signs arm64 and publishes a checksum per asset
+
+-- API keys entered in the UI survive a restart --
+  ok    OLD BUG reproduced: a UI key lived only in memory, so a restart lost it
+  ok    fixed: a key saved from Settings is read back on the next start
+  ok    the saved key outranks .env, so replacing a rotated key actually sticks
+  ok    .env is used when nothing has been saved
+  ok    no key anywhere reports none rather than a blank that looks configured
+  ok    forgetting one key leaves the other intact
+  ok    an empty value is never written — a blank field must not erase a key
+  ok    a corrupt store degrades to empty instead of stopping the bot booting
+  ok    the store never lands in the repo
+
+-- "RPC stays down on a valid key": the four causes --
+  ok    OLD BUG: an env override outranks the Helius key — now it is reported, not silent
+  ok    no override: the key is used and nothing claims it was overridden
+  ok    keyOverridden is false with no key — an override is then the intended path
+  ok    the fallback chain still degrades rather than dying
+  ok    the host is exposed but the credential never is
+  ok    OLD BUG: a pasted RPC URL nested inside another URL — now the key is extracted
+  ok    a websocket URL form is accepted the same way
+  ok    a URL with no api-key is REFUSED, and points at the right setting
+  ok    junk that cannot survive a query string is refused rather than encoded
+  ok    quotes from a .env line or JSON blob are stripped
+  ok    a clean key passes with no note at all
+  ok    a non-UUID token is warned about but still accepted — the format is theirs to change
+  ok    an empty key is not usable and says so
+
+-- One blip must not blank the wallet or refuse to arm --
+
+-- Copy trader: leader sells are queued, routed by the sell venue, and retried --
+  ok    OLD BUG: the exit went to the venue recorded at BUY time
+  ok    an on-chain (Helius) sell carries no venue, so auto is first; auto is never duplicated
+  ok    a failed sell is retried with backoff, bounded, and capped so the queue behind it moves
+  ok    the leader's sell fraction comes from their post-trade balance
+  ok    sell slippage is the wider of the copy setting and the engine's sell band
+
+-- Copy trader: the on-chain wallet watcher owns its socket --
+  ok    subscribes every tracked wallet with logsSubscribe at processed, healthy only once acknowledged
+  ok    a notification reaches the wallet that owns the subscription; failed txs are passed through for the caller to drop
+  ok    changing the tracked set diffs in place: removed wallets unsubscribe, new ones subscribe, no reconnect
+  ok    the copy trader, the engine and the UI are wired to all of this
+
+-- Copy trader: transfers are not trades, a flip inside our buy is not lost, paper exits print the leader price --
+  ok    OLD BUG: tokens arriving with no SOL leaving read as a BUY, so an airdrop got copied
+  ok    OLD BUG: tokens leaving with no SOL arriving read as a SELL, so a wallet-to-wallet move dumped our bag
+  ok    receiving tokens can cost rent and a fee without buying any — still a transfer
+  ok    a known venue program in the transaction proves a trade however small; a swap leg has no SOL by nature
+  ok    the venue comes from the programs the transaction invoked, in PumpPortal vocabulary
+  ok    OLD BUG: the network fee was inside the "price" of a small buy
+  ok    OLD BUG: a paper sell filled at our stale price, so it booked -3% whatever the leader got
+  ok    the service is wired to all of this
+
+-- Copy trader: pump.fun trades are read from the log lines at processed — no RPC on the hot path --
+  ok    a real pump.fun buy decodes from its log lines exactly as the chain reports it
+  ok    the discriminator is Anchor's for TradeEvent
+  ok    a sell event carries isBuy=false and its own amounts
+  ok    an identical event emitted by some OTHER program is not a pump.fun trade
+  ok    nested CPI: a pump.fun trade inside a router is still attributed to pump.fun
+  ok    garbage and short payloads are ignored, never thrown
+  ok    the service takes the fast lane first and reconciles its tally against the chain
+
+-- Copy trader: stablecoin swaps and foreign venues are not memecoin buys --
+  ok    MEASURED 2026-08-23: a tracked market-maker produced 210 copied "buys" of USDC in two minutes
+  ok    a buy is copied only from a venue the executor can trade on
+  ok    the service applies both before sizing a copy buy, and sells are NOT gated (we may hold the bag)
+
+-- Copy trader v1.0.4 regression: the venue gate refused nearly every aggregator route --
+  ok    MEASURED: 9 of 10 Jupiter routes expose no venue program — a launchpad mint still buys via auto
+  ok    a known venue routes directly; unknown venue + unknown mint is the only refusal
+  ok    paper junk in stablecoins is purged on load so the book cannot stay wedged at 10/10
+
+-- Async tests (36, run sequentially) --
+  ok    fixed: a live mint authority is detected and rejected
+  ok    fixed: a renounced mint authority passes
+  ok    freeze authority is still detected independently
+  ok    both authorities live yields both reasons
+  ok    #21: an unreachable mint account reports unverified, never a silent pass
+  ok    fixed: silence past staleMs terminates the socket so close (and reconnect) fire
+  ok    a socket that keeps delivering is never terminated
+  ok    a pong counts as life, so an idle curve subscription survives
+  ok    stop() ends the watchdog so a closed socket is not terminated later
+  ok    a transient failure is retried and then succeeds
+  ok    a rejected credential fails fast instead of retrying pointlessly
+  ok    a not-yet-visible account is retried rather than read as absent
+  ok    retryOnEmpty still gives up and returns empty rather than hanging
+  ok    health counts successes and failures so "barely working" has a number
+  ok    a mint that throws once is still verified, not written off as unverifiable
+  ok    a mint not yet propagated is retried, then read
+  ok    a genuinely absent account is STILL unverified — retry must not invent a pass
+  ok    a live mint authority is still caught after a retry
+  ok    countHealth:false keeps a heartbeat out of the rolling success rate
+  ok    an uncounted call still latches a rejected credential — that is real signal
+  ok    counted calls are still counted — the default did not change
+[Wallet] Linked 4b36ugcHPcRNt5ngEuhVucKrT1aZTCZWsre55kuchr22 | 2 SOL
+  ok    OLD BUG: one 429 flipped RPC to DOWN, which refuses to arm REAL mode
+[Wallet] Linked 4b36ugcHPcRNt5ngEuhVucKrT1aZTCZWsre55kuchr22 | 2 SOL
+  ok    a sustained outage still reads as DOWN — hysteresis must not hide a real one
+  ok    a recovered RPC clears the latch on the FIRST good read
+  ok    OLD BUG: a link that reports failure left the wallet armed anyway
+[Wallet] Linked 4b36ugcHPcRNt5ngEuhVucKrT1aZTCZWsre55kuchr22 | 2 SOL
+  ok    a failed re-link restores the wallet that was already working
+[Wallet] Linked 4b36ugcHPcRNt5ngEuhVucKrT1aZTCZWsre55kuchr22 | 2 SOL
+  ok    a malformed key is still rejected without touching the linked wallet
+  ok    OLD BUG: an exit already in flight silently swallowed the next leader sell
+  ok    fixed: the queue runs both in order, so "50% then the rest" leaves us flat like the leader
+  ok    a failed exit does not block the one queued behind it
+  ok    positions never wait on each other
+  ok    isBusy reports running or queued work, and clears afterwards
+  ok    OLD BUG: onLogs reconnected only from close, so a half-open socket stayed deaf; now silence terminates it and every wallet is re-subscribed
+  ok    stop() closes the socket and does not reconnect
+  ok    OLD BUG: a leader sell arriving while our buy was still landing found nothing and was dropped
+  ok    fixed: buys and sells share one queue per mint, so the sell waits for its bag
+
+371 passed, 0 failed
+
+================ FILTER PROOFS ================
+
+-- honeypotDetector: on-chain mint account --
+
+
+-- entryGateV2: payload + RugCheck screening --
+
+  ok    Mint authority NOT renounced
+        bad input : SPL mint with mintAuthority COption tag = 1 (creator can mint unlimited supply)
+        REJECTED  : "Mint authority is NOT renounced — the creator can mint unlimited new supply"
+
+  ok    Freeze authority active
+        bad input : SPL mint with freezeAuthority COption tag = 1 (holders can be frozen out of selling)
+        REJECTED  : "Freeze authority is active — holders can be frozen out of selling"
+
+  ok    Token-2022 transfer FEE
+        bad input : Token-2022 mint with TransferFeeConfig extension (ext type 1) — sells silently taxed
+        REJECTED  : "Token-2022 transfer fee present — sells can be taxed arbitrarily"
+
+  ok    Token-2022 transfer HOOK
+        bad input : Token-2022 mint with TransferHook extension (ext type 14) — arbitrary code can block the sell
+        REJECTED  : "Token-2022 transfer hook present — arbitrary code runs on every transfer and can block sells"
+
+  ok    Token-2022 PERMANENT DELEGATE
+        bad input : Token-2022 mint with PermanentDelegate extension (ext type 12) — third party can seize tokens
+        REJECTED  : "Token-2022 permanent delegate — a third party can move your tokens at will"
+
+  ok    Token-2022 DEFAULT ACCOUNT STATE (blacklist mechanism)
+        bad input : Token-2022 mint with DefaultAccountState extension (ext type 6) — new accounts created frozen
+        REJECTED  : "Token-2022 default account state — new accounts can be created frozen"
+
+  ok    Mint owned by an unexpected program
+        bad input : mint account owned by neither the SPL nor Token-2022 program
+        REJECTED  : "Mint owned by an unexpected program (11111111...)"
+
+  ok    RugCheck danger flag propagated
+        bad input : indexed RugCheck report carrying a danger-level risk named "Honeypot"
+        REJECTED  : "RugCheck danger: Honeypot risk"
+
+  ok    Dev initial buy % of supply too LARGE
+        bad input : create where the dev buys 150,000,000 tokens = 15% of the 1B supply
+        REJECTED  : "Dev initial buy 15.0% of supply > max 6%"
+
+  ok    Dev initial buy SOL too SMALL (no skin in the game)
+        bad input : create where the dev commits 0 SOL of their own
+        REJECTED  : "Dev initial buy 0.000 SOL < min 0.1 (no skin in the game)"
+
+  ok    Dev initial buy SOL too LARGE (exit-liquidity setup)
+        bad input : create where the dev commits 50 SOL — building a bag to dump on buyers
+        REJECTED  : "Dev initial buy 50.00 SOL > max 10 (exit-liquidity setup risk)"
+
+  ok    Real SOL in curve below minimum
+        bad input : create with vSolInBondingCurve = 30.0 (zero real SOL above the 30 virtual base)
+        REJECTED  : "Real SOL in curve 0.000 < min 0.5"
+
+  ok    Market cap already pumped at detection
+        bad input : create arriving at marketCapSol = 5000 — the move already happened
+        REJECTED  : "Market cap 5000.0 SOL > max 120 (already pumped at detection)"
+
+  ok    RugCheck risk score above maximum
+        bad input : indexed RugCheck report with score 120,001
+        REJECTED  : "RugCheck score 120001 > max 1000"
+
+  ok    Mint authority active (via RugCheck)
+        bad input : indexed RugCheck report with a non-null mintAuthority
+        REJECTED  : "Mint authority active"
+
+  ok    Freeze authority active (via RugCheck)
+        bad input : indexed RugCheck report with a non-null freezeAuthority
+        REJECTED  : "Freeze authority active"
+
+  ok    BUNDLED LAUNCH — top 10 holders concentration
+        bad input : dev holds 90% across 20 wallets that look organic: top10Pct = 90 with a 20-holder sample
+        REJECTED  : "Top10 holders 90.0% > max 30% (measured, pools excluded)"
+
+  ok    Single largest holder too big
+        bad input : one wallet holding 60% of supply
+        REJECTED  : "Largest holder 60.0% > max 12%"
+
+  ok    Insider holdings too big
+        bad input : RugCheck-flagged insider network holding 55%
+        REJECTED  : "Insider holdings 55.0% > max 35%"
+
+  ok    RugCheck marks token as RUGGED
+        bad input : indexed report with fileMeta.rugged = true
+        REJECTED  : "RugCheck marks token as rugged"
+
+  ok    Holder concentration UNVERIFIED (empty holder list)
+        bad input : indexed report whose holder sample is 0 — unknown must not read as safe
+        REJECTED  : "Holder concentration unverified (RugCheck holder list empty) — unknown is not safe"
+
+  ok    RugCheck NOT INDEXED yet
+        bad input : rug = null — the token is too fresh for RugCheck to have data
+        REJECTED  : "RugCheck not indexed yet — concentration unverified, unknown is not safe"
+
+  ok    Migration already pumped (buying the snipers exit)
+        bad input : migration with +362% in 5m on a 77s-old pair and only $20,969 of volume — the $KINGLON entry that lost 93.5%
+        REJECTED  : "Already +362% in 5m on a 77s-old pair (max +100%, or $25,000 of 5m volume to confirm) — buying the snipers' exit"
+
+  ok    No linked socials
+        bad input : migration with socialCount = 0 (published lift for socials is 8.94x-17.4x)
+        REJECTED  : "No linked socials (0 < 1) — tokens with socials graduate 8.9-17.4x more often"
+
+==============================================
+24 filters PROVEN to fire, 0 unproven
+==============================================
+
+
+================ GUARDRAIL PROOFS ================
+
+-- Entry rate limit: max attempts per hour --
+
+  ok    allows attempts up to the cap
+        FIRED: "entry rate limit: 5 attempts in the last 60 min (max 5); next slot frees in 3595s"
+  ok    REFUSES the attempt past the cap, and says when a slot frees
+  ok    the window rolls — an hour later the cap is clear again
+  ok    0 disables the limiter rather than blocking everything
+
+-- Consecutive failed-transaction breaker --
+
+  ok    a success resets the streak, so isolated failures never trip it
+        FIRED: "3 consecutive transactions failed to land (last: 6002 TooMuchSolRequired) — every failed submission still pays its fee"
+  ok    TRIPS on the Nth consecutive failure
+  ok    stays tripped — no automatic recovery at 3am
+
+-- Feed freshness gate --
+
+  ok    a fresh feed permits trading
+        FIRED: "launch feed stale: silent for 65.0s (~163 slots, limit 150). Refusing to trade on state of unknown age."
+  ok    REFUSES to trade once the feed is stale beyond N slots
+  ok    a message arriving clears the staleness
+
+-- Composition: first refusal wins --
+
+        FIRED: "entry rate limit: 1 attempts in the last 60 min (max 1); next slot frees in 3600s"
+  ok    evaluateGuardrails reports ONE clear cause, not a pile
+  ok    all clear reports allowed
+
+-- Crash recovery: does a restart know it holds a bag? --
+
+  ok    OLD BUG reproduced: with no store, a restart sees nothing and orphans the bag
+        RESTORED: 1 open position(s) worth $7.48 restored (saved 0 min ago; the previous process did NOT exit cleanly). These are UNRECONCILED — they record what the last process believed, not what the wallet holds now.
+  ok    a saved position is restored after a simulated crash
+  ok    every restored position is flagged UNRECONCILED
+  ok    a clean shutdown is distinguished from a crash
+        FIRED: "⚠️ POSITION STORE: state file is corrupt (truncated write?) — open positions may exist on-chain that this process cannot see"
+  ok    a TRUNCATED store is reported, never read as "nothing was open"
+  ok    the write is atomic — a failed write leaves the previous good file intact
+  ok    clearing the store removes it
+
+==================================================
+19 guardrail proofs passed, 0 failed
+==================================================
+
+[Flags] Enabled: entryGateV2, shadowGateV2, strictMigrationDetect, dynamicPriorityFee, localTxBuild, localTxShadowCompare, concurrentExits, killSwitch, timelineSlotSampling, honestPaper, enforceTradeEconomics, playbookRouting, honeypotChecks, devSellStop, allInSizing, launchSnipe
+⚠️ No Helius API key. Enter one in UI Settings — it is saved to .api-keys.json and reused on the next start — or set HELIUS_API_KEY in the .env beside the exe.
+⚠️ Falling back to https://api.mainnet-beta.solana.com — heavily rate limited. Open positions can still be priced and sold, but do NOT expect to win snipes on it.
+🌐 RPC endpoint: api.mainnet-beta.solana.com (source: public)
+[10:02:51 PM] [INFO] ⚡ Smart Sniper Engine Initialized (STRICT Mode Active)
+
+-- 1. Leader BUY is copied (paper) --
+  ✓ a copy position opened
+  ✓ buysSeen=1, copiedBuys=1
+  ✓ tokens are held
+
+-- 2. Leader sells HALF → mirrored partial exit --
+  ✓ sellsSeen=1, copiedSells=1
+  ✓ position is PARTIAL
+  ✓ about half the bag was sold
+
+-- 3. Leader EXITS FULLY → position closes --
+  ✓ position is CLOSED with 0 tokens
+  ✓ sellsSeen=2, copiedSells=2
+  ✓ history holds 2 sell records
+  ✓ paper sells carry sim_ txids
+
+-- 4. copySells OFF → the bot HOLDS and says so --
+  ✓ position stays OPEN with copySells off
+  ✓ the HOLDING line reached the feed
+
+-- 5. Token MOVES: a held bag leaving the leader wallet is an exit --
+  ✓ a dust-level move (0.5%) is HELD
+  ✓ the dust hold reached the feed
+  ✓ a full token move MIRRORS as an exit — position CLOSED
+  ✓ the move counted as a sell
+  ✓ the EXIT explanation reached the feed
+  ✓ un-held token move stays ignored
+  ✓ airdrop-shaped inflow is never copied as a buy
+  ✓ with the toggle OFF a full move is ignored (old behavior)
+
+-- 6. A REAL position is never paper-exited in paper mode --
+  ✓ real position stays OPEN in paper mode
+  ✓ the refusal reached the feed
+  ✓ no phantom sell was booked
+
+==== COPY-SELL DRILL: 23 passed, 0 failed ====
+(state written under C:\Users\Rever\AppData\Local\Temp\copy-sell-drill-S7BJ92)
+
+-- Replay: the measured 2026-08-23 session --
+  OLD math (shipped in v1.0.6):
+    buy stakes landed:  0.0420 + 0.0042 SOL
+    wallet after buys:  0.00150 SOL
+    sell priority fee:  0.001 SOL
+    100% exit lands:    NO — position stuck
+  NEW math (v1.0.7):
+    buy stakes landed:  0.0307 + 0.0042 SOL
+    wallet after buys:  0.01294 SOL
+    sell priority fee:  0.001 SOL
+    100% exit lands:    YES
+  ✓ old math reproduces the measured drain (~0.0016 SOL left)
+  ✓ old math reproduces the failure: the exit cannot land
+  ✓ new math: the exit lands
+  ✓ new math keeps the fee payer above rent exemption after the sell
+  ✓ new math keeps the gas float intact after both buys
+
+-- Rescue: the stranded wallet (0.00162 SOL) with the sell-fee clamp alone --
+    configured fee 0.001 → clamped 0.000619 SOL
+  ✓ the stranded position becomes sellable
+  ✓ at the configured fee it stays stuck (sanity)
+
+-- Forward: a 0.1 SOL wallet DCAing three copy buys into one token, then exiting --
+  NEW math:
+    buy stakes landed:  0.0300 + 0.0300 + 0.0180 SOL
+    wallet after buys:  0.01579 SOL
+    sell priority fee:  0.001 SOL
+    100% exit lands:    YES
+  ✓ the position stays exitable
+  ✓ the wallet never dips below the gas float after buys
+
+==== COPY GAS SIM: 9 passed, 0 failed ====
+TESTS EXIT: 0
+
+=== SMOKE BOOT (headless, port 3901): CLEAN — no errors; copy=paper/disabled, wallet unlinked, API 200s ===
+
+> pumpfun-token-screening-pipeline@1.0.8 dev
+> node --use-system-ca --env-file-if-exists=.env -r ts-node/register src/server.ts
+
+🔑 Loaded settings from C:\Users\Rever\Documents\New folder\.env
+[Flags] Enabled: entryGateV2, shadowGateV2, strictMigrationDetect, dynamicPriorityFee, localTxBuild, localTxShadowCompare, concurrentExits, killSwitch, timelineSlotSampling, honestPaper, enforceTradeEconomics, playbookRouting, honeypotChecks, devSellStop, allInSizing, launchSnipe
+🔑 Helius key loaded from the environment/.env.
+🌐 RPC endpoint: mainnet.helius-rpc.com (source: helius)
+[10:03:38 PM] [INFO] ⚡ Smart Sniper Engine Initialized (STRICT Mode Active)
+🖥️  Serving UI from C:\Users\Rever\Documents\New folder\dist — open http://localhost:3901
+
+========================================================
+🚀 PUMPFUN SNIPER BOT ONLINE — LOCALHOST ACTIVE
+========================================================
+🖥️  UI Server listening at http://localhost:3901
+🔑 Enter your Photon Wallet & Helius API key in UI Settings
+========================================================
+
+🖥️  SNIPER_NO_WINDOW set — running headless. Open the URL above yourself.
