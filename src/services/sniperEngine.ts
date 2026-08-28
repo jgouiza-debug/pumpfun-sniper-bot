@@ -1788,6 +1788,12 @@ export class SniperEngine {
 
           if (payload.txType === 'migrate') {
             this.migrationSeenAt.set(payload.mint, arrivalMs);
+            // Bound the map: a migration older than ~10 min is well past any Play-3
+            // window and will never be acted on, so it is dead weight (sniper-correctness-7).
+            if (this.migrationSeenAt.size > 200) {
+              const cutoff = arrivalMs - 10 * 60_000;
+              for (const [m, t] of this.migrationSeenAt) if (t < cutoff) this.migrationSeenAt.delete(m);
+            }
           }
 
           // Structural stop first: a creator sell on a token we hold outranks
@@ -3400,6 +3406,17 @@ export class SniperEngine {
    * position orphaned that bag permanently, with no exit ever running against
    * it. Silent and uncapped.
    */
+  /**
+   * Record a DELIBERATE process exit with the current open positions, so the
+   * next boot does not cry crash. Must be called from the real exit paths
+   * (SIGINT/SIGTERM, window close, /api/server/shutdown) — running mutations
+   * persist with cleanShutdown=false, which is correct for an actual crash but
+   * meant every deliberate restart reported one (sniper-correctness-6).
+   */
+  public markCleanShutdown(): void {
+    try { this.persistPositions(true); } catch { /* best effort on the way out */ }
+  }
+
   private persistPositions(cleanShutdown = false): void {
     const snapshot: PersistedPosition[] = this.activePositions.map((p) => ({
       id: p.id,

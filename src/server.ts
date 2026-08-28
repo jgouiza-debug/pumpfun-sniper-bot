@@ -335,10 +335,9 @@ app.post('/api/bot/kill', (req, res) => {
 // POST shutdown dev server process completely
 app.post('/api/server/shutdown', (req, res) => {
   res.json({ success: true, message: 'Dev server process is shutting down.' });
-  console.log('🛑 Dev server shutdown requested via UI. Terminating process...');
-  setTimeout(() => {
-    process.exit(0);
-  }, 500);
+  console.log('🛑 Server shutdown requested via UI. Terminating process...');
+  // Record a clean shutdown and surface any open positions before exiting.
+  setTimeout(() => gracefulShutdown('shutdown endpoint'), 500);
 });
 
 // GET recent T0-T7 candidate timelines with per-stage durations
@@ -713,10 +712,7 @@ function launchAppWindow(url: string, server: http.Server): void {
     // trading headlessly after the user thinks they shut it down.
     child.on('exit', () => {
       console.log('\n🛑 App window closed — shutting the bot down.');
-      try { sniperEngine.toggleBot(false); } catch { /* already stopped */ }
-      server.close(() => process.exit(0));
-      // Never hang on a lingering keep-alive socket.
-      setTimeout(() => process.exit(0), 3000).unref();
+      gracefulShutdown('window closed', server);
     });
 
     console.log('🪟 Opened as a desktop app window (close it to stop the bot).');
@@ -724,6 +720,33 @@ function launchAppWindow(url: string, server: http.Server): void {
     console.warn('⚠️ Could not open the app window — open ' + url + ' manually.');
   }
 }
+
+/**
+ * One deliberate-exit path for every trigger (window close, SIGINT/SIGTERM,
+ * /api/server/shutdown). Records a clean shutdown so the next boot does not cry
+ * crash (sniper-correctness-6), and logs any open positions being left behind so
+ * the durable bot.log names what was abandoned mid-trade (server-updater-3).
+ */
+let shuttingDown = false;
+function gracefulShutdown(reason: string, server?: http.Server): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    const open = sniperEngine.getStatus().activePositions ?? [];
+    if (open.length > 0) {
+      console.warn(`⚠️ Shutting down (${reason}) with ${open.length} open position(s): ${open.map((p: any) => `$${p.tokenSymbol}`).join(', ')}. They are persisted and will be restored on the next start; no exits run while the process is down.`);
+    }
+    try { sniperEngine.toggleBot(false); } catch { /* already stopped */ }
+    sniperEngine.markCleanShutdown();
+  } catch { /* best effort on the way out */ }
+  const done = () => process.exit(0);
+  if (server) server.close(done); else done();
+  // Never hang on a lingering keep-alive socket.
+  setTimeout(done, 3000).unref();
+}
+
+process.on('SIGINT', () => { console.log('\n🛑 SIGINT — shutting down.'); gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { console.log('\n🛑 SIGTERM — shutting down.'); gracefulShutdown('SIGTERM'); });
 
 /** Shared truthy-string parse for the env switches this file reads. */
 function parseBoolish(v: string | undefined): boolean {
