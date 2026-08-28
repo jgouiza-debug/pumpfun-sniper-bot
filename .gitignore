@@ -33,3 +33,9 @@ flags.json
 meme-coin-finder-app/
 .vercel
 dist-exe/
+
+# Electron build output (electron-builder). Large; produced by build:win/mac/linux.
+release-app/
+installers/
+desktop-build/
+dist-desktop/

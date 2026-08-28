@@ -1,0 +1,84 @@
+name: Build Desktop Installers (Electron)
+
+# Produces the real per-platform installers via electron-builder:
+#   Windows -> NSIS .exe   macOS -> .dmg   Linux -> AppImage + .deb
+# On a v* tag it publishes them to the GitHub release (electron-updater reads
+# these). On a manual run it uploads them as workflow artifacts only.
+#
+# Why CI and not a local build: the Windows NSIS step needs symlink-creation
+# privilege (Developer Mode / admin) to unpack the code-sign toolkit, and a
+# macOS .dmg can only be built on a mac runner. CI runners have both; a normal
+# Windows dev box has neither. The local `npm run build:win -- --dir` still
+# produces a runnable unpacked app for testing.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --win
+          - os: macos-latest
+            args: --mac
+          - os: ubuntu-latest
+            args: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # --ignore-scripts: never run dependency install scripts on the runner
+      # (a malicious postinstall would run with the release token). The uuid
+      # override (package.json) keeps @solana/web3.js's rpc-websockets working
+      # under Electron's Node without native builds.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build engine + UI
+        run: npm run build
+
+      - name: Run tests
+        run: npm run test:all
+
+      # Signing is opt-in: when the signing secrets are present in the repo they
+      # are used; otherwise electron-builder produces an UNSIGNED installer (the
+      # local dev/testing case). Do not force-sign, so a fork without certs can
+      # still build.
+      - name: Build & publish installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Windows Authenticode (optional): CSC_LINK (base64 .pfx) + CSC_KEY_PASSWORD
+          # macOS Developer ID (optional): CSC_LINK + CSC_KEY_PASSWORD + APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: >
+          npx electron-builder ${{ matrix.args }}
+          ${{ startsWith(github.ref, 'refs/tags/') && '--publish always' || '--publish never' }}
+
+      - name: Upload installers as artifacts
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: |
+            release-app/*.exe
+            release-app/*.dmg
+            release-app/*.AppImage
+            release-app/*.deb
+          if-no-files-found: ignore

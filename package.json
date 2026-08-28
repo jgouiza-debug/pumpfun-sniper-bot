@@ -2,13 +2,20 @@
   "name": "pumpfun-token-screening-pipeline",
   "version": "1.0.8",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
-  "main": "dist/index.js",
+  "author": "jgouiza",
+  "main": "electron/main.js",
   "bin": "dist/server.js",
   "scripts": {
     "build": "vite build && tsc",
+    "electron": "npm run build && electron .",
+    "electron:dev": "electron .",
+    "build:win": "npm run build && electron-builder --win",
+    "build:mac": "npm run build && electron-builder --mac",
+    "build:linux": "npm run build && electron-builder --linux",
+    "dist": "npm run build && electron-builder -mwl",
     "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets host --output dist-exe/pumpfun-sniper-bot.exe",
-    "build:mac": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-arm64 --output dist-exe/pumpfun-sniper-bot-macos-arm64",
-    "build:mac-intel": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-x64 --output dist-exe/pumpfun-sniper-bot-macos-x64",
+    "build:pkg-mac": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-arm64 --output dist-exe/pumpfun-sniper-bot-macos-arm64",
+    "build:pkg-mac-intel": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-x64 --output dist-exe/pumpfun-sniper-bot-macos-x64",
     "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
     "server": "tsc && node --use-system-ca --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
@@ -19,6 +26,56 @@
     "test:guardrails": "ts-node src/tests/guardrailProofs.ts",
     "test:copy": "ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts",
     "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts"
+  },
+  "build": {
+    "appId": "com.pumpfun.sniperbot",
+    "productName": "Pumpfun Sniper Bot",
+    "copyright": "Copyright © 2026",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release-app",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.finance"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "build/icon.png",
+      "category": "Finance",
+      "maintainer": "jgouiza"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "jgouiza-debug",
+        "repo": "pumpfun-sniper-bot"
+      }
+    ]
   },
   "pkg": {
     "scripts": "dist/**/*.js",
@@ -54,8 +111,14 @@
     "@types/react-dom": "^19.0.4",
     "@types/ws": "^8.5.14",
     "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.2",
     "vite": "^6.2.1"
+  },
+  "dependencies-note": "electron-updater is intentionally NOT a runtime dep yet — auto-update is configured (build.publish) but not wired into electron/main.js until signing certs exist; see phase4-packaging-notes.md.",
+  "overrides": {
+    "uuid": "9.0.1"
   }
 }
