@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import { installBaseDir } from './installPaths';
+import { encryptSecret, decryptSecret } from './secureStore';
 
 /**
  * Persistence for the API credentials the operator supplies through the UI.
@@ -41,10 +43,9 @@ export interface StoredKeys {
 const FIELDS: StorableKeyField[] = ['heliusApiKey', 'pumpPortalApiKey'];
 
 export function keyStorePath(): string {
-  // Same rule as apiAuth.ts and loadEnv.ts: next to the exe when packaged.
-  const isPackaged = Boolean((process as any).pkg);
-  const baseDir = isPackaged ? path.dirname(process.execPath) : process.cwd();
-  return path.join(baseDir, STORE_FILE);
+  // installBaseDir centralizes the rule: the Electron data dir, else next to the
+  // exe when packaged, else the working directory.
+  return path.join(installBaseDir(), STORE_FILE);
 }
 
 /** Never throws — a corrupt or unreadable store must not stop the bot booting. */
@@ -55,7 +56,12 @@ export function loadStoredKeys(): StoredKeys {
     const out: StoredKeys = {};
     for (const f of FIELDS) {
       const v = parsed?.[f];
-      if (typeof v === 'string' && v.trim()) out[f] = v.trim();
+      // decryptSecret transparently returns plaintext for legacy values and
+      // decrypts OS-keychain-encrypted ones written under Electron.
+      if (typeof v === 'string' && v.trim()) {
+        const plain = decryptSecret(v).trim();
+        if (plain) out[f] = plain;
+      }
     }
     return out;
   } catch {
@@ -97,7 +103,14 @@ export function clearStoredKey(field: StorableKeyField): boolean {
 
 function writeStore(next: StoredKeys): boolean {
   try {
-    fs.writeFileSync(keyStorePath(), JSON.stringify(next, null, 2), { mode: 0o600 });
+    // Encrypt each value at rest when the OS keychain is available (Electron);
+    // a passthrough plaintext write otherwise, exactly as before.
+    const onDisk: Record<string, string> = {};
+    for (const f of FIELDS) {
+      const v = next[f];
+      if (typeof v === 'string' && v.trim()) onDisk[f] = encryptSecret(v.trim());
+    }
+    fs.writeFileSync(keyStorePath(), JSON.stringify(onDisk, null, 2), { mode: 0o600 });
     return true;
   } catch {
     // Read-only install directory, or the file is locked by another instance.

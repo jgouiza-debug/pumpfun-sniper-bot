@@ -80,7 +80,9 @@ app.get('/api/session-token', (req, res) => {
   // would. Disable it in the packaged app so that exposure is gone; dev keeps it
   // for the vite server on another port. The instance switcher in a packaged
   // build takes the target token explicitly instead of reading it here.
-  if (Boolean((process as any).pkg)) {
+  // Packaged = the pkg exe ((process as any).pkg) OR the packaged Electron app
+  // (SNIPER_PACKAGED, set by electron/main.js when app.isPackaged).
+  if (Boolean((process as any).pkg) || process.env.SNIPER_PACKAGED === '1') {
     res.status(404).json({ error: 'session-token is not served by the packaged app; the UI is served with its token embedded.' });
     return;
   }

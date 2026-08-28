@@ -2973,7 +2973,9 @@ console.log('\n-- macOS build: the updater must never install another platform\'
     // node18-macos-arm64 404s in the pkg remote cache and then falls back to
     // building from source, which fails on a non-Mac host (measured 2026-08-13).
     const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
-    const macScripts = [pkgJson.scripts['build:mac'], pkgJson.scripts['build:mac-intel']].join(' ');
+    // The pkg-exe mac builds were renamed to build:pkg-mac* when the Electron
+    // build (build:mac -> electron-builder .dmg) took the plain names.
+    const macScripts = [pkgJson.scripts['build:pkg-mac'], pkgJson.scripts['build:pkg-mac-intel']].join(' ');
     assert.ok(!/node18-macos/.test(macScripts), 'node18 has no prebuilt macOS base');
     assert.ok(/node22-macos-arm64/.test(macScripts) && /node22-macos-x64/.test(macScripts));
   });

@@ -4,6 +4,7 @@ import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.j
 import bs58 from 'bs58';
 import { withRpcRetry } from './rpcHealth';
 import { installPath } from './installPaths';
+import { encryptSecret, decryptSecret, secureStorageAvailable } from './secureStore';
 
 export type WalletSource = 'none' | 'runtime' | 'env' | 'file';
 
@@ -203,7 +204,9 @@ export class WalletService {
     try {
       if (fs.existsSync(WALLET_FILE)) {
         const raw = JSON.parse(fs.readFileSync(WALLET_FILE, 'utf8'));
-        const kp = WalletService.parseSecret(String(raw.privateKey || ''));
+        // decryptSecret returns plaintext for legacy files and decrypts
+        // OS-keychain-encrypted ones.
+        const kp = WalletService.parseSecret(decryptSecret(String(raw.privateKey || '')));
         if (kp) {
           this.keypair = kp;
           this.source = 'file';
@@ -338,11 +341,13 @@ export class WalletService {
       try {
         fs.writeFileSync(
           WALLET_FILE,
-          JSON.stringify({ privateKey: secret.trim(), address: kp.publicKey.toBase58() }, null, 2),
+          // Encrypt the signing key at rest when the OS keychain is available
+          // (Electron); plaintext passthrough otherwise, as before.
+          JSON.stringify({ privateKey: encryptSecret(secret.trim()), address: kp.publicKey.toBase58() }, null, 2),
           { mode: 0o600 }
         );
         this.source = 'file';
-        console.log('[Wallet] Persisted to .photon-wallet.json (add it to .gitignore).');
+        console.log(`[Wallet] Persisted to .photon-wallet.json${secureStorageAvailable() ? ' (OS-keychain encrypted)' : ' (plaintext — add it to .gitignore)'}.`);
       } catch (err: any) {
         console.warn(`[Wallet] Could not persist wallet: ${err.message}`);
       }

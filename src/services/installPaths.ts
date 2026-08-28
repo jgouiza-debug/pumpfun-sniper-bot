@@ -14,6 +14,12 @@ import path from 'path';
  * remaining files stop drifting from it.
  */
 export function installBaseDir(): string {
+  // Under Electron the main process sets SNIPER_DATA_DIR to app.getPath('userData')
+  // — a real per-user app-data location (AppData on Windows, ~/Library on macOS,
+  // ~/.config on Linux) — so per-install files live there, not next to the
+  // (read-only, often Program Files) executable.
+  const dataDir = (process.env.SNIPER_DATA_DIR || '').trim();
+  if (dataDir) return dataDir;
   const isPackaged = Boolean((process as any).pkg);
   return isPackaged ? path.dirname(process.execPath) : process.cwd();
 }
