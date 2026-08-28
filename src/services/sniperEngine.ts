@@ -698,6 +698,17 @@ export class SniperEngine {
   }
 
   /**
+   * SOL the copy trader has claimed for in-flight buys on the SHARED wallet.
+   * Registered by server.ts (the sniper cannot import the copy service without a
+   * cycle). Subtracted from the sniper's deployable so the two engines do not
+   * both size against the same balance and overdraft it (copy-correctness-5).
+   */
+  private copyInFlightReservedProvider: () => number = () => 0;
+  public setCopyInFlightReservedProvider(fn: () => number): void {
+    this.copyInFlightReservedProvider = fn;
+  }
+
+  /**
    * Resolve a timed-out external sell before any resubmit. The transaction
    * stays landable until its blockhash expires; polling the signature tells
    * us which world we are in: landed (returns the result with its inspected
@@ -2783,7 +2794,10 @@ export class SniperEngine {
     if (this.config.tradingMode === 'real') {
       await this.wallet.refreshBalance(true);
       const reservedByPeers = Math.max(0, this.entriesInFlight.size - 1) * this.reservedPerEntrySol();
-      this.availableTradeSol = Math.max(0, this.wallet.getDeployableSol() - reservedByPeers);
+      // The copy trader shares this wallet; subtract its in-flight buys too, or
+      // both engines size against the same balance and jointly overdraft it.
+      const reservedByCopy = Math.max(0, this.copyInFlightReservedProvider());
+      this.availableTradeSol = Math.max(0, this.wallet.getDeployableSol() - reservedByPeers - reservedByCopy);
     }
 
     // Size against the worst-case priority fee: with dynamicPriorityFee the

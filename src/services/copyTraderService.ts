@@ -1332,6 +1332,19 @@ export class CopyTraderService {
     return sum;
   }
 
+  /**
+   * Total SOL claimed by copy buys currently in flight, across all mints. The
+   * sniper shares this wallet and must subtract it when sizing its own entries,
+   * or the two engines both size against the same balance and jointly overdraft
+   * it (copy-correctness-5). The copy side already subtracts the sniper's
+   * in-flight; this makes the accounting symmetric.
+   */
+  public getInFlightBuyReservedSol(): number {
+    let sum = 0;
+    for (const sol of this.inFlightBuySol.values()) sum += sol;
+    return sum;
+  }
+
   private async onLeaderBuy(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
     const mint = sig.mint;
     const symbol = this.symbolFor(sig);

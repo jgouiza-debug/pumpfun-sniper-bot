@@ -509,6 +509,11 @@ app.post('/api/updater/apply', async (req, res) => {
  * a PID that is about to vanish. Wired here rather than inside the updater so
  * that module stays free of engine imports.
  */
+// The sniper and copy trader share one wallet. Let the sniper subtract the copy
+// trader's in-flight buy reservations when sizing, so the two never overdraft
+// the wallet together (copy-correctness-5). Wired here to avoid an import cycle.
+sniperEngine.setCopyInFlightReservedProvider(() => copyTrader.getInFlightBuyReservedSol());
+
 updaterService.setRestartGuard(() => {
   const status = sniperEngine.getStatus();
   if (status.activePositions?.length) {
