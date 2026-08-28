@@ -516,6 +516,51 @@ export class CopyTraderService {
     return true;
   }
 
+  /**
+   * Reconcile every open copy position against the wallet's real on-chain token
+   * balance (from the v1.1.0 lineage's sync-balances action, rebuilt on master's
+   * model). Closes positions whose bag is genuinely gone — sold manually on
+   * Photon/Dex, or dust-swept — and corrects tokensHeld where the chain and our
+   * record disagree.
+   *
+   * Only ever closes on POSITIVE evidence of an empty wallet: a null read (RPC
+   * down) leaves the position untouched, because "cannot see it" is not "it is
+   * gone". Paper positions are skipped — they have no on-chain balance to read.
+   */
+  public async syncPositionsWithOnChainBalances(): Promise<{ checked: number; closed: number; corrected: number }> {
+    const open = this.positions.filter(p => p.status !== 'CLOSED' && !(p.buyTxid ?? '').startsWith('sim_'));
+    let closed = 0;
+    let corrected = 0;
+    for (const pos of open) {
+      const held = await this.getOwnedTokenAmount(pos.mint);
+      if (held === null) continue; // unreadable — never treat as zero
+      const expected = pos.tokensHeld || 0;
+      if (held <= Math.max(0, expected * 0.05)) {
+        this.closeAsExternallyExited(pos);
+        closed++;
+      } else if (expected > 0 && Math.abs(held - expected) / expected > 0.05) {
+        // The chain is the truth; a drifted record would mis-size the next sell.
+        pos.tokensHeld = held;
+        corrected++;
+      }
+    }
+    if (closed || corrected) {
+      this.persist();
+      this.emitChange();
+    }
+    console.log(`[CopyTrader] Balance sync: ${open.length} checked, ${closed} closed as externally exited, ${corrected} quantity-corrected.`);
+    return { checked: open.length, closed, corrected };
+  }
+
+  /**
+   * Alias kept for the v1.1.0 lineage's DISCARD action. It routes to
+   * forceClosePosition rather than main's bare removal, so the on-chain balance
+   * check and the "you still hold this" warning still apply.
+   */
+  public async discardPosition(positionId: string): Promise<boolean> {
+    return this.forceClosePosition(positionId, 'Discarded by operator');
+  }
+
   public async forceClosePosition(positionId: string, reason = 'Liquidated / dismissed by operator'): Promise<boolean> {
     const pos = this.positions.find(p => p.id === positionId && p.status !== 'CLOSED');
     if (!pos) return false;

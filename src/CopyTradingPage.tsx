@@ -192,6 +192,18 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
     await post('/api/copy/clear-history');
   };
 
+  // From the v1.1.0 lineage: reconcile open positions against the real on-chain
+  // balances, so a bag sold manually on Photon/Dex stops showing as open.
+  const [syncing, setSyncing] = useState<boolean>(false);
+  const syncBalances = async () => {
+    setSyncing(true);
+    const r = await post('/api/copy/sync-balances');
+    setSyncing(false);
+    if (r?.success) {
+      window.alert(`Checked ${r.checked} position(s): ${r.closed} closed as already exited, ${r.corrected} quantity-corrected.`);
+    }
+  };
+
   const saveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     setSettingsError('');
@@ -406,7 +418,20 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
           <div className="section-header" style={{ marginTop: '8px' }}>
             <div className="section-title">Open Copy Positions</div>
-            <div className="section-count">{positions.length} OPEN</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {positions.length > 0 && (
+                <button
+                  className="btn-terminal-outline"
+                  onClick={syncBalances}
+                  disabled={syncing}
+                  title="Re-read the wallet's real on-chain balances: closes bags already sold elsewhere and corrects drifted quantities."
+                  style={{ fontSize: '10px', padding: '2px 8px' }}
+                >
+                  {syncing ? 'SYNCING…' : '⟳ SYNC BALANCES'}
+                </button>
+              )}
+              <div className="section-count">{positions.length} OPEN</div>
+            </div>
           </div>
 
           <div className="matrix-container flex-matrix">

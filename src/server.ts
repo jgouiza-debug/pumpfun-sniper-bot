@@ -475,6 +475,62 @@ app.post('/api/copy/positions/close', async (req, res) => {
   res.status(success ? 200 : 404).json({ success });
 });
 
+/**
+ * Tab heartbeat + auto-shutdown failsafe, from the v1.1.0 lineage — kept, but
+ * made safe.
+ *
+ * Main's version called process.exit(0) unconditionally 12s after the last
+ * heartbeat. That kills the engine mid-trade: open positions are abandoned with
+ * no exits running, and a closed/refreshed/backgrounded tab is indistinguishable
+ * from a closed app. Here it routes through gracefulShutdown (which records a
+ * clean shutdown and logs what was open) and REFUSES to exit while any position
+ * is open — an unattended browser tab must never be able to strand a bag.
+ *
+ * The packaged Electron app does not rely on this at all: closing its window
+ * already runs the same gracefulShutdown path.
+ */
+let lastTabHeartbeatAt = Date.now();
+let receivedFirstTabHeartbeat = false;
+let warnedHeartbeatHeldOpen = false;
+
+app.post('/api/heartbeat', (req, res) => {
+  lastTabHeartbeatAt = Date.now();
+  receivedFirstTabHeartbeat = true;
+  res.json({ success: true });
+});
+
+setInterval(() => {
+  if (!receivedFirstTabHeartbeat || Date.now() - lastTabHeartbeatAt <= 12_000) return;
+  const openPositions = (sniperEngine.getStatus().activePositions?.length ?? 0)
+    + (copyTrader.getStatus().positions?.length ?? 0);
+  if (openPositions > 0) {
+    if (!warnedHeartbeatHeldOpen) {
+      warnedHeartbeatHeldOpen = true;
+      console.warn(`⚠️ UI tabs are closed but ${openPositions} position(s) are still open — staying up so exits keep running. Use the shutdown button (or close them) to stop.`);
+    }
+    return;
+  }
+  console.log('🛑 All UI tabs closed (heartbeat timeout) and no open positions — shutting down.');
+  gracefulShutdown('UI heartbeat timeout');
+}, 3000).unref();
+
+// POST reconcile open copy positions against real on-chain balances (v1.1.0
+// lineage's sync-balances). Closes bags that are genuinely gone and corrects
+// drifted quantities; an unreadable balance never closes anything.
+app.post('/api/copy/sync-balances', async (req, res) => {
+  const result = await copyTrader.syncPositionsWithOnChainBalances();
+  res.json({ success: true, ...result, status: copyTrader.getStatus() });
+});
+
+// POST discard a stuck copy position (v1.1.0 lineage's DISCARD). Routed through
+// forceClosePosition so the on-chain "you still hold this" check still applies.
+app.post('/api/copy/discard', async (req, res) => {
+  const { positionId } = req.body || {};
+  if (!positionId) return res.status(400).json({ error: 'positionId is required' });
+  const success = await copyTrader.discardPosition(String(positionId));
+  res.status(success ? 200 : 404).json({ success });
+});
+
 // POST wipe feed + receipts (open positions are kept)
 app.post('/api/copy/clear-history', (req, res) => {
   copyTrader.clearHistory();

@@ -482,4 +482,62 @@ export class WalletService {
       blockers: this.getBlockers(),
     };
   }
+
+  /**
+   * Queries actual on-chain SPL token balances for specified mints in a single
+   * batched RPC call. Returns a map from mint to UI token balance, or null on RPC error.
+   */
+  public async getOnChainTokenBalances(mints: string[]): Promise<Map<string, number> | null> {
+    if (!this.keypair || !mints.length) return new Map();
+
+    const mintSet = new Set(mints);
+    const balances = new Map<string, number>();
+    for (const m of mints) balances.set(m, 0);
+
+    try {
+      const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+      const res = await this.connection.getParsedTokenAccountsByOwner(
+        this.keypair.publicKey,
+        { programId: TOKEN_PROGRAM_ID },
+        'confirmed'
+      );
+
+      for (const item of res.value) {
+        const info = item.account.data?.parsed?.info;
+        if (!info) continue;
+        const mint = info.mint;
+        if (mintSet.has(mint)) {
+          const uiAmount = info.tokenAmount?.uiAmount ?? 0;
+          balances.set(mint, (balances.get(mint) || 0) + uiAmount);
+        }
+      }
+
+      // Check Token-2022 program as well
+      try {
+        const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+        const res2022 = await this.connection.getParsedTokenAccountsByOwner(
+          this.keypair.publicKey,
+          { programId: TOKEN_2022_PROGRAM_ID },
+          'confirmed'
+        );
+        for (const item of res2022.value) {
+          const info = item.account.data?.parsed?.info;
+          if (!info) continue;
+          const mint = info.mint;
+          if (mintSet.has(mint)) {
+            const uiAmount = info.tokenAmount?.uiAmount ?? 0;
+            balances.set(mint, (balances.get(mint) || 0) + uiAmount);
+          }
+        }
+      } catch {
+        // Token-2022 optional
+      }
+
+      return balances;
+    } catch (err) {
+      // RPC hit failed: return null so callers don't falsely treat a network error as 0 tokens
+      return null;
+    }
+  }
 }
+
