@@ -291,6 +291,17 @@ async function main(): Promise<void> {
   check('and leaves no dedup marker (Helius will drive it)', !svc.unsignedCopies.has(`${MINT10}:buy`));
   svc.logWatcher = null;
 
+  console.log('\n-- 9. copy-correctness-3/7: leader balance writes are slot-ordered and bounded --');
+  const K = 'LeaderX:MintY';
+  svc.setLeaderBalance(K, 100, 50);
+  svc.setLeaderBalance(K, 60, 55);           // newer slot, a real sell
+  svc.setLeaderBalance(K, 100, 52);          // a LATE reconcile for an OLDER slot
+  check('a stale reconcile does not clobber a newer balance', svc.leaderBalances.get(K) === 60,
+    `got ${svc.leaderBalances.get(K)} (expected 60)`);
+  svc.setLeaderBalance(K, 0, 60);            // account emptied
+  check('a zero balance is dropped, not kept forever',
+    !svc.leaderBalances.has(K) && !svc.leaderBalanceSlot.has(K));
+
   console.log(`\n==== COPY-SELL DRILL: ${passed} passed, ${failed} failed ====`);
   console.log(`(state written under ${drillDir})`);
   process.exit(failed > 0 ? 1 : 0);

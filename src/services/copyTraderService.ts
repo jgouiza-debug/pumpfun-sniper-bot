@@ -243,6 +243,34 @@ export class CopyTraderService {
    * chain's own balances as soon as each transaction is readable.
    */
   private leaderBalances = new Map<string, number>();
+  /** Slot of the last update applied per `${leader}:${mint}` — a late reconcile
+   * for an OLDER slot must not clobber a newer balance and mis-size the next
+   * mirror sell (copy-correctness-3). */
+  private leaderBalanceSlot = new Map<string, number>();
+  private static readonly MAX_LEADER_BALANCE_KEYS = 500;
+
+  /**
+   * Apply a leader balance, but only if `slot` is at least as new as the last
+   * update for that key. A zero balance is dropped (the account emptied) rather
+   * than kept forever. Bounds the map so a long run cannot grow it without limit
+   * (copy-correctness-7).
+   */
+  private setLeaderBalance(key: string, value: number, slot: number): void {
+    const lastSlot = this.leaderBalanceSlot.get(key) ?? -1;
+    if (slot < lastSlot) return; // a stale reconcile — ignore
+    this.leaderBalanceSlot.set(key, slot);
+    if (value <= 0) {
+      this.leaderBalances.delete(key);
+      this.leaderBalanceSlot.delete(key);
+      return;
+    }
+    this.leaderBalances.set(key, value);
+    if (this.leaderBalances.size > CopyTraderService.MAX_LEADER_BALANCE_KEYS) {
+      // Evict the oldest-tracked key (Maps preserve insertion order).
+      const oldest = this.leaderBalances.keys().next().value;
+      if (oldest !== undefined) { this.leaderBalances.delete(oldest); this.leaderBalanceSlot.delete(oldest); }
+    }
+  }
 
   /** Signatures already handled — the cross-feed dedup. FIFO-pruned. */
   private processedSigs = new Set<string>();
@@ -705,7 +733,7 @@ export class CopyTraderService {
         // the tally so sells route through the analysis path's real balances
         // until reconciliation repopulates it.
         for (const key of [...this.leaderBalances.keys()]) {
-          if (key.startsWith(`${leaderAddress}:`)) this.leaderBalances.delete(key);
+          if (key.startsWith(`${leaderAddress}:`)) { this.leaderBalances.delete(key); this.leaderBalanceSlot.delete(key); }
         }
       }
       return;
@@ -799,7 +827,7 @@ export class CopyTraderService {
         fast: true,
       });
     }
-    for (const [key, value] of tallyUpdates) this.leaderBalances.set(key, value);
+    for (const [key, value] of tallyUpdates) this.setLeaderBalance(key, value, ev.slot);
 
     this.markSigProcessed(ev.signature);
     // Keep the tally honest against the chain without slowing the order: once
@@ -826,14 +854,20 @@ export class CopyTraderService {
     if (this.txFetchQueue.length > 4) return;
     const parsed = await this.fetchParsedTx(signature);
     if (!parsed || !parsed.meta || parsed.meta.err) return;
-    this.recordLeaderBalances(leaderAddress, parsed.meta.preTokenBalances, parsed.meta.postTokenBalances);
+    this.recordLeaderBalances(leaderAddress, parsed.meta.preTokenBalances, parsed.meta.postTokenBalances, parsed.slot ?? 0);
   }
 
-  /** The leader's post-transaction balance per mint, from the transaction's own token balance lists. */
+  /**
+   * The leader's post-transaction balance per mint, from the transaction's own
+   * token balance lists. Applied slot-ordered: a reconcile that resolves late,
+   * for a tx OLDER than a balance already recorded by the fast lane, is ignored
+   * rather than allowed to overwrite the newer number (copy-correctness-3).
+   */
   private recordLeaderBalances(
     leaderAddress: string,
     pre: TokenBalance[] | null | undefined,
-    post: TokenBalance[] | null | undefined
+    post: TokenBalance[] | null | undefined,
+    slot: number
   ): void {
     const balances = new Map<string, number>();
     for (const tb of post ?? []) {
@@ -844,7 +878,7 @@ export class CopyTraderService {
       // Present before, absent after: the account was closed — balance is zero.
       if (tb.owner === leaderAddress && tb.mint !== WSOL_MINT && !balances.has(tb.mint)) balances.set(tb.mint, 0);
     }
-    for (const [mint, balance] of balances) this.leaderBalances.set(`${leaderAddress}:${mint}`, balance);
+    for (const [mint, balance] of balances) this.setLeaderBalance(`${leaderAddress}:${mint}`, balance, slot);
   }
 
   /**
@@ -955,7 +989,7 @@ export class CopyTraderService {
     touch(meta.postTokenBalances, 1);
     if (!deltaByMint.size) return []; // plain SOL transfer / staking / rent
     // Exact balances for the fast lane's tally, whichever path handled this tx.
-    this.recordLeaderBalances(leaderAddress, meta.preTokenBalances, meta.postTokenBalances);
+    this.recordLeaderBalances(leaderAddress, meta.preTokenBalances, meta.postTokenBalances, parsed.slot ?? 0);
 
     // The venue, from the programs the transaction invoked. Routes our exit,
     // and on its own proves a balance change was a trade and not a transfer.
