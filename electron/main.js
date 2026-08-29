@@ -117,6 +117,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    clearOwnQuarantine();
     startEngine();
     createWindow();
     wireAutoUpdate();
@@ -124,6 +125,31 @@ if (!gotLock) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   });
+
+  /**
+   * Clear macOS's download-quarantine flag from our OWN bundle, at every start.
+   *
+   * This app is ad-hoc signed but not notarized (notarizing needs a paid Apple
+   * Developer ID). macOS attaches com.apple.quarantine to anything downloaded,
+   * and for a non-notarized app that flag makes the NEXT launch fail with
+   * "Apple could not verify ... is free of malware". auto-update re-downloads
+   * the app, so the flag comes back on every single update and the user is
+   * blocked again — they had to re-clear it by hand after 2.0.6, 2.0.7, 2.0.9
+   * and 2.0.10, which is most of why the bot kept being "broken".
+   *
+   * Doing it here is safe and self-healing: we only reach this line because
+   * Gatekeeper already admitted THIS launch, and we only touch our own bundle.
+   * It fixes the launch after the next update rather than the current one.
+   */
+  function clearOwnQuarantine() {
+    if (process.platform !== 'darwin') return;
+    try {
+      // .../Pumpfun Sniper Bot.app/Contents/MacOS/<exe> -> the .app bundle
+      const bundle = path.resolve(path.dirname(process.execPath), '..', '..');
+      if (!bundle.endsWith('.app')) return;
+      require('child_process').execFile('xattr', ['-dr', 'com.apple.quarantine', bundle], () => {});
+    } catch { /* never block startup on this */ }
+  }
 
   app.on('window-all-closed', () => {
     // Quitting ends the engine (same process). The server's SIGTERM/exit path

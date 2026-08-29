@@ -3669,6 +3669,30 @@ console.log('\n-- Per-install files must all resolve from installBaseDir --');
   });
 }
 
+console.log('\n-- Auto-update must not re-block the app every time --');
+{
+  const main = require('fs').readFileSync(
+    require('path').resolve(__dirname, '../../electron/main.js'), 'utf8');
+
+  test('OLD BUG: every auto-update re-quarantined the app and macOS blocked it', () => {
+    // The app is ad-hoc signed but not notarized, so macOS blocks any copy
+    // carrying com.apple.quarantine. auto-update re-downloads the bundle, so
+    // the flag returned on EVERY update — the user had to clear it by hand
+    // after 2.0.6, 2.0.7, 2.0.9 and 2.0.10, each time looking like the bot had
+    // broken again.
+    assert.ok(/clearOwnQuarantine/.test(main), 'the app must clear its own quarantine flag');
+    assert.ok(/xattr'?,\s*\['-dr', 'com\.apple\.quarantine'/.test(main),
+      'it must actually remove the attribute');
+    assert.ok(/process\.platform !== 'darwin'/.test(main), 'no-op off macOS');
+    assert.ok(/endsWith\('\.app'\)/.test(main),
+      'it must only ever touch our own .app bundle');
+    const call = main.indexOf('clearOwnQuarantine();');
+    const ready = main.indexOf('app.whenReady()');
+    assert.ok(call > ready && call < main.indexOf('wireAutoUpdate();'),
+      'it runs at startup, before the updater can fetch the next build');
+  });
+}
+
 console.log('\n-- macOS first-run must be explained where the user downloads --');
 {
   const fs2 = require('fs');
