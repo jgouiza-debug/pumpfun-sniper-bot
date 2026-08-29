@@ -3474,6 +3474,40 @@ console.log('\n-- "RPC stays down on a valid key": the four causes --');
   });
 }
 
+console.log('\n-- The macOS build must not ship a broken signature --');
+{
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.resolve(__dirname, '../..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+
+  test('OLD BUG: the .dmg shipped unsigned and macOS called it "damaged"', () => {
+    // v2.0.6 shipped a bundle carrying only the stock Electron linker
+    // signature: Identifier=Electron, Info.plist not bound, and
+    // `codesign --verify` failing with "code has no resources but signature
+    // indicates they must be present". Gatekeeper renders that as "damaged,
+    // move to Trash", which reads as a corrupt download. CI sets
+    // CSC_IDENTITY_AUTO_DISCOVERY=false (no Developer ID), which makes
+    // electron-builder skip signing entirely — so the bundle must be ad-hoc
+    // signed after packing instead.
+    assert.strictEqual(pkg.build.afterPack, 'build/afterPack.js',
+      'the mac bundle must be ad-hoc signed after packing, or it ships broken');
+
+    const hook = fs.readFileSync(path.join(root, 'build/afterPack.js'), 'utf8');
+    assert.ok(/codesign/.test(hook), 'the hook must actually run codesign');
+    assert.ok(/'--force', '--deep', '--sign', '-'/.test(hook), 'ad-hoc identity is "-"');
+    assert.ok(/--verify/.test(hook),
+      'the hook must VERIFY, so a broken signature fails the build instead of shipping');
+    assert.ok(/darwin/.test(hook), 'it must be a no-op on non-mac packing');
+  });
+
+  test('the afterPack hook is loadable and exports a default function', () => {
+    const mod = require(path.join(root, 'build/afterPack.js'));
+    assert.strictEqual(typeof mod.default, 'function',
+      'electron-builder calls module.default(context)');
+  });
+}
+
 console.log('\n-- One blip must not blank the wallet or refuse to arm --');
 {
   const { WalletService } = require('../services/walletService');
