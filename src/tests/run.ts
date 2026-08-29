@@ -4496,6 +4496,24 @@ console.log('\n-- Copy trader: pump.fun trades are read from the log lines at pr
     assert.ok(/} else if \(this\.config\.sellMode === 'full'\)/.test(svc),
       'full mode is a distinct branch that sells 100% without the confirmed-fetch');
   });
+
+  test('reconcile is coalesced per leader so a high-volume leader cannot 429 the key', () => {
+    const svc = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    // The fast lane must SCHEDULE (debounce) reconcile, not fire one confirmed
+    // fetch per trade — measured 2026-08-29, once-per-trade on an arb leader
+    // was the residual 429 source; coalescing dropped 429s/90s from 31 to 0.
+    assert.ok(/this\.scheduleReconcile\(ev\.address, ev\.signature\)/.test(svc),
+      'the fast lane schedules a coalesced reconcile');
+    assert.ok(/private scheduleReconcile\(/.test(svc) && /reconcileTimers\.has\(leaderAddress\)/.test(svc),
+      'one armed timer per leader, newest signature wins');
+    // Concurrency adapts to the key: 5 on a real Helius key, 2 on fallback, and
+    // backs off on repeated 429s.
+    assert.ok(/isFallbackEndpoint\(this\.heliusKeyInUse\) \? 2 : 5/.test(svc),
+      'real key gets a bigger fetch pool than the rate-limited fallback');
+    assert.ok(/this\.maxConcurrentTxFetch = Math\.max\(2, this\.maxConcurrentTxFetch - 1\)/.test(svc),
+      'repeated 429s shrink the pool toward the floor');
+  });
 }
 
 console.log('\n-- Copy trader: stablecoin swaps and foreign venues are not memecoin buys --');

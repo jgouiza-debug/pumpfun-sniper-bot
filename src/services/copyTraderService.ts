@@ -11,7 +11,7 @@ import {
   TrackedWalletPublic,
 } from '../types';
 import { sniperEngine, type TradeResult } from './sniperEngine';
-import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError } from './rpcHealth';
+import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError, isFallbackEndpoint } from './rpcHealth';
 import { affordableStakeSol, sellAmountParam, splitWalletIntoSlots } from './pipelineUtils';
 import { breakevenPct } from './paperSimulator';
 import { installPath } from './installPaths';
@@ -251,6 +251,9 @@ export class CopyTraderService {
   private logWatcher: WalletLogWatcher | null = null;
   /** Signatures whose transaction is being fetched right now ('processed' logs can repeat). */
   private analyzingSigs = new Set<string>();
+  /** Coalesced reconcile: newest unreconciled signature per leader, and the single armed timer. */
+  private reconcilePending = new Map<string, string>();
+  private reconcileTimers = new Map<string, NodeJS.Timeout>();
   /**
    * Running tally of each leader's token balance per mint (`address:mint`),
    * so a pump.fun SELL decoded from the log lines can be sized as a fraction
@@ -311,7 +314,20 @@ export class CopyTraderService {
 
   /** Limit concurrent getParsedTransaction RPC calls so bursts of logs do not trigger 429 storms. */
   private txFetchInFlight = 0;
-  private static readonly MAX_CONCURRENT_TX_FETCH = 2;
+  /**
+   * Concurrent confirmed-fetch cap. A real Helius key comfortably serves ~5 in
+   * flight; the public/fallback endpoint does not, so it stays at 2. The value
+   * backs OFF toward 2 when the poll loop hits repeated 429s and recovers when
+   * the key goes quiet, so a rate-limited key is not hammered (adjusted in
+   * fetchParsedTx / on 429).
+   */
+  private maxConcurrentTxFetch = 2;
+  private txFetch429Streak = 0;
+
+  /** Real Helius key -> 5, fallback/public -> 2. Called when the key changes. */
+  private refreshFetchConcurrency(): void {
+    this.maxConcurrentTxFetch = isFallbackEndpoint(this.heliusKeyInUse) ? 2 : 5;
+  }
   /** Live trade-classification fetches (an entry/exit is riding on them) jump ahead of
    * fire-and-forget reconcile bookkeeping so they are never head-of-line-blocked (perf-latency-4). */
   private txFetchPriorityQueue: Array<() => void> = [];
@@ -325,7 +341,7 @@ export class CopyTraderService {
 
   private async acquireTxFetchSlot(priority = false): Promise<() => void> {
     if (priority) this.priorityFetchOutstanding++;
-    while (this.txFetchInFlight >= CopyTraderService.MAX_CONCURRENT_TX_FETCH) {
+    while (this.txFetchInFlight >= this.maxConcurrentTxFetch) {
       await new Promise<void>((resolve) =>
         (priority ? this.txFetchPriorityQueue : this.txFetchNormalQueue).push(resolve));
     }
@@ -710,6 +726,7 @@ export class CopyTraderService {
       this.stopHeliusWatcher();
       this.heliusConn = new Connection(rpcEndpoint(key), connectionConfig());
       this.heliusKeyInUse = key;
+      this.refreshFetchConcurrency();
     }
 
     if (!this.logWatcher) {
@@ -944,7 +961,7 @@ export class CopyTraderService {
     // Keep the tally honest against the chain without slowing the order: once
     // the transaction is readable, the leader's real post-trade balances
     // replace whatever was inferred here.
-    void this.reconcileLeaderBalances(ev.address, ev.signature);
+    this.scheduleReconcile(ev.address, ev.signature);
     void (async () => {
       for (const sig of signals) {
         // The tally above is already updated (the leader's balance is real
@@ -959,6 +976,29 @@ export class CopyTraderService {
       }
     })();
     return true;
+  }
+
+  /**
+   * Coalesce reconcile per leader. Reconcile is pure bookkeeping — it confirms
+   * the arithmetic tally against the chain — so a high-volume (arb-bot) leader
+   * firing one confirmed-fetch PER trade was the dominant residual RPC load and
+   * a real 429 source (measured 2026-08-29). We only need the leader's LATEST
+   * post-trade balance, so keep just the newest signature per leader and run a
+   * single reconcile ~1s later, cancelling any older pending one. Cuts reconcile
+   * fetch volume from once-per-trade to at most once-per-second per leader; the
+   * slot-ordered recordLeaderBalances still ignores a stale late resolve.
+   */
+  private scheduleReconcile(leaderAddress: string, signature: string): void {
+    this.reconcilePending.set(leaderAddress, signature);
+    if (this.reconcileTimers.has(leaderAddress)) return;
+    const timer = setTimeout(() => {
+      this.reconcileTimers.delete(leaderAddress);
+      const sig = this.reconcilePending.get(leaderAddress);
+      this.reconcilePending.delete(leaderAddress);
+      if (sig) void this.reconcileLeaderBalances(leaderAddress, sig);
+    }, 1000);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.reconcileTimers.set(leaderAddress, timer);
   }
 
   private async reconcileLeaderBalances(leaderAddress: string, signature: string): Promise<void> {
@@ -1054,6 +1094,16 @@ export class CopyTraderService {
           if (!priority) pollDelay = Math.min(1000, pollDelay + 150);
         } catch (err) {
           const is429 = isRateLimitError(err);
+          if (is429) {
+            // Repeated 429s mean the key is over budget — shrink the pool
+            // toward the safe floor so we stop hammering it.
+            if (++this.txFetch429Streak >= 3) {
+              this.maxConcurrentTxFetch = Math.max(2, this.maxConcurrentTxFetch - 1);
+              this.txFetch429Streak = 0;
+            }
+          } else {
+            this.txFetch429Streak = 0;
+          }
           await sleep(is429 ? 2000 : 500);
         }
       }
