@@ -40,7 +40,10 @@ REM git pull can never leave you silently running yesterday's code.
 node -e "const fs=require('fs'),p=require('path');const d='dist/server.js';if(!fs.existsSync(d))process.exit(1);const t=fs.statSync(d).mtimeMs;const w=x=>fs.readdirSync(x,{withFileTypes:true}).some(e=>{const f=p.join(x,e.name);return e.isDirectory()?w(f):/\.(ts|tsx)$/.test(f)&&fs.statSync(f).mtimeMs>t});process.exit(w('src')?1:0)" >nul 2>&1
 if errorlevel 1 (
   echo Source changed since the last build - rebuilding, one moment...
-  if not exist "node_modules" call npm install
+  REM --ignore-scripts skips Electron's ~100MB binary download, which this
+  REM Node path never uses and which is a common failure point on a fresh
+  REM machine. vite and tsc build fine without any install scripts.
+  if not exist "node_modules" call npm install --ignore-scripts
   call npm run build
   if errorlevel 1 (
     echo [X] Build failed. Fix the error above, then run this again.
