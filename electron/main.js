@@ -60,6 +60,13 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // The renderer sends the /api/heartbeat the server's stay-alive check
+      // depends on. Electron throttles timers in a minimized/occluded window,
+      // the heartbeats stop, and 12s later the server shuts itself down if the
+      // bot happens to be flat at that moment — which read as "the bot randomly
+      // shuts down while trading in real mode". The window is a local trading
+      // console; it must never be throttled.
+      backgroundThrottling: false,
     },
   });
 

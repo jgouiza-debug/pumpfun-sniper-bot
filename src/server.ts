@@ -13,6 +13,8 @@ import path from 'path';
 import cors from 'cors';
 import WebSocket from 'ws';
 import { RugCheckService } from './services/rugcheckService';
+import { runDiagnostics, worstLevel } from './services/diagnostics';
+import { rpcHealth } from './services/rpcHealth';
 import { RiskFilter } from './filters/riskFilter';
 import { DexScreenerService } from './services/dexscreenerService';
 import { FilterResult, PumpTokenLaunch } from './types';
@@ -434,6 +436,44 @@ app.get('/api/copy/status', (req, res) => {
   res.json(copyTrader.getStatus());
 });
 
+// GET the bot's own answer to "why is it not trading?" — every known silent
+// failure (rejected key, dead watcher, zero-stake sizing, guard refusals, an
+// inactive switch) as a list the UI can show, instead of a log nobody reads.
+app.get('/api/diagnostics', (req, res) => {
+  const engineStatus = sniperEngine.getStatus();
+  const copyStatus = copyTrader.getStatus();
+  const health = rpcHealth();
+  const findings = runDiagnostics({
+    engine: {
+      isBotActive: engineStatus.isBotActive,
+      tradingMode: engineStatus.tradingMode,
+      walletAddress: engineStatus.wallet?.address,
+      solBalance: engineStatus.wallet?.solBalance,
+      deployableSol: engineStatus.wallet?.deployableSol,
+      rpcHealthy: engineStatus.wallet?.rpcHealthy,
+      logs: engineStatus.logs,
+    },
+    copy: {
+      enabled: copyStatus.enabled,
+      tradingMode: copyStatus.tradingMode,
+      streamConnected: copyStatus.streamConnected,
+      heliusConnected: copyStatus.heliusConnected,
+      config: copyStatus.config,
+      wallets: copyStatus.wallets ?? [],
+      openPositions: copyStatus.positions?.length ?? 0,
+    },
+    rpc: {
+      credentialRejected: health.credentialRejected,
+      consecutiveFailures: health.consecutiveFailures,
+      lastError: health.lastError,
+    },
+    heliusKeySet: Boolean((engineStatus.config as any)?.heliusApiKeySet),
+    priorityFeeSol: sniperEngine.getSizingPriorityFeeSol(),
+    now: Date.now(),
+  });
+  res.json({ level: worstLevel(findings), findings });
+});
+
 // POST master switch: { enabled: boolean }
 app.post('/api/copy/toggle', (req, res) => {
   const result = copyTrader.setEnabled(req.body?.enabled === true);
@@ -511,16 +551,30 @@ app.post('/api/heartbeat', (req, res) => {
 
 setInterval(() => {
   if (!receivedFirstTabHeartbeat || Date.now() - lastTabHeartbeatAt <= 12_000) return;
-  const openPositions = (sniperEngine.getStatus().activePositions?.length ?? 0)
-    + (copyTrader.getStatus().positions?.length ?? 0);
-  if (openPositions > 0) {
+  const engineStatus = sniperEngine.getStatus();
+  const copyStatus = copyTrader.getStatus();
+  const openPositions = (engineStatus.activePositions?.length ?? 0)
+    + (copyStatus.positions?.length ?? 0);
+  // "No open positions" is NOT "nothing is running". A live copy-trading or
+  // sniping session is flat most of the time — between one exit and the next
+  // entry there is nothing open, and this check used to fire in exactly that
+  // gap. Measured 2026-08-29: a minimized Electron window throttled the
+  // renderer's heartbeat timer, 12s passed while the bot was flat, and an
+  // ACTIVE real-money session shut itself down mid-trading. A session counts
+  // as active while the copy trader is enabled with leaders to follow, or the
+  // sniper engine is armed.
+  const sessionActive = (copyStatus.enabled && (copyStatus.wallets?.length ?? 0) > 0)
+    || engineStatus.isBotActive === true;
+  if (openPositions > 0 || sessionActive) {
     if (!warnedHeartbeatHeldOpen) {
       warnedHeartbeatHeldOpen = true;
-      console.warn(`⚠️ UI tabs are closed but ${openPositions} position(s) are still open — staying up so exits keep running. Use the shutdown button (or close them) to stop.`);
+      console.warn(openPositions > 0
+        ? `⚠️ UI tabs are closed but ${openPositions} position(s) are still open — staying up so exits keep running. Use the shutdown button (or close them) to stop.`
+        : '⚠️ UI tabs are closed but the session is still ACTIVE (copy trading enabled or bot armed) — staying up. Use the shutdown button to stop.');
     }
     return;
   }
-  console.log('🛑 All UI tabs closed (heartbeat timeout) and no open positions — shutting down.');
+  console.log('🛑 All UI tabs closed (heartbeat timeout), nothing active and no open positions — shutting down.');
   gracefulShutdown('UI heartbeat timeout');
 }, 3000).unref();
 
@@ -809,7 +863,25 @@ function launchAppWindow(url: string, server: http.Server): void {
 
     // Closing the window ends the session. Without this the bot would keep
     // trading headlessly after the user thinks they shut it down.
+    const spawnedAt = Date.now();
     child.on('exit', () => {
+      // A Chromium that finds a live instance on the same profile HANDS OFF
+      // and exits immediately — the window is open, but this child is gone.
+      // Measured 2026-08-29: 142ms from spawn to exit, and the bot shut itself
+      // down one second after starting. An exit that fast is a handoff or a
+      // crash, never the user closing a window they had barely seen.
+      if (Date.now() - spawnedAt < 5_000) {
+        console.warn('⚠️ App window process exited immediately (another window instance likely took over). Staying up — use the shutdown button or Ctrl+C to stop.');
+        return;
+      }
+      // Closing the window with real money in flight must behave like the
+      // heartbeat path: exits keep running, and the operator is told.
+      const openNow = (sniperEngine.getStatus().activePositions?.length ?? 0)
+        + (copyTrader.getStatus().positions?.length ?? 0);
+      if (openNow > 0 && sniperEngine.getStatus().tradingMode !== 'paper') {
+        console.warn(`⚠️ App window closed but ${openNow} REAL position(s) are open — staying up so exits keep running. Use the shutdown button after they close.`);
+        return;
+      }
       console.log('\n🛑 App window closed — shutting the bot down.');
       gracefulShutdown('window closed', server);
     });

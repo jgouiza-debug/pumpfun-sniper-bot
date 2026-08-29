@@ -3669,6 +3669,102 @@ console.log('\n-- Per-install files must all resolve from installBaseDir --');
   });
 }
 
+console.log('\n-- An active session must not shut itself down --');
+{
+  const fs3 = require('fs');
+  const srv = fs3.readFileSync(require.resolve('../server.ts'), 'utf8');
+  const mainJs = fs3.readFileSync(require('path').resolve(__dirname, '../../electron/main.js'), 'utf8');
+
+  test('OLD BUG: a flat-but-active real session shut down on a heartbeat gap', () => {
+    // The stay-alive check only asked "are positions open?". A live copy-trading
+    // session is FLAT most of the time — between one exit and the next entry
+    // nothing is open — so a 12s heartbeat gap in that window killed an active
+    // real-money session. Reported as "the bot randomly shuts down when trading
+    // on chain in real mode".
+    assert.ok(/const sessionActive =/.test(srv), 'an active session must be recognised');
+    assert.ok(/copyStatus\.enabled && \(copyStatus\.wallets\?\.length \?\? 0\) > 0/.test(srv),
+      'copy trading enabled with leaders counts as active');
+    assert.ok(/engineStatus\.isBotActive === true/.test(srv), 'an armed sniper engine counts as active');
+    assert.ok(/openPositions > 0 \|\| sessionActive/.test(srv),
+      'the shutdown must be gated on BOTH, not on open positions alone');
+  });
+
+  test('the renderer heartbeat must not be throttled when the window is minimized', () => {
+    // Electron throttles timers in a backgrounded window, which stops the
+    // heartbeat the server relies on — the upstream cause of the above.
+    assert.ok(/backgroundThrottling: false/.test(mainJs),
+      'a local trading console must keep its timers running while minimized');
+  });
+
+  test('an instant window-process exit is a handoff, not the user closing it', () => {
+    // Chromium that finds a live instance on the same profile hands off and
+    // exits immediately: measured 142ms from spawn to exit, and the bot shut
+    // itself down a second after starting.
+    assert.ok(/Date\.now\(\) - spawnedAt < 5_000/.test(srv),
+      'an exit within seconds of spawn must not be treated as a window close');
+  });
+
+  test('closing the window with REAL positions open keeps exits running', () => {
+    assert.ok(/openNow > 0 && sniperEngine\.getStatus\(\)\.tradingMode !== 'paper'/.test(srv),
+      'real money in flight must outlive the window');
+  });
+}
+
+console.log('\n-- The UI must say why the bot is not trading --');
+{
+  const { runDiagnostics, worstLevel } = require('../services/diagnostics');
+  const base = {
+    engine: { isBotActive: false, tradingMode: 'paper', walletAddress: 'W', solBalance: 1, deployableSol: 1, rpcHealthy: true, logs: [] },
+    copy: { enabled: true, tradingMode: 'paper', streamConnected: true, heliusConnected: true,
+      config: { maxOpenPositions: 6, buySizeMode: 'fixed', fixedBuySol: 0.05, maxSlippagePct: 25, copySells: true },
+      wallets: [{ address: 'Leader1111', buysSeen: 5, copiedBuys: 5, skippedSignals: 0, addedAt: 1 }], openPositions: 0 },
+    rpc: { credentialRejected: false, consecutiveFailures: 0, lastError: null },
+    heliusKeySet: true, priorityFeeSol: 0.001, now: 1,
+  };
+
+  test('a healthy bot reports nothing', () => {
+    assert.deepStrictEqual(runDiagnostics(base as any), []);
+    assert.strictEqual(worstLevel([]), 'ok');
+  });
+
+  test('it names every failure that actually cost this project a night', () => {
+    const rejected = runDiagnostics({ ...base, rpc: { ...base.rpc, credentialRejected: true } } as any);
+    assert.ok(rejected.some((d: any) => /rejected your API key/i.test(d.title)), 'a refused Helius key');
+
+    const off = runDiagnostics({ ...base, copy: { ...base.copy, enabled: false } } as any);
+    assert.ok(off.some((d: any) => /switched off/i.test(d.title)), 'copy trading silently off');
+
+    const dead = runDiagnostics({ ...base, copy: { ...base.copy, heliusConnected: false } } as any);
+    assert.ok(dead.some((d: any) => /watcher disconnected/i.test(d.title)), 'a dead leader watcher');
+
+    // The exact bug that made paper open nothing: split sizing computing 0.
+    const zero = runDiagnostics({
+      ...base,
+      engine: { ...base.engine, deployableSol: 0, tradingMode: 'real' },
+      copy: { ...base.copy, tradingMode: 'real', config: { ...base.copy.config, buySizeMode: 'split' } },
+    } as any);
+    assert.ok(zero.some((d: any) => /stakes 0 SOL/i.test(d.title)), 'zero-stake sizing');
+
+    const guard = runDiagnostics({ ...base, engine: { ...base.engine, logs: [
+      { level: 'error', message: 'Refusing to sign buy for ABC — instruction invokes unexpected program X', timestamp: 1 }] } } as any);
+    assert.ok(guard.some((d: any) => /Refusing to sign/.test(d.detail)), 'a guard refusal reaches the UI');
+  });
+
+  test('every finding tells the operator what to DO', () => {
+    const all = runDiagnostics({ ...base, rpc: { ...base.rpc, credentialRejected: true }, copy: { ...base.copy, enabled: false } } as any);
+    assert.ok(all.length >= 2);
+    for (const d of all) {
+      assert.ok(d.title && d.detail, 'a finding must say what is wrong');
+      if (d.level !== 'info') assert.ok(d.fix, `"${d.title}" must say how to fix it`);
+    }
+  });
+
+  test('worstLevel escalates critical over warning', () => {
+    assert.strictEqual(worstLevel([{ level: 'warning' }, { level: 'critical' }] as any), 'critical');
+    assert.strictEqual(worstLevel([{ level: 'info' }, { level: 'warning' }] as any), 'warning');
+  });
+}
+
 console.log('\n-- Auto-update must not re-block the app every time --');
 {
   const main = require('fs').readFileSync(
