@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
+import { installPath } from './installPaths';
 
 /**
  * Access control for the local API.
@@ -33,10 +34,19 @@ import type { Request, Response, NextFunction } from 'express';
 const TOKEN_FILE = '.api-token';
 
 function tokenFilePath(): string {
-  // Same base-dir rule as the .env loader: next to the exe when packaged.
-  const isPackaged = Boolean((process as any).pkg);
-  const baseDir = isPackaged ? path.dirname(process.execPath) : process.cwd();
-  return path.join(baseDir, TOKEN_FILE);
+  // MUST go through installBaseDir(). This function used to compute its own
+  // base dir as `process.pkg ? dirname(execPath) : process.cwd()`, which is
+  // wrong under Electron: `process.pkg` is undefined there, so the base became
+  // process.cwd() — and a .app launched from Finder has cwd `/`. Writing
+  // `/.api-token` fails, the failure is swallowed, and a NEW random token is
+  // minted on every start. That silently breaks the one thing the file exists
+  // for (the UI on :3001 authenticating against another instance on :3002) and
+  // makes the API unscriptable, since the token is never anywhere on disk.
+  //
+  // installBaseDir() already resolves SNIPER_DATA_DIR (which the Electron main
+  // process sets to a real per-user app-data path), then the packaged exe dir,
+  // then cwd — the same rule keyStore and loadEnv follow.
+  return installPath(TOKEN_FILE);
 }
 
 let cachedToken: string | null = null;

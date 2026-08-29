@@ -3584,6 +3584,40 @@ console.log('\n-- Paper copy trading must not need a funded wallet --');
   });
 }
 
+console.log('\n-- Per-install files must all resolve from installBaseDir --');
+{
+  const fsx = require('fs');
+  /** True when process.cwd() appears in real CODE, ignoring comments — a
+   *  comment describing the old bug must not fail the guard against it. */
+  const hasCwdInCode = (src: string) => /process\.cwd\(\)/.test(
+    src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n'));
+
+  test('OLD BUG: the API token was written to / under Electron and never persisted', () => {
+    // apiAuth computed its own base dir as
+    //   process.pkg ? dirname(execPath) : process.cwd()
+    // `process.pkg` is undefined under Electron, so the base became cwd — and a
+    // .app launched from Finder has cwd '/'. Writing /.api-token fails, the
+    // failure is swallowed, and a fresh random token is minted every start:
+    // the file the instance switcher depends on never exists, and the API
+    // cannot be scripted because no token is anywhere on disk. Measured
+    // 2026-08-29 on a running 2.0.9 build (lsof showed cwd '/').
+    const src = fsx.readFileSync(require.resolve('../services/apiAuth.ts'), 'utf8');
+    assert.ok(/installPath\(TOKEN_FILE\)/.test(src),
+      'the token file must resolve through installBaseDir()');
+    assert.ok(!hasCwdInCode(src),
+      'apiAuth must not compute its own base dir any more');
+  });
+
+  test('every per-install file goes through installPaths', () => {
+    // installPaths.ts exists precisely so these cannot drift apart again.
+    for (const f of ['apiAuth.ts', 'keyStore.ts']) {
+      const src = fsx.readFileSync(require.resolve('../services/' + f), 'utf8');
+      assert.ok(/installPath|installBaseDir/.test(src), f + ' must use installPaths');
+      assert.ok(!hasCwdInCode(src), f + ' must not resolve against cwd');
+    }
+  });
+}
+
 console.log('\n-- macOS first-run must be explained where the user downloads --');
 {
   const fs2 = require('fs');
