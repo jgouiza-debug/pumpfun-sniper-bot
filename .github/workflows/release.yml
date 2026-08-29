@@ -127,5 +127,33 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          # First-run instructions belong ON the release page. The macOS build
+          # is ad-hoc signed but NOT notarized (that needs a paid Apple
+          # Developer ID this project does not have), so macOS refuses the first
+          # launch with either "the application is damaged" or
+          # "Apple could not verify it is free of malware". Both read as a
+          # corrupt or malicious download and neither is one; without this note
+          # every macOS user hits it and has no way to know that.
+          body: |
+            ## macOS: first launch
+
+            macOS may refuse to open the app the first time. You will see either
+            **"Apple could not verify it is free of malware"** or
+            **"the application is damaged"**.
+
+            The download is fine. The app is signed, but not *notarized* — that
+            requires a paid Apple Developer ID. macOS flags everything downloaded,
+            and for a non-notarized app that flag blocks the launch.
+
+            Drag the app to **Applications**, then run this once:
+
+            ```bash
+            xattr -dr com.apple.quarantine "/Applications/Pumpfun Sniper Bot.app"
+            ```
+
+            Or double-click `Fix_Blocked_App_macOS.command` from the repo, which does
+            the same thing and verifies the signature afterwards.
+
+            Windows installs normally; SmartScreen may need "More info" → "Run anyway".
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

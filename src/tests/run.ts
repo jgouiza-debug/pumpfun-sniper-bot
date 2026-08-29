@@ -3584,6 +3584,36 @@ console.log('\n-- Paper copy trading must not need a funded wallet --');
   });
 }
 
+console.log('\n-- macOS first-run must be explained where the user downloads --');
+{
+  const fs2 = require('fs');
+  const path2 = require('path');
+  const root2 = path2.resolve(__dirname, '../..');
+
+  test('the release page carries the first-run unblock command', () => {
+    // The mac build is ad-hoc signed but NOT notarized (no paid Developer ID),
+    // so the first launch is refused with "Apple could not verify ... is free
+    // of malware" or "the application is damaged". Both read as a bad download.
+    // Shipping the fix only in a commit message helps nobody holding a .dmg.
+    const rel = fs2.readFileSync(path2.join(root2, '.github/workflows/release.yml'), 'utf8');
+    assert.ok(/body: \|/.test(rel), 'the release must carry a notes body');
+    assert.ok(/xattr -dr com\.apple\.quarantine/.test(rel),
+      'the notes must contain the actual command that unblocks the app');
+    assert.ok(/could not verify/.test(rel) && /damaged/.test(rel),
+      'both wordings macOS uses must be named, so the user can match what they saw');
+  });
+
+  test('the macOS unblock helper exists and verifies the signature', () => {
+    const p2 = path2.join(root2, 'Fix_Blocked_App_macOS.command');
+    assert.ok(fs2.existsSync(p2), 'a mac equivalent of Fix_Blocked_App_RunAsAdmin.bat must exist');
+    const sh = fs2.readFileSync(p2, 'utf8');
+    assert.ok(/xattr -dr com\.apple\.quarantine/.test(sh));
+    assert.ok(/codesign --verify/.test(sh),
+      'it must refuse to bless an app whose signature does NOT verify — that one really is broken');
+    assert.ok(/Applications\/Pumpfun Sniper Bot\.app/.test(sh), 'it must target only this app');
+  });
+}
+
 console.log('\n-- The macOS build must not ship a broken signature --');
 {
   const fs = require('fs');
