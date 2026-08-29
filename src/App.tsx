@@ -257,6 +257,7 @@ export function App() {
     }
 
     let linked = false;
+    let lastError = '';
     for (const port of [selectedPort, 3001, 3002]) {
       try {
         const res = await apiFetch(`http://localhost:${port}/api/wallet/link`, {
@@ -269,13 +270,13 @@ export function App() {
           linked = true;
           break;
         }
-        if (data?.error) setWalletError(data.error);
+        if (data?.error) lastError = data.error;
       } catch { /* try the next instance */ }
     }
 
     setWalletKeyInput('');
-    if (!linked && !walletError) {
-      setWalletError('No bot instance accepted the wallet. Is the server running on this port?');
+    if (!linked) {
+      setWalletError(lastError || 'No bot instance accepted the wallet. Is the server running on this port?');
     }
   };
 
@@ -468,25 +469,12 @@ export function App() {
     fetchFlags(selectedPort);
   }, [selectedPort]);
 
-  // Tab Close Auto-Shutdown & Heartbeat
+  // Heartbeat only. No shutdown beacon on tab close: one stale tab closing or
+  // refreshing must not kill a server other tabs (or the app window) still use.
+  // The server's heartbeat failsafe + the Electron window-close path already
+  // handle "everything closed" shutdown safely.
   useEffect(() => {
-    const shutdownUrl = `http://localhost:${selectedPort}/api/server/shutdown`;
     const heartbeatUrl = `http://localhost:${selectedPort}/api/heartbeat`;
-
-    const handleTabClose = () => {
-      try {
-        if (navigator.sendBeacon) {
-          navigator.sendBeacon(shutdownUrl);
-        } else {
-          apiFetch(shutdownUrl, { method: 'POST' }).catch(() => {});
-        }
-      } catch {
-        /* browser tab closing */
-      }
-    };
-
-    window.addEventListener('beforeunload', handleTabClose);
-    window.addEventListener('pagehide', handleTabClose);
 
     const pingHeartbeat = () => {
       apiFetch(heartbeatUrl, { method: 'POST' }).catch(() => {});
@@ -495,8 +483,6 @@ export function App() {
     const heartbeatTimer = setInterval(pingHeartbeat, 3000);
 
     return () => {
-      window.removeEventListener('beforeunload', handleTabClose);
-      window.removeEventListener('pagehide', handleTabClose);
       clearInterval(heartbeatTimer);
     };
   }, [selectedPort]);
