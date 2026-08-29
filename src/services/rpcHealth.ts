@@ -297,8 +297,79 @@ function hostOf(url: string): string {
  * startup log — reported which endpoint was really in use. Callers now surface
  * this so the answer is visible instead of deducible.
  */
+/**
+ * The exact key value a live probe saw rejected. Latched by key STRING, not a
+ * bare boolean, so applying a different key un-latches on its own and a
+ * transient 401 in some unrelated hot path can never demote a good credential.
+ *
+ * WHY this exists: shape validation cannot know a key is revoked, expired or
+ * over quota. On 2026-08-28 an 89-character value sat in `heliusApiKey` — not
+ * a UUID, but free of the punctuation normalizeHeliusKey rejects, so it was
+ * accepted with a note. Every socket then answered 401 and web3.js retried
+ * forever: 8,000 `ws error: Unexpected server response: 401` lines, no leader
+ * feed, no launch stream, and not one line anywhere saying the key was the
+ * problem. A key the server refuses must be treated as no key at all.
+ */
+let rejectedHeliusKey: string | null = null;
+
+/** Record that the server refused this exact key. Endpoint resolution then skips it. */
+export function markHeliusKeyRejected(key: string): void {
+  rejectedHeliusKey = (key || '').trim() || null;
+}
+
+/** True when `key` is the one a probe saw refused. */
+export function isHeliusKeyRejected(key: string | undefined | null): boolean {
+  const k = (key || '').trim();
+  return Boolean(k) && k === rejectedHeliusKey;
+}
+
+export interface HeliusProbeResult {
+  ok: boolean;
+  /** HTTP status when the server answered; undefined when the request never completed. */
+  status?: number;
+  /** The credential itself was refused — retrying changes nothing. */
+  rejected: boolean;
+  note?: string;
+}
+
+/**
+ * One live call to Helius to find out whether the key actually works, so a dead
+ * credential is reported once, in words, instead of as an endless 401 retry
+ * storm. A network failure is NOT a rejection: unreachable is transient, 401 is
+ * terminal, and conflating them would demote a good key on a flaky connection.
+ */
+export async function probeHeliusKey(key: string, timeoutMs = 8000): Promise<HeliusProbeResult> {
+  const normalized = normalizeHeliusKey(key).key;
+  if (!normalized) return { ok: false, rejected: false, note: 'No key to probe.' };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(normalized)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+      signal: controller.signal,
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, status: res.status, rejected: true, note: `Helius refused the key (HTTP ${res.status}).` };
+    }
+    if (!res.ok) {
+      return { ok: false, status: res.status, rejected: false, note: `Helius answered HTTP ${res.status}.` };
+    }
+    return { ok: true, status: res.status, rejected: false };
+  } catch (err: any) {
+    return { ok: false, rejected: false, note: `Could not reach Helius (${err?.name === 'AbortError' ? 'timed out' : err?.message || 'network error'}).` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function resolveRpcEndpoint(heliusKey: string | undefined | null): ResolvedRpcEndpoint {
-  const key = normalizeHeliusKey(heliusKey).key;
+  // A key the server refused is not a key. Skipping it here means every caller
+  // — engine, copy trader, curve watcher — falls back together, with no edit at
+  // any of their call sites.
+  const key = isHeliusKeyRejected(heliusKey) ? '' : normalizeHeliusKey(heliusKey).key;
 
   const explicit = (process.env.SOLANA_RPC_URL || '').trim();
   if (explicit) {
@@ -370,6 +441,7 @@ export function connectionConfig() {
 
 /** Cleared when a new key is applied, so a fixed credential clears the latch. */
 export function resetRpcHealth(): void {
+  rejectedHeliusKey = null;
   state.ok = 0;
   state.failed = 0;
   state.consecutiveFailures = 0;

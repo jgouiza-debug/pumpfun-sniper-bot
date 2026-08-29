@@ -3339,6 +3339,85 @@ console.log('\n-- "RPC stays down on a valid key": the four causes --');
     const h = rpcHealth();
     assert.strictEqual(h.ok, 1);
   });
+
+  // ---- Cause 5: the server refuses the key and NOTHING says so ----
+  //
+  // Measured 2026-08-28: an 89-character value in `heliusApiKey` passed the
+  // shape check (no URL punctuation, so only a soft note), and every socket
+  // answered 401. web3.js retried forever — thousands of `ws error:
+  // Unexpected server response: 401` lines, a silent leader feed, and no line
+  // anywhere naming the credential. A refused key must resolve like no key.
+
+  test('OLD BUG: a refused key kept being used — now it resolves to the fallback', () => {
+    const { markHeliusKeyRejected, isHeliusKeyRejected } = require('../services/rpcHealth');
+    withEnv({}, () => {
+      resetRpcHealth();
+      assert.strictEqual(resolveRpcEndpoint(UUID).source, 'helius', 'baseline: a fresh key is used');
+
+      markHeliusKeyRejected(UUID);
+      assert.strictEqual(isHeliusKeyRejected(UUID), true);
+      const after = resolveRpcEndpoint(UUID);
+      assert.strictEqual(after.source, 'public',
+        'a key the server refused must be skipped, not retried into a 401 storm');
+      assert.ok(!after.url.includes(UUID), 'the refused key must not reach the endpoint');
+      resetRpcHealth();
+    });
+  });
+
+  test('the latch is per-key, so a DIFFERENT key is unaffected', () => {
+    const { markHeliusKeyRejected, isHeliusKeyRejected } = require('../services/rpcHealth');
+    const OTHER = '99999999-8888-7777-6666-555555555555';
+    withEnv({}, () => {
+      resetRpcHealth();
+      markHeliusKeyRejected(UUID);
+      assert.strictEqual(isHeliusKeyRejected(OTHER), false);
+      assert.strictEqual(resolveRpcEndpoint(OTHER).source, 'helius',
+        'one dead key must not demote every other credential');
+      resetRpcHealth();
+    });
+  });
+
+  test('applying a new key clears the latch — a fixed credential recovers', () => {
+    const { markHeliusKeyRejected, isHeliusKeyRejected } = require('../services/rpcHealth');
+    withEnv({}, () => {
+      markHeliusKeyRejected(UUID);
+      resetRpcHealth();
+      assert.strictEqual(isHeliusKeyRejected(UUID), false);
+      assert.strictEqual(resolveRpcEndpoint(UUID).source, 'helius');
+    });
+  });
+
+  test('an unreachable Helius is NOT a rejection — transient must not demote a good key', async () => {
+    const { probeHeliusKey } = require('../services/rpcHealth');
+    const savedFetch = globalThis.fetch;
+    (globalThis as any).fetch = async () => { throw new Error('ECONNRESET'); };
+    try {
+      const r = await probeHeliusKey(UUID);
+      assert.strictEqual(r.ok, false);
+      assert.strictEqual(r.rejected, false,
+        'a network failure must never latch the key as refused');
+    } finally { (globalThis as any).fetch = savedFetch; }
+  });
+
+  test('a 401 from Helius IS a rejection', async () => {
+    const { probeHeliusKey } = require('../services/rpcHealth');
+    const savedFetch = globalThis.fetch;
+    (globalThis as any).fetch = async () => ({ ok: false, status: 401 });
+    try {
+      const r = await probeHeliusKey(UUID);
+      assert.strictEqual(r.rejected, true);
+      assert.ok((r.note || '').includes('401'));
+    } finally { (globalThis as any).fetch = savedFetch; }
+  });
+
+  test('a 429 is NOT a rejection — rate limiting is transient', async () => {
+    const { probeHeliusKey } = require('../services/rpcHealth');
+    const savedFetch = globalThis.fetch;
+    (globalThis as any).fetch = async () => ({ ok: false, status: 429 });
+    try {
+      assert.strictEqual((await probeHeliusKey(UUID)).rejected, false);
+    } finally { (globalThis as any).fetch = savedFetch; }
+  });
 }
 
 console.log('\n-- One blip must not blank the wallet or refuse to arm --');
@@ -3973,6 +4052,98 @@ console.log('\n-- Copy trader v1.0.4 regression: the venue gate refused nearly e
     }).compileToV0Message();
     return new VersionedTransaction(msg);
   };
+
+  test('OLD BUG: any lookup-table transaction was refused, so every real buy died', () => {
+    // Measured 2026-08-29: PumpPortal returns lookup-bearing transactions for
+    // ordinary routes. The guard refused all of them with "unverifiable route",
+    // so real mode signed nothing while paper mode looked healthy.
+    const { AddressLookupTableAccount } = require('@solana/web3.js');
+    const extra = Keypair.generate().publicKey;
+    const tableKey = Keypair.generate().publicKey;
+
+    const inner = new TransactionMessage({
+      payerKey: owner,
+      recentBlockhash: '11111111111111111111111111111111',
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+        new TransactionInstruction({
+          programId: PUMP,
+          keys: [
+            { pubkey: owner, isSigner: true, isWritable: true },
+            { pubkey: extra, isSigner: false, isWritable: true },
+          ],
+          data: Buffer.from([0, 1, 2, 3]),
+        }),
+      ],
+    });
+
+    const table = new AddressLookupTableAccount({
+      key: tableKey,
+      state: { deactivationSlot: BigInt('18446744073709551615'), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0, addresses: [extra] },
+    });
+    const tx = new VersionedTransaction(inner.compileToV0Message([table]));
+    assert.ok((tx.message as any).addressTableLookups.length > 0, 'fixture must actually use a lookup table');
+
+    assert.strictEqual(assertOutboundTradeTx(tx, owner).ok, false,
+      'with no tables supplied it must still refuse — unverified is unsigned');
+    assert.strictEqual(assertOutboundTradeTx(tx, owner, [table]).ok, true,
+      'with the table resolved the same trade verifies and is allowed');
+  });
+
+  test('a lookup table we could not fetch is still refused, never signed blind', () => {
+    const { AddressLookupTableAccount } = require('@solana/web3.js');
+    const extra = Keypair.generate().publicKey;
+    const tableKey = Keypair.generate().publicKey;
+    const inner = new TransactionMessage({
+      payerKey: owner,
+      recentBlockhash: '11111111111111111111111111111111',
+      instructions: [new TransactionInstruction({
+        programId: PUMP,
+        keys: [{ pubkey: owner, isSigner: true, isWritable: true }, { pubkey: extra, isSigner: false, isWritable: true }],
+        data: Buffer.from([0]),
+      })],
+    });
+    const table = new AddressLookupTableAccount({
+      key: tableKey,
+      state: { deactivationSlot: BigInt('18446744073709551615'), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0, addresses: [extra] },
+    });
+    const tx = new VersionedTransaction(inner.compileToV0Message([table]));
+    // A DIFFERENT table handed in: the one the tx names is still unresolved.
+    const wrong = new AddressLookupTableAccount({
+      key: Keypair.generate().publicKey,
+      state: { deactivationSlot: BigInt('18446744073709551615'), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0, addresses: [extra] },
+    });
+    const v = assertOutboundTradeTx(tx, owner, [wrong]);
+    assert.strictEqual(v.ok, false);
+    assert.ok(/not resolved/.test(v.reason || ''), 'the reason names the unresolved table');
+  });
+
+  test('resolving tables does NOT weaken the guard — a hidden drain is still caught', () => {
+    const { AddressLookupTableAccount } = require('@solana/web3.js');
+    const attacker = Keypair.generate().publicKey;
+    const tableKey = Keypair.generate().publicKey;
+    const inner = new TransactionMessage({
+      payerKey: owner,
+      recentBlockhash: '11111111111111111111111111111111',
+      instructions: [
+        new TransactionInstruction({
+          programId: PUMP,
+          keys: [{ pubkey: owner, isSigner: true, isWritable: true }],
+          data: Buffer.from([0]),
+        }),
+        // the drain, with the destination hidden inside the lookup table
+        SystemProgram.transfer({ fromPubkey: owner, toPubkey: attacker, lamports: 1_000_000_000 }),
+      ],
+    });
+    const table = new AddressLookupTableAccount({
+      key: tableKey,
+      state: { deactivationSlot: BigInt('18446744073709551615'), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0, addresses: [attacker] },
+    });
+    const tx = new VersionedTransaction(inner.compileToV0Message([table]));
+    const v = assertOutboundTradeTx(tx, owner, [table]);
+    assert.strictEqual(v.ok, false, 'a lamport transfer to an unrelated account must be refused even when hidden in a table');
+    assert.ok(/transfer/i.test(v.reason || ''));
+  });
 
   test('H1 guard: a normal pump trade for us is allowed', () => {
     const legit = mkTx(owner, [

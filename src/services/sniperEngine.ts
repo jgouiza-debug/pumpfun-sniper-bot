@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import axios from 'axios';
-import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { AddressLookupTableAccount, Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import {
   BotConfig,
@@ -43,6 +43,7 @@ import {
 import { PositionStore, describeRestoration, type PersistedPosition } from './positionStore';
 import {
   rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth,
+  probeHeliusKey, markHeliusKeyRejected,
   resolveRpcEndpoint, normalizeHeliusKey,
 } from './rpcHealth';
 import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } from './keyStore';
@@ -520,6 +521,13 @@ export class SniperEngine {
     console.log(`🌐 RPC endpoint: ${startupEndpoint.host} (source: ${startupEndpoint.source})`);
     if (startupEndpoint.keyOverridden) {
       console.warn(`⚠️ SOLANA_RPC_URL is set, so your Helius key is NOT being used — every call goes to ${startupEndpoint.host}. Remove SOLANA_RPC_URL from the .env beside the app to use the key.`);
+    }
+
+    // The shape check above cannot see a revoked, mistyped or over-quota key —
+    // only the server can. Ask it once, in the background, so the answer costs
+    // no startup latency.
+    if (apiKey && startupEndpoint.source === 'helius') {
+      void this.verifyHeliusKey(apiKey);
     }
 
     this.solanaConnection = new Connection(startupEndpoint.url, connectionConfig());
@@ -1576,7 +1584,13 @@ export class SniperEngine {
         // intent. The trade-local bytes come from a third party; a hostile
         // response could carry a balance transfer or an authority reassignment.
         // Our own local build passes the same gate. Fail closed.
-        const intent = assertOutboundTradeTx(tx, keypair.publicKey);
+        //
+        // A lookup-bearing transaction cannot be read without its tables, and
+        // PumpPortal returns those for ordinary routes — so fetch them and let
+        // the guard check the COMPLETE account list. A table we cannot fetch
+        // stays unresolved and the guard refuses, which is the safe direction.
+        const lookupAccounts = await this.resolveLookupTables(tx);
+        const intent = assertOutboundTradeTx(tx, keypair.publicKey, lookupAccounts);
         if (!intent.ok) {
           this.log('error', `⛔ Refusing to sign ${action} for ${mint.slice(0, 8)}… — ${intent.reason} (source: ${buildSource}). No transaction was sent.`, mint);
           return null;
@@ -3097,6 +3111,56 @@ export class SniperEngine {
   }
 
   /** (Re)build the Solana connection and rebind everything that holds one. */
+  /**
+   * Confirm the Helius key works, and if the server refuses it, say so ONCE in
+   * words and stop using it.
+   *
+   * Without this a bad key is invisible: `normalizeHeliusKey` accepts anything
+   * without URL punctuation, so an 89-character paste sailed through, and the
+   * only symptom was web3.js printing `ws error: Unexpected server response:
+   * 401` several thousand times a minute while the leader feed and the launch
+   * stream stayed silent. Demoting to the public endpoint is the same
+   * degraded-but-alive state the bot already runs in with no key at all —
+   * strictly better than a socket that can never open.
+   */
+  private async verifyHeliusKey(apiKey: string): Promise<void> {
+    const result = await probeHeliusKey(apiKey);
+    if (result.ok || !result.rejected) {
+      // Unreachable is transient — never demote a good key on a flaky network.
+      if (!result.ok && result.note) {
+        this.log('warn', `⚠️ Could not verify the Helius key yet: ${result.note} Continuing with it.`);
+      }
+      return;
+    }
+
+    markHeliusKeyRejected(apiKey);
+    const fallback = resolveRpcEndpoint(this.config.heliusApiKey);
+    this.rebindConnection(fallback.url);
+    this.onFallbackRpc = true;
+    this.log('error', `❌ Helius REJECTED your API key — ${result.note} Nothing that needs RPC will work until it is replaced: no launch feed, no leader watching, no buys.`);
+    this.log('error', `❌ Fix it in UI Settings, or edit heliusApiKey in ${keyStorePath()}. A Helius key is a 36-character UUID like 1234abcd-12ab-34cd-56ef-1234567890ab — get one free at https://dashboard.helius.dev.`);
+    this.log('warn', `⚠️ Running on ${fallback.host} (${fallback.source}) meanwhile — heavily rate limited. Open positions can still be priced and sold, but do NOT expect to win snipes on it.`);
+  }
+
+  /**
+   * Fetch the address lookup tables a versioned transaction references, so the
+   * intent guard can verify the accounts they hide. Returns an empty array when
+   * there are none; a table that cannot be fetched is simply absent, and the
+   * guard refuses on the gap rather than signing a half-read transaction.
+   */
+  private async resolveLookupTables(tx: VersionedTransaction): Promise<AddressLookupTableAccount[]> {
+    const lookups: any[] = (tx.message as any)?.addressTableLookups ?? [];
+    if (!lookups.length) return [];
+    const out: AddressLookupTableAccount[] = [];
+    for (const l of lookups) {
+      try {
+        const res = await this.solanaConnection.getAddressLookupTable(l.accountKey);
+        if (res.value) out.push(res.value);
+      } catch { /* left unresolved on purpose — the guard refuses on the gap */ }
+    }
+    return out;
+  }
+
   private rebindConnection(url: string): void {
     this.solanaConnection = new Connection(url, connectionConfig());
     this.wallet.setConnection(this.solanaConnection);

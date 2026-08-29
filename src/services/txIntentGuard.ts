@@ -1,4 +1,5 @@
 import {
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   PublicKey,
   SystemProgram,
@@ -71,18 +72,55 @@ export interface TxIntentVerdict {
  * signed. Returns `{ ok: false, reason }` on anything suspicious; the caller must
  * refuse to sign when `ok` is false.
  */
-export function assertOutboundTradeTx(tx: VersionedTransaction, owner: PublicKey): TxIntentVerdict {
+export function assertOutboundTradeTx(
+  tx: VersionedTransaction,
+  owner: PublicKey,
+  lookupAccounts?: readonly AddressLookupTableAccount[],
+): TxIntentVerdict {
   try {
     const msg: any = tx.message;
 
-    // Address-table lookups would hide account identities behind tables we would
-    // have to fetch to resolve. Our known-good routes never use them, so a
-    // lookup-bearing tx is unverifiable here — refuse rather than sign blind.
-    if (Array.isArray(msg.addressTableLookups) && msg.addressTableLookups.length > 0) {
-      return { ok: false, reason: 'transaction uses address lookup tables (unverifiable route)' };
-    }
+    // Address-table lookups hide account identities behind tables that have to
+    // be fetched to resolve. Refusing every one of them fails closed but ALSO
+    // fails useful: measured 2026-08-29, PumpPortal returns lookup-bearing
+    // transactions for ordinary routes, so a blanket refusal blocked every
+    // real buy while paper mode looked fine — the bot appeared to trade and
+    // nothing reached the chain.
+    //
+    // Resolving the tables loses no safety: the checks below then run over the
+    // COMPLETE account list, exactly as they do for a static message. What is
+    // still refused is a table we could not resolve — unverified is unsigned.
+    const tableLookups = Array.isArray(msg.addressTableLookups) ? msg.addressTableLookups : [];
+    let keys: PublicKey[];
 
-    const keys: PublicKey[] = msg.staticAccountKeys;
+    if (tableLookups.length > 0) {
+      if (!lookupAccounts || lookupAccounts.length === 0) {
+        return { ok: false, reason: 'transaction uses address lookup tables that were not resolved (unverifiable route)' };
+      }
+      const supplied = new Set(lookupAccounts.map((a) => a.key.toBase58()));
+      for (const l of tableLookups) {
+        const wanted = l.accountKey?.toBase58?.();
+        if (!wanted || !supplied.has(wanted)) {
+          return { ok: false, reason: `address lookup table ${wanted ?? 'unknown'} was not resolved — refusing to sign blind` };
+        }
+      }
+      try {
+        // getAccountKeys returns static keys followed by the writable then the
+        // readonly loaded addresses — the exact order compiledInstructions
+        // index into, so every check below keeps working unchanged.
+        const resolved = msg.getAccountKeys({ addressLookupTableAccounts: lookupAccounts as AddressLookupTableAccount[] });
+        keys = [];
+        for (let i = 0; i < resolved.length; i++) {
+          const k = resolved.get(i);
+          if (!k) return { ok: false, reason: `address lookup resolution left account index ${i} empty` };
+          keys.push(k);
+        }
+      } catch (err: any) {
+        return { ok: false, reason: `could not resolve address lookup tables (${err?.message || 'unknown error'})` };
+      }
+    } else {
+      keys = msg.staticAccountKeys;
+    }
     const instructions: Array<{ programIdIndex: number; accountKeyIndexes: number[]; data: Uint8Array }> =
       msg.compiledInstructions;
     if (!Array.isArray(keys) || !Array.isArray(instructions)) {
