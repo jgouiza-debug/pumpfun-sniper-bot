@@ -3656,7 +3656,11 @@ console.log('\n-- Per-install files must all resolve from installBaseDir --');
   /** True when process.cwd() appears in real CODE, ignoring comments — a
    *  comment describing the old bug must not fail the guard against it. */
   const hasCwdInCode = (src: string) => /process\.cwd\(\)/.test(
-    src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n'));
+    // Strip \r FIRST: on a Windows (CRLF) checkout the trailing \r left by
+    // split('\n') sits between the comment text and end-of-line, so /\/\/.*$/
+    // (`.` never matches \r, `$` needs true end) failed to strip the comment
+    // and this guard fired on a comment that merely NAMES the old bug.
+    src.replace(/\r/g, '').replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n'));
 
   test('OLD BUG: the API token was written to / under Electron and never persisted', () => {
     // apiAuth computed its own base dir as
