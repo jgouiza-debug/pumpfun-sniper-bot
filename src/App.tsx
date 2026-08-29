@@ -76,6 +76,68 @@ function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean })
   );
 }
 
+/**
+ * "Why is it not trading?" — the backend's own diagnosis, on screen.
+ *
+ * Every silent failure in this bot's history (a rejected Helius key answering
+ * 401 forever, the pre-sign guard refusing every real buy, split sizing
+ * staking 0 SOL so every leader signal was skipped, copy trading simply
+ * switched off) was visible in a log and invisible in the UI. The operator saw
+ * a healthy-looking screen and a bot that did nothing. This polls
+ * /api/diagnostics and puts the reason where they are already looking.
+ */
+function DiagnosticsPanel() {
+  const [diag, setDiag] = useState<{ level: string; findings: Array<{ level: string; title: string; detail: string; fix: string }> } | null>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await apiFetch('/api/diagnostics');
+        if (r.ok && alive) setDiag(await r.json());
+      } catch { /* backend unreachable — the RPC pill already says so */ }
+    };
+    pull();
+    const iv = setInterval(pull, 10_000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  if (!diag || diag.level === 'ok' || !diag.findings.length) return null;
+  const color = diag.level === 'critical' ? '#ff1744' : diag.level === 'warning' ? '#ffb300' : '#64b5f6';
+  const icon = diag.level === 'critical' ? '\u26d4' : diag.level === 'warning' ? '\u26a0\ufe0f' : '\u2139\ufe0f';
+  const worst = diag.findings.filter((f) => f.level === diag.level);
+
+  return (
+    <div style={{ borderBottom: `1px solid ${color}55`, background: `${color}14`, fontSize: '12px' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        style={{ all: 'unset', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', boxSizing: 'border-box', padding: '8px 20px', color }}
+      >
+        <span style={{ fontWeight: 700, minWidth: 0 }}>
+          {icon} {worst.length === 1 ? worst[0].title : `${diag.findings.length} issues need attention`}
+          {!open && worst.length === 1 && (
+            <span style={{ fontWeight: 400, opacity: 0.9 }}> &mdash; {worst[0].detail.slice(0, 110)}</span>
+          )}
+        </span>
+        <span style={{ opacity: 0.8, whiteSpace: 'nowrap' }}>{open ? 'hide' : `details (${diag.findings.length})`}</span>
+      </button>
+      {open && (
+        <div style={{ padding: '0 20px 10px' }}>
+          {diag.findings.map((f, i) => (
+            <div key={i} style={{ padding: '6px 0', borderTop: i ? '1px solid rgba(255,255,255,0.06)' : 'none' }}>
+              <div style={{ color: f.level === 'critical' ? '#ff1744' : f.level === 'warning' ? '#ffb300' : '#64b5f6', fontWeight: 700 }}>{f.title}</div>
+              <div style={{ color: '#cfd8dc' }}>{f.detail}</div>
+              {f.fix && <div style={{ color: '#80cbc4' }}>&rarr; {f.fix}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function App() {
   // Page routing: the sniper terminal and the copy trading desk share the
   // backend instance but render as separate full-screen pages.
@@ -696,6 +758,7 @@ export function App() {
   if (activePage === 'copy') {
     return (
       <div>
+        <DiagnosticsPanel />
         <header className="header">
           <div>
             <div className="brand-title">PUMPPORTAL TERMINAL — MEME COIN WALLET COPY TRADING DESK</div>
