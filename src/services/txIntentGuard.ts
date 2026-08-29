@@ -33,6 +33,35 @@ const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const PUMP_AMM_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+/**
+ * PumpPortal's routing program. Every trade-local response goes through it as
+ * of 2026-08-29, which is why refusing it blocked 100% of real trades from
+ * v2.0.0 onward — the version before that signed these transactions with no
+ * checks at all.
+ *
+ * Understand what allowing this does and does not mean. It is NOT pump.fun's:
+ * those mints' bonding curves are owned by 6EF8rrec…, and this program's
+ * upgrade authority (83CpBne2…) differs from the one pump.fun uses for both of
+ * its programs (7gZufwww…). It is upgradeable, so its code can change without
+ * warning, and it is undocumented.
+ *
+ * It is allow-listed deliberately, as an operator decision, and every other
+ * check in this file still applies: the fee payer must be our wallet, ours must
+ * be the only signature, no SetAuthority / Approve / CloseAccount may appear,
+ * and lamports leaving our wallet to an address outside the trade are capped
+ * (below). That is strictly more protection than the pre-v2.0.0 build, which
+ * signed the same transactions blind. The way to stop trusting it entirely is
+ * localTxBuild, which constructs the pump.fun instruction directly.
+ */
+const PUMPPORTAL_ROUTER = 'FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe';
+
+/**
+ * Lamports allowed to leave our wallet, in total, to addresses that are not
+ * part of the trade. A vendor fee is a small slice; a drain is the balance.
+ * ponytail: one absolute cap, not a percentage of a trade size this function
+ * cannot see — raise it if you trade sizes where a ~1% routing fee exceeds it.
+ */
+const MAX_UNRELATED_LAMPORTS = 10_000_000; // 0.01 SOL
 const SYSTEM_PROGRAM = SystemProgram.programId.toBase58();
 const COMPUTE_BUDGET = ComputeBudgetProgram.programId.toBase58();
 
@@ -45,6 +74,7 @@ const ALLOWED_PROGRAMS = new Set<string>([
   ATA_PROGRAM,
   PUMP_PROGRAM,
   PUMP_AMM_PROGRAM,
+  PUMPPORTAL_ROUTER,
 ]);
 
 const TOKEN_PROGRAMS = new Set<string>([TOKEN_PROGRAM, TOKEN_2022_PROGRAM]);
@@ -143,6 +173,8 @@ export function assertOutboundTradeTx(
     // ATA). A legitimate SOL wrap or rent payment goes to one of these; a siphon
     // goes to a fresh external address that appears nowhere else.
     const tradeAccountSet = new Set<string>();
+    /** Total lamports leaving our wallet to addresses outside the trade. */
+    let unrelatedLamports = 0n;
     for (const ix of instructions) {
       const program = keys[ix.programIdIndex]?.toBase58();
       if (program && program !== SYSTEM_PROGRAM && program !== COMPUTE_BUDGET) {
@@ -171,7 +203,18 @@ export function assertOutboundTradeTx(
           const from = keys[ix.accountKeyIndexes[0]]?.toBase58();
           const to = keys[ix.accountKeyIndexes[1]]?.toBase58();
           if (from === ownerB58 && to && to !== ownerB58 && !tradeAccountSet.has(to)) {
-            return { ok: false, reason: `SystemProgram transfer from our wallet to unrelated account ${to}` };
+            // Refusing this outright also refused the routing fee PumpPortal
+            // collects, which is a legitimate part of every real trade. Cap it
+            // instead: a fee is a slice, a drain is the balance. Amounts are
+            // SUMMED so many small transfers cannot add up to a drain.
+            const lamports = data.length >= 12 ? data.readBigUInt64LE(4) : 0n;
+            unrelatedLamports += lamports;
+            if (unrelatedLamports > BigInt(MAX_UNRELATED_LAMPORTS)) {
+              return {
+                ok: false,
+                reason: `SystemProgram transfer(s) of ${Number(unrelatedLamports) / 1e9} SOL from our wallet to account(s) outside the trade (${to}) — above the ${MAX_UNRELATED_LAMPORTS / 1e9} SOL fee allowance`,
+              };
+            }
           }
         }
       }

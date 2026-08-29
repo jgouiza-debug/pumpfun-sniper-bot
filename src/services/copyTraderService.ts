@@ -1519,8 +1519,22 @@ export class CopyTraderService {
       // Provisional only — real mode re-slices against a freshly read balance
       // inside the queue, where the exit-gas and in-flight reserves are known.
       const openNow = this.positions.filter(p => p.status !== 'CLOSED').length;
-      copySol = this.splitStakeSol(
-        sniperEngine.getWalletStatus().deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol());
+      const deployableSol = sniperEngine.getWalletStatus().deployableSol;
+      const stakeSol = this.splitStakeSol(deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol());
+      // Paper must not need a funded wallet. Split sizing returns 0 both with
+      // no wallet linked AND for any balance too small to cover a slot's fee
+      // plus slippage buffer, so EVERY leader buy was skipped with "the wallet
+      // is empty after the exit-gas reserve" — a simulation refusing to
+      // simulate over money it was never going to spend. The engine's own paper
+      // path already falls back to a notional bankroll; the copy trader never
+      // got that, which is why paper copy trading opened nothing.
+      //
+      // Gate on the computed STAKE, not on the balance: gating on
+      // `deployableSol <= 0` leaves a dust-funded wallet skipping every buy for
+      // exactly the same reason.
+      copySol = (this.config.tradingMode === 'paper' && stakeSol <= 0)
+        ? this.config.maxBuySol
+        : stakeSol;
     } else {
       if (sig.solAmount <= 0) {
         return skip('Token→token swap carries no SOL size to scale from — switch to fixed sizing to copy these.');

@@ -3474,6 +3474,116 @@ console.log('\n-- "RPC stays down on a valid key": the four causes --');
   });
 }
 
+console.log('\n-- The router is allowed, the drain protection is NOT --');
+{
+  const owner2 = Keypair.generate().publicKey;
+  const ROUTER = new PublicKey('FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe');
+  const PUMP2 = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+  const mk = (ixs: any[]) => new VersionedTransaction(new TransactionMessage({
+    payerKey: owner2, recentBlockhash: '11111111111111111111111111111111', instructions: ixs,
+  }).compileToV0Message());
+
+  test('OLD BUG: v2.0.0 refused PumpPortal\'s router, blocking 100% of real trades', () => {
+    // v1.1.0 had no guard at all and real trading worked. 4d636ed added one
+    // whose allow-list predates PumpPortal routing every trade through
+    // FAdo9NCw, so from v2.0.0 on nothing could be signed.
+    const tx = mk([new TransactionInstruction({
+      programId: ROUTER,
+      keys: [{ pubkey: owner2, isSigner: true, isWritable: true }],
+      data: Buffer.from([1, 2, 3]),
+    })]);
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, true,
+      'the router is allow-listed as a deliberate operator decision');
+  });
+
+  test('a large transfer to an unrelated account is STILL refused — the drain guard survives', () => {
+    const attacker = Keypair.generate().publicKey;
+    const tx = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+      SystemProgram.transfer({ fromPubkey: owner2, toPubkey: attacker, lamports: 900_000_000 }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false, 'allowing a fee must not allow a drain');
+    assert.ok(/above the .* SOL fee allowance/.test(v.reason || ''), v.reason);
+  });
+
+  test('a small routing fee IS allowed — that is the whole point of the cap', () => {
+    const feeWallet = Keypair.generate().publicKey;
+    const tx = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+      SystemProgram.transfer({ fromPubkey: owner2, toPubkey: feeWallet, lamports: 500_000 }), // 0.0005 SOL
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, true);
+  });
+
+  test('many small transfers cannot ADD UP to a drain — the cap is on the sum', () => {
+    const a = Keypair.generate().publicKey, b = Keypair.generate().publicKey;
+    const tx = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+      SystemProgram.transfer({ fromPubkey: owner2, toPubkey: a, lamports: 6_000_000 }),
+      SystemProgram.transfer({ fromPubkey: owner2, toPubkey: b, lamports: 6_000_000 }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false, '2 x 0.006 SOL exceeds the 0.01 SOL allowance in total');
+  });
+
+  test('authority theft is still refused even for the router', () => {
+    // SetAuthority (tag 6) must never be signable, no matter who invokes it.
+    const victimAta = Keypair.generate().publicKey;
+    const tx = mk([new TransactionInstruction({
+      programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      keys: [{ pubkey: victimAta, isSigner: false, isWritable: true }, { pubkey: owner2, isSigner: true, isWritable: false }],
+      data: Buffer.from([6, 2, 1]),
+    })]);
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, false);
+  });
+}
+
+console.log('\n-- Paper copy trading must not need a funded wallet --');
+{
+  const src = require('fs').readFileSync(require.resolve('../services/copyTraderService.ts'), 'utf8');
+  const { splitWalletIntoSlots, maxAffordableBuySol } = require('../services/pipelineUtils');
+
+  test('OLD BUG: split sizing staked 0 with no wallet, so every paper leader buy was skipped', () => {
+    // Measured: paper copy trading opened nothing. buySizeMode 'split' sizes
+    // from deployableSol, which is 0 with no wallet linked, so copySol was 0
+    // and onLeaderBuy skipped with "the wallet is empty after the exit-gas
+    // reserve" — paper refusing to simulate over money it never spends.
+    assert.strictEqual(splitWalletIntoSlots({
+      deployableSol: 0, slots: 3, maxSlippagePct: 25, priorityFeeSol: 0.001,
+    }).stakePerSlotSol, 0, 'the underlying sizing really does return 0');
+
+    assert.ok(/tradingMode === 'paper' && stakeSol <= 0/.test(src),
+      'paper must fall back to a notional stake when split sizing yields nothing');
+    assert.ok(/copySol = \(this\.config\.tradingMode === 'paper' && stakeSol <= 0\)\s*\?\s*this\.config\.maxBuySol/.test(src),
+      'the fallback is maxBuySol');
+  });
+
+  test('the fallback triggers on the computed STAKE, not just an empty wallet', () => {
+    // Gating on `deployableSol <= 0` misses the case it was written for: a
+    // dust-funded wallet. maxAffordableBuySol returns 0 whenever the per-slot
+    // share cannot cover the priority fee plus the slippage buffer, so a small
+    // NON-zero balance still staked 0 and still skipped every paper buy.
+    const dust = splitWalletIntoSlots({
+      deployableSol: 0.004, slots: 3, maxSlippagePct: 25, priorityFeeSol: 0.001,
+    }).stakePerSlotSol;
+    assert.strictEqual(dust, 0, 'a dust balance really does size to 0');
+    assert.strictEqual(maxAffordableBuySol(0.004 / 3, 25, 0.001), 0);
+
+    assert.ok(!/tradingMode === 'paper' && deployableSol <= 0/.test(src),
+      'the old balance-based gate must be gone — it left dust wallets broken');
+  });
+
+  test('real mode is NOT given the paper fallback', () => {
+    // The fallback invents a stake. In real mode that would size an order the
+    // wallet cannot fund.
+    const m = src.match(/copySol = \(this\.config\.tradingMode === 'paper'[^;]+;/);
+    assert.ok(m, 'the sizing branch must exist');
+    assert.ok(/'paper'/.test(m[0]) && !/'real'/.test(m[0]),
+      'only paper may substitute a notional stake');
+  });
+}
+
 console.log('\n-- The macOS build must not ship a broken signature --');
 {
   const fs = require('fs');
