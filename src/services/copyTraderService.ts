@@ -646,6 +646,21 @@ export class CopyTraderService {
     this.startHeliusWatcher();
   }
 
+  /**
+   * Re-read the API keys and rebuild the feeds on them.
+   *
+   * Called when the operator saves a key in Settings. Without it, a key added
+   * after boot changed only the sniper's connection: the copy trader kept the
+   * key it resolved at start — usually none — so the on-chain watcher stayed
+   * down for the rest of the session while the UI reported a healthy engine.
+   * That is a leader whose every trade is invisible, with nothing in the feed
+   * to say so. A no-op unless copy trading is armed; restartSignalFeeds()
+   * already returns early when it is not.
+   */
+  public onApiKeysChanged(): void {
+    this.restartSignalFeeds();
+  }
+
   // ---------------- HELIUS ON-CHAIN WATCHER ----------------
 
   /**

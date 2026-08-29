@@ -2047,6 +2047,8 @@ console.log('\n-- Minimum viable wallet is computed, not guessed --');
 console.log('\n-- A packaged exe must not ship with every safety flag off --');
 {
   const { DEFAULTS, PACKAGED_DEFAULTS } = require('../services/featureFlags');
+  const flagsSrc: string = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'services', 'featureFlags.ts'), 'utf8');
 
   // Measured 2026-08-10: the built exe run from a clean directory reported
   // "Enabled: allInSizing" — all-in sizing ON with every guard OFF.
@@ -2080,6 +2082,64 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
       assert.ok(k in PACKAGED_DEFAULTS, `${k} missing from PACKAGED_DEFAULTS`);
       assert.strictEqual(typeof PACKAGED_DEFAULTS[k], 'boolean');
     }
+  });
+
+  test('OLD BUG: the installed desktop app was not counted as a packaged build', () => {
+    // IS_PACKAGED tested `process.pkg` and nothing else, so the Electron .dmg /
+    // NSIS Setup — the builds almost everyone runs since v2.0.0 — resolved to
+    // DEFAULTS: every guard off with allInSizing ON. Installed fresh, with no
+    // flags.json beside it, that is what it traded with.
+    const line = flagsSrc.split('\n').find((l: string) => l.includes('const IS_PACKAGED')) ?? '';
+    assert.ok(/SNIPER_PACKAGED/.test(line),
+      'the packaged check must recognise the Electron build, not only pkg');
+    assert.ok(/process as any\)\.pkg/.test(line), 'and must still recognise the pkg binary');
+  });
+
+  test('an installed build reads its overrides from the writable data dir', () => {
+    // Beside the executable is inside the .app bundle on macOS and Program
+    // Files on Windows — neither is writable, so a packaged build that only
+    // looked there could never load (or save) an override.
+    const fn = flagsSrc.slice(flagsSrc.indexOf('function flagsSearchPaths'), flagsSrc.indexOf('function resolveFlagsPath'));
+    assert.ok(/SNIPER_DATA_DIR/.test(fn), 'the per-user data dir must be searched first');
+    assert.ok(fn.indexOf('SNIPER_DATA_DIR') < fn.indexOf('process.execPath'),
+      'the writable dir must outrank the read-only one beside the executable');
+  });
+
+  test('OLD BUG: a Helius key saved after boot never reached the copy feeds', () => {
+    // The copy trader resolves the Helius key when its watcher starts and
+    // never again. Saving the key in Settings rebuilt only the sniper's
+    // connection, so the on-chain lane — the only lane that works without a
+    // paid PumpPortal key — stayed down for the rest of the session with a
+    // healthy-looking UI. Observed in bot.log: key saved 02:03:08, no watcher
+    // line ever followed.
+    const fsx = require('fs'), pathx = require('path');
+    const server = fsx.readFileSync(pathx.join(__dirname, '..', 'server.ts'), 'utf8');
+    const route = server.slice(server.indexOf("app.post('/api/bot/config'"), server.indexOf("app.post('/api/bot/sell-position'"));
+    assert.ok(/onApiKeysChanged\(\)/.test(route), 'a saved key must restart the copy feeds');
+    assert.ok(/heliusApiKey/.test(route) && /pumpPortalApiKey/.test(route),
+      'both keys feed the copy lanes, so both must trigger the restart');
+
+    const copy = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+    assert.ok(/public onApiKeysChanged\(\)/.test(copy), 'the entry point must be public for server.ts to call');
+  });
+
+  test('OLD BUG: persisting one toggle froze every guard OFF onto disk', () => {
+    // set() wrote the whole resolved set. On a dev checkout that is DEFAULTS —
+    // everything-off — so flags.json gained an explicit `false` for each guard
+    // and then outranked PACKAGED_DEFAULTS in every later run, including a
+    // packaged one. This repo's own flags.json was found in exactly that state
+    // on 2026-08-28: all six guards false, allInSizing true.
+    const fn = flagsSrc.slice(flagsSrc.indexOf('public set('), flagsSrc.length);
+    assert.ok(!/JSON\.stringify\(this\.flags/.test(fn),
+      'writing the whole resolved set is what pinned the guards off');
+    assert.ok(/JSON\.stringify\(overrides/.test(fn),
+      'only deliberate changes belong in flags.json');
+  });
+
+  test('the persisted overrides are sparse relative to the build baseline', () => {
+    const fn = flagsSrc.slice(flagsSrc.indexOf('public set('), flagsSrc.length);
+    assert.ok(/IS_PACKAGED \? PACKAGED_DEFAULTS : DEFAULTS/.test(fn),
+      'a packaged build must diff against what IT ships, not the dev defaults');
   });
 
   test('localTxBuild stays off until a parity run proves it', () => {

@@ -164,8 +164,18 @@ export const INTENDED_PACKAGED_DIVERGENCE: Array<keyof FeatureFlagSet> = [
   'localTxShadowCompare',
 ];
 
-/** True when running from a pkg-built single-file executable. */
-const IS_PACKAGED = Boolean((process as any).pkg);
+/**
+ * True when running as a SHIPPED build rather than a dev checkout.
+ *
+ * Both shapes count. `process.pkg` is the single-file binary; SNIPER_PACKAGED
+ * is set by electron/main.js when app.isPackaged, and it has to be honoured
+ * here or the installed desktop app — the .dmg and the NSIS Setup, i.e. what
+ * almost everyone runs — falls through to DEFAULTS: every guard off and
+ * allInSizing ON, the exact combination PACKAGED_DEFAULTS exists to prevent.
+ * That was live from the moment the Electron build shipped (v2.0.0), because
+ * the packaged check only ever knew about pkg.
+ */
+const IS_PACKAGED = Boolean((process as any).pkg) || process.env.SNIPER_PACKAGED === '1';
 
 /**
  * Where to look for flags.json, most specific first:
@@ -175,6 +185,10 @@ const IS_PACKAGED = Boolean((process as any).pkg);
  */
 function flagsSearchPaths(): string[] {
   const paths: string[] = [];
+  // The desktop app's per-user data dir, when it set one. Inside a .app bundle
+  // or Program Files, the directory beside the executable is not writable, so
+  // that is where an installed build's overrides actually live.
+  if (process.env.SNIPER_DATA_DIR) paths.push(path.join(process.env.SNIPER_DATA_DIR, 'flags.json'));
   if (IS_PACKAGED) paths.push(path.join(path.dirname(process.execPath), 'flags.json'));
   paths.push(path.resolve(process.cwd(), 'flags.json'));
   paths.push(path.resolve(__dirname, '../../flags.json'));
@@ -186,6 +200,7 @@ function resolveFlagsPath(): string {
   for (const p of flagsSearchPaths()) {
     try { if (fs.existsSync(p)) return p; } catch { /* keep looking */ }
   }
+  if (process.env.SNIPER_DATA_DIR) return path.join(process.env.SNIPER_DATA_DIR, 'flags.json');
   return IS_PACKAGED
     ? path.join(path.dirname(process.execPath), 'flags.json')
     : path.resolve(process.cwd(), 'flags.json');
@@ -245,12 +260,29 @@ class FeatureFlags {
     return { ...this.flags };
   }
 
-  /** Sets a flag at runtime and persists it, so a toggle survives restarts. */
+  /**
+   * Sets a flag at runtime and persists it, so a toggle survives restarts.
+   *
+   * Only the flags that DIFFER from this build's baseline are written. Writing
+   * the whole resolved set froze whatever the process happened to be running
+   * onto disk: toggle one flag on a dev checkout and flags.json gained an
+   * explicit `false` for every guard, because DEFAULTS is everything-off. The
+   * file then outranked PACKAGED_DEFAULTS forever after, so a shipped build
+   * reading it ran with the honeypot check, dev-sell stop, kill switch and
+   * economics gate all off and allInSizing ON — observed in this repo's own
+   * flags.json, 2026-08-28. A sparse file can only ever say what was
+   * deliberately changed.
+   */
   public set(key: keyof FeatureFlagSet, value: boolean): FeatureFlagSet {
     if (!(key in DEFAULTS)) throw new Error(`Unknown feature flag: ${key}`);
     this.flags[key] = value;
+    const baseline = IS_PACKAGED ? PACKAGED_DEFAULTS : DEFAULTS;
+    const overrides: Partial<FeatureFlagSet> = {};
+    for (const k of Object.keys(DEFAULTS) as Array<keyof FeatureFlagSet>) {
+      if (this.flags[k] !== baseline[k]) overrides[k] = this.flags[k];
+    }
     try {
-      fs.writeFileSync(FLAGS_PATH, JSON.stringify(this.flags, null, 2));
+      fs.writeFileSync(FLAGS_PATH, JSON.stringify(overrides, null, 2) + '\n');
     } catch (err: any) {
       console.warn(`[Flags] Could not persist flags.json: ${err.message}`);
     }

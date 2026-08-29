@@ -235,7 +235,16 @@ app.post('/api/bot/toggle', (req, res) => {
 
 // POST Update Bot Strategy Config
 app.post('/api/bot/config', (req, res) => {
+  const before = sniperEngine.getConfig();
+  const keysBefore = `${before.heliusApiKey ?? ''}|${before.pumpPortalApiKey ?? ''}`;
   sniperEngine.updateConfig(req.body);
+  const after = sniperEngine.getConfig();
+  // A key saved from Settings has to reach the copy trader's feeds too. It
+  // resolves the key when its watcher starts and never again, so a key added
+  // after boot left the on-chain lane down for the whole session.
+  if (`${after.heliusApiKey ?? ''}|${after.pumpPortalApiKey ?? ''}` !== keysBefore) {
+    copyTrader.onApiKeysChanged();
+  }
   // getPublicConfig(), not getConfig(): the latter carries the raw Helius and
   // PumpPortal keys, and this response is readable by any loopback-origin page.
   res.json({ success: true, config: sniperEngine.getPublicConfig() });
