@@ -132,21 +132,20 @@ export const PACKAGED_DEFAULTS: FeatureFlagSet = {
   //   when the chain is busy and overpays when it is quiet.
   // timelineSlotSampling: t5/t6/t7 have ZERO samples on record, so the build →
   //   submit → land phase — where the 2.55x fill happened — is unmeasured.
-  // localTxShadowCompare: collects the parity evidence that localTxBuild
-  //   requires before it may be enabled. Costs nothing; runs after submission.
   entryGateV2: true,
   dynamicPriorityFee: true,
   timelineSlotSampling: true,
-  localTxShadowCompare: true,
-  // 2026-08-29 promotion. PumpPortal's trade-local now returns transactions
-  // routed through a third-party program, which the pre-sign intent guard
-  // refuses — so with this OFF, every real trade on a bonding-curve token is
-  // refused and nothing is sent. Building the pump.fun instruction directly
-  // removes the router, the vendor fee transfer and the HTTP hop, and each
-  // locally built transaction is proved by on-chain simulation before it is
-  // signed. A migrated token still falls back to trade-local (the AMM route is
-  // not implemented locally), as does any build that will not simulate.
-  localTxBuild: true,
+  // localTxBuild / localTxShadowCompare stay OFF by default (inherited from
+  // DEFAULTS). They build the pump.fun instruction locally and PROVE it by
+  // simulation before signing — which means several getAccountInfo +
+  // simulateTransaction calls PER trade, plus a fee-recipient walk. Measured
+  // 2026-08-29 on a live real-mode session with an active leader: that burst
+  // rate-limited the Helius key (a 429 storm) and every trade — and the leader
+  // watcher sharing the key — slowed to a crawl, which read as "buys are
+  // delayed / not showing up". The pre-sign guard now allow-lists PumpPortal's
+  // router, so trade-local (one HTTP call, no per-trade RPC) works and is
+  // faster. Local building remains available as an opt-in for operators who
+  // want PumpPortal independence AND have RPC headroom; it is not the default.
 };
 
 /**
@@ -170,8 +169,6 @@ export const INTENDED_PACKAGED_DIVERGENCE: Array<keyof FeatureFlagSet> = [
   'entryGateV2',
   'dynamicPriorityFee',
   'timelineSlotSampling',
-  'localTxShadowCompare',
-  'localTxBuild',
 ];
 
 /**

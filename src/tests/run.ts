@@ -2142,24 +2142,24 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
       'a packaged build must diff against what IT ships, not the dev defaults');
   });
 
-  test('localTxBuild ships ON, and every local tx is proved by simulation first', () => {
-    // Promoted 2026-08-29. It used to wait for shadow parity against
-    // PumpPortal's trade-local build — evidence that can no longer be
-    // collected, because trade-local now returns transactions routed through a
-    // third-party program that will never structurally match a direct pump.fun
-    // instruction. Waiting for that parity meant waiting forever, while the
-    // intent guard refused every routed transaction: no real trade could land
-    // by either path.
-    //
-    // The per-session evidence requirement did not go away, it got stronger:
-    // the engine simulates each locally built transaction against the chain and
-    // falls back to trade-local unless the simulation is clean.
-    assert.strictEqual(PACKAGED_DEFAULTS.localTxBuild, true,
-      'the PumpPortal bypass must actually be on, or real trades die in the intent guard');
+  test('localTxBuild ships OFF: real trades use the fast trade-local path by default', () => {
+    // It was briefly promoted ON (2026-08-29) to bypass PumpPortal's router.
+    // But building locally PROVES each trade by simulation — several
+    // getAccountInfo + simulateTransaction calls per trade plus a fee-recipient
+    // walk — and on a live real-mode session with an active leader that burst
+    // rate-limited the Helius key (a 429 storm), slowing every trade AND the
+    // leader watcher that shares the key. The pre-sign guard now allow-lists
+    // PumpPortal's router, so trade-local (one HTTP call) works and is faster,
+    // so local building is opt-in, not the default.
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxBuild, false,
+      'the RPC-heavy local build must not be the default — it rate-limits the key');
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxShadowCompare, false,
+      'the shadow compare also builds locally per trade — off by default too');
 
+    // The capability must still EXIST and stay simulation-gated for opt-in use.
     const engineSrc = require('fs').readFileSync(require.resolve('../services/sniperEngine.ts'), 'utf8');
     assert.ok(/const sim = await localTxBuilder\.simulateOk\(built\.tx\)/.test(engineSrc),
-      'a locally built tx must be simulated before it is used');
+      'when enabled, a locally built tx must still be simulated before it is used');
     assert.ok(/if \(sim\.ok\) \{[\s\S]{0,120}buildSource = 'local'/.test(engineSrc),
       'only a CLEANLY simulating build may be signed — anything else falls back');
 
