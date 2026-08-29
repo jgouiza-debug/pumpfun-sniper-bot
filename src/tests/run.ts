@@ -4486,9 +4486,15 @@ console.log('\n-- Copy trader: pump.fun trades are read from the log lines at pr
     const fsx = require('fs');
     const pathx = require('path');
     const svc = fsx.readFileSync(pathx.join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
-    assert.ok(/if \(this\.handleFastLog\(ev\)\) return;/.test(svc), 'log lines before RPC');
+    assert.ok(/if \(this\.handleFastLog\(ev, allEvents\)\) return;/.test(svc),
+      'log lines before RPC (decode reused, not recomputed)');
     assert.ok(/reconcileLeaderBalances\(/.test(svc));
-    assert.ok(/tracked \+ 1e-6 < tokens\) return false/.test(svc), 'a sell larger than the tally takes the exact path rather than being mis-sized');
+    // Mirror mode still takes the exact (slow) path when a sell exceeds the
+    // tally, so a partial is sized correctly; full mode skips it (fraction=1).
+    assert.ok(/tracked \+ 1e-6 < tokens\) return false/.test(svc),
+      'mirror mode keeps the exact-path bail so a partial is sized correctly');
+    assert.ok(/} else if \(this\.config\.sellMode === 'full'\)/.test(svc),
+      'full mode is a distinct branch that sells 100% without the confirmed-fetch');
   });
 }
 

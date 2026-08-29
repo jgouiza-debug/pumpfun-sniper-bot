@@ -35,10 +35,16 @@ export async function inspectFill(
   mint: string,
   opts: { retries?: number; delayMs?: number } = {}
 ): Promise<ActualFill | null> {
-  // 12 × 500ms rather than 6 × 1500ms: the same 6s window, but a fill that is
-  // readable 300ms after confirmation is booked in 500ms instead of 1.5s —
-  // and the copy trader's next queued order waits on exactly this.
-  const retries = opts.retries ?? 12;
+  // 4 × 500ms (was 12): this read runs AFTER confirmTransaction already
+  // confirmed, purely to book cost basis — and it holds the per-mint queue, so
+  // a leader's flip-sell of the same mint waits behind it. The common
+  // fresh-index case reads on attempt 1 (unchanged); the 12-retry tail only
+  // engaged when the parsed-tx index lagged, and that tail was pinning the
+  // queue for up to ~6s. Cap it at ~2s; a still-unreadable fill falls back to
+  // the estimated basis (the existing null path), which syncLiveWalletBalance
+  // reconciles anyway. Measured 2026-08-29: this tail was a top sell-latency
+  // source with a fast-flipping leader.
+  const retries = opts.retries ?? 4;
   const delayMs = opts.delayMs ?? 500;
 
   for (let attempt = 0; attempt < retries; attempt++) {

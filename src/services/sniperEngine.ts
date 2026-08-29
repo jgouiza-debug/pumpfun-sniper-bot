@@ -1762,9 +1762,10 @@ export class SniperEngine {
       } catch {
         // RPC hiccup — keep polling until the deadline.
       }
-      // 500ms, not 1500: a confirmation is usually visible within 1–2s, and a
-      // queued copy exit waits on this poll before it can start.
-      await new Promise(res => setTimeout(res, 500));
+      // 300ms: a confirmation is usually visible within 1–2s, and a queued
+      // copy exit for the same mint waits on this poll before it can start, so
+      // a tighter cadence shortens the gap between one exit and the next.
+      await new Promise(res => setTimeout(res, 300));
     }
     return 'timeout';
   }
@@ -3185,14 +3186,17 @@ export class SniperEngine {
   private async resolveLookupTables(tx: VersionedTransaction): Promise<AddressLookupTableAccount[]> {
     const lookups: any[] = (tx.message as any)?.addressTableLookups ?? [];
     if (!lookups.length) return [];
-    const out: AddressLookupTableAccount[] = [];
-    for (const l of lookups) {
+    // Fetch every table CONCURRENTLY — a migrated/AMM route can reference
+    // several, and reading them one after another added ~50-150ms each to the
+    // buy. Per-item catch keeps a single unreadable table from dropping the
+    // rest (the guard then refuses on the missing one).
+    const results = await Promise.all(lookups.map(async (l) => {
       try {
         const res = await this.solanaConnection.getAddressLookupTable(l.accountKey);
-        if (res.value) out.push(res.value);
-      } catch { /* left unresolved on purpose — the guard refuses on the gap */ }
-    }
-    return out;
+        return res.value ?? null;
+      } catch { return null; }
+    }));
+    return results.filter((v): v is AddressLookupTableAccount => v !== null);
   }
 
   private rebindConnection(url: string): void {

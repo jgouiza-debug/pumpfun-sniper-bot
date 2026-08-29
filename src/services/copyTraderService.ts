@@ -19,7 +19,7 @@ import { appendBotLog } from './fileLogger';
 import { DexScreenerService } from './dexscreenerService';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
 import { WalletLogWatcher, type WalletLogEvent } from './walletLogWatcher';
-import { tradeEventsFromLogs, tradeEventPriceSol, PUMP_TOKEN_DECIMALS } from './pumpEventDecoder';
+import { tradeEventsFromLogs, tradeEventPriceSol, PUMP_TOKEN_DECIMALS, PumpTradeEvent } from './pumpEventDecoder';
 import { bondingCurvePda } from './curveWatcher';
 import {
   detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, isCopyableMint, resolveBuyPool,
@@ -746,7 +746,8 @@ export class CopyTraderService {
           // Fast lane: a pump.fun trade is fully described by the event in
           // the log lines already in hand — no RPC, no wait for confirmation.
           // Everything else takes the on-chain analysis path.
-          if (this.handleFastLog(ev)) return;
+          // Reuse the decode from just above — do not decode the same log lines twice.
+          if (this.handleFastLog(ev, allEvents)) return;
           void this.handleWalletLog(ev.address, ev.signature);
         },
         log: (level, msg) => (level === 'warn' ? console.warn : console.log)(`[CopyTrader] ${msg}`),
@@ -887,11 +888,11 @@ export class CopyTraderService {
    * cannot be sized exactly without the transaction; those take the
    * analysis path unchanged.
    */
-  private handleFastLog(ev: WalletLogEvent): boolean {
+  private handleFastLog(ev: WalletLogEvent, allEvents: PumpTradeEvent[]): boolean {
     const wallet = this.wallets.get(ev.address);
     if (!wallet || !wallet.enabled || !this.config.enabled) return false;
 
-    const events = tradeEventsFromLogs(ev.logs).filter(e => e.user === ev.address);
+    const events = allEvents.filter(e => e.user === ev.address);
     if (!events.length) return false;
 
     const signals: LeaderSignal[] = [];
@@ -904,12 +905,21 @@ export class CopyTraderService {
       let remainingTokens: number | undefined;
       if (e.isBuy) {
         tallyUpdates.push([key, (tracked ?? 0) + tokens]);
+      } else if (this.config.sellMode === 'full') {
+        // Full mode sells 100% of OUR bag on any leader sell, so it never needs
+        // the leader's post-trade balance — forcing the slow confirmed-fetch
+        // here just to compute a fraction it then discards cost ~0.4-1s on
+        // every exit. Leave remainingTokens undefined (onLeaderSell forces
+        // fraction=1); update the tally only when we already have a real one,
+        // and never plant a fabricated 0 (that would over-exit a later
+        // mode switch before reconcile lands).
+        if (tracked !== undefined) tallyUpdates.push([key, Math.max(0, tracked - tokens)]);
       } else {
-        // The mirror needs the leader's post-trade balance, which the event
-        // does not carry. Our running tally is exact once a transaction has
-        // been reconciled against the chain; until then — the first sell of a
-        // bag we never saw them buy, or one larger than we tracked — the
-        // analysis path sizes it from the real balances.
+        // Mirror mode needs the leader's post-trade balance to size a PARTIAL
+        // sell, and the event does not carry it. Our running tally is exact
+        // once a transaction has been reconciled against the chain; until
+        // then — the first sell of a bag we never saw them buy, or one larger
+        // than we tracked — the analysis path sizes it from the real balances.
         if (tracked === undefined || tracked + 1e-6 < tokens) return false;
         remainingTokens = Math.max(0, tracked - tokens);
         tallyUpdates.push([key, remainingTokens]);
@@ -1024,7 +1034,9 @@ export class CopyTraderService {
     const release = await this.acquireTxFetchSlot(priority);
     try {
       const deadline = Date.now() + TX_FETCH_DEADLINE_MS;
-      await sleep(350);
+      // First read near the 'confirmed' floor; a live sell (priority) starts a
+      // hair sooner.
+      await sleep(priority ? 300 : 350);
       let pollDelay = TX_FETCH_INTERVAL_MS;
       while (Date.now() < deadline) {
         try {
@@ -1033,8 +1045,13 @@ export class CopyTraderService {
             commitment: 'confirmed',
           });
           if (parsed) return parsed;
-          await sleep(pollDelay);
-          pollDelay = Math.min(1000, pollDelay + 150);
+          // A live sell polls at a flat tight interval so each miss costs a
+          // small bounded wait instead of the escalating 250→400→550→700
+          // ladder — that backoff growth, not the pre-sleep, was the dominant
+          // term delaying a slow-confirmed exit. Non-priority keeps the gentle
+          // ramp to stay light on the shared key.
+          await sleep(priority ? 200 : pollDelay);
+          if (!priority) pollDelay = Math.min(1000, pollDelay + 150);
         } catch (err) {
           const is429 = isRateLimitError(err);
           await sleep(is429 ? 2000 : 500);
