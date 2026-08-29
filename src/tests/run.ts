@@ -3582,6 +3582,21 @@ console.log('\n-- Paper copy trading must not need a funded wallet --');
     assert.ok(/'paper'/.test(m[0]) && !/'real'/.test(m[0]),
       'only paper may substitute a notional stake');
   });
+
+  test('a dust-sized copy is SKIPPED, not bought (both at arrival and after reserves)', () => {
+    // A sub-cent entry loses the round-trip fee the moment it lands. Split
+    // sizing across many slots on a small wallet is exactly what produces
+    // these, so the floor is checked where the size is first computed AND
+    // again after the execution-time clamp, which can shrink a real order.
+    assert.ok(/minCopyBuySol/.test(src), 'the floor config must exist');
+    const hits = src.match(/copySol < this\.config\.minCopyBuySol/g) || [];
+    assert.ok(hits.length >= 2,
+      'the floor must be enforced at arrival AND after the reserve clamp');
+    // Default is a real floor, not 0.
+    assert.ok(/minCopyBuySol: 0\.01/.test(src), 'the default floor is 0.01 SOL');
+    // Sanitizer must accept and clamp it.
+    assert.ok(/partial\.minCopyBuySol/.test(src), 'the config field must be sanitised');
+  });
 }
 
 console.log('\n-- The local builder must match the DEPLOYED pump.fun layout --');

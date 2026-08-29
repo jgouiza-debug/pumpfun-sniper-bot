@@ -187,6 +187,11 @@ const DEFAULT_CONFIG: CopyTraderConfig = {
   // 0 = copy EVERY buy, which is the whole point of a wallet copier. Raise it
   // only to deliberately ignore the leader's dust.
   minLeaderBuySol: 0,
+  // Don't make dust buys. Below this, our computed size is skipped rather than
+  // bought — a sub-0.01 SOL entry loses the round-trip fee before it can move.
+  // Split sizing across many slots on a small wallet is exactly what produces
+  // these; this stops them without forcing the operator to shrink the book.
+  minCopyBuySol: 0.01,
   // Live again since 2026-08-13 (see onLeaderSell). ON by default because a
   // copy position whose leader has left is a position with no thesis behind
   // it — the whole reason it was opened was that the leader was in it.
@@ -1547,6 +1552,11 @@ export class CopyTraderService {
         ? 'Split sizing has nothing to stake — the wallet is empty after the exit-gas reserve.'
         : 'Computed copy size is 0 SOL — check buy sizing in Copy Settings.');
     }
+    // No dust buys: a size below the floor loses the round-trip fee on entry,
+    // so skip it rather than open a guaranteed-underwater mini position.
+    if (this.config.minCopyBuySol > 0 && copySol < this.config.minCopyBuySol) {
+      return skip(`Copy size ${copySol} SOL is below the ${this.config.minCopyBuySol} SOL minimum — too small to be worth the fees, skipped. Lower "min copy buy" or the open-position count to make each slice bigger.`);
+    }
 
     // The leader's realized price straight from their fill — exact for
     // pump.fun curve trades; DexScreener as the fallback when the trade
@@ -1645,6 +1655,16 @@ export class CopyTraderService {
           clampNote = ` (clamped from ${copySol} SOL — all the wallet can fund after the exit-gas reserve)`;
         }
         copySol = affordable;
+
+        // No dust buys, at execution time too: the clamp above can shrink a
+        // real order below the floor, and a sub-cent entry loses the round-trip
+        // fee the moment it lands.
+        if (this.config.minCopyBuySol > 0 && copySol < this.config.minCopyBuySol) {
+          wallet.skippedSignals++;
+          this.pushFeed(wallet, sig, 'skipped',
+            `Copy size ${copySol} SOL is below the ${this.config.minCopyBuySol} SOL minimum after reserves — too small to be worth the fees, skipped.`);
+          return;
+        }
 
         // Say what this slice actually has to make back. Fixed round-trip costs
         // (ATA rent + base fees + two priority fees) do NOT shrink with the
@@ -2546,6 +2566,7 @@ function sanitizeConfig(partial: Partial<CopyTraderConfig>): Partial<CopyTraderC
   if (isFiniteNum(partial.proportionalPct)) out.proportionalPct = clamp(partial.proportionalPct!, 1, 200);
   if (isFiniteNum(partial.maxBuySol)) out.maxBuySol = clamp(partial.maxBuySol!, 0.001, 100);
   if (isFiniteNum(partial.minLeaderBuySol)) out.minLeaderBuySol = clamp(partial.minLeaderBuySol!, 0, 100);
+  if (isFiniteNum(partial.minCopyBuySol)) out.minCopyBuySol = clamp(partial.minCopyBuySol!, 0, 100);
   if (typeof partial.copySells === 'boolean') out.copySells = partial.copySells;
   if (partial.sellMode === 'mirror' || partial.sellMode === 'full') out.sellMode = partial.sellMode;
   if (typeof partial.mirrorLeaderTokenMoves === 'boolean') out.mirrorLeaderTokenMoves = partial.mirrorLeaderTokenMoves;

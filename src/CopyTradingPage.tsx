@@ -699,6 +699,19 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 </div>
 
                 <div className="form-group">
+                  <label className="form-label">Min Copy Buy Size (SOL) — no dust buys</label>
+                  <input
+                    type="number" step="0.005" className="form-input"
+                    value={configForm.minCopyBuySol ?? 0.01}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, minCopyBuySol: Number(e.target.value) })}
+                  />
+                  <div className="form-help" style={{ fontSize: '8px' }}>
+                    Skip the copy when OUR computed size would be smaller than this. A sub-cent
+                    entry loses the round-trip fee before it can move. 0 = allow any size.
+                  </div>
+                </div>
+
+                <div className="form-group">
                   <label className="form-label">
                     Max Open Copy Positions{sizeMode === 'split' ? ' (= split divisor)' : ''}
                   </label>

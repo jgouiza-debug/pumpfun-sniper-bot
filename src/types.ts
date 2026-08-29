@@ -792,6 +792,13 @@ export interface CopyTraderConfig {
   maxBuySol: number;
   /** Ignore leader buys below this size. 0 (the default) copies EVERY buy. */
   minLeaderBuySol: number;
+  /**
+   * Skip the copy entirely when OUR computed buy would be below this size in
+   * SOL. Distinct from minLeaderBuySol (which floors the LEADER's buy): this
+   * floors what WE would spend, so a dust-sized slice from split sizing is not
+   * bought at all — the fees alone make a sub-cent entry a guaranteed loss.
+   */
+  minCopyBuySol: number;
   copySells: boolean;
   sellMode: CopySellMode;
   /**
