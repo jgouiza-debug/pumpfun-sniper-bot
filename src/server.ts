@@ -549,7 +549,27 @@ app.post('/api/heartbeat', (req, res) => {
   res.json({ success: true });
 });
 
+// Under Electron the window IS the lifecycle: `window-all-closed` and
+// `before-quit` already run the shutdown path, and the renderer's cross-process
+// heartbeat is exactly what macOS throttles when the window is minimized or the
+// machine sleeps. Running this guard there does nothing but race the renderer
+// and kill a live window — measured 2026-08-29, the packaged app shut its own
+// server down ~12s after launch and showed a blank window. So it is browser-tab
+// only. (process.versions.electron is set in the same process the main script
+// requires the server into.)
+const UNDER_ELECTRON = Boolean((process as any).versions?.electron) || process.env.SNIPER_PACKAGED === '1';
+let lastHeartbeatTick = Date.now();
+
 setInterval(() => {
+  // If the process itself was suspended (laptop asleep, app backgrounded), the
+  // gap between two 3s ticks blows past the interval. That is not a dead UI —
+  // it is a frozen process. Treat the wall-clock jump as a fresh heartbeat and
+  // skip this tick rather than shutting down a session that was only asleep.
+  const sinceLastTick = Date.now() - lastHeartbeatTick;
+  lastHeartbeatTick = Date.now();
+  if (sinceLastTick > 10_000) { lastTabHeartbeatAt = Date.now(); return; }
+
+  if (UNDER_ELECTRON) return;
   if (!receivedFirstTabHeartbeat || Date.now() - lastTabHeartbeatAt <= 12_000) return;
   const engineStatus = sniperEngine.getStatus();
   const copyStatus = copyTrader.getStatus();
@@ -908,6 +928,7 @@ function gracefulShutdown(reason: string, server?: http.Server): void {
       console.warn(`⚠️ Shutting down (${reason}) with ${open.length} open position(s): ${open.map((p: any) => `$${p.tokenSymbol}`).join(', ')}. They are persisted and will be restored on the next start; no exits run while the process is down.`);
     }
     try { sniperEngine.toggleBot(false); } catch { /* already stopped */ }
+    try { copyTrader.flushStateSync(); } catch { /* best effort */ }
     sniperEngine.markCleanShutdown();
   } catch { /* best effort on the way out */ }
   const done = () => process.exit(0);

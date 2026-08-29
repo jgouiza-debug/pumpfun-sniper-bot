@@ -3696,6 +3696,69 @@ console.log('\n-- An active session must not shut itself down --');
       'a local trading console must keep its timers running while minimized');
   });
 
+  test('OLD BUG: the heartbeat guard ran under Electron and blanked the window', () => {
+    // Even with the sessionActive fix, a fresh Electron launch with copy trading
+    // OFF and nothing open still shut the server down ~12s in, before the first
+    // renderer heartbeat landed — and the window went blank because the server
+    // it was loading had quit. Electron owns its own lifecycle via window
+    // events, so the tab-heartbeat guard must not run there at all.
+    assert.ok(/const UNDER_ELECTRON =/.test(srv), 'the guard must detect Electron');
+    assert.ok(/versions\?\.electron/.test(srv), 'process.versions.electron is the signal');
+    assert.ok(/if \(UNDER_ELECTRON\) return;/.test(srv),
+      'under Electron the tab-heartbeat guard must be a no-op');
+  });
+
+  test('a suspended process (laptop asleep) is not a dead UI', () => {
+    // If the machine slept, the gap between two 3s ticks is huge — that is a
+    // frozen process, not closed tabs. Treat the jump as a fresh heartbeat.
+    assert.ok(/sinceLastTick > 10_000/.test(srv), 'a wall-clock jump must be detected');
+    assert.ok(/lastTabHeartbeatAt = Date\.now\(\); return;/.test(srv),
+      'a suspend must reset the heartbeat and skip the tick, not shut down');
+  });
+
+  test('shutdown flushes copy state synchronously so the last trade is not lost', () => {
+    // persist() debounces 500ms; every shutdown path exits in the same tick. A
+    // sell recorded just before shutdown was never written, so the next boot
+    // restored a phantom OPEN position for a bag already sold.
+    assert.ok(/copyTrader\.flushStateSync\(\)/.test(srv),
+      'gracefulShutdown must flush copy state before exit');
+    const cs = fs3.readFileSync(require.resolve('../services/copyTraderService.ts'), 'utf8');
+    assert.ok(/public flushStateSync\(\)/.test(cs) && /clearTimeout\(this\.persistTimer\)/.test(cs),
+      'flushStateSync must cancel the debounce and write inline');
+  });
+
+  test('Electron quit runs the clean-shutdown path (no false crash next boot)', () => {
+    // app.quit() delivers no signal to the in-process engine, so
+    // markCleanShutdown never ran and the next boot reported a crash — which
+    // auto-disabled real copy mode. before-quit now triggers it.
+    assert.ok(/app\.on\('before-quit', runCleanShutdown\)/.test(mainJs),
+      'before-quit must run the clean shutdown');
+    assert.ok(/process\.emit\('SIGTERM'\)/.test(mainJs),
+      'it reaches the in-process server via SIGTERM');
+  });
+
+  test('realModeLock no longer exits before the server can shut down cleanly', () => {
+    // Its SIGINT handler used to process.exit(130) before server.ts's
+    // gracefulShutdown could run, so Ctrl+C skipped markCleanShutdown and every
+    // terminal stop looked like a crash.
+    const rl = fs3.readFileSync(require.resolve('../services/realModeLock.ts'), 'utf8');
+    assert.ok(!/process\.exit\(130\)/.test(rl), 'the premature exit must be gone');
+    assert.ok(!/process\.on\('SIGINT'/.test(rl), 'realModeLock must not own SIGINT');
+    assert.ok(/process\.on\('exit', \(\) => realModeLock\.release\(\)\)/.test(rl),
+      'the lock still releases on the exit event');
+  });
+
+  test('paper and real copy positions are never pooled for sizing or merging', () => {
+    // A leftover paper position counted against the real open-position cap
+    // collapsed split sizing into a near-all-in real buy, and a real buy could
+    // DCA-merge into a paper bag, stranding real tokens behind a simulated exit.
+    const cs = fs3.readFileSync(require.resolve('../services/copyTraderService.ts'), 'utf8');
+    assert.ok(/openPositionsForCurrentMode\(\)/.test(cs), 'counts must be provenance-aware');
+    assert.ok(/mergeablePositionFor\(/.test(cs), 'merges must be provenance-aware');
+    assert.ok(/isPaperPos\(p\) === wantPaper/.test(cs),
+      'same-mode is decided by the sim_ txid provenance');
+  });
+
   test('an instant window-process exit is a handoff, not the user closing it', () => {
     // Chromium that finds a live instance on the same profile hands off and
     // exits immediately: measured 142ms from spawn to exit, and the bot shut

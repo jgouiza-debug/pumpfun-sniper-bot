@@ -1802,6 +1802,10 @@ export class SniperEngine {
     return Boolean((this.config.pumpPortalApiKey || process.env.PUMPPORTAL_API_KEY || '').trim());
   }
 
+  public hasHeliusKey(): boolean {
+    return Boolean((this.config.heliusApiKey || process.env.HELIUS_API_KEY || '').trim());
+  }
+
   private subscribeStream(): void {
     if (this.ws) return;
 

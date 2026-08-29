@@ -169,13 +169,11 @@ export const realModeLock = new RealModeLock();
 // Note: We do NOT call process.exit() here — the server must keep running even
 // when the bot is stopped/paused. Only a hard kill (SIGKILL) should stop it.
 process.on('exit', () => realModeLock.release());
-process.on('SIGINT', () => {
-  realModeLock.release();
-  // Allow graceful shutdown only on explicit Ctrl+C in a terminal
-  process.exit(130);
-});
-process.on('SIGTERM', () => {
-  // On SIGTERM (e.g. from a process manager), release the lock but stay alive
-  realModeLock.release();
-});
+// Do NOT register SIGINT/SIGTERM handlers here. This module is imported before
+// server.ts registers its own, and listeners run in registration order — a
+// process.exit() in this one killed the process before server.ts's
+// gracefulShutdown could run, so Ctrl+C skipped markCleanShutdown() and every
+// terminal stop looked like a crash (which then auto-disabled real copy mode on
+// the next boot). server.ts owns the signal handlers; its gracefulShutdown
+// exits, which fires the 'exit' listener above and releases the lock.
 

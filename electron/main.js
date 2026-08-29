@@ -158,9 +158,21 @@ if (!gotLock) {
     } catch { /* never block startup on this */ }
   }
 
+  // Run the server's graceful-shutdown path exactly once on the way out.
+  // app.quit() alone does NOT deliver a signal to the in-process engine, so
+  // markCleanShutdown()/flushStateSync() never ran — the next boot reported a
+  // crash and auto-disabled real copy mode. The server requires itself into
+  // this same process, so emitting SIGTERM here reaches its handler, which
+  // flushes state, marks a clean exit, and calls process.exit.
+  let cleanShutdownStarted = false;
+  const runCleanShutdown = () => {
+    if (cleanShutdownStarted) return;
+    cleanShutdownStarted = true;
+    try { process.emit('SIGTERM'); } catch { /* fall through to quit */ }
+  };
+  app.on('before-quit', runCleanShutdown);
   app.on('window-all-closed', () => {
-    // Quitting ends the engine (same process). The server's SIGTERM/exit path
-    // records a clean shutdown and logs any open positions.
+    runCleanShutdown();
     app.quit();
   });
 }

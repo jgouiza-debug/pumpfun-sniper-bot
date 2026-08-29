@@ -1484,13 +1484,13 @@ export class CopyTraderService {
       return skip(`Leader buy ${sig.solAmount.toFixed(4)} SOL is below the ${this.config.minLeaderBuySol} SOL minimum.`);
     }
 
-    const existing = this.positions.find(p => p.mint === mint && p.status !== 'CLOSED');
+    const existing = this.mergeablePositionFor(mint);
     if (existing && this.config.blockRepeatBuys) {
       return skip('Already holding this mint and repeat buys are blocked.');
     }
 
     if (!existing) {
-      const openCount = this.positions.filter(p => p.status !== 'CLOSED').length;
+      const openCount = this.openPositionsForCurrentMode().length;
       if (openCount >= this.config.maxOpenPositions) {
         return skip(`Max open copy positions reached (${openCount}/${this.config.maxOpenPositions}) — SELL a position to free a slot, or raise the limit in Copy Settings.`);
       }
@@ -1518,7 +1518,7 @@ export class CopyTraderService {
     } else if (this.config.buySizeMode === 'split') {
       // Provisional only — real mode re-slices against a freshly read balance
       // inside the queue, where the exit-gas and in-flight reserves are known.
-      const openNow = this.positions.filter(p => p.status !== 'CLOSED').length;
+      const openNow = this.openPositionsForCurrentMode().length;
       const deployableSol = sniperEngine.getWalletStatus().deployableSol;
       const stakeSol = this.splitStakeSol(deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol());
       // Paper must not need a funded wallet. Split sizing returns 0 both with
@@ -1570,13 +1570,13 @@ export class CopyTraderService {
 
       // Re-resolve at execution time: a second leader buy that queued behind
       // this one must fold into the position this one opens, not open a twin.
-      const existingNow = this.positions.find(p => p.mint === mint && p.status !== 'CLOSED');
+      const existingNow = this.mergeablePositionFor(mint);
 
       // Re-check the book cap HERE too: the arrival-time check cannot see
       // buys of other mints that are still landing (positions are recorded
       // only after confirmation), so N concurrent signals could all pass it.
       if (!existingNow) {
-        const openNow = this.positions.filter(p => p.status !== 'CLOSED').length;
+        const openNow = this.openPositionsForCurrentMode().length;
         const landingNew = [...this.inFlightBuySol.keys()]
           .filter(m => m !== mint && !this.positions.some(p => p.mint === m && p.status !== 'CLOSED')).length;
         if (openNow + landingNew >= this.config.maxOpenPositions) {
@@ -1610,7 +1610,7 @@ export class CopyTraderService {
         // Balance-only forced read, bounded so a hung RPC socket cannot pin
         // this mint's queue while a leader flip-sell waits behind the buy.
         await Promise.race([sniperEngine.refreshWalletBalance(), sleep(1500)]);
-        const openAfterThisBuy = this.positions.filter(p => p.status !== 'CLOSED').length + (existingNow ? 0 : 1);
+        const openAfterThisBuy = this.openPositionsForCurrentMode().length + (existingNow ? 0 : 1);
         const reservedForExits = round4(COPY_EXIT_GAS_RESERVE_SOL * openAfterThisBuy);
         // SOL claimed by concurrent buys of OTHER mints (they run in their
         // own queues against the same snapshot) — without this, two leaders
@@ -1736,6 +1736,30 @@ export class CopyTraderService {
   }
 
   /** Open a new copy position, or fold a repeat buy into the existing one. */
+  /** A position is paper iff its buy was a simulated fill. */
+  private isPaperPos(p: CopyPositionInternal): boolean {
+    return (p.buyTxid ?? '').startsWith('sim_');
+  }
+
+  /**
+   * Open positions of the SAME provenance as the trade the current mode would
+   * make. Paper and real positions must never be pooled: counting a leftover
+   * paper bag against the real open-position cap collapsed split sizing into a
+   * near-all-in real buy, and merging a real buy into a paper position stranded
+   * real tokens behind a simulated exit. In a single-mode session this is every
+   * open position, so it changes nothing there.
+   */
+  private openPositionsForCurrentMode(): CopyPositionInternal[] {
+    const wantPaper = this.config.tradingMode === 'paper';
+    return this.positions.filter(p => p.status !== 'CLOSED' && this.isPaperPos(p) === wantPaper);
+  }
+
+  /** The open position for `mint` that the current mode may add to, if any. */
+  private mergeablePositionFor(mint: string): CopyPositionInternal | undefined {
+    const wantPaper = this.config.tradingMode === 'paper';
+    return this.positions.find(p => p.mint === mint && p.status !== 'CLOSED' && this.isPaperPos(p) === wantPaper);
+  }
+
   private recordBuy(
     wallet: TrackedWalletInternal,
     sig: LeaderSignal,
@@ -2372,6 +2396,29 @@ export class CopyTraderService {
         }, null, 2));
       } catch { /* persistence is best-effort */ }
     }, 500);
+  }
+
+  /**
+   * Write state to disk RIGHT NOW, cancelling any pending debounced write.
+   *
+   * persist() coalesces behind a 500ms timer, but every shutdown path
+   * (gracefulShutdown, SIGTERM, the updater restart, Electron quit) exits
+   * synchronously in the same tick — so a copy sell recorded <500ms before
+   * shutdown was never written, and the next boot restored a phantom OPEN
+   * position for a bag already sold. Shutdown calls this so the last trade is
+   * always on disk.
+   */
+  public flushStateSync(): void {
+    if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = null; }
+    try {
+      fs.writeFileSync(STATE_FILE, JSON.stringify({
+        configVersion: COPY_CONFIG_VERSION,
+        config: this.config,
+        wallets: [...this.wallets.values()],
+        positions: this.positions.filter(p => p.status !== 'CLOSED'),
+        history: this.history.slice(0, HISTORY_LIMIT),
+      }, null, 2));
+    } catch { /* best effort on the way out */ }
   }
 
   private loadState(): void {
