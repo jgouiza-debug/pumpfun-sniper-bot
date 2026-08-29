@@ -2173,7 +2173,7 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
     // Getting it backwards builds a transaction that fails on chain, so the
     // order is pinned here as well as caught by the simulation gate.
     const src = require('fs').readFileSync(require.resolve('../services/localTxBuilder.ts'), 'utf8');
-    const sell = src.slice(src.indexOf('public async buildSell'), src.indexOf('ownedTokenAmountRaw'));
+    const sell = src.slice(src.indexOf('private async buildSellVariant'), src.indexOf('Build a sell and prove it'));
     // The token program is resolved per mint (legacy SPL vs Token-2022), so the
     // account is `tokenProgram`, not the module constant.
     const vaultAt = sell.indexOf('p.creatorVault');
@@ -2181,7 +2181,7 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
     assert.ok(vaultAt > 0 && tokenAt > 0, 'both accounts must appear in the sell instruction');
     assert.ok(vaultAt < tokenAt, 'sell order is creator_vault then token_program');
 
-    const buy = src.slice(src.indexOf('public async buildBuy'), src.indexOf('public async buildSell'));
+    const buy = src.slice(src.indexOf('private async buildBuyWith'), src.indexOf('Shadow compare'));
     const bVault = buy.indexOf('p.creatorVault');
     // skip the ATA-create occurrence and take the one inside the pump instruction
     const bToken = buy.lastIndexOf('pubkey: tokenProgram', bVault);
@@ -3581,6 +3581,57 @@ console.log('\n-- Paper copy trading must not need a funded wallet --');
     assert.ok(m, 'the sizing branch must exist');
     assert.ok(/'paper'/.test(m[0]) && !/'real'/.test(m[0]),
       'only paper may substitute a notional stake');
+  });
+}
+
+console.log('\n-- The local builder must match the DEPLOYED pump.fun layout --');
+{
+  const src = require('fs').readFileSync(require.resolve('../services/localTxBuilder.ts'), 'utf8');
+
+  test('OLD BUG: 6062 BuybackFeeRecipientMissing — two accounts the IDL omits', () => {
+    // The deployed program requires bonding_curve_v2 and buyback_fee_recipient
+    // that its published IDL does not list. Verified 2026-08-29 over 108 landed
+    // instructions (29 mints, 72 wallets), and by simulating a landed buy with
+    // one account swapped for a random key so the program names them itself:
+    //   idx16 swapped -> 6074 InvalidBondingCurveV2       (sell.rs:133)
+    //   idx17 swapped -> 6057 BuybackFeeRecipientNotAuthorized (lib.rs:1494)
+    //   omitted       -> 6062 BuybackFeeRecipientMissing  (sell.rs:145)
+    assert.ok(/bonding-curve-v2/.test(src), 'the v2 curve seed must be present');
+    assert.ok(/GLOBAL_BUYBACK_OFFSET = 741/.test(src),
+      'the buyback recipients are read from global at 741 + 32*i');
+    assert.ok(/getBuybackFeeRecipient/.test(src), 'the recipient must be READ, never hardcoded');
+    assert.ok(!/5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD/.test(src),
+      'pump.fun rotates these — hardcoding one earns 6057 the day it changes');
+  });
+
+  test('the SELL takes the cashback form FIRST — the short form strands exits', () => {
+    // An adversarial re-check overturned the first mapping here: on 6 of 6 live
+    // holders the 16-account sell fails 6073 InvalidCashbackAccumulator
+    // (sell.rs:33) and only the 17-account form with user_volume_accumulator
+    // first simulates clean. Which form a wallet needs is per-user state, so
+    // both are tried and the chain decides.
+    const sell = src.slice(src.indexOf('public async buildSell('), src.indexOf('// ---------------- Shadow compare'));
+    assert.ok(/for \(const withCashback of \[true, false\]\)/.test(sell),
+      'the cashback form must be attempted BEFORE the short form');
+    assert.ok(/userVolumeAccumulator/.test(src) && /withCashback \?/.test(src),
+      'the accumulator is what distinguishes the two forms');
+  });
+
+  test('fee recipients are walked, not assumed — one is not authorized for every mint', () => {
+    // pump.fun runs several fee recipients at once; the primary alone failed
+    // 3 of 5 live mints with 6000 NotAuthorized (fee_recipient.rs:19).
+    assert.ok(/getFeeRecipients/.test(src), 'the authorized set must be read');
+    assert.ok(/162 \+ 32 \* i/.test(src), 'the secondary array lives at 162 + 32*i');
+    assert.ok(/6000\|NotAuthorized\|InvalidAccountForFee/.test(src),
+      'only a credential-shaped rejection should trigger the next recipient');
+  });
+
+  test('nothing is signed without a clean simulation — the whole safety story', () => {
+    assert.ok(/const sim = await this\.simulateOk\(built\.tx\)/.test(src),
+      'every locally built tx is simulated before it is returned');
+    const engine = require('fs').readFileSync(require.resolve('../services/sniperEngine.ts'), 'utf8');
+    assert.ok(/if \(sim\.ok\) \{[\s\S]{0,120}buildSource = 'local'/.test(engine),
+      'the engine only uses a build that simulated clean');
   });
 }
 

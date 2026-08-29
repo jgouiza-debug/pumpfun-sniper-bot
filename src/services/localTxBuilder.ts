@@ -43,6 +43,25 @@ const FEE_PROGRAM = new PublicKey('pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ')
 /** The IDL's second fee_config seed, a 32-byte constant. */
 const FEE_CONFIG_SEED = Buffer.from('0156e0f693665acf44db1568bf175baa5189cb97f5d2ff3b655d2bb6fd6d18b0', 'hex');
 
+/**
+ * Two more accounts the DEPLOYED program requires that its published IDL does
+ * not list, verified 2026-08-29 across 108 landed instructions (29 mints, 72
+ * wallets) and by simulating a landed buy with one account swapped for a random
+ * key, which makes the program name them itself:
+ *
+ *   idx swapped -> AnchorError 6074 InvalidBondingCurveV2   (sell.rs:133)
+ *   idx swapped -> AnchorError 6057 BuybackFeeRecipientNotAuthorized (lib.rs:1494)
+ *   omitted     -> AnchorError 6062 BuybackFeeRecipientMissing (sell.rs:145)
+ *
+ * 6062 is the error this builder used to die on. The seed below was also found
+ * verbatim in the deployed BPF binary next to "bonding-curve" and
+ * "creator-vault".
+ */
+const BONDING_CURVE_V2_SEED = 'bonding-curve-v2';
+/** Offset of the 8-entry buyback-recipient array inside the pump `global` account. */
+const GLOBAL_BUYBACK_OFFSET = 741;
+const GLOBAL_BUYBACK_COUNT = 8;
+
 // Anchor discriminator, computed rather than trusted from memory.
 const BUY_DISCRIMINATOR = crypto.createHash('sha256').update('global:buy').digest().subarray(0, 8);
 const SELL_DISCRIMINATOR = crypto.createHash('sha256').update('global:sell').digest().subarray(0, 8);
@@ -70,6 +89,8 @@ export class LocalTxBuilder {
   private blockhashFetchedAt = 0;
   private refresher: NodeJS.Timeout | null = null;
   private feeRecipient: PublicKey | null = null;
+  private buybackRecipient: PublicKey | null = null;
+  private feeRecipients: PublicKey[] | null = null;
   private lastParityAt = 0;
   private lastParityDetail = 'never compared';
 
@@ -128,27 +149,55 @@ export class LocalTxBuilder {
       [Buffer.from('user_volume_accumulator'), user.toBuffer()], PUMP_PROGRAM);
     const [feeConfig] = PublicKey.findProgramAddressSync(
       [Buffer.from('fee_config'), FEE_CONFIG_SEED], FEE_PROGRAM);
+    // Uninitialized on chain for every mint checked — pass it anyway, the
+    // program only validates the address.
+    const [bondingCurveV2] = PublicKey.findProgramAddressSync(
+      [Buffer.from(BONDING_CURVE_V2_SEED), mint.toBuffer()], PUMP_PROGRAM);
     return {
       global, bondingCurve, eventAuthority, associatedBondingCurve, associatedUser, creatorVault,
-      globalVolumeAccumulator, userVolumeAccumulator, feeConfig,
+      globalVolumeAccumulator, userVolumeAccumulator, feeConfig, bondingCurveV2,
     };
   }
 
   // ---------------- On-chain reads ----------------
 
-  private async getFeeRecipient(): Promise<PublicKey | null> {
-    if (this.feeRecipient) return this.feeRecipient;
-    if (!this.connection) return null;
+  /**
+   * Every fee recipient the pump `global` account authorizes, most-likely first.
+   *
+   * Offset 41 is the primary, and offsets 162 + 32*i (i = 0..6) are the
+   * secondary array; both are live simultaneously — measured 2026-08-29, seven
+   * distinct recipients appeared across 20 landed instructions. Using the
+   * primary alone made 3 of 5 buys simulate as 6000 NotAuthorized
+   * (fee_recipient.rs:19), so the caller walks this list until one simulates.
+   */
+  private async getFeeRecipients(): Promise<PublicKey[]> {
+    if (this.feeRecipients) return this.feeRecipients;
+    if (!this.connection) return [];
     try {
       const [global] = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
       const info = await this.connection.getAccountInfo(global, 'confirmed');
-      if (!info) return null;
-      // Global layout: 8 discriminator + 1 initialized + 32 authority + 32 feeRecipient
-      this.feeRecipient = new PublicKey(info.data.subarray(41, 73));
-      return this.feeRecipient;
+      if (!info) return [];
+      const out: PublicKey[] = [];
+      const push = (off: number) => {
+        if (off + 32 > info.data.length) return;
+        const pk = new PublicKey(info.data.subarray(off, off + 32));
+        if (!pk.equals(PublicKey.default) && !out.some((k) => k.equals(pk))) out.push(pk);
+      };
+      push(41);                                   // primary
+      for (let i = 0; i < 7; i++) push(162 + 32 * i); // secondary array
+      push(483);
+      this.feeRecipients = out;
+      return out;
     } catch {
-      return null;
+      return [];
     }
+  }
+
+  /** The recipient that last simulated clean, tried first next time. */
+  private async getFeeRecipient(): Promise<PublicKey | null> {
+    const all = await this.getFeeRecipients();
+    if (!all.length) return null;
+    return this.feeRecipient ?? all[0];
   }
 
   /** The token program that actually owns this mint (legacy SPL or Token-2022). */
@@ -160,6 +209,33 @@ export class LocalTxBuilder {
       const owner = info.owner;
       if (owner.equals(TOKEN_PROGRAM) || owner.equals(TOKEN_2022_PROGRAM)) return owner;
       return null; // some other program owns it — not a token we can trade
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * One of the 8 authorized buyback fee recipients, read out of the pump
+   * `global` account rather than hardcoded — pump.fun rotates them, and a key
+   * that is not in the live array is rejected with 6057
+   * BuybackFeeRecipientNotAuthorized. Any of the 8 is accepted.
+   */
+  private async getBuybackFeeRecipient(): Promise<PublicKey | null> {
+    if (this.buybackRecipient) return this.buybackRecipient;
+    if (!this.connection) return null;
+    try {
+      const [global] = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
+      const info = await this.connection.getAccountInfo(global, 'confirmed');
+      if (!info || info.data.length < GLOBAL_BUYBACK_OFFSET + 32 * GLOBAL_BUYBACK_COUNT) return null;
+      const keys: PublicKey[] = [];
+      for (let i = 0; i < GLOBAL_BUYBACK_COUNT; i++) {
+        const off = GLOBAL_BUYBACK_OFFSET + 32 * i;
+        const pk = new PublicKey(info.data.subarray(off, off + 32));
+        if (!pk.equals(PublicKey.default)) keys.push(pk);
+      }
+      if (!keys.length) return null;
+      this.buybackRecipient = keys[0];
+      return this.buybackRecipient;
     } catch {
       return null;
     }
@@ -191,24 +267,25 @@ export class LocalTxBuilder {
    * when: curve missing/complete (migrated), blockhash stale, or fee recipient
    * unknown. Never throws onto the buy path.
    */
-  public async buildBuy(params: {
+  private async buildBuyWith(params: {
     user: PublicKey;
     mint: string;
     solAmount: number;
     slippagePct: number;
     priorityFeeSol: number;
-  }): Promise<{ tx: VersionedTransaction; tokensOutRaw: bigint; detail: string } | null> {
+  }, feeRecipientOverride: PublicKey | null): Promise<{ tx: VersionedTransaction; tokensOutRaw: bigint; detail: string } | null> {
     try {
       if (!this.connection) return null;
       if (!this.blockhash || Date.now() - this.blockhashFetchedAt > 60_000) return null;
 
       const mint = new PublicKey(params.mint);
-      const [feeRecipient, curve, tokenProgram] = await Promise.all([
-        this.getFeeRecipient(), this.getCurveState(mint), this.getTokenProgram(mint),
+      const [defaultFeeRecipient, curve, tokenProgram, buybackRecipient] = await Promise.all([
+        this.getFeeRecipient(), this.getCurveState(mint), this.getTokenProgram(mint), this.getBuybackFeeRecipient(),
       ]);
+      const feeRecipient = feeRecipientOverride ?? defaultFeeRecipient;
       if (!feeRecipient) return null;
       if (!curve || curve.complete) return null; // migrated or unknown -> AMM territory, not ours
-      if (!tokenProgram) return null;
+      if (!tokenProgram || !buybackRecipient) return null;
 
       const lamportsIn = BigInt(Math.floor(params.solAmount * 1e9));
       const tokensOut = bondingCurveTokensOut(lamportsIn, curve.virtualSolReserves, curve.virtualTokenReserves);
@@ -264,6 +341,11 @@ export class LocalTxBuilder {
           { pubkey: p.userVolumeAccumulator, isSigner: false, isWritable: true },
           { pubkey: p.feeConfig, isSigner: false, isWritable: false },
           { pubkey: FEE_PROGRAM, isSigner: false, isWritable: false },
+          // Required by the deployed program, absent from its IDL. Omitting
+          // them is exactly the 6062 BuybackFeeRecipientMissing this builder
+          // used to die on. Confirmed clean by three independent simulations.
+          { pubkey: p.bondingCurveV2, isSigner: false, isWritable: false },
+          { pubkey: buybackRecipient, isSigner: false, isWritable: true },
         ],
         data: Buffer.concat([BUY_DISCRIMINATOR, u64le(tokensOut), u64le(maxSolCost)]),
       }));
@@ -296,25 +378,26 @@ export class LocalTxBuilder {
    * a transaction that simulates as a program error, which is exactly what the
    * simulation gate below is for.
    */
-  public async buildSell(params: {
+  private async buildSellVariant(params: {
     user: PublicKey;
     mint: string;
     tokenAmountRaw: bigint;
     slippagePct: number;
     priorityFeeSol: number;
-  }): Promise<{ tx: VersionedTransaction; minSolOutRaw: bigint; detail: string } | null> {
+  }, withCashback: boolean, feeRecipientOverride: PublicKey | null = null): Promise<{ tx: VersionedTransaction; minSolOutRaw: bigint; detail: string } | null> {
     try {
       if (!this.connection) return null;
       if (!this.blockhash || Date.now() - this.blockhashFetchedAt > 60_000) return null;
       if (params.tokenAmountRaw <= 0n) return null;
 
       const mint = new PublicKey(params.mint);
-      const [feeRecipient, curve, tokenProgram] = await Promise.all([
-        this.getFeeRecipient(), this.getCurveState(mint), this.getTokenProgram(mint),
+      const [defaultFeeRecipient, curve, tokenProgram, buybackRecipient] = await Promise.all([
+        this.getFeeRecipient(), this.getCurveState(mint), this.getTokenProgram(mint), this.getBuybackFeeRecipient(),
       ]);
+      const feeRecipient = feeRecipientOverride ?? defaultFeeRecipient;
       if (!feeRecipient) return null;
       if (!curve || curve.complete) return null; // migrated -> AMM, not ours
-      if (!tokenProgram) return null;
+      if (!tokenProgram || !buybackRecipient) return null;
 
       const p = this.pdas(mint, params.user, curve.creator, tokenProgram);
       if (!p.creatorVault) {
@@ -349,6 +432,17 @@ export class LocalTxBuilder {
             // Sell takes fee_config + fee_program, and NO volume accumulators.
             { pubkey: p.feeConfig, isSigner: false, isWritable: false },
             { pubkey: FEE_PROGRAM, isSigner: false, isWritable: false },
+            // Extras the deployed program wants but the IDL omits. Sell takes
+            // the CASHBACK form: user_volume_accumulator FIRST, then
+            // bonding_curve_v2, then the buyback recipient. Measured
+            // 2026-08-29 on 6 of 6 live holders: without the accumulator the
+            // program answers 6073 InvalidCashbackAccumulator (sell.rs:33),
+            // with it the sell simulates clean. `withCashback` false builds the
+            // shorter form some wallets still take — which one applies is
+            // per-user state, so buildSell simulates and picks.
+            ...(withCashback ? [{ pubkey: p.userVolumeAccumulator, isSigner: false, isWritable: true }] : []),
+            { pubkey: p.bondingCurveV2, isSigner: false, isWritable: false },
+            { pubkey: buybackRecipient, isSigner: false, isWritable: true },
           ],
           data: Buffer.concat([SELL_DISCRIMINATOR, u64le(params.tokenAmountRaw), u64le(minSolOut)]),
         }),
@@ -363,11 +457,52 @@ export class LocalTxBuilder {
       return {
         tx: new VersionedTransaction(msg),
         minSolOutRaw: minSolOut,
-        detail: `local sell build: ${params.tokenAmountRaw} raw tokens, minSol ${Number(minSolOut) / 1e9}`,
+        detail: `local sell build (${withCashback ? 'cashback' : 'short'} form): ${params.tokenAmountRaw} raw tokens, minSol ${Number(minSolOut) / 1e9}`,
       };
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Build a sell and prove it, trying the cashback form first.
+   *
+   * Which form a wallet needs is per-user state that cannot be read ahead of
+   * time — measured 2026-08-29, ordinary holders require the accumulator
+   * (without it: 6073 InvalidCashbackAccumulator) while a minority of landed
+   * sells used the shorter form. Rather than guess, build both and let the
+   * chain decide: simulation is already the gate before signing, so trying the
+   * second form costs one extra simulate on an exit that would otherwise fail.
+   *
+   * An exit that cannot be built is worse than an entry that cannot be — it
+   * strands a position — so this deliberately spends the extra round trip.
+   */
+  public async buildSell(params: {
+    user: PublicKey;
+    mint: string;
+    tokenAmountRaw: bigint;
+    slippagePct: number;
+    priorityFeeSol: number;
+  }): Promise<{ tx: VersionedTransaction; minSolOutRaw: bigint; detail: string } | null> {
+    const candidates = await this.getFeeRecipients();
+    const ordered = this.feeRecipient
+      ? [this.feeRecipient, ...candidates.filter((k) => !k.equals(this.feeRecipient!))]
+      : candidates;
+
+    for (const withCashback of [true, false]) {
+      for (const fr of ordered) {
+        const built = await this.buildSellVariant(params, withCashback, fr);
+        if (!built) break; // build failure is about the curve, not the recipient
+        const sim = await this.simulateOk(built.tx);
+        if (sim.ok) {
+          this.feeRecipient = fr;
+          return built;
+        }
+        this.lastParityDetail = `sell ${withCashback ? 'cashback' : 'short'} form: ${sim.detail}`;
+        if (!/6000|NotAuthorized|InvalidAccountForFee/.test(sim.detail)) break; // wrong FORM, try the other one
+      }
+    }
+    return null;
   }
 
   /** Raw token balance of the user's ATA for `mint`, or null when unreadable. */
@@ -420,6 +555,48 @@ export class LocalTxBuilder {
     } catch (err: any) {
       return { ok: false, detail: `simulation threw: ${err?.message || 'unknown'}` };
     }
+  }
+
+  /**
+   * Build a buy and prove it by simulation, walking the authorized fee
+   * recipients until one is accepted.
+   *
+   * pump.fun runs several fee recipients at once and rejects the wrong one for
+   * a given mint with 6000 NotAuthorized. Using the primary alone failed 3 of 5
+   * live mints. The recipient that works is cached, so the common case costs a
+   * single simulate.
+   */
+  public async buildBuy(params: {
+    user: PublicKey;
+    mint: string;
+    solAmount: number;
+    slippagePct: number;
+    priorityFeeSol: number;
+  }): Promise<{ tx: VersionedTransaction; tokensOutRaw: bigint; detail: string } | null> {
+    const candidates = await this.getFeeRecipients();
+    if (!candidates.length) return null;
+    // Whatever worked last time first — pump.fun does not rotate these often.
+    const ordered = this.feeRecipient
+      ? [this.feeRecipient, ...candidates.filter((k) => !k.equals(this.feeRecipient!))]
+      : candidates;
+
+    for (const fr of ordered) {
+      const built = await this.buildBuyWith(params, fr);
+      if (!built) return null; // a build failure is not about the recipient
+      const sim = await this.simulateOk(built.tx);
+      if (sim.ok) {
+        this.feeRecipient = fr;
+        return built;
+      }
+      // Only a credential-shaped rejection is worth another recipient; a
+      // slippage or economics failure would fail identically for all of them.
+      if (!/6000|NotAuthorized|InvalidAccountForFee/.test(sim.detail)) {
+        this.lastParityDetail = sim.detail;
+        return null;
+      }
+      this.lastParityDetail = sim.detail;
+    }
+    return null;
   }
 
   // ---------------- Shadow compare ----------------
