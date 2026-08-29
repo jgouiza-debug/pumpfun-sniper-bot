@@ -92,6 +92,25 @@ export function bondingCurveTokensOut(
 }
 
 /**
+ * SOL out of a pump.fun bonding-curve SELL, the exact inverse of
+ * bondingCurveTokensOut with the same 1% fee and the same floor-division
+ * direction (which favours the curve, never us). Used to compute the
+ * min_sol_output floor a local sell instruction carries.
+ */
+export function bondingCurveSolOut(
+  tokensInRaw: bigint,
+  vSolLamports: bigint,
+  vTokensRaw: bigint,
+  feeBps: bigint = 100n
+): bigint {
+  if (tokensInRaw <= 0n || vSolLamports <= 0n || vTokensRaw <= 0n) return 0n;
+  const newVTokens = vTokensRaw + tokensInRaw;
+  const newVSol = (vSolLamports * vTokensRaw) / newVTokens;
+  const grossOut = vSolLamports - newVSol;
+  return (grossOut * (10_000n - feeBps)) / 10_000n;
+}
+
+/**
  * Clamp a computed priority fee: never below the configured static floor,
  * never above the hard ceiling nor `positionPct` percent of the position.
  */

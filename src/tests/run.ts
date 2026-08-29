@@ -2142,16 +2142,70 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
       'a packaged build must diff against what IT ships, not the dev defaults');
   });
 
-  test('localTxBuild stays off until a parity run proves it', () => {
-    // The one flag that still needs per-session evidence: it replaces the
-    // transaction PumpPortal would have built. entryGateV2, dynamicPriorityFee
-    // and timelineSlotSampling were promoted 2026-08-13 — they had been shadow-
-    // validated for days and shipping them off meant the live path kept using
-    // the code they exist to replace.
-    assert.strictEqual(PACKAGED_DEFAULTS.localTxBuild, false,
-      'a locally built tx must never ship enabled without shadow parity');
-    assert.strictEqual(PACKAGED_DEFAULTS.localTxShadowCompare, true,
-      'the parity evidence localTxBuild requires must be collected by default');
+  test('localTxBuild ships ON, and every local tx is proved by simulation first', () => {
+    // Promoted 2026-08-29. It used to wait for shadow parity against
+    // PumpPortal's trade-local build — evidence that can no longer be
+    // collected, because trade-local now returns transactions routed through a
+    // third-party program that will never structurally match a direct pump.fun
+    // instruction. Waiting for that parity meant waiting forever, while the
+    // intent guard refused every routed transaction: no real trade could land
+    // by either path.
+    //
+    // The per-session evidence requirement did not go away, it got stronger:
+    // the engine simulates each locally built transaction against the chain and
+    // falls back to trade-local unless the simulation is clean.
+    assert.strictEqual(PACKAGED_DEFAULTS.localTxBuild, true,
+      'the PumpPortal bypass must actually be on, or real trades die in the intent guard');
+
+    const engineSrc = require('fs').readFileSync(require.resolve('../services/sniperEngine.ts'), 'utf8');
+    assert.ok(/const sim = await localTxBuilder\.simulateOk\(built\.tx\)/.test(engineSrc),
+      'a locally built tx must be simulated before it is used');
+    assert.ok(/if \(sim\.ok\) \{[\s\S]{0,120}buildSource = 'local'/.test(engineSrc),
+      'only a CLEANLY simulating build may be signed — anything else falls back');
+
+    const builderSrc = require('fs').readFileSync(require.resolve('../services/localTxBuilder.ts'), 'utf8');
+    assert.ok(/if \(res\.value\.err\)/.test(builderSrc), 'a simulation error must be treated as failure');
+    assert.ok(/return \{ ok: false/.test(builderSrc), 'simulateOk fails closed');
+  });
+
+  test('the local sell puts creator_vault BEFORE token_program — the reverse of buy', () => {
+    // pump.fun's sell instruction swaps those two accounts relative to buy.
+    // Getting it backwards builds a transaction that fails on chain, so the
+    // order is pinned here as well as caught by the simulation gate.
+    const src = require('fs').readFileSync(require.resolve('../services/localTxBuilder.ts'), 'utf8');
+    const sell = src.slice(src.indexOf('public async buildSell'), src.indexOf('ownedTokenAmountRaw'));
+    // The token program is resolved per mint (legacy SPL vs Token-2022), so the
+    // account is `tokenProgram`, not the module constant.
+    const vaultAt = sell.indexOf('p.creatorVault');
+    const tokenAt = sell.indexOf('pubkey: tokenProgram');
+    assert.ok(vaultAt > 0 && tokenAt > 0, 'both accounts must appear in the sell instruction');
+    assert.ok(vaultAt < tokenAt, 'sell order is creator_vault then token_program');
+
+    const buy = src.slice(src.indexOf('public async buildBuy'), src.indexOf('public async buildSell'));
+    const bVault = buy.indexOf('p.creatorVault');
+    // skip the ATA-create occurrence and take the one inside the pump instruction
+    const bToken = buy.lastIndexOf('pubkey: tokenProgram', bVault);
+    assert.ok(bToken > 0 && bToken < bVault, 'buy order is token_program then creator_vault');
+
+    // Token-2022 is the standard the current pump.fun mints use; deriving the
+    // ATA with the legacy program produced IncorrectProgramId on every one.
+    assert.ok(/getTokenProgram/.test(src), 'the mint owner decides the token program, never a hardcoded constant');
+  });
+
+  test('the sell curve math is the exact inverse of the buy curve math', () => {
+    const { bondingCurveTokensOut, bondingCurveSolOut } = require('../services/pipelineUtils');
+    const vSol = 30_000_000_000n, vTok = 1_073_000_000_000_000n;
+    const solIn = 100_000_000n;                                   // 0.1 SOL
+    const tokens = bondingCurveTokensOut(solIn, vSol, vTok);
+    assert.ok(tokens > 0n);
+    // Selling straight back returns slightly less: two 1% fees plus floor
+    // division. It must never return MORE than went in — that would be a
+    // free-money bug that sized every exit wrong.
+    const back = bondingCurveSolOut(tokens, vSol + solIn, vTok - tokens);
+    assert.ok(back < solIn, 'a round trip must lose the fee, never gain');
+    assert.ok(back > (solIn * 90n) / 100n, 'and must not lose an implausible amount');
+    assert.strictEqual(bondingCurveSolOut(0n, vSol, vTok), 0n);
+    assert.strictEqual(bondingCurveSolOut(tokens, 0n, vTok), 0n);
   });
 
   test('divergence from DEFAULTS is declared, not accidental', () => {
