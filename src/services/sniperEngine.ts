@@ -1528,23 +1528,53 @@ export class SniperEngine {
       let remoteTxBytes: Uint8Array | null = null;
       let buildSource: 'local' | 'trade-local' = 'trade-local';
 
-      if (action === 'buy' && featureFlags.get('localTxBuild')) {
-        if (localTxBuilder.hasRecentParity()) {
-          const built = await localTxBuilder.buildBuy({
+      if (featureFlags.get('localTxBuild')) {
+        // Build the trade ourselves and prove it by SIMULATION before signing.
+        //
+        // This is the PumpPortal bypass. trade-local now returns transactions
+        // routed through a third-party program (measured 2026-08-29), which the
+        // intent guard refuses — correctly — so every real trade died there.
+        // A direct pump.fun instruction has no router, no vendor fee transfer
+        // and no HTTP hop on the critical path. It only covers the bonding
+        // curve: a migrated token returns null here and still uses trade-local,
+        // because the AMM route is not implemented locally.
+        let built: { tx: VersionedTransaction } | null = null;
+
+        if (action === 'buy') {
+          built = await localTxBuilder.buildBuy({
             user: keypair.publicKey,
             mint,
             solAmount,
             slippagePct: effectiveSlippage,
             priorityFeeSol,
           });
-          if (built) {
+        } else {
+          const owned = await localTxBuilder.ownedTokenAmountRaw(keypair.publicKey, mint);
+          if (owned && owned > 0n) {
+            // amountPct is the same '100%'-style string trade-local is given —
+            // parse it through the one helper that already owns that format.
+            const pctNum = Number(sellAmountParam(amountPct).replace('%', ''));
+            const pct = BigInt(Math.max(1, Math.min(100, Math.round(pctNum))));
+            const tokenAmountRaw = (owned * pct) / 100n;
+            built = await localTxBuilder.buildSell({
+              user: keypair.publicKey,
+              mint,
+              tokenAmountRaw,
+              slippagePct: effectiveSlippage,
+              priorityFeeSol,
+            });
+          }
+        }
+
+        if (built) {
+          const sim = await localTxBuilder.simulateOk(built.tx);
+          if (sim.ok) {
             tx = built.tx;
             buildSource = 'local';
           } else {
-            this.log('warn', `⚠️ Local build unavailable (${localTxBuilder.getParityStatus().detail}) — using trade-local.`, mint);
+            // Fail closed onto the old path rather than sign an unproven layout.
+            this.log('warn', `⚠️ Local ${action} did not simulate cleanly (${sim.detail}) — using trade-local.`, mint);
           }
-        } else {
-          this.log('warn', '⚠️ localTxBuild is ON but no shadow parity this session — using trade-local. Run with localTxShadowCompare first.', mint);
         }
       }
 

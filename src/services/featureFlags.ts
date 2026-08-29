@@ -138,6 +138,15 @@ export const PACKAGED_DEFAULTS: FeatureFlagSet = {
   dynamicPriorityFee: true,
   timelineSlotSampling: true,
   localTxShadowCompare: true,
+  // 2026-08-29 promotion. PumpPortal's trade-local now returns transactions
+  // routed through a third-party program, which the pre-sign intent guard
+  // refuses — so with this OFF, every real trade on a bonding-curve token is
+  // refused and nothing is sent. Building the pump.fun instruction directly
+  // removes the router, the vendor fee transfer and the HTTP hop, and each
+  // locally built transaction is proved by on-chain simulation before it is
+  // signed. A migrated token still falls back to trade-local (the AMM route is
+  // not implemented locally), as does any build that will not simulate.
+  localTxBuild: true,
 };
 
 /**
@@ -162,6 +171,7 @@ export const INTENDED_PACKAGED_DIVERGENCE: Array<keyof FeatureFlagSet> = [
   'dynamicPriorityFee',
   'timelineSlotSampling',
   'localTxShadowCompare',
+  'localTxBuild',
 ];
 
 /**
