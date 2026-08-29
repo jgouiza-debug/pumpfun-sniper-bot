@@ -1,6 +1,6 @@
 {
   "name": "pumpfun-token-screening-pipeline",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "author": "jgouiza",
   "main": "electron/main.js",
@@ -29,7 +29,7 @@
   "build": {
     "appId": "com.pumpfun.sniperbot",
     "productName": "Pumpfun Sniper Bot",
-    "copyright": "Copyright \u00a9 2026",
+    "copyright": "Copyright © 2026",
     "npmRebuild": false,
     "directories": {
       "output": "release-app",
@@ -83,7 +83,7 @@
     "assets": [
       "dist/**/*"
     ],
-    "//targets": "build:exe uses `--targets host`, so the SHIPPED Windows exe embeds whatever Node the CI runner uses (currently Node 22 \u2014 see release.yml). This `targets` entry only governs a bare `pkg .` fallback; it is pinned to node22-win-x64 to MATCH the host build rather than the old node18 (which is EOL and would ship an unsupported runtime). macOS binaries come from build:mac / build:mac-intel (node22) and arm64 must be produced ON macOS.",
+    "//targets": "build:exe uses `--targets host`, so the SHIPPED Windows exe embeds whatever Node the CI runner uses (currently Node 22 — see release.yml). This `targets` entry only governs a bare `pkg .` fallback; it is pinned to node22-win-x64 to MATCH the host build rather than the old node18 (which is EOL and would ship an unsupported runtime). macOS binaries come from build:mac / build:mac-intel (node22) and arm64 must be produced ON macOS.",
     "targets": [
       "node22-win-x64"
     ],
