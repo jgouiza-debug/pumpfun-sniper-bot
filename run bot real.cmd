@@ -60,7 +60,9 @@ echo  Dashboard   : http://localhost:3001
 echo  Closing this window stops the bot.
 echo.
 
-node --use-system-ca "dist\server.js"
+REM No --use-system-ca here: it only exists on Node 22.15+, and on anything
+REM older node exits immediately with "bad option" instead of starting the bot.
+node "dist\server.js"
 
 echo.
 echo Bot stopped.

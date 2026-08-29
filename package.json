@@ -1,6 +1,6 @@
 {
   "name": "pumpfun-token-screening-pipeline",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Pump.fun Token Screening Pipeline with MCP server/client and RugCheck integration",
   "author": "jgouiza",
   "main": "electron/main.js",
@@ -11,11 +11,9 @@
     "electron:dev": "electron .",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "npm run build && electron-builder --mac",
-    "build:linux": "npm run build && electron-builder --linux",
-    "dist": "npm run build && electron-builder -mwl",
+    "dist": "npm run build && electron-builder -mw",
     "build:exe": "vite build && tsc && npx @yao-pkg/pkg . --targets host --output dist-exe/pumpfun-sniper-bot.exe",
     "build:pkg-mac": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-arm64 --output dist-exe/pumpfun-sniper-bot-macos-arm64",
-    "build:pkg-mac-intel": "vite build && tsc && npx @yao-pkg/pkg . --targets node22-macos-x64 --output dist-exe/pumpfun-sniper-bot-macos-x64",
     "start": "node --env-file-if-exists=.env -r ts-node/register src/index.ts",
     "server": "tsc && node --env-file-if-exists=.env dist/server.js",
     "ui": "vite",
@@ -25,12 +23,13 @@
     "test:filters": "ts-node src/tests/filterProofs.ts",
     "test:guardrails": "ts-node src/tests/guardrailProofs.ts",
     "test:copy": "ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts",
-    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts"
+    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyGasSim.ts && ts-node src/tests/autoUpdateProofs.ts",
+    "test:autoupdate": "ts-node src/tests/autoUpdateProofs.ts"
   },
   "build": {
     "appId": "com.pumpfun.sniperbot",
     "productName": "Pumpfun Sniper Bot",
-    "copyright": "Copyright © 2026",
+    "copyright": "Copyright \u00a9 2026",
     "npmRebuild": false,
     "directories": {
       "output": "release-app",
@@ -57,19 +56,15 @@
     },
     "mac": {
       "target": [
-        "dmg"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
       "icon": "build/icon.png",
       "category": "public.app-category.finance"
-    },
-    "linux": {
-      "target": [
-        "AppImage",
-        "deb"
-      ],
-      "icon": "build/icon.png",
-      "category": "Finance",
-      "maintainer": "jgouiza"
     },
     "publish": [
       {
@@ -87,7 +82,7 @@
     "assets": [
       "dist/**/*"
     ],
-    "//targets": "build:exe uses `--targets host`, so the SHIPPED Windows exe embeds whatever Node the CI runner uses (currently Node 22 — see release.yml). This `targets` entry only governs a bare `pkg .` fallback; it is pinned to node22-win-x64 to MATCH the host build rather than the old node18 (which is EOL and would ship an unsupported runtime). macOS binaries come from build:mac / build:mac-intel (node22) and arm64 must be produced ON macOS.",
+    "//targets": "build:exe uses `--targets host`, so the SHIPPED Windows exe embeds whatever Node the CI runner uses (currently Node 22 \u2014 see release.yml). This `targets` entry only governs a bare `pkg .` fallback; it is pinned to node22-win-x64 to MATCH the host build rather than the old node18 (which is EOL and would ship an unsupported runtime). macOS binaries come from build:mac / build:mac-intel (node22) and arm64 must be produced ON macOS.",
     "targets": [
       "node22-win-x64"
     ],
@@ -99,6 +94,7 @@
     "axios": "^1.8.1",
     "bs58": "^6.0.0",
     "cors": "^2.8.5",
+    "electron-updater": "^6.3.9",
     "express": "^4.21.2",
     "lucide-react": "^0.479.0",
     "react": "^19.0.0",
@@ -120,7 +116,6 @@
     "typescript": "^5.8.2",
     "vite": "^6.2.1"
   },
-  "dependencies-note": "electron-updater is intentionally NOT a runtime dep yet — auto-update is configured (build.publish) but not wired into electron/main.js until signing certs exist; see phase4-packaging-notes.md.",
   "overrides": {
     "uuid": "9.0.1"
   }

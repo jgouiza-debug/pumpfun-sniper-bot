@@ -25,6 +25,20 @@ export function releaseAssetName(
   return `pumpfun-sniper-bot-${platform}-${arch}`;
 }
 
+/**
+ * Should this process install its own updates in the background?
+ *
+ * Only the standalone binary. The Electron build ships electron-updater, which
+ * downloads the real installer and applies it on quit — running both would have
+ * two updaters racing to replace the same app. A dev checkout has no binary to
+ * swap at all. SNIPER_NO_AUTO_UPDATE opts out of everything.
+ */
+export function autoUpdateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const optOut = env.SNIPER_NO_AUTO_UPDATE;
+  if (optOut !== undefined && ['1', 'true', 'on', 'yes'].includes(optOut.toLowerCase())) return false;
+  return env.SNIPER_PACKAGED !== '1';
+}
+
 export interface UpdateCheckResult {
   currentVersion: string;
   latestVersion: string;

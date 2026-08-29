@@ -14,6 +14,7 @@
 // single-operator trading console, and the crash is logged either way.
 
 const { app, BrowserWindow, ipcMain, safeStorage, shell, dialog } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 
 const PORT = Number(process.env.PORT) || 3001;
@@ -79,6 +80,31 @@ function createWindow() {
   return win;
 }
 
+/**
+ * Background auto-update for the installed desktop app.
+ *
+ * electron-updater reads the release's latest*.yml (published by
+ * .github/workflows/desktop.yml) and downloads the new installer in the
+ * background, so the user never re-downloads by hand. It is applied on quit,
+ * NOT mid-session: swapping the app out from under a running engine would
+ * strand open positions, and quit already runs the clean-shutdown path.
+ *
+ * Only a packaged build has a release to update from — a source checkout run
+ * via `electron .` would just error against its own dev version.
+ */
+function wireAutoUpdate() {
+  if (!app.isPackaged) return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  // Offline, rate-limited, or a release without this platform's asset. The
+  // periodic check retries; a failed update must never take the window down.
+  autoUpdater.on('error', () => {});
+  // Checks, downloads, and shows a native "update ready" notification.
+  const check = () => { autoUpdater.checkForUpdatesAndNotify().catch(() => {}); };
+  check();
+  setInterval(check, 6 * 60 * 60 * 1000).unref();
+}
+
 // Single instance: two windows would fight over the port and (in real mode) the
 // wallet lock. Focus the existing window instead.
 const gotLock = app.requestSingleInstanceLock();
@@ -93,6 +119,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     startEngine();
     createWindow();
+    wireAutoUpdate();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });

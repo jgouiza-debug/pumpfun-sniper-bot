@@ -2299,7 +2299,7 @@ console.log('\n-- Self-updater: version identity, verification, restart safety -
 
   test('the release workflow publishes the checksum the updater requires', () => {
     assert.ok(/\.sha256/.test(workflow), 'without this asset every client refuses to update');
-    assert.ok(/npm version \$version/.test(workflow), 'the tag must be stamped into the build');
+    assert.ok(/npm version "\$VERSION"/.test(workflow), 'the tag must be stamped into the build');
     assert.ok(/npm test/.test(workflow), 'a release must not ship a failing build');
   });
 
@@ -2962,7 +2962,9 @@ console.log('\n-- macOS build: the updater must never install another platform\'
   test('the build scripts produce exactly the names the updater asks for', () => {
     const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
     const scripts = JSON.stringify(pkgJson.scripts);
-    for (const platform of [['darwin', 'arm64'], ['darwin', 'x64']] as Array<[string, string]>) {
+    // Apple Silicon only since 2.0.3: the Intel binary and the Linux packages
+    // were dropped so the release page offers one download per platform.
+    for (const platform of [['darwin', 'arm64']] as Array<[string, string]>) {
       const name = releaseAssetName(platform[0] as any, platform[1]);
       assert.ok(scripts.includes(name),
         `no build script outputs ${name}, so the updater would look for an asset nothing produces`);
@@ -2975,9 +2977,9 @@ console.log('\n-- macOS build: the updater must never install another platform\'
     const pkgJson = JSON.parse(fsm.readFileSync(pathm.join(root, 'package.json'), 'utf8'));
     // The pkg-exe mac builds were renamed to build:pkg-mac* when the Electron
     // build (build:mac -> electron-builder .dmg) took the plain names.
-    const macScripts = [pkgJson.scripts['build:pkg-mac'], pkgJson.scripts['build:pkg-mac-intel']].join(' ');
+    const macScripts = String(pkgJson.scripts['build:pkg-mac']);
     assert.ok(!/node18-macos/.test(macScripts), 'node18 has no prebuilt macOS base');
-    assert.ok(/node22-macos-arm64/.test(macScripts) && /node22-macos-x64/.test(macScripts));
+    assert.ok(/node22-macos-arm64/.test(macScripts));
   });
 
   test('a multi-platform release leaves exactly one .sha256, for pre-1.0.1 clients', () => {
@@ -3010,7 +3012,7 @@ console.log('\n-- macOS build: the updater must never install another platform\'
 
   test('the workflow publishes macOS checksums as .sha256sum, not .sha256', () => {
     const wf = fsm.readFileSync(pathm.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
-    assert.ok(/macos-arm64\.sha256sum/.test(wf) && /macos-x64\.sha256sum/.test(wf));
+    assert.ok(/macos-arm64\.sha256sum/.test(wf));
     assert.ok(!/macos-arm64\.sha256\b(?!sum)/.test(wf),
       'a macOS .sha256 asset would break every pre-1.0.1 client again');
   });
@@ -3020,7 +3022,7 @@ console.log('\n-- macOS build: the updater must never install another platform\'
     assert.ok(/runs-on:\s*macos/.test(wf), 'arm64 signing cannot run on a non-Mac runner');
     assert.ok(/codesign --force/.test(wf),
       'Apple Silicon refuses to execute an unsigned arm64 binary at all');
-    for (const name of ['pumpfun-sniper-bot-macos-arm64', 'pumpfun-sniper-bot-macos-x64']) {
+    for (const name of ['pumpfun-sniper-bot-macos-arm64']) {
       assert.ok(wf.includes(`${name}.sha256`),
         `${name} must ship a checksum — the updater refuses any release without one`);
     }

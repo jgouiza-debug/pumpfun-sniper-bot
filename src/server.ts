@@ -23,7 +23,7 @@ import { featureFlags, FeatureFlagSet } from './services/featureFlags';
 import { latencyTimeline, LatencyTimelineLogger } from './services/latencyTimeline';
 import { entryGateV2 } from './services/entryGateV2';
 import { localTxBuilder } from './services/localTxBuilder';
-import { updaterService } from './services/updaterService';
+import { autoUpdateEnabled, updaterService } from './services/updaterService';
 import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
 // ─── Hardened crash guards ──────────────────────────────────────────────────
 // @solana/web3.js retries 429 / timeout errors internally then re-throws.
@@ -590,6 +590,32 @@ updaterService.setRestartGuard(() => {
   }
   return { ok: true };
 });
+
+/**
+ * Background auto-update for the standalone binary (pumpfun-sniper-bot.exe and
+ * the macOS builds), so it keeps itself current instead of the user hunting for
+ * a fresh download. The Electron app is excluded — electron-updater owns that
+ * path — and so is a dev checkout, which has no binary to swap.
+ *
+ * applyUpdate() goes through the restart guard above, so an update is only ever
+ * installed while the engine is idle; with anything open or trading it is left
+ * for the UI's manual banner and retried on the next tick. Set
+ * SNIPER_NO_AUTO_UPDATE=1 to opt out.
+ */
+if (autoUpdateEnabled()) {
+  const autoUpdate = async () => {
+    try {
+      const check = await updaterService.checkForUpdates();
+      if (!check.hasUpdate || !check.canSelfUpdate) return;
+      const result = await updaterService.applyUpdate();
+      if (!result.ok) {
+        console.log(`ℹ️ v${check.latestVersion} is available but was not installed: ${result.error} — it will retry, or use Check for Updates in the UI.`);
+      }
+    } catch { /* offline or GitHub rate-limited — the next tick retries */ }
+  };
+  setTimeout(autoUpdate, 15_000).unref();
+  setInterval(autoUpdate, 6 * 60 * 60 * 1000).unref();
+}
 
 // SSE push of the copy-trader state — same contract as /api/stream.
 app.get('/api/copy/stream', (req, res) => {

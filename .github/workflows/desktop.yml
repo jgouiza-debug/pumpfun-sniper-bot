@@ -1,9 +1,13 @@
 name: Build Desktop Installers (Electron)
 
-# Produces the real per-platform installers via electron-builder:
-#   Windows -> NSIS .exe   macOS -> .dmg   Linux -> AppImage + .deb
+# Produces the real installers via electron-builder:
+#   Windows -> NSIS Setup .exe   macOS (Apple Silicon) -> .dmg
 # On a v* tag it publishes them to the GitHub release (electron-updater reads
 # these). On a manual run it uploads them as workflow artifacts only.
+#
+# Two platforms, deliberately. A release page that lists an installer per
+# platform per architecture plus loose binaries is a page nobody can pick from;
+# this ships one obvious download for Windows and one for a Mac.
 #
 # Why CI and not a local build: the Windows NSIS step needs symlink-creation
 # privilege (Developer Mode / admin) to unpack the code-sign toolkit, and a
@@ -30,8 +34,6 @@ jobs:
             args: --win
           - os: macos-latest
             args: --mac
-          - os: ubuntu-latest
-            args: --linux
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -91,6 +93,4 @@ jobs:
           path: |
             release-app/*.exe
             release-app/*.dmg
-            release-app/*.AppImage
-            release-app/*.deb
           if-no-files-found: ignore
