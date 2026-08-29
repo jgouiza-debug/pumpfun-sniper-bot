@@ -468,6 +468,39 @@ export function App() {
     fetchFlags(selectedPort);
   }, [selectedPort]);
 
+  // Tab Close Auto-Shutdown & Heartbeat
+  useEffect(() => {
+    const shutdownUrl = `http://localhost:${selectedPort}/api/server/shutdown`;
+    const heartbeatUrl = `http://localhost:${selectedPort}/api/heartbeat`;
+
+    const handleTabClose = () => {
+      try {
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(shutdownUrl);
+        } else {
+          apiFetch(shutdownUrl, { method: 'POST' }).catch(() => {});
+        }
+      } catch {
+        /* browser tab closing */
+      }
+    };
+
+    window.addEventListener('beforeunload', handleTabClose);
+    window.addEventListener('pagehide', handleTabClose);
+
+    const pingHeartbeat = () => {
+      apiFetch(heartbeatUrl, { method: 'POST' }).catch(() => {});
+    };
+    pingHeartbeat();
+    const heartbeatTimer = setInterval(pingHeartbeat, 3000);
+
+    return () => {
+      window.removeEventListener('beforeunload', handleTabClose);
+      window.removeEventListener('pagehide', handleTabClose);
+      clearInterval(heartbeatTimer);
+    };
+  }, [selectedPort]);
+
   // Auto-scroll terminal log
   useEffect(() => {
     terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });

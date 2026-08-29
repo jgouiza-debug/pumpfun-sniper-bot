@@ -94,6 +94,7 @@ app.get('/api/session-token', (req, res) => {
 // remembering. GETs stay open behind the origin guard — they are status reads.
 app.use('/api', (req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  if (req.path === '/heartbeat' || req.path === '/server/shutdown') return next();
   return requireApiToken(req, res, next);
 });
 
