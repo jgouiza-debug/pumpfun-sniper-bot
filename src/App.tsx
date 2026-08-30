@@ -229,8 +229,14 @@ export function App() {
   const [updateError, setUpdateError] = useState<string>('');
 
   // Feature Flags State
+  // Initial values are a PLACEHOLDER until fetchFlags answers, and every one of
+  // them is the SAFE side. allInSizing in particular used to start `true` here,
+  // and because fetchFlags was unreachable (see the effect below) it stayed
+  // true forever — so the dashboard reported "ALL-IN MODE: ON" on an install
+  // where it was genuinely off, and handleSaveConfig POSTed that literal back
+  // and turned it on for real.
   const [featureFlags, setFeatureFlags] = useState<Record<string, boolean>>({
-    allInSizing: true,
+    allInSizing: false,
     devSellStop: true,
     honestPaper: true,
     playbookRouting: true,
@@ -526,13 +532,18 @@ export function App() {
       startPolling();
     }
 
+    // Placed BEFORE the cleanup return. It used to sit after it, which made it
+    // unreachable: the UI never once read the server's real feature flags, so
+    // every flag rendered (and every flag posted back) was the hardcoded
+    // initial state above.
+    void fetchFlags(selectedPort);
+
     return () => {
       closed = true;
       es?.close();
       if (pollTimer) clearInterval(pollTimer);
       setStreamLive(false);
     };
-    fetchFlags(selectedPort);
   }, [selectedPort]);
 
   // Heartbeat only. No shutdown beacon on tab close: one stale tab closing or
@@ -661,7 +672,13 @@ export function App() {
       const res = await apiFetch(`http://localhost:${selectedPort}/api/bot/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...configForm, allInSizing: featureFlags.allInSizing })
+        // allInSizing is NOT sent from here. It is a feature flag with its own
+        // endpoint and its own toggle; including it meant that saving ANY
+        // unrelated setting also wrote this flag from whatever the client
+        // happened to be holding — which, with fetchFlags dead, was a
+        // hardcoded `true`. Saving a Helius key turned on 100%-of-wallet
+        // sizing. The flag is changed only by its own control now.
+        body: JSON.stringify(configForm)
       });
       const data = await res.json();
       if (data.success) {

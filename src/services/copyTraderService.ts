@@ -152,6 +152,28 @@ const TOKEN_MOVE_MIN_FRACTION = 0.02;
 const COPY_EXIT_GAS_RESERVE_SOL = 0.002;
 
 /**
+ * What one exit ACTUALLY needs, given the fee the operator configured.
+ *
+ * The flat 0.002 above was measured against the default 0.001 priority fee. It
+ * is not a constant of nature: `priorityFeeSol` is an operator setting and
+ * `maxPriorityFeeSol` (with dynamic fees on) reaches 0.05. Reserving 0.002 per
+ * position while each exit intends to spend up to 0.05 means the reserve is
+ * short by more than an order of magnitude — the buys are allowed to consume
+ * everything else, and when the leader dumps every mint at once,
+ * affordableSellPriorityFeeSol clamps each exit's fee down to dust and the
+ * sells miss the dump they were supposed to front-run.
+ *
+ * Scaled from the fee that will actually be paid, with the old flat value as a
+ * floor so this can only ever reserve MORE, never less.
+ */
+function copyExitGasReserveSol(sizingPriorityFeeSol: number): number {
+  const fee = Number.isFinite(sizingPriorityFeeSol) && sizingPriorityFeeSol > 0 ? sizingPriorityFeeSol : 0.001;
+  // The priority fee, the base signature fee, and a little headroom so the fee
+  // payer is still rent-exempt afterwards.
+  return Math.max(COPY_EXIT_GAS_RESERVE_SOL, round4(fee + 0.0006));
+}
+
+/**
  * Ceiling on the slippage a copy BUY will accept. maxSlippagePct is clamped to
  * 1..100 for config, but a buy at 100% accepts paying double — a footgun on an
  * entry we can simply decline. Sells stay at the full configured tolerance
@@ -635,7 +657,7 @@ export class CopyTraderService {
    * down) leaves the position untouched, because "cannot see it" is not "it is
    * gone". Paper positions are skipped — they have no on-chain balance to read.
    */
-  public async syncPositionsWithOnChainBalances(): Promise<{ checked: number; closed: number; corrected: number }> {
+  public async syncPositionsWithOnChainBalances(): Promise<{ checked: number; closed: number; corrected: number; unreadable: number }> {
     // Now runs automatically on a timer as well as from the button, so it has
     // to be safe against work that is still settling. Three exclusions, each
     // covering a way an honest read can be MISLEADING rather than wrong:
@@ -657,9 +679,12 @@ export class CopyTraderService {
       && !this.tradeQueue.isBusy(p.mint));
     let closed = 0;
     let corrected = 0;
+    // Counted and reported: a sync that could read nothing must not look like a
+    // sync that found nothing wrong.
+    let unreadable = 0;
     for (const pos of open) {
       const held = await this.getOwnedTokenAmount(pos.mint);
-      if (held === null) continue; // unreadable — never treat as zero
+      if (held === null) { unreadable++; continue; } // unreadable — never treat as zero
       const expected = pos.tokensHeld || 0;
       if (held <= Math.max(0, expected * 0.05)) {
         this.closeAsExternallyExited(pos);
@@ -674,8 +699,9 @@ export class CopyTraderService {
       this.persist();
       this.emitChange();
     }
-    console.log(`[CopyTrader] Balance sync: ${open.length} checked, ${closed} closed as externally exited, ${corrected} quantity-corrected.`);
-    return { checked: open.length, closed, corrected };
+    console.log(`[CopyTrader] Balance sync: ${open.length} checked, ${closed} closed as externally exited, `
+      + `${corrected} quantity-corrected, ${unreadable} unreadable (left untouched).`);
+    return { checked: open.length, closed, corrected, unreadable };
   }
 
   /**
@@ -1154,7 +1180,19 @@ export class CopyTraderService {
    */
   private async getOwnedTokenAmount(mint: string): Promise<number | null> {
     const address = sniperEngine.getWalletStatus().address;
-    if (!this.heliusConn || !address) return null;
+    // FALL BACK TO THE ENGINE'S CONNECTION. heliusConn is only built by
+    // startHeliusWatcher, i.e. only while copy trading is ARMED. Every on-chain
+    // balance check therefore returned null the moment the copy trader was
+    // switched off — including the SYNC BALANCES button, which then reported
+    // "checked N, closed 0, corrected 0" and looked like a clean bill of health
+    // while having asked the chain nothing at all. That is exactly the state an
+    // operator is in when they suspect a phantom position and go looking.
+    //
+    // The engine's connection always exists, and its reader also covers
+    // Token-2022, which this one does not.
+    if (!this.heliusConn || !address) {
+      return sniperEngine.readOwnedTokenAmount(mint);
+    }
     try {
       const res = await this.heliusConn.getParsedTokenAccountsByOwner(
         new PublicKey(address),
@@ -1897,7 +1935,9 @@ export class CopyTraderService {
         // this mint's queue while a leader flip-sell waits behind the buy.
         await Promise.race([sniperEngine.refreshWalletBalance(), sleep(1500)]);
         const openAfterThisBuy = this.openPositionsForCurrentMode().length + (existingNow ? 0 : 1);
-        const reservedForExits = round4(COPY_EXIT_GAS_RESERVE_SOL * openAfterThisBuy);
+        // Per open position, sized from the fee this session will actually pay.
+        const exitGasPerPosition = copyExitGasReserveSol(sniperEngine.getSizingPriorityFeeSol());
+        const reservedForExits = round4(exitGasPerPosition * openAfterThisBuy);
         // SOL claimed by concurrent buys of OTHER mints (they run in their
         // own queues against the same snapshot) — without this, two leaders
         // or one leader buying two tokens re-creates the drain cross-mint.
@@ -1967,7 +2007,7 @@ export class CopyTraderService {
         // another mint reserves for this position before it is recorded.
         this.inFlightBuySol.set(mint,
           copySol * (1 + this.config.maxSlippagePct / 100 + 0.015) + sizingFeeSol + 0.0025
-          + (existingNow ? 0 : COPY_EXIT_GAS_RESERVE_SOL));
+          + (existingNow ? 0 : exitGasPerPosition));
         let result: TradeResult | null;
         try {
           result = await sniperEngine.executeExternalTrade(

@@ -94,7 +94,21 @@ export const DEFAULTS: FeatureFlagSet = {
   playbookRouting: false,
   honeypotChecks: false,
   devSellStop: false,
-  allInSizing: true,
+  // FALSE since 2026-08-30. This was the one entry in a table whose own comment
+  // calls it "legacy behaviour, everything off" that was actually ON — and ON
+  // means every entry stakes 100% of the wallet.
+  //
+  // It only mattered for a run that is not a packaged build, and the project
+  // ships a launcher that is exactly that: `run bot real.cmd` ends in
+  // `node "dist\server.js"`, with no SNIPER_PACKAGED, so IS_PACKAGED is false
+  // and DEFAULTS applies. Anyone starting the bot the documented way got all-in
+  // sizing with the kill switch, honeypot check, dev-sell stop and economics
+  // gate all off — the combination PACKAGED_DEFAULTS exists to prevent,
+  // reachable through the front door.
+  //
+  // A dangerous default has no safe context. If it is wrong to ship, it is
+  // wrong to run.
+  allInSizing: false,
   launchSnipe: false,
 };
 
@@ -122,7 +136,6 @@ export const PACKAGED_DEFAULTS: FeatureFlagSet = {
   playbookRouting: true,
   honeypotChecks: true,
   devSellStop: true,
-  allInSizing: false,
   // 2026-08-13 promotions. Each of these was written, tested and left OFF,
   // which meant the live path kept running the code they were built to replace.
   //
@@ -165,7 +178,9 @@ export const INTENDED_PACKAGED_DIVERGENCE: Array<keyof FeatureFlagSet> = [
   'playbookRouting',
   'honeypotChecks',
   'devSellStop',
-  'allInSizing',
+  // 'allInSizing' is deliberately NOT here any more: it is false in BOTH tables
+  // now, so there is nothing to declare. It was the only flag whose "divergence"
+  // consisted of DEFAULTS being the DANGEROUS side.
   'entryGateV2',
   'dynamicPriorityFee',
   'timelineSlotSampling',

@@ -1234,6 +1234,25 @@ export class SniperEngine {
     }
 
     newConfig = this.clampConfig(newConfig);
+
+    // `isBotActive` IS NOT A SETTING. It is run state, and START/STOP
+    // (toggleBot) is the only thing allowed to move it — that path runs the
+    // real-mode preflight, takes the exclusive live lock and clears the kill
+    // switch deliberately.
+    //
+    // The settings modal POSTs a snapshot of the whole config, including
+    // whatever `isBotActive` was when the modal was opened. So: the kill switch
+    // trips, the bot pauses, the operator opens Settings to tighten sizing in
+    // response — and their save writes `isBotActive: true` straight back in,
+    // silently un-pausing a bot whose breaker is still latched. The bot resumes
+    // with `killSwitchTripped` still true, so the switch that stopped it once
+    // can never stop it again this session.
+    if (newConfig.isBotActive !== undefined && newConfig.isBotActive !== this.config.isBotActive) {
+      this.log('warn', `🎛️ Ignoring isBotActive in a settings save (${this.config.isBotActive} → ${newConfig.isBotActive}). `
+        + 'Use START / STOP — that path runs the preflight and the live lock; a settings snapshot does not.');
+    }
+    delete (newConfig as any).isBotActive;
+
     this.config = { ...this.config, ...newConfig };
 
     // Changing execution mode mid-run must go through the full start preflight
@@ -3954,8 +3973,25 @@ export class SniperEngine {
     }
     pos.sellBlockedByBackoff = false;
 
-    // Exit on the same venue the entry filled on, for the same reason.
-    let result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`, pos.venue);
+    // Exit on the venue the entry filled on — but a token MIGRATES. A position
+    // opened on the bonding curve and graduated to the AMM is no longer sellable
+    // there: the pump.fun program rejects the order with 0x1775
+    // BondingCurveComplete, the sell branch bumps slippage once and fails again,
+    // and every subsequent exit tick repeats it. Each attempt burns a priority
+    // fee, and the position rides to zero unsellable while the retry counter
+    // walks to its cap.
+    //
+    // So the buy-time venue is a HINT, not a routing decision: after the first
+    // failure, fall back to 'auto' and let PumpPortal resolve where the token
+    // actually trades now. Alternating rather than switching outright, because
+    // 'auto' has its own failure mode on a freshly migrated token (it resolves
+    // against an index that has not caught up), which is why the venue is
+    // recorded in the first place.
+    const sellVenue = (pos.sellFailCount ?? 0) % 2 === 1 ? undefined : pos.venue;
+    if (sellVenue !== pos.venue) {
+      this.log('info', `🔀 Retrying the exit for $${pos.tokenSymbol} on 'auto' instead of '${pos.venue}' — the token may have migrated since entry.`, pos.mint);
+    }
+    let result = await this.executeRealMainnetTrade('sell', pos.mint, pos.investedSol || this.config.buyAmountSol, `${pct}%`, sellVenue);
     // A timed-out sell may still land. Resolve its real on-chain outcome before
     // deciding to retry — resubmitting a percentage sell that actually landed
     // sells the bag twice and corrupts the accounting (sniper-correctness-5).

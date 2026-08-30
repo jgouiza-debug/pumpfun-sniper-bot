@@ -685,9 +685,16 @@ console.log('\n-- Fixed trade sizing (all-in removed 2026-08-09) --');
     assert.strictEqual(affordableSellPriorityFeeSol(10, 0.0002), 0.0002, 'the clamp must never raise a fee');
   });
 
-  test('the allInSizing flag exists and is enabled', () => {
-    const { DEFAULTS } = require('../services/featureFlags');
-    assert.strictEqual(DEFAULTS.allInSizing, true, 'allInSizing must be enabled in default flag set');
+  test('the allInSizing flag exists and ships OFF in BOTH flag sets', () => {
+    // This test used to assert `DEFAULTS.allInSizing === true`, i.e. it locked
+    // in 100%-of-wallet sizing as the default for any run that is not a
+    // packaged build — and the project ships a launcher that is exactly that
+    // (`run bot real.cmd` ends in `node "dist\server.js"`, no SNIPER_PACKAGED).
+    // A test can only protect a behaviour; this one was protecting the wrong one.
+    const { DEFAULTS, PACKAGED_DEFAULTS } = require('../services/featureFlags');
+    assert.ok('allInSizing' in DEFAULTS, 'the flag must still exist — it is opt-in, not removed');
+    assert.strictEqual(DEFAULTS.allInSizing, false, 'a dangerous default has no safe context');
+    assert.strictEqual(PACKAGED_DEFAULTS.allInSizing, false);
   });
 }
 
@@ -2062,9 +2069,15 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
     }
   });
 
-  test('OLD BUG reproduced: DEFAULTS also turn all-in sizing ON', () => {
-    assert.strictEqual(DEFAULTS.allInSizing, true,
-      'all-in sizing with no guards is the worst combination this codebase can produce');
+  test('fixed: all-in sizing is OFF in DEFAULTS too — the guards being off makes it worse, not safer', () => {
+    // The original of this test asserted `true` here and called the result
+    // "the worst combination this codebase can produce" — accurately, and then
+    // pinned it in place. PACKAGED_DEFAULTS turned it off for the shipped exe,
+    // but every non-packaged run (including the project's own `run bot
+    // real.cmd`) still landed on DEFAULTS: all-in sizing with the kill switch,
+    // honeypot check, dev-sell stop and economics gate all off.
+    assert.strictEqual(DEFAULTS.allInSizing, false,
+      'all-in sizing with no guards is the worst combination this codebase can produce — so it is not a default anywhere');
   });
 
   for (const g of GUARDS) {

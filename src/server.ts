@@ -957,6 +957,21 @@ function gracefulShutdown(reason: string, server?: http.Server): void {
       console.warn(`⚠️ Shutting down (${reason}) with ${open.length} open position(s): ${open.map((p: any) => `$${p.tokenSymbol}`).join(', ')}. They are persisted and will be restored on the next start; no exits run while the process is down.`);
     }
     try { sniperEngine.toggleBot(false); } catch { /* already stopped */ }
+    // STOP THE COPY TRADER TOO. Shutdown disarmed the sniper and flushed the
+    // copy trader's state, but never actually stopped it: its signal feeds
+    // stayed live right up to process.exit, so a leader signal arriving in the
+    // last moments started a buy that got signed and sent while the process was
+    // on its way out. The transaction lands; the state file was flushed BEFORE
+    // it existed; nothing records the position. That is a bag in the wallet
+    // that no restart ever learns about.
+    try { copyTrader.setEnabled(false); } catch { /* already stopped */ }
+    const inFlight = copyTrader.getInFlightBuyCount();
+    if (inFlight > 0) {
+      console.warn(`⚠️ Shutting down with ${inFlight} copy buy(s) still in flight. They may land after this process is gone — `
+        + 'check the wallet for untracked bags before arming again.');
+    }
+    // Flushed LAST, after both engines have stopped, so the file on disk is the
+    // final state rather than a snapshot taken before the last mutation.
     try { copyTrader.flushStateSync(); } catch { /* best effort */ }
     sniperEngine.markCleanShutdown();
   } catch { /* best effort on the way out */ }
