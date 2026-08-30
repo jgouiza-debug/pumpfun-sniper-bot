@@ -70,6 +70,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
   // Settings modal
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [showAdvanced, setShowAdvanced] = useState<boolean>(false);
   const [configForm, setConfigForm] = useState<Partial<CopyTraderConfig>>({});
   const [settingsError, setSettingsError] = useState<string>('');
   const showSettingsRef = useRef(false);
@@ -697,208 +698,179 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
             <div className="modal-title">Copy Trading Parameters</div>
 
             <form onSubmit={saveSettings}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                <div className="form-group">
-                  <label className="form-label">Execution Environment Mode</label>
-                  <select
-                    className="form-select"
-                    value={configForm.tradingMode || 'paper'}
-                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, tradingMode: e.target.value as 'paper' | 'real' })}
-                  >
-                    <option value="paper">Paper Simulation (Risk-Free Testbed)</option>
-                    <option value="real">Real Photon Mainnet Wallet Execution</option>
-                  </select>
-                  <div className="form-help" style={{ fontSize: '8px' }}>
-                    Real mode signs with the same Photon wallet linked in Sniper settings.
-                  </div>
-                </div>
+              {/* ─── The 4 things that matter ─────────────────────────── */}
+              <div className="form-group">
+                <label className="form-label">Trading mode</label>
+                <select
+                  className="form-select"
+                  value={configForm.tradingMode || 'paper'}
+                  onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, tradingMode: e.target.value as 'paper' | 'real' })}
+                >
+                  <option value="paper">Paper — practice, no real money</option>
+                  <option value="real">Real — spends SOL from your linked wallet</option>
+                </select>
+              </div>
 
-                <div className="form-group">
-                  <label className="form-label">Buy Sizing Mode</label>
-                  <select
-                    className="form-select"
-                    value={sizeMode}
-                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, buySizeMode: e.target.value as 'fixed' | 'proportional' | 'split' })}
-                  >
-                    <option value="split">Split wallet across open slots</option>
-                    <option value="fixed">Fixed SOL per copy</option>
-                    <option value="proportional">% of leader's buy size</option>
-                  </select>
-                </div>
-
-                {sizeMode === 'split' ? (
-                  <div className="form-group">
-                    <div className="form-help" style={{ fontSize: '8px' }}>
-                      Each copy stakes your deployable balance divided by the FREE slots below,
-                      so a small wallet gets a slice per trade instead of spending itself on the
-                      first one. The slice tracks the wallet: up when a position closes green,
-                      down when red.
-                      {engineWallet?.deployableSol ? (
-                        <div style={{ marginTop: '4px', color: 'var(--accent)' }}>
-                          Now: {engineWallet.deployableSol.toFixed(4)} SOL ÷ {slotCount} ={' '}
-                          <strong>~{(engineWallet.deployableSol / Math.max(1, slotCount)).toFixed(4)} SOL</strong> per copy
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                ) : sizeMode === 'proportional' ? (
-                  <div className="form-group">
-                    <label className="form-label">Copy % of Leader Size</label>
-                    <input
-                      type="number" step="1" className="form-input"
-                      value={configForm.proportionalPct ?? 10}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, proportionalPct: Number(e.target.value) })}
-                    />
-                  </div>
-                ) : (
-                  <div className="form-group">
-                    <label className="form-label">Fixed Buy Size (SOL)</label>
-                    <input
-                      type="number" step="0.001" className="form-input"
-                      value={configForm.fixedBuySol ?? 0.05}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, fixedBuySol: Number(e.target.value) })}
-                    />
-                  </div>
-                )}
-
-                <div className="form-group">
-                  <label className="form-label">Max Buy Ceiling (SOL)</label>
-                  <input
-                    type="number" step="0.01" className="form-input"
-                    value={configForm.maxBuySol ?? 0.5}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxBuySol: Number(e.target.value) })}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Min Leader Buy to Copy (SOL)</label>
-                  <input
-                    type="number" step="0.01" className="form-input"
-                    value={configForm.minLeaderBuySol ?? 0}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, minLeaderBuySol: Number(e.target.value) })}
-                  />
-                  <div className="form-help" style={{ fontSize: '8px' }}>
-                    0 = copy EVERY buy the leader makes. Raise to ignore their dust.
-                  </div>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Min Copy Buy Size (SOL) — no dust buys</label>
-                  <input
-                    type="number" step="0.005" className="form-input"
-                    value={configForm.minCopyBuySol ?? 0.01}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, minCopyBuySol: Number(e.target.value) })}
-                  />
-                  <div className="form-help" style={{ fontSize: '8px' }}>
-                    Skip the copy when OUR computed size would be smaller than this. A sub-cent
-                    entry loses the round-trip fee before it can move. 0 = allow any size.
-                  </div>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">
-                    Max Open Copy Positions{sizeMode === 'split' ? ' (= split divisor)' : ''}
-                  </label>
-                  <input
-                    type="number" className="form-input"
-                    value={slotCount}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxOpenPositions: Number(e.target.value) })}
-                  />
-                  {sizeMode === 'split' ? (
-                    <div className="form-help" style={{ fontSize: '8px' }}>
-                      This is also how many ways the wallet is cut. More slots = more
-                      diversification but a smaller slice, and fixed costs (token-account rent
-                      ~0.002 SOL + fees) do not shrink with it — so past a point every trade
-                      needs an implausible move just to break even. The feed prints the
-                      breakeven for each slice.
-                    </div>
+              <div className="form-group">
+                <label className="form-label">SOL per copy trade</label>
+                <input
+                  type="number" step="0.005" min="0" className="form-input"
+                  value={configForm.fixedBuySol ?? 0.02}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, buySizeMode: 'fixed', fixedBuySol: Number(e.target.value) })}
+                />
+                <div className="form-help">
+                  How much SOL to spend each time you copy one of the leader's buys.
+                  {engineWallet?.deployableSol ? (
+                    <> Your wallet holds {engineWallet.deployableSol.toFixed(3)} SOL — about{' '}
+                      <strong>{Math.max(0, Math.floor(engineWallet.deployableSol / Math.max(0.001, configForm.fixedBuySol ?? 0.02)))} buys</strong> worth.</>
                   ) : null}
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Max Slippage (%)</label>
-                  <input
-                    type="number" className="form-input"
-                    value={configForm.maxSlippagePct ?? 25}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxSlippagePct: Number(e.target.value) })}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Per-Wallet Cooldown (sec, 0 = off)</label>
-                  <input
-                    type="number" className="form-input"
-                    value={configForm.perWalletCooldownSec ?? 0}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, perWalletCooldownSec: Number(e.target.value) })}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Auto-Clear Feed (min, 0 = keep)</label>
-                  <input
-                    type="number" className="form-input"
-                    value={configForm.feedAutoClearMinutes ?? 2}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, feedAutoClearMinutes: Number(e.target.value) })}
-                  />
-                  <div className="form-help" style={{ fontSize: '8px' }}>
-                    Feed lines older than this drop off on their own. Receipts are never auto-cleared.
-                  </div>
                 </div>
               </div>
 
-              {/* Exits. Auto-sells were removed 2026-08-12 and restored as a toggle
-                  on 2026-08-13 — but the control never reached this form, so
-                  upgraded installs (where the migration switches copySells OFF)
-                  had no way to turn it back on and never sold. */}
-              <div style={{ marginTop: '10px', padding: '8px', border: '1px solid rgba(148,163,184,0.35)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <div className="form-group">
+                <label className="form-label">Max positions at once</label>
+                <input
+                  type="number" min="1" className="form-input"
+                  value={configForm.maxOpenPositions ?? 5}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxOpenPositions: Number(e.target.value) })}
+                />
+                <div className="form-help">
+                  Once this many copies are open, new leader buys wait until one closes.
+                </div>
+              </div>
+
+              {/* Sells */}
+              <div className="form-group" style={{ border: '1px solid rgba(148,163,184,0.35)', padding: '8px' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
                   <input
                     type="checkbox"
                     checked={configForm.copySells === true}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, copySells: e.target.checked })}
                   />
-                  Copy sells — when a tracked leader sells, sell too
+                  Sell when the leader sells
                 </label>
                 {configForm.copySells === true && (
-                  <div className="form-group" style={{ marginBottom: 0 }}>
-                    <label className="form-label">When the leader sells</label>
+                  <div className="form-group" style={{ marginTop: 6, marginBottom: 0 }}>
                     <select
                       className="form-select"
                       value={configForm.sellMode || 'mirror'}
                       onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, sellMode: e.target.value as 'mirror' | 'full' })}
                     >
-                      <option value="mirror">Mirror — sell the same fraction of our bag that they sold of theirs</option>
-                      <option value="full">Full — any leader sell closes our whole position</option>
+                      <option value="mirror">Match their sell — they sell 50%, you sell 50%</option>
+                      <option value="full">Sell everything — any leader sell closes your whole position</option>
                     </select>
                   </div>
                 )}
-                {configForm.copySells === true && (
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
-                    <input
-                      type="checkbox"
-                      checked={configForm.mirrorLeaderTokenMoves !== false}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, mirrorLeaderTokenMoves: e.target.checked })}
-                    />
-                    Treat a leader MOVING a held token out (no SOL back) as their exit
-                  </label>
-                )}
-                <div className="form-help" style={{ fontSize: '8px' }}>
+                <div className="form-help">
                   {configForm.copySells === true
-                    ? 'Fires on the leader\'s exit only — never on price. A sell that fails is retried (up to 6 attempts, alternating venue); one arriving while another is in flight is queued, not dropped. No take-profit, no stop-loss. The SELL button always works.'
-                    : 'OFF — leader sells show in the feed and the position is HELD. The SELL button on each position is the only exit.'}
+                    ? 'Fires only when the leader exits, never on price. No take-profit or stop-loss. The SELL button on each position always works.'
+                    : 'Off — the leader\'s sells are shown but your position is held. You exit with the SELL button.'}
                 </div>
               </div>
 
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#94a3b8' }}>
-                  <input
-                    type="checkbox"
-                    checked={configForm.blockRepeatBuys === true}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, blockRepeatBuys: e.target.checked })}
-                  />
-                  Block repeat buys (off = a leader re-buy ADDS to the copy position, like their DCA)
-                </label>
-              </div>
+              {/* ─── Advanced (hidden by default) ─────────────────────── */}
+              <button
+                type="button"
+                onClick={() => setShowAdvanced(a => !a)}
+                style={{ all: 'unset', cursor: 'pointer', display: 'block', margin: '12px 0 6px', fontSize: '0.75rem', color: '#94a3b8', fontWeight: 700 }}
+              >
+                {showAdvanced ? '▾' : '▸'} Advanced settings
+              </button>
+
+              {showAdvanced && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid rgba(148,163,184,0.25)', paddingTop: '10px' }}>
+                  <div className="form-group">
+                    <label className="form-label">Sizing method</label>
+                    <select
+                      className="form-select"
+                      value={sizeMode}
+                      onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, buySizeMode: e.target.value as 'fixed' | 'proportional' | 'split' })}
+                    >
+                      <option value="fixed">Fixed SOL per copy (simple)</option>
+                      <option value="split">Split wallet across slots</option>
+                      <option value="proportional">% of the leader's buy</option>
+                    </select>
+                    <div className="form-help">Fixed is recommended for a small wallet — split can size trades down to dust.</div>
+                  </div>
+
+                  {sizeMode === 'proportional' && (
+                    <div className="form-group">
+                      <label className="form-label">Copy % of leader size</label>
+                      <input type="number" step="1" className="form-input"
+                        value={configForm.proportionalPct ?? 10}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, proportionalPct: Number(e.target.value) })} />
+                    </div>
+                  )}
+
+                  <div className="form-group">
+                    <label className="form-label">Never spend more than (SOL)</label>
+                    <input type="number" step="0.01" className="form-input"
+                      value={configForm.maxBuySol ?? 0.5}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxBuySol: Number(e.target.value) })} />
+                    <div className="form-help">Hard ceiling on any single copy buy.</div>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Ignore leader buys under (SOL)</label>
+                    <input type="number" step="0.01" className="form-input"
+                      value={configForm.minLeaderBuySol ?? 0}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, minLeaderBuySol: Number(e.target.value) })} />
+                    <div className="form-help">0 = copy every buy. Raise to skip the leader's tiny buys.</div>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Skip our buys under (SOL)</label>
+                    <input type="number" step="0.005" className="form-input"
+                      value={configForm.minCopyBuySol ?? 0.01}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, minCopyBuySol: Number(e.target.value) })} />
+                    <div className="form-help">No dust: skip if our size would be smaller than this (loses the fee).</div>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Max slippage (%)</label>
+                    <input type="number" className="form-input"
+                      value={configForm.maxSlippagePct ?? 25}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxSlippagePct: Number(e.target.value) })} />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Wait between copies (sec)</label>
+                    <input type="number" className="form-input"
+                      value={configForm.perWalletCooldownSec ?? 0}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, perWalletCooldownSec: Number(e.target.value) })} />
+                    <div className="form-help">0 = no wait. Throttles a fast-flipping leader.</div>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Clear feed after (min)</label>
+                    <input type="number" className="form-input"
+                      value={configForm.feedAutoClearMinutes ?? 5}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, feedAutoClearMinutes: Number(e.target.value) })} />
+                    <div className="form-help">0 = keep. Receipts are never auto-cleared.</div>
+                  </div>
+
+                  <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+                      <input type="checkbox"
+                        checked={configForm.blockRepeatBuys !== true}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, blockRepeatBuys: !e.target.checked })} />
+                      Add to a position when the leader buys the same coin again
+                    </label>
+                    <div className="form-help">On = follow the leader's adds (DCA). Off = one buy per coin, ignore their re-buys.</div>
+                  </div>
+
+                  {configForm.copySells === true && (
+                    <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+                        <input type="checkbox"
+                          checked={configForm.mirrorLeaderTokenMoves !== false}
+                          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, mirrorLeaderTokenMoves: e.target.checked })} />
+                        Count the leader moving a coin out as a sell
+                      </label>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {settingsError && (
                 <div style={{ fontSize: '9.5px', marginTop: '8px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(239,68,68,0.08)' }}>
