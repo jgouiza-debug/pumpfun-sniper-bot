@@ -449,12 +449,26 @@ export class CopyTraderService {
       if (blockers.length) {
         return { ok: false, error: `Cannot arm REAL copy trading: ${blockers.join(' ')}` };
       }
+      // ONE LIVE INSTANCE PER WALLET — copy trading included.
+      //
+      // This check existed only in sniperEngine.toggleBot. Copy trading arms
+      // through here and never asked for the lock, so a second instance could
+      // arm REAL copy trading while the first was already live on the same key.
+      // Both then copied the same leader, doubling every order and sizing
+      // against a balance the other was already spending.
+      const lock = sniperEngine.acquireRealLockForCopy();
+      if (!lock.ok) {
+        return { ok: false, error: `Cannot arm REAL copy trading: ${lock.message}` };
+      }
     }
     this.config.enabled = enabled;
     if (enabled) {
       this.startSignalFeeds();
     } else {
       this.stopSignalFeeds();
+      // Reference-counted: this drops only the copy trader's claim, so a
+      // running sniper keeps the lock.
+      sniperEngine.releaseRealLockForCopy();
     }
     this.persist();
     this.emitChange();
@@ -464,12 +478,27 @@ export class CopyTraderService {
   public updateConfig(partial: Partial<CopyTraderConfig>): { ok: boolean; error?: string } {
     const next = { ...this.config, ...sanitizeConfig(partial) };
 
-    // Arming real mode requires a usable signer NOW, not at the first signal —
-    // same principle as the sniper's preflight.
-    if (next.tradingMode === 'real' && this.config.tradingMode !== 'real' && next.enabled) {
+    // ARMING PREFLIGHT — on the RESULTING state, not on the transition.
+    //
+    // The old condition also required `this.config.tradingMode !== 'real'`, so
+    // it only fired on a paper -> real switch. A restart leaves tradingMode
+    // 'real' on disk with enabled forced false, so re-enabling from that state
+    // was already "real -> real" and skipped the preflight entirely: no blocker
+    // check, and — once the lock was added — no lock either. Any client that
+    // POSTs `{enabled: true}` to the config endpoint took that path.
+    //
+    // Now the question is simply "will this config be live in real mode", which
+    // is the question that actually matters.
+    const willBeLiveReal = next.tradingMode === 'real' && next.enabled;
+    const isLiveReal = this.config.tradingMode === 'real' && this.config.enabled;
+    if (willBeLiveReal && !isLiveReal) {
       const blockers = sniperEngine.getWalletStatus().blockers;
       if (blockers.length) {
         return { ok: false, error: `Cannot switch to REAL mode: ${blockers.join(' ')}` };
+      }
+      const lock = sniperEngine.acquireRealLockForCopy();
+      if (!lock.ok) {
+        return { ok: false, error: `Cannot arm REAL copy trading: ${lock.message}` };
       }
     }
 
@@ -479,6 +508,10 @@ export class CopyTraderService {
       if (next.enabled) this.startSignalFeeds();
       else this.stopSignalFeeds();
     }
+    // Going off live-real (disabled, or switched to paper) hands the lock back
+    // so another instance can arm. Reference-counted, so a running sniper keeps
+    // holding it.
+    if (isLiveReal && !willBeLiveReal) sniperEngine.releaseRealLockForCopy();
     this.persist();
     this.emitChange();
     return { ok: true };
@@ -1541,11 +1574,33 @@ export class CopyTraderService {
   }
 
   /**
-   * How many copy buys are submitted and unresolved. The spend governor's
-   * concurrency ceiling counts both engines, because they share the signer.
+   * How many copy buys are submitted and unresolved.
    */
   public getInFlightBuyCount(): number {
     return this.inFlightBuySol.size;
+  }
+
+  /**
+   * Mints the copy trader holds or is in the middle of buying — the sniper must
+   * not open a position in any of them.
+   *
+   * The mirror of copyTraderService's own `sniperEngine.getHeldMints()` check,
+   * which existed on this side only. A PumpPortal sell is a PERCENTAGE of the
+   * WALLET's balance of the mint, not of one bot's notion of its position, so
+   * two engines holding the same mint means either one's exit moves part of the
+   * other's bag: a sniper take-profit of '50%' on a shared mint sells half of
+   * everything, and the copy trader's book still says its bag is intact.
+   *
+   * In-flight buys are included: a mint whose copy buy has not landed yet is
+   * still a mint we are about to share.
+   */
+  public getHeldMints(): Set<string> {
+    const mints = new Set<string>();
+    for (const p of this.positions) {
+      if (p.status !== 'CLOSED' && !(p.buyTxid ?? '').startsWith('sim_')) mints.add(p.mint);
+    }
+    for (const m of this.inFlightBuySol.keys()) mints.add(m);
+    return mints;
   }
 
   /**
@@ -2245,6 +2300,12 @@ export class CopyTraderService {
       let solReceived: number;
       let txid: string | undefined;
       let fillVerified = false;
+      /**
+       * The bag the CHAIN says is left, when we managed to read it. Preferred
+       * over `tokensHeld - tokensSold` because that arithmetic starts from the
+       * fraction we requested rather than from what moved.
+       */
+      let remainingOnChain: number | null = null;
 
       // Real positions sell for real; PAPER-bought bags (sim_ txid) simulate.
       // Requiring a buyTxid to exist here booked a phantom "paper" sell for a
@@ -2283,6 +2344,23 @@ export class CopyTraderService {
           solReceived = Math.max(0, fill.solDelta);
           tokensSold = Math.abs(Math.min(0, fill.tokenDelta)) || tokensSold;
         } else {
+          // The transaction landed but could not be parsed. `tokensSold` is
+          // still the amount we ASKED to sell and `pos.currentPriceSol` can be
+          // stale by a whole dump — multiplying them books an invented
+          // proceeds figure and an invented realized P&L.
+          //
+          // Ask the wallet instead. The balance before the sell is what the
+          // position recorded, so the difference is what actually sold; it is a
+          // measured number even when the transaction is unreadable.
+          const heldAfter = await this.getOwnedTokenAmount(pos.mint);
+          if (heldAfter !== null) {
+            const measuredSold = Math.max(0, (pos.tokensHeld || 0) - heldAfter);
+            if (measuredSold > 0) tokensSold = measuredSold;
+            // The remaining bag is now known from the chain rather than from
+            // the requested fraction, so a sell that moved less than asked
+            // leaves the rest tracked instead of being written off.
+            remainingOnChain = heldAfter;
+          }
           solReceived = tokensSold * pos.currentPriceSol;
         }
       } else {
@@ -2306,11 +2384,21 @@ export class CopyTraderService {
       const pnlUsd = pnlSol * solPriceUsd;
       const pnlPct = costBasisSol > 0 ? (pnlSol / costBasisSol) * 100 : 0;
 
-      pos.tokensHeld = Math.max(0, pos.tokensHeld - tokensSold);
+      // The chain wins when it answered. `isFull` is the fraction we ASKED for,
+      // and closing on it alone writes off whatever did not actually sell —
+      // a bag with no position tracking it is a bag nothing will ever exit.
+      pos.tokensHeld = remainingOnChain !== null
+        ? Math.max(0, remainingOnChain)
+        : Math.max(0, pos.tokensHeld - tokensSold);
       pos.realizedPnlSol += pnlSol;
       pos.realizedPnlUsd += pnlUsd;
-      pos.status = isFull || pos.tokensHeld <= 1e-9 ? 'CLOSED' : 'PARTIAL';
+      const emptied = pos.tokensHeld <= 1e-9;
+      pos.status = emptied || (isFull && remainingOnChain === null) ? 'CLOSED' : 'PARTIAL';
       if (pos.status === 'CLOSED') pos.tokensHeld = 0;
+      if (isFull && !emptied && remainingOnChain !== null) {
+        this.pushFeed(wallet ?? this.standInWallet(pos), feedSig, 'pending',
+          `$${pos.tokenSymbol}: a FULL exit was requested but the wallet still holds ${pos.tokensHeld} tokens — position kept OPEN so the remainder is still tracked and can be sold.`);
+      }
       this.repricePosition(pos, pos.currentPriceSol);
 
       const owner = wallet ?? this.wallets.get(pos.leaderWallet);
@@ -2417,6 +2505,19 @@ export class CopyTraderService {
             `SELL ${pct}% of $${pos.tokenSymbol} submitted but unconfirmed — watching the transaction before any retry (a blind resubmit can sell twice).`);
         }
         const outcome = await sniperEngine.resolveTimedOutSell(result.txid, pos.mint);
+        if (outcome === 'unknown') {
+          // We do not know whether that sell landed, so retrying it here would
+          // be the blind resubmit this whole branch exists to prevent — the
+          // retry loop is the resubmit. Stop, keep the position, and let the
+          // periodic on-chain balance sync establish the truth; a later exit
+          // starts from the wallet's real balance rather than from a guess.
+          if (wallet) {
+            this.pushFeed(wallet, feedSig, 'failed',
+              `SELL ${pct}% of $${pos.tokenSymbol} could not be resolved (the RPC never answered). NOT retried — a blind resubmit can sell the bag twice. `
+              + `The position is kept and re-checked against the chain shortly. https://solscan.io/tx/${result.txid}`);
+          }
+          return null;
+        }
         if (outcome !== 'failed' && outcome !== 'expired') return outcome; // landed late — book it
       } else if (result) {
         return result;
@@ -2544,6 +2645,7 @@ export class CopyTraderService {
       // Skipped while an exit is in flight (below, inside the sync) so it
       // cannot race a sell that is mid-settlement.
       if (this.config.tradingMode === 'real'
+        && !this.positionsWalletMismatch
         && Date.now() - this.lastPositionSyncAt > POSITION_SYNC_INTERVAL_MS
         && !this.positionSyncInFlight) {
         this.lastPositionSyncAt = Date.now();
@@ -2561,6 +2663,13 @@ export class CopyTraderService {
 
   private lastPositionSyncAt = 0;
   private positionSyncInFlight = false;
+  /**
+   * True when the restored positions were bought by a DIFFERENT wallet than the
+   * one linked now. Automatic reconciliation is suppressed while it holds: a
+   * balance check against the wrong wallet reads zero for every mint and would
+   * close every real position as "externally exited".
+   */
+  private positionsWalletMismatch = false;
 
   // ---------------- FEED / HISTORY / HELPERS ----------------
 
@@ -2644,20 +2753,62 @@ export class CopyTraderService {
    * positions represent tokens actually sitting in the wallet — dropping them
    * on restart would orphan real holdings with no exit watching them.
    */
+  /** The exact bytes of the current state. One definition, three call sites. */
+  private serializeState(): string {
+    return JSON.stringify({
+      // Stamped so the copySells opt-out migration runs exactly once.
+      configVersion: COPY_CONFIG_VERSION,
+      // Whose positions these are. Without it, restored bags were reconciled
+      // against WHATEVER wallet happened to be linked on the next boot — relink
+      // a different key and the balance sync reads zero for every mint and
+      // closes real positions as "externally exited".
+      walletAddress: sniperEngine.getWalletStatus().address ?? null,
+      config: this.config,
+      wallets: [...this.wallets.values()],
+      positions: this.positions.filter(p => p.status !== 'CLOSED'),
+      history: this.history.slice(0, HISTORY_LIMIT),
+    }, null, 2);
+  }
+
+  /**
+   * Write the state file so that a process death can never leave it truncated.
+   *
+   * It used to be a bare `fs.writeFileSync(STATE_FILE, ...)`. A kill, a crash
+   * or a power loss partway through that call leaves a half-written file, and
+   * the next boot's `JSON.parse` throws — at which point loadState's outer
+   * `catch` swallowed it and the service started on DEFAULT_CONFIG. Every open
+   * real position, every tracked leader and every hardened safety setting the
+   * operator had chosen (a raised minimum, blockRepeatBuys, a cooldown, a
+   * smaller book) was gone, silently, replaced by defaults that are more
+   * permissive than what they had set.
+   *
+   * Write to a temp file, then rename — rename is atomic on every platform this
+   * ships to, so the state file is only ever the old bytes or the new ones. The
+   * previous good copy is kept alongside as .bak for loadState to fall back to.
+   */
+  private writeStateFile(): void {
+    const payload = this.serializeState();
+    const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, payload, { encoding: 'utf8' });
+      // Keep the last good file before replacing it. A backup is what turns
+      // "the state file is unreadable" from data loss into a rollback.
+      try {
+        if (fs.existsSync(STATE_FILE)) fs.copyFileSync(STATE_FILE, `${STATE_FILE}.bak`);
+      } catch { /* a missing backup must never block the real write */ }
+      fs.renameSync(tmp, STATE_FILE);
+    } catch (err: any) {
+      console.error(`[CopyTrader] ⚠️ Could not write ${STATE_FILE}: ${err?.message ?? err}. `
+        + 'If this process dies, open positions and settings will not survive the restart.');
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* nothing more to do */ }
+    }
+  }
+
   private persist(): void {
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      try {
-        fs.writeFileSync(STATE_FILE, JSON.stringify({
-          // Stamped so the copySells opt-out migration runs exactly once.
-          configVersion: COPY_CONFIG_VERSION,
-          config: this.config,
-          wallets: [...this.wallets.values()],
-          positions: this.positions.filter(p => p.status !== 'CLOSED'),
-          history: this.history.slice(0, HISTORY_LIMIT),
-        }, null, 2));
-      } catch { /* persistence is best-effort */ }
+      this.writeStateFile();
     }, 500);
   }
 
@@ -2673,21 +2824,69 @@ export class CopyTraderService {
    */
   public flushStateSync(): void {
     if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = null; }
-    try {
-      fs.writeFileSync(STATE_FILE, JSON.stringify({
-        configVersion: COPY_CONFIG_VERSION,
-        config: this.config,
-        wallets: [...this.wallets.values()],
-        positions: this.positions.filter(p => p.status !== 'CLOSED'),
-        history: this.history.slice(0, HISTORY_LIMIT),
-      }, null, 2));
-    } catch { /* best effort on the way out */ }
+    this.writeStateFile();
+  }
+
+  /**
+   * Read the state file, falling back to the backup, and NEVER pretend a
+   * corrupt file is an absent one.
+   *
+   * The old code parsed inside loadState's single outer try/catch, so a
+   * truncated or malformed file took the same path as "no file yet": the
+   * service started on DEFAULT_CONFIG with no positions, no tracked wallets and
+   * every hardened safety setting reverted — without a word in the log. The
+   * operator would have seen a bot that had forgotten its own configuration and
+   * was trading with more permissive limits than they set.
+   *
+   * Now: try the file, then the backup, and if both are unreadable say so
+   * loudly AND preserve the bad file for inspection instead of overwriting it.
+   */
+  private readStateFile(): any | null {
+    for (const [path, label] of [[STATE_FILE, 'state file'], [`${STATE_FILE}.bak`, 'backup']] as const) {
+      if (!fs.existsSync(path)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(path, 'utf8'));
+        if (parsed && typeof parsed === 'object') {
+          if (label === 'backup') {
+            console.warn(`[CopyTrader] ⚠️ ${STATE_FILE} was unreadable — recovered settings, wallets and positions from the backup instead.`);
+          }
+          return parsed;
+        }
+        console.error(`[CopyTrader] ⚠️ The ${label} parsed but is not an object — ignoring it.`);
+      } catch (err: any) {
+        console.error(`[CopyTrader] ⚠️ The ${label} at ${path} is CORRUPT (${err?.message ?? err}).`);
+      }
+    }
+    if (fs.existsSync(STATE_FILE)) {
+      // Both copies failed. Move the bad file aside rather than letting the
+      // next persist() overwrite the only evidence of what was in it.
+      const quarantine = `${STATE_FILE}.corrupt`;
+      try {
+        fs.renameSync(STATE_FILE, quarantine);
+        console.error(`[CopyTrader] 🛑 Starting with DEFAULT settings and NO restored positions. The unreadable file was kept at ${quarantine}. `
+          + 'CHECK YOUR WALLET for open bags this bot is no longer tracking before you arm real trading again.');
+      } catch { /* keep going — defaults are still the only option */ }
+    }
+    return null;
   }
 
   private loadState(): void {
     try {
-      if (!fs.existsSync(STATE_FILE)) return;
-      const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      const raw = this.readStateFile();
+      if (!raw) return;
+
+      // Positions belong to the wallet that bought them. Reconciling wallet A's
+      // bags against wallet B reads zero for every mint and closes all of them
+      // as "externally exited" — real positions, deleted, for a key change.
+      const savedWallet = typeof raw.walletAddress === 'string' ? raw.walletAddress : null;
+      const currentWallet = sniperEngine.getWalletStatus().address ?? null;
+      const walletChanged = Boolean(savedWallet && currentWallet && savedWallet !== currentWallet);
+      if (walletChanged) {
+        console.warn(`[CopyTrader] ⚠️ The saved positions belong to wallet ${shortAddr(savedWallet!)} but ${shortAddr(currentWallet!)} is linked now. `
+          + 'They are restored but will NOT be auto-reconciled against this wallet — a balance check against the wrong wallet would close them all as sold. '
+          + 'Relink the original key, or dismiss them once you have checked them.');
+      }
+      this.positionsWalletMismatch = walletChanged;
 
       if (raw.config && typeof raw.config === 'object') {
         this.config = { ...DEFAULT_CONFIG, ...sanitizeConfig(raw.config) };

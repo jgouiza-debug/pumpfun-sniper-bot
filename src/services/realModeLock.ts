@@ -33,8 +33,33 @@ export interface LockState {
  *
  * Paper mode is untouched: run as many simulated instances as you like.
  */
+/**
+ * Which engine holds live execution. Both sign with the same wallet, so the
+ * machine-wide lock must be held while EITHER is armed.
+ */
+export type LockEngine = 'sniper' | 'copy';
+
 export class RealModeLock {
   private owned = false;
+  /**
+   * Engines in this process that currently need the lock.
+   *
+   * Reference-counted because the lock was a single boolean owned by the
+   * sniper's toggleBot, and the copy trader — which reaches the same signer
+   * through executeExternalTrade — never took it at all. Two consequences, both
+   * live before 2026-08-30:
+   *
+   *  - a second instance could arm REAL copy trading while the first held the
+   *    lock, because copy arming never asked. Two processes then copied the
+   *    same leader with the same key, doubling every order and racing each
+   *    other's balance reads;
+   *  - stopping the sniper called release() while copy trading was still live,
+   *    dropping the lock and letting another instance arm underneath it.
+   *
+   * Releasing now only clears the file when no engine in this process still
+   * needs it.
+   */
+  private holders = new Set<LockEngine>();
 
   private read(): LockHolder | null {
     try {
@@ -92,7 +117,7 @@ export class RealModeLock {
    * Failure is always closed: an unwritable lock means no live trading, never
    * unguarded live trading.
    */
-  public acquire(port: number, instanceName: string): { ok: boolean; holder?: LockHolder } {
+  public acquire(port: number, instanceName: string, engine: LockEngine = 'sniper'): { ok: boolean; holder?: LockHolder } {
     const payload = JSON.stringify(
       { pid: process.pid, port, instanceName, startedAt: Date.now() } satisfies LockHolder,
       null,
@@ -110,6 +135,7 @@ export class RealModeLock {
           fs.closeSync(fd);
         }
         this.owned = true;
+        this.holders.add(engine);
         return { ok: true };
       } catch (err: any) {
         if (err?.code !== 'EEXIST') return { ok: false };
@@ -122,6 +148,7 @@ export class RealModeLock {
           try {
             fs.writeFileSync(LOCK_FILE, payload);
             this.owned = true;
+            this.holders.add(engine);
             return { ok: true };
           } catch {
             return { ok: false };
@@ -140,8 +167,21 @@ export class RealModeLock {
     return { ok: false };
   }
 
-  /** Releases only if this process owns it, so we never free someone else's lock. */
-  public release(): void {
+  /**
+   * Release one engine's claim. The file is only cleared once NO engine in this
+   * process still needs it — stopping the sniper must not drop the lock while
+   * copy trading is still live on the same wallet.
+   *
+   * `release()` with no argument releases everything, which is what the exit
+   * handlers want.
+   */
+  public release(engine?: LockEngine): void {
+    if (engine) {
+      this.holders.delete(engine);
+      if (this.holders.size > 0) return;
+    } else {
+      this.holders.clear();
+    }
     if (!this.owned) return;
     const holder = this.read();
     if (holder && holder.pid !== process.pid) {
@@ -150,6 +190,11 @@ export class RealModeLock {
     }
     this.forceClear();
     this.owned = false;
+  }
+
+  /** Engines in this process currently holding live execution. */
+  public heldBy(): LockEngine[] {
+    return [...this.holders];
   }
 
   private forceClear(): void {

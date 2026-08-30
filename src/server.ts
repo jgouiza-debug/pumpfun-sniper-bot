@@ -681,6 +681,9 @@ app.post('/api/updater/apply', async (req, res) => {
 // trader's in-flight buy reservations when sizing, so the two never overdraft
 // the wallet together (copy-correctness-5). Wired here to avoid an import cycle.
 sniperEngine.setCopyInFlightReservedProvider(() => copyTrader.getInFlightBuyReservedSol());
+// Shared-mint refusal, in BOTH directions: a percentage sell moves the wallet's
+// whole balance of a mint, so neither engine may open one the other holds.
+sniperEngine.setCopyHeldMintsProvider(() => copyTrader.getHeldMints());
 
 updaterService.setRestartGuard(() => {
   const status = sniperEngine.getStatus();

@@ -755,6 +755,12 @@ export class SniperEngine {
    */
   private inFlightBuyCount = 0;
 
+  /** Mints the copy trader holds — see withEntrySlot. Wired in server.ts. */
+  private copyHeldMintsProvider: () => Set<string> = () => new Set();
+  public setCopyHeldMintsProvider(fn: () => Set<string>): void {
+    this.copyHeldMintsProvider = fn;
+  }
+
   /**
    * Say a governor halt out loud exactly once per trip. A high-frequency leader
    * would otherwise repeat the same line on every signal, which buries it —
@@ -771,6 +777,32 @@ export class SniperEngine {
     // the sniper's own loop too so it is not left looking active while refusing
     // every entry.
     if (this.config.isBotActive) this.toggleBot(false);
+  }
+
+  /**
+   * Take (or release) the machine-wide live-trading lock on the copy trader's
+   * behalf. The lock lives here because the instance identity does; the copy
+   * trader must hold it for exactly as long as it is armed in real mode, or a
+   * second instance can arm on the same wallet underneath it.
+   */
+  public acquireRealLockForCopy(): { ok: boolean; message?: string } {
+    const lock = realModeLock.acquire(
+      this.config.instancePort ?? 3001,
+      this.config.instanceName ?? 'Bot',
+      'copy'
+    );
+    if (lock.ok) return { ok: true };
+    const h = lock.holder;
+    return {
+      ok: false,
+      message: h
+        ? `"${h.instanceName}" (port ${h.port}, pid ${h.pid}) is already trading live with this wallet. Stop it first, or run this instance in PAPER mode.`
+        : 'could not acquire the live-trading lock',
+    };
+  }
+
+  public releaseRealLockForCopy(): void {
+    realModeLock.release('copy');
   }
 
   /** Operator-facing governor state, for the dashboard and the API. */
@@ -800,26 +832,46 @@ export class SniperEngine {
    * rejection — a resubmit is safe now), or 'expired' (it can no longer land
    * — a resubmit is safe).
    */
-  public async resolveTimedOutSell(txid: string, mint: string, maxWaitMs = 75_000): Promise<TradeResult | 'failed' | 'expired'> {
-    const started = Date.now();
-    while (Date.now() - started < maxWaitMs) {
-      try {
-        const status = await this.solanaConnection.getSignatureStatus(txid);
-        const value = status?.value;
-        if (value) {
-          if (value.err) return 'failed';
-          if (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized') {
-            const owner = this.wallet.getAddress();
-            const fill = owner ? await inspectFill(this.solanaConnection, txid, owner, mint) : null;
-            this.log('warn', `⏱️ Timed-out sell ${txid.slice(0, 8)}... LANDED late — booking it, no resubmit.`, mint);
-            void this.syncLiveWalletBalance();
-            return { txid, fill };
-          }
-        }
-      } catch { /* transient RPC noise — keep polling */ }
-      await new Promise(res => setTimeout(res, 3000));
+  public async resolveTimedOutSell(
+    txid: string,
+    mint: string,
+    maxWaitMs = 75_000,
+    blockhash?: string
+  ): Promise<TradeResult | 'failed' | 'expired' | 'unknown'> {
+    // Rebuilt on txSettlement 2026-08-30. This method had re-implemented, line
+    // for line, the confirmation bug that produced phantom BUYS — the same
+    // getSignatureStatus call with searchTransactionHistory defaulting to
+    // false, the same bare `catch {}` swallowing every RPC error, and the same
+    // "we ran out of patience" verdict at the end.
+    //
+    // Here it was worse than a phantom position. The final `return 'expired'`
+    // tells callers the transaction can never land, which is their licence to
+    // RESUBMIT. Under a 429 storm — measured repeatedly against this key —
+    // every poll throws for the full window, and a sell that landed perfectly
+    // well is reported as expired. The retry then sells a PERCENTAGE of the bag
+    // a second time. A 40% mirror exit becomes 64% sold; a 100% exit becomes a
+    // second sell of whatever else the wallet holds of that mint.
+    const res = await settleTransaction(this.solanaConnection, txid, {
+      timeoutMs: maxWaitMs,
+      pollMs: 3_000,
+      blockhash,
+      log: (level, msg) => this.log(level, msg, mint),
+    });
+
+    if (res.outcome === 'landed') {
+      const owner = this.wallet.getAddress();
+      const fill = owner ? await inspectFill(this.solanaConnection, txid, owner, mint) : null;
+      this.log('warn', `⏱️ Unresolved sell ${txid.slice(0, 8)}... LANDED late — booking it, no resubmit.`, mint);
+      void this.syncLiveWalletBalance();
+      return { txid, fill };
     }
-    return 'expired';
+    if (res.outcome === 'reverted' || res.outcome === 'slippage') return 'failed';
+    if (res.outcome === 'expired') return 'expired';
+
+    // UNKNOWN is NOT a licence to resubmit. Before this distinction existed,
+    // this case returned 'expired' and sold the bag twice.
+    this.log('error', `❓ Sell ${txid.slice(0, 8)}... could not be resolved (${res.detail}). NOT resubmitting — a blind retry of a percentage sell can sell the bag twice. Check https://solscan.io/tx/${txid}`, mint);
+    return 'unknown';
   }
 
   /**
@@ -1151,7 +1203,7 @@ export class SniperEngine {
     if (wasActive && newConfig.tradingMode && newConfig.tradingMode !== prevMode) {
       this.config.isBotActive = false;
       this.unsubscribeStream();
-      realModeLock.release();
+      realModeLock.release('sniper');
       this.finishRun();
       this.log('warn', `⏸️ Trading mode changed ${prevMode.toUpperCase()} -> ${newConfig.tradingMode.toUpperCase()} mid-run. Bot stopped — press START to arm the new mode with full preflight.`);
     }
@@ -1249,7 +1301,8 @@ export class SniperEngine {
         // Paper instances are unlimited.
         const lock = realModeLock.acquire(
           this.config.instancePort ?? 3001,
-          this.config.instanceName ?? 'Bot'
+          this.config.instanceName ?? 'Bot',
+          'sniper'
         );
         if (!lock.ok) {
           const h = lock.holder;
@@ -1313,7 +1366,7 @@ export class SniperEngine {
     } else {
       this.config.isBotActive = false;
       this.unsubscribeStream();
-      realModeLock.release();
+      realModeLock.release('sniper');
       // Armed snipes die with the run — a wakeup should never fire a buy that
       // was armed before the pause.
       for (const [mint, pending] of this.pendingSnipes) {
@@ -1974,7 +2027,7 @@ export class SniperEngine {
           // It landed after all. Book the REAL quantity the wallet holds.
           this.log('info', `📗 Buy ${txid.slice(0, 8)}... DID land — the wallet holds ${owned.toLocaleString()} tokens. Recording the real amount, not an estimate.`, mint);
           tradeGovernor.recordBuyOutcome(true, 'confirmed by balance read');
-          this.failureBreaker.recordSuccess();
+          if (!opts.external) this.failureBreaker.recordSuccess();
           return {
             txid,
             fill: { txid, solDelta: -solAmount, tokenDelta: owned, feeSol: priorityFeeSol, slot: 0 },
@@ -1986,7 +2039,13 @@ export class SniperEngine {
         // breaker is about a broken path, and this path just worked. The
         // governor's streak is cleared for the same reason, and only ever by a
         // transaction that actually confirmed.
-        this.failureBreaker.recordSuccess();
+        // Symmetric with noteTradeFailure, which excludes copy trades from this
+        // breaker: a copy trade must not CLEAR it either. It could, and a
+        // steady copy feed therefore reset the sniper's fee-burn streak
+        // faster than the sniper could accumulate it — the breaker that exists
+        // to notice a systematically broken sniper path could never reach its
+        // threshold while copy trading was running.
+        if (!opts.external) this.failureBreaker.recordSuccess();
         if (action === 'buy') tradeGovernor.recordBuyOutcome(true, 'confirmed');
         latencyTimeline.stamp(mint, 't7ConfirmedMs');
 
@@ -3059,6 +3118,19 @@ export class SniperEngine {
     if (this.entriesInFlight.has(mint)) return;
     if (this.activePositions.some(p => p.mint === mint)) return;
 
+    // Never share a mint with the copy trader. The guard existed only on the
+    // copy side (`sniperEngine.getHeldMints().has(mint)` in onLeaderBuy), so
+    // the sniper could still buy into a mint the copy trader already held —
+    // and a PumpPortal sell moves a PERCENTAGE OF THE WALLET's balance of the
+    // mint, not of one engine's idea of its own position. A sniper take-profit
+    // of '50%' on a shared mint sells half of the copy trader's bag too, while
+    // the copy book still reports it intact and later tries to exit tokens
+    // that are gone.
+    if (this.copyHeldMintsProvider().has(mint)) {
+      this.log('warn', `⏭️ Skipping $${symbol} — the copy trader already holds this mint. Sharing it would make either bot's exit sell part of the other's bag.`, mint);
+      return;
+    }
+
     const committed = this.activePositions.length + this.entriesInFlight.size;
     if (committed >= this.config.maxActivePositions) {
       this.log('warn', `⚠️ Position limit reached (${this.activePositions.length} open + ${this.entriesInFlight.size} in flight / ${this.config.maxActivePositions}). Skipping buy for $${symbol}.`);
@@ -3817,6 +3889,17 @@ export class SniperEngine {
       // Hold off any concurrent exit trigger for this position while resolving.
       pos.sellRetryAfterMs = now + 90_000;
       const outcome = await this.resolveTimedOutSell(result.txid, pos.mint);
+      if (outcome === 'unknown') {
+        // Neither landed nor provably dead. Retrying now is the blind resubmit
+        // this branch exists to prevent, and counting it as a failure would
+        // walk the position toward the attempt cap for something that may have
+        // sold perfectly well. Hold until the blockhash cannot possibly still
+        // be alive, then let the normal path try again from a clean read.
+        pos.sellRetryAfterMs = now + 5 * 60_000;
+        this.log('warn', `⏸️ Sell for $${pos.tokenSymbol} is unresolved — holding off retries for 5 minutes so a transaction that may have landed is not sent twice.`, pos.mint);
+        void this.syncLiveWalletBalance();
+        return null;
+      }
       result = (outcome === 'failed' || outcome === 'expired') ? null : outcome;
     }
     if (!result) {
