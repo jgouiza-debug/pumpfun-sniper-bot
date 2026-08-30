@@ -924,6 +924,44 @@ export class SniperEngine {
   private unresolvedBuys = new Map<string, { txid: string; attempts: number }>();
   private unresolvedBuyTimer: NodeJS.Timeout | null = null;
 
+  /**
+   * A transaction we signed but whose send threw. It may be on chain.
+   *
+   * Runs in the background — the caller has already returned a failure, which
+   * is the correct answer for it (no position may be opened from something
+   * unproven). This exists so the OPERATOR still finds out, and so a buy that
+   * really did land does not become a bag nothing is tracking.
+   */
+  private async resolveOrphanedSubmission(
+    action: 'buy' | 'sell',
+    mint: string,
+    txid: string,
+    blockhash?: string
+  ): Promise<void> {
+    const res = await settleTransaction(this.solanaConnection, txid, {
+      timeoutMs: 95_000,
+      pollMs: 2_000,
+      blockhash,
+      log: (level, msg) => this.log(level, msg, mint),
+    });
+
+    if (res.outcome === 'landed') {
+      this.log('error', `🚨 ${action.toUpperCase()} ${txid.slice(0, 8)}… DID LAND despite the send error. `
+        + (action === 'buy'
+          ? 'The wallet now holds tokens with no position tracking them — reconciling.'
+          : 'The bag was sold; the position record may be stale — reconciling.'), mint);
+      this.queueUnresolvedBuy(mint, txid);
+      void this.syncLiveWalletBalance();
+      return;
+    }
+    if (res.outcome === 'unknown') {
+      this.log('error', `❓ ${action.toUpperCase()} ${txid.slice(0, 8)}… could not be resolved after the send error — checking the wallet instead. https://solscan.io/tx/${txid}`, mint);
+      this.queueUnresolvedBuy(mint, txid);
+      return;
+    }
+    this.log('info', `✅ ${action.toUpperCase()} ${txid.slice(0, 8)}… ${res.detail} — nothing landed, nothing to track.`, mint);
+  }
+
   private queueUnresolvedBuy(mint: string, txid: string): void {
     this.unresolvedBuys.set(mint, { txid, attempts: 0 });
     if (this.unresolvedBuyTimer) return;
@@ -1665,6 +1703,13 @@ export class SniperEngine {
     let inFlightCounted = false;
     /** Undoes the governor claim if this order never reaches the chain. */
     let releaseReservation: (() => void) | null = null;
+    /**
+     * The signature of the signed transaction, known BEFORE it is sent. Set as
+     * soon as signing completes so a throw from sendRawTransaction still leaves
+     * something to resolve — see the catch.
+     */
+    let signedTxid: string | null = null;
+    let signedBlockhash: string | undefined;
 
     const keypair = this.wallet.getKeypair();
     if (!keypair) {
@@ -1723,6 +1768,11 @@ export class SniperEngine {
         mint,
         solAmount: worstCaseSol,
         walletSol: this.wallet.getSolBalance(),
+        // The balance is only as good as its last SUCCESSFUL read. walletService
+        // keeps the previous value on failure without advancing this stamp, so
+        // under a 429 storm the figure freezes at a pre-spend number and every
+        // ceiling that consults it silently over-permits.
+        walletSolAgeMs: Date.now() - this.wallet.getStatus(this.config.solPriceUsd).lastCheckedAt,
         // this.inFlightBuyCount alone IS the cross-engine figure: both engines
         // reach the chain through this function and nowhere else, so every
         // order — sniper or copy — is already counted here exactly once.
@@ -1905,6 +1955,19 @@ export class SniperEngine {
         tx.sign([keypair]);
         latencyTimeline.stamp(mint, 't5BuiltSignedMs');
 
+        // KNOW THE SIGNATURE BEFORE SENDING IT.
+        //
+        // A signed transaction's id is its first signature — it does not depend
+        // on the node accepting it, or on the HTTP response coming back. That
+        // matters because sendRawTransaction can THROW after the node has
+        // already accepted and forwarded the transaction: a connection reset, a
+        // lost response, an exhausted 429 retry. The old code learned the
+        // signature only from the return value, so on a throw it had nothing —
+        // the buy could land, and no position, no reconcile and no log line
+        // existed anywhere to notice it. The bag would simply sit in the wallet.
+        signedTxid = bs58.encode(tx.signatures[0]);
+        signedBlockhash = tx.message.recentBlockhash;
+
         const txid = await this.solanaConnection.sendRawTransaction(tx.serialize(), {
           skipPreflight: true,
           maxRetries: 3,
@@ -2076,6 +2139,17 @@ export class SniperEngine {
       // as the breaker is concerned: a fee may have been spent and no position
       // exists. Counting it is what stops a crashing path from looping.
       if (action === 'buy') tradeGovernor.recordBuyOutcome(false, err?.message ?? 'threw during execution');
+
+      // The transaction was signed, so it may be ON CHAIN even though the call
+      // that sent it threw. Do not walk away from it. Resolving it in the
+      // background costs nothing on the hot path and is the difference between
+      // an untracked bag and a line the operator can act on.
+      if (signedTxid) {
+        const orphan = signedTxid;
+        const orphanHash = signedBlockhash;
+        this.log('warn', `⚠️ ${action.toUpperCase()} ${orphan.slice(0, 8)}… was SIGNED and may have landed despite the error — resolving it in the background. https://solscan.io/tx/${orphan}`, mint);
+        void this.resolveOrphanedSubmission(action, mint, orphan, orphanHash);
+      }
     } finally {
       // Released on EVERY exit path — return, throw, or fall-through. A leaked
       // in-flight count would ratchet the concurrency ceiling down until it

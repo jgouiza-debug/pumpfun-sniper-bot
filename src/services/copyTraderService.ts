@@ -118,6 +118,18 @@ const TX_FETCH_DEADLINE_MS = 8000;
 const TX_FETCH_INTERVAL_MS = 250;
 /** One paced re-read of a leader tx that outlived the polling budget — long enough for an RPC 429 storm to pass. */
 const TX_REFETCH_DELAY_MS = 20_000;
+/**
+ * Oldest a leader BUY signal may be and still be worth copying.
+ *
+ * The retry path can surface a buy ~28s after it happened
+ * (TX_FETCH_DEADLINE_MS + TX_REFETCH_DELAY_MS), which on these tokens is an
+ * eternity — the leader may already be out. Entering there is not copying the
+ * leader, it is buying their exit liquidity.
+ *
+ * SELLS are deliberately NOT aged out: a late exit still gets us out, and
+ * refusing one would strand the bag.
+ */
+const MAX_BUY_SIGNAL_AGE_MS = 15_000;
 /** How long a signature-less PumpPortal copy blocks the delayed Helius re-read of the same mint+side. */
 const UNSIGNED_COPY_DEDUP_MS = 90_000;
 
@@ -167,6 +179,15 @@ interface LeaderSignal {
   isTokenSwap?: boolean;
   /** Leader's realized price in SOL per token for this leg, when the trade carried one. */
   priceSol?: number;
+  /**
+   * When the leader's transaction was FIRST OBSERVED, not when this signal
+   * object was built. The two diverge on the retry path: a transaction the RPC
+   * could not serve within TX_FETCH_DEADLINE_MS is re-read
+   * TX_REFETCH_DELAY_MS later, so a signal can be produced ~28s after the
+   * leader actually traded — long enough for them to have dumped the token
+   * already. Carried through so onLeaderBuy can refuse to chase a stale entry.
+   */
+  observedAt?: number;
   /**
    * 'transfer' = tokens moved with no SOL against them (airdrop, dust, a bag
    * moved between the leader's own wallets). Surfaced in the feed, never
@@ -876,7 +897,7 @@ export class CopyTraderService {
     this.emitChange();
   }
 
-  private async handleWalletLog(leaderAddress: string, signature: string, isRetry = false): Promise<void> {
+  private async handleWalletLog(leaderAddress: string, signature: string, isRetry = false, observedAt = Date.now()): Promise<void> {
     const wallet = this.wallets.get(leaderAddress);
     if (!wallet || !wallet.enabled || !this.config.enabled || !this.heliusConn) return;
     // The retry path re-enters here after a delay — the other lane may have
@@ -920,7 +941,10 @@ export class CopyTraderService {
         this.pendingRetrySigs.add(signature);
         setTimeout(() => {
           this.pendingRetrySigs.delete(signature);
-          void this.handleWalletLog(leaderAddress, signature, true);
+          // The ORIGINAL observation time is carried into the retry — the age
+          // that matters is how long ago the leader traded, not how long ago
+          // we last tried to read it.
+          void this.handleWalletLog(leaderAddress, signature, true, observedAt);
         }, TX_REFETCH_DELAY_MS);
       } else {
         if (shouldPushFeed) {
@@ -949,6 +973,9 @@ export class CopyTraderService {
     this.markSigProcessed(signature);
 
     for (const sig of signals) {
+      // Stamp the ORIGINAL observation time so onLeaderBuy can tell how long
+      // ago the leader actually traded, not how long ago we managed to read it.
+      sig.observedAt = observedAt;
       // A Helius delivery — fast lane, this analysis path, or the 20s re-read —
       // may match a trade already copied from a PumpPortal payload that carried
       // no signature, the one case signature dedup cannot see. Mirroring it
@@ -1709,8 +1736,28 @@ export class CopyTraderService {
       return skip('Leader bought on a venue this bot cannot execute on (not pump.fun / PumpSwap / Raydium / LaunchLab, and not a pump/bonk mint) — not copied.');
     }
 
-    if (this.config.minLeaderBuySol > 0 && !sig.isTokenSwap && sig.solAmount < this.config.minLeaderBuySol) {
-      return skip(`Leader buy ${sig.solAmount.toFixed(4)} SOL is below the ${this.config.minLeaderBuySol} SOL minimum.`);
+    // STALE SIGNAL. A buy the RPC could not serve in time is re-read 20s later,
+    // so this can be the first sight of a trade that happened ~28s ago. On
+    // these tokens the leader may already be out; entering now is not copying
+    // them, it is buying their exit liquidity. Sells are never aged out — a
+    // late exit still gets us out.
+    const signalAgeMs = sig.observedAt ? Date.now() - sig.observedAt : 0;
+    if (signalAgeMs > MAX_BUY_SIGNAL_AGE_MS) {
+      return skip(`Leader buy signal is ${Math.round(signalAgeMs / 1000)}s old (max ${MAX_BUY_SIGNAL_AGE_MS / 1000}s) — the RPC was too slow to read it and the price has moved. Not chased.`);
+    }
+
+    // A user-set minimum must MEAN something. `!sig.isTokenSwap` used to let
+    // every token->token leg past it, and those legs carry solAmount 0 — so a
+    // leader who routes through another token bypassed the minimum entirely.
+    // A swap we cannot size in SOL cannot be checked against a SOL minimum, so
+    // when the operator has set one, it is skipped rather than waved through.
+    if (this.config.minLeaderBuySol > 0) {
+      if (sig.isTokenSwap && sig.solAmount <= 0) {
+        return skip(`Leader's token→token swap carries no SOL size, so it cannot be checked against the ${this.config.minLeaderBuySol} SOL minimum — skipped. Set the minimum to 0 to copy these.`);
+      }
+      if (sig.solAmount < this.config.minLeaderBuySol) {
+        return skip(`Leader buy ${sig.solAmount.toFixed(4)} SOL is below the ${this.config.minLeaderBuySol} SOL minimum.`);
+      }
     }
 
     const existing = this.mergeablePositionFor(mint);

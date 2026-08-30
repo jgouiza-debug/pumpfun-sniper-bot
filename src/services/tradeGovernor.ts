@@ -91,6 +91,17 @@ export interface GovernorLimits {
   minWalletReserveSol: number;
   /** Buys allowed in flight at once, across both engines. */
   maxConcurrentBuys: number;
+  /**
+   * How old the wallet-balance reading may be when a buy is sized against it.
+   *
+   * walletService keeps the LAST KNOWN balance when a read fails and does not
+   * advance its timestamp, so under a 429 storm every subsequent read fails and
+   * the figure simply freezes — at a value from before the buys that have
+   * landed since. Sizing against a frozen balance is how several orders each
+   * "afford" money that is already spent. A stale reading is not a small error;
+   * it is the wrong number, so it refuses.
+   */
+  maxBalanceAgeMs: number;
 }
 
 /**
@@ -113,6 +124,10 @@ export const DEFAULT_GOVERNOR_LIMITS: GovernorLimits = {
   maxConsecutiveFailures: 5,
   minWalletReserveSol: 0.01,
   maxConcurrentBuys: 3,
+  // 30s: comfortably longer than the 8s balance TTL and any normal refresh, so
+  // it never fires in healthy operation, and decisively shorter than the window
+  // in which a frozen balance can fund several phantom-affordable orders.
+  maxBalanceAgeMs: 30_000,
 };
 
 /** What the governor needs to know about a proposed buy. */
@@ -129,6 +144,13 @@ export interface BuyRequest {
   walletSol: number;
   /** Buys already submitted and not yet resolved, across both engines. */
   inFlightBuys: number;
+  /**
+   * Age of `walletSol` in ms — how long ago the balance was last READ FROM THE
+   * CHAIN successfully, not how long ago it was asked for. Omit only where no
+   * timestamp is available; a missing value is treated as fresh, so callers
+   * that can supply it must.
+   */
+  walletSolAgeMs?: number;
   /** Which engine is asking — for the refusal message and the audit trail. */
   engine: 'sniper' | 'copy';
 }
@@ -219,6 +241,18 @@ export class TradeGovernor {
 
     const L = this.limits;
     this.prune(req.now);
+
+    // 0. Is the number we are about to size against still true? Checked before
+    //    every ceiling that consults it, because a stale balance makes all of
+    //    them wrong in the same direction — permissive.
+    if (L.maxBalanceAgeMs > 0 && usable(req.walletSolAgeMs) && req.walletSolAgeMs > L.maxBalanceAgeMs) {
+      return {
+        allowed: false,
+        reason: `the wallet balance was last read ${Math.round(req.walletSolAgeMs / 1000)}s ago `
+          + `(max ${Math.round(L.maxBalanceAgeMs / 1000)}s) — refusing to size a buy against a stale balance. `
+          + `This usually means the RPC is rate-limited or down.`,
+      };
+    }
 
     // 1. Wallet floor. Checked FIRST of the real limits because it is the one
     //    that describes the reported harm directly: the wallet must not be

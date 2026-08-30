@@ -557,6 +557,21 @@ test('the WORST-CASE outflow is what gets charged, not the nominal stake', () =>
     'charging what actually leaves the wallet refuses it');
 });
 
+test('a STALE wallet balance refuses the buy — a frozen number is the wrong number', () => {
+  // walletService keeps the last known balance when a read fails and does NOT
+  // advance its timestamp, so under a 429 storm the figure freezes at a value
+  // from before the buys that have landed since. Several orders then each
+  // "afford" money that is already spent.
+  const g = new TradeGovernor({ maxBalanceAgeMs: 30_000 });
+  assert.strictEqual(g.checkBuy(req({ walletSolAgeMs: 5_000 })).allowed, true);
+  const d = g.checkBuy(req({ walletSolAgeMs: 45_000 }));
+  assert.strictEqual(d.allowed, false);
+  assert.ok(/stale balance/.test(d.reason!), d.reason);
+  // A non-finite age must not sneak past the comparison.
+  assert.strictEqual(g.checkBuy(req({ walletSolAgeMs: NaN as any })).allowed, true,
+    'an unusable age falls back to the other ceilings rather than refusing everything');
+});
+
 test('the governor never blocks a SELL — a halted wallet is the one that most needs to exit', () => {
   // Enforced structurally: checkBuy is the only gate, and executeRealMainnetTrade
   // consults it under `if (action === 'buy')`. The governor has no sell API at
