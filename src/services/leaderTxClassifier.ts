@@ -40,20 +40,71 @@ export function detectVenue(accountKeys: readonly string[]): string | undefined 
 export const TRADE_MIN_SOL_BUY = 0.003;
 export const TRADE_MIN_SOL_SELL = 0.0005;
 
+/**
+ * The floor a BUY must clear even when a venue program was present.
+ *
+ * `venueKnown` used to make the SOL check vanish entirely for buys, and that is
+ * a much weaker signal than it looks: `detectVenue` scans a transaction's
+ * ACCOUNT KEYS, so it answers "was a DEX program mentioned anywhere in this
+ * transaction", not "did the leader swap". Anything that puts an unrelated
+ * program in the same transaction as a token arriving in the leader's wallet —
+ * a bundle, a multi-recipient distribution, an airdrop routed through a
+ * program, another party's swap the leader merely co-signed or was referenced
+ * by — satisfied it.
+ *
+ * With the check gone, such a transaction produced a BUY signal carrying
+ * `solAmount: 0`, and nothing downstream refused it: `minLeaderBuySol` defaults
+ * to 0, and split sizing never consults the leader's size at all. The bot
+ * bought, at a full slice, a token the leader had not bought. That is the
+ * reported "random buys".
+ *
+ * A real buy costs SOL. This floor stays far below any buy worth copying
+ * (0.0005 SOL is well under a single priority fee) while still requiring that
+ * something was actually paid.
+ */
+export const VENUE_TRADE_MIN_SOL_BUY = 0.0005;
+
 export type FlowKind = 'trade' | 'transfer';
 
 export function classifyFlow(p: {
   side: 'buy' | 'sell';
   /** SOL that moved against the tokens, net of network fee. */
   tradeSol: number;
-  /** A known DEX program was invoked — a trade however small. */
+  /** A known DEX program appears among the transaction's account keys. */
   venueKnown: boolean;
   /** Leg of a token→token swap — no SOL by nature. */
   isTokenSwap: boolean;
 }): FlowKind {
+  // ---- BUY: the leader must have GIVEN SOMETHING UP ----------------------
+  //
+  // Asymmetric on purpose, and the asymmetry is the fix. A false BUY spends
+  // real money on a token nobody chose; a false SELL exits a position early.
+  // Those costs are nowhere near equal, so the buy side is now the strict one
+  // and the sell side keeps the permissive rules its exit behaviour was tuned
+  // against.
+  //
+  // Both of the old short-circuits fired on evidence that does not establish a
+  // purchase:
+  //   - `venueKnown` only says a DEX program was MENTIONED in the transaction
+  //     (see VENUE_TRADE_MIN_SOL_BUY);
+  //   - `isTokenSwap` is computed upstream as "some mint went up and some mint
+  //     went down in this transaction", which is equally true of a bag
+  //     transferred out while an airdrop landed in the same block of
+  //     instructions.
+  //
+  // So a buy is a trade when SOL actually left, or when it is a token→token
+  // swap that at least executed somewhere we recognise.
+  if (p.side === 'buy') {
+    if (p.isTokenSwap && p.venueKnown) return 'trade';
+    const floor = p.venueKnown ? VENUE_TRADE_MIN_SOL_BUY : TRADE_MIN_SOL_BUY;
+    return p.tradeSol > floor ? 'trade' : 'transfer';
+  }
+
+  // ---- SELL: unchanged --------------------------------------------------
+  // A sell signal can only ever act on a bag we already hold, and failing to
+  // notice a leader's exit is the expensive direction.
   if (p.isTokenSwap || p.venueKnown) return 'trade';
-  const min = p.side === 'buy' ? TRADE_MIN_SOL_BUY : TRADE_MIN_SOL_SELL;
-  return p.tradeSol > min ? 'trade' : 'transfer';
+  return p.tradeSol > TRADE_MIN_SOL_SELL ? 'trade' : 'transfer';
 }
 
 /**

@@ -235,6 +235,32 @@ app.post('/api/bot/toggle', (req, res) => {
   res.json({ success: true, isBotActive: active });
 });
 
+// ---- SPEND GOVERNOR ---------------------------------------------------------
+//
+// The ceiling that both engines pass through (see services/tradeGovernor.ts).
+// It is surfaced as its own endpoint rather than buried in a status blob so the
+// operator can always answer two questions directly: how close am I to a limit,
+// and if trading stopped, WHY. A breaker whose state is invisible reads as the
+// bot breaking again, which is the trust problem this whole change addresses.
+
+// GET where the wallet stands against every ceiling.
+app.get('/api/governor', (req, res) => {
+  res.json(sniperEngine.getGovernorSnapshot());
+});
+
+// POST clear a latched halt. Deliberately an explicit operator action: a halt
+// that cleared itself would put the bot straight back into whatever emptied it.
+app.post('/api/governor/clear-halt', (req, res) => {
+  sniperEngine.clearGovernorHalt();
+  res.json({ success: true, governor: sniperEngine.getGovernorSnapshot() });
+});
+
+// POST clear the halt AND the rolling/session spend totals — a fresh session.
+app.post('/api/governor/reset', (req, res) => {
+  sniperEngine.resetGovernorSession();
+  res.json({ success: true, governor: sniperEngine.getGovernorSnapshot() });
+});
+
 // POST Update Bot Strategy Config
 app.post('/api/bot/config', (req, res) => {
   const before = sniperEngine.getConfig();

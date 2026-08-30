@@ -91,6 +91,22 @@ const PRICE_STALE_MS = 1500;
 const FEED_LIMIT = 120;
 const HISTORY_LIMIT = 200;
 const MONITOR_INTERVAL_MS = 250;
+/**
+ * How often the open book is re-checked against the wallet's real balances.
+ *
+ * 90s: slow enough that a full book costs a trivial number of RPC reads, fast
+ * enough that a position which does not match the chain — a drifted quantity, a
+ * bag that was never actually bought, a bag sold elsewhere — is caught within a
+ * couple of minutes instead of never.
+ */
+const POSITION_SYNC_INTERVAL_MS = 90_000;
+/**
+ * A position must be at least this old before the chain is allowed to
+ * contradict it. A token account can lag a landed buy by several seconds; a
+ * fresh position reading zero is propagation delay, not an absent bag, and
+ * acting on it would delete real positions seconds after opening them.
+ */
+const POSITION_SYNC_MIN_AGE_MS = 60_000;
 const PROCESSED_SIG_LIMIT = 3000;
 
 /**
@@ -480,6 +496,23 @@ export class CopyTraderService {
       return { ok: false, error: 'That wallet is already being tracked.' };
     }
 
+    // NEVER track our own signer. The watcher fires on any transaction the
+    // address appears in — including the copy trader's OWN buys — so tracking
+    // the trading wallet makes every copy a fresh "leader buy" that gets copied
+    // again. It is a self-feeding loop with no upstream limiter: one leader
+    // signal becomes an unbounded chain of buys, each carving another slice off
+    // the wallet, and every one of them looks legitimate in the feed.
+    //
+    // Easy to do by accident: the trading wallet's address is on screen in the
+    // dashboard, one panel away from the "add a wallet to copy" box.
+    const own = (sniperEngine.getWalletStatus().address || '').trim();
+    if (own && own === trimmed) {
+      return {
+        ok: false,
+        error: 'That is this bot\'s own trading wallet. Tracking it would make the bot copy its own buys in a loop — refused.',
+      };
+    }
+
     this.wallets.set(trimmed, {
       address: trimmed,
       shortAddress: shortAddr(trimmed),
@@ -549,7 +582,25 @@ export class CopyTraderService {
    * gone". Paper positions are skipped — they have no on-chain balance to read.
    */
   public async syncPositionsWithOnChainBalances(): Promise<{ checked: number; closed: number; corrected: number }> {
-    const open = this.positions.filter(p => p.status !== 'CLOSED' && !(p.buyTxid ?? '').startsWith('sim_'));
+    // Now runs automatically on a timer as well as from the button, so it has
+    // to be safe against work that is still settling. Three exclusions, each
+    // covering a way an honest read can be MISLEADING rather than wrong:
+    //
+    //  - exitInFlight: a sell mid-settlement has already moved part of the bag.
+    //    Correcting to the interim balance would mis-size the rest of the exit,
+    //    and reading it as empty would close a position that is still selling.
+    //  - too young: the token account can lag a landed buy by seconds. A brand
+    //    new position reading zero is propagation, not absence — and treating
+    //    it as absence would delete a real position moments after opening it.
+    //  - the trade queue busy on this mint: a buy or sell is running for it
+    //    right now, so the balance is a moving target.
+    const now = Date.now();
+    const open = this.positions.filter(p =>
+      p.status !== 'CLOSED'
+      && !(p.buyTxid ?? '').startsWith('sim_')
+      && !p.exitInFlight
+      && now - (p.entryTime ?? 0) > POSITION_SYNC_MIN_AGE_MS
+      && !this.tradeQueue.isBusy(p.mint));
     let closed = 0;
     let corrected = 0;
     for (const pos of open) {
@@ -1490,6 +1541,14 @@ export class CopyTraderService {
   }
 
   /**
+   * How many copy buys are submitted and unresolved. The spend governor's
+   * concurrency ceiling counts both engines, because they share the signer.
+   */
+  public getInFlightBuyCount(): number {
+    return this.inFlightBuySol.size;
+  }
+
+  /**
    * SPLIT sizing: one slice of the wallet per concurrent copy.
    *
    * `maxOpenPositions` is the divisor — it is already "how many copies do I
@@ -1511,14 +1570,57 @@ export class CopyTraderService {
    * splitWalletIntoSlots) backs those costs out, which is what makes the slice
    * hold steady across the whole set.
    */
-  private splitStakeSol(deployableSol: number, openPositionCount: number, priorityFeeSol: number): number {
+  private splitStakeSol(
+    deployableSol: number,
+    openPositionCount: number,
+    priorityFeeSol: number,
+    isRepeatBuy = false
+  ): number {
     const slots = Math.max(1, Math.floor(this.config.maxOpenPositions));
-    // Never divide by zero, and never size a slot we could not open anyway:
-    // the book cap is enforced separately, so this floor is only a guard.
-    const freeSlots = Math.max(1, slots - Math.max(0, openPositionCount));
+    const open = Math.max(0, openPositionCount);
+
+    // THE WALLET-EMPTYING BUG (fixed 2026-08-30). This line used to read:
+    //
+    //     const freeSlots = Math.max(1, slots - Math.max(0, openPositionCount));
+    //
+    // and its comment called the floor "only a guard", on the reasoning that
+    // the book cap is enforced separately. It is not enforced separately for a
+    // REPEAT buy: onLeaderBuy skips the maxOpenPositions check entirely when a
+    // position for the mint already exists (`if (!existing) { …cap check… }`),
+    // because a repeat buy merges into that position instead of opening a new
+    // one. So with the book full — open == slots, which is the normal steady
+    // state of a bot that is working — a repeat buy arrived here with
+    // openPositionCount == slots, the subtraction gave 0, the floor turned it
+    // into 1, and splitWalletIntoSlots divided the deployable balance by ONE.
+    //
+    // One slot became the WHOLE WALLET. Every leader top-up on a mint we
+    // already held staked everything that was left, and with blockRepeatBuys
+    // defaulting to false there was nothing upstream to stop it repeating.
+    //
+    // THE FIX, in two parts.
+    //
+    // (a) A REPEAT (DCA) buy always divides by the FULL book. A top-up on a mint
+    //     we already hold is not claiming a new slot — it is adding to a
+    //     position that already has its slice — so "how many slots are free"
+    //     is the wrong question for it, and it is the question whose answer
+    //     went to 1 (via the floor) and handed over the wallet. Sizing a
+    //     top-up at one full-book slice is bounded no matter how many times
+    //     the leader scales in, which is what blockRepeatBuys=false needs in
+    //     order to be a safe default.
+    //
+    // (b) A NEW position keeps the self-correcting free-slot divisor, which is
+    //     the whole point of split sizing: 0.1 SOL over 5 free slots stakes
+    //     0.02, and after that buy 0.08 over 4 free slots still stakes 0.02.
+    //     Dividing a new entry by the full book instead would make each slice
+    //     decay (0.02 → 0.016 → 0.0128 …) and strand most of the wallet — the
+    //     exact defect the free-slot divisor was introduced to fix. The floor
+    //     is gone: with the book full there are no free slots, and the only
+    //     honest divisor left is the full book.
+    const divisor = (isRepeatBuy || open >= slots) ? slots : slots - open;
+
     const { stakePerSlotSol } = splitWalletIntoSlots({
       deployableSol: Math.max(0, deployableSol),
-      slots: freeSlots,
+      slots: divisor,
       maxSlippagePct: this.config.maxSlippagePct,
       priorityFeeSol,
     });
@@ -1592,7 +1694,12 @@ export class CopyTraderService {
       // inside the queue, where the exit-gas and in-flight reserves are known.
       const openNow = this.openPositionsForCurrentMode().length;
       const deployableSol = sniperEngine.getWalletStatus().deployableSol;
-      const stakeSol = this.splitStakeSol(deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol());
+      // A leader top-up on a mint already held is a REPEAT buy — sized at one
+      // full-book slice, never at whatever is left of the wallet.
+      const stakeSol = this.splitStakeSol(
+        deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol(),
+        Boolean(this.mergeablePositionFor(mint))
+      );
       // Paper must not need a funded wallet. Split sizing returns 0 both with
       // no wallet linked AND for any balance too small to cover a slot's fee
       // plus slippage buffer, so EVERY leader buy was skipped with "the wallet
@@ -1705,7 +1812,7 @@ export class CopyTraderService {
         // (post-reserves, post-settlement) rather than the pre-queue snapshot.
         if (this.config.buySizeMode === 'split') {
           copySol = round4(Math.min(
-            this.splitStakeSol(deployableSol, openAfterThisBuy - (existingNow ? 0 : 1), sizingFeeSol),
+            this.splitStakeSol(deployableSol, openAfterThisBuy - (existingNow ? 0 : 1), sizingFeeSol, Boolean(existingNow)),
             this.config.maxBuySol
           ));
         }
@@ -1773,13 +1880,52 @@ export class CopyTraderService {
           return;
         }
 
-        // Balance deltas are facts; quotes are opinions. Use the fill when the
-        // inspector could read it, estimates otherwise.
-        const fill = result.fill;
-        const tokensBought = fill && fill.tokenDelta > 0
-          ? fill.tokenDelta
-          : (leaderPriceSol > 0 ? copySol / leaderPriceSol : 0);
-        const solSpent = fill ? Math.abs(Math.min(0, fill.solDelta)) : copySol;
+        // Balance deltas are facts; quotes are opinions.
+        //
+        // A non-null `result` now means the transaction demonstrably landed —
+        // executeRealMainnetTrade returns null for every outcome that did not,
+        // including the unresolved ones it used to report as success. So there
+        // IS a bag; the only question left is how big it is.
+        //
+        // That question is never answered by arithmetic on the leader's price
+        // again. The old line was:
+        //
+        //     tokensBought = fill?.tokenDelta ?? (copySol / leaderPriceSol)
+        //
+        // and the fallback invented a quantity out of OUR order size and THEIR
+        // fill price. It was wrong whenever our fill differed from theirs —
+        // i.e. always, and by the most on exactly the volatile launches this
+        // bot trades. That fabricated number then sized every later partial
+        // sell and every P&L figure the operator was shown.
+        let fill = result.fill;
+        if (!fill || !(fill.tokenDelta > 0)) {
+          // The transaction landed but its fill could not be parsed. Ask the
+          // wallet what it holds — a real number, one RPC call away.
+          const owned = await sniperEngine.readOwnedTokenAmount(mint);
+          if (owned !== null && owned > 0) {
+            const prior = existingNow ? existingNow.tokensHeld : 0;
+            const gained = Math.max(0, owned - prior);
+            if (gained > 0) {
+              fill = { txid: result.txid, solDelta: -copySol, tokenDelta: gained, feeSol: 0, slot: 0 };
+            }
+          }
+        }
+
+        if (!fill || !(fill.tokenDelta > 0)) {
+          // Landed, but we cannot establish a quantity from either the
+          // transaction or the wallet. Recording an invented number here is
+          // precisely the phantom position the operator reported, so nothing is
+          // recorded — and it is said loudly, because a real bag may exist.
+          this.pushFeed(wallet, sig, 'failed',
+            `⚠️ BUY ${result.txid.slice(0, 8)}… landed but its size could not be read from the transaction OR the wallet. `
+            + `No position was opened rather than inventing one. CHECK https://solscan.io/tx/${result.txid}`);
+          this.persist();
+          this.emitChange();
+          return;
+        }
+
+        const tokensBought = fill.tokenDelta;
+        const solSpent = Math.abs(Math.min(0, fill.solDelta)) || copySol;
         const entryPriceSol = tokensBought > 0 ? solSpent / tokensBought : leaderPriceSol;
 
         this.recordBuy(wallet, sig, existingNow, {
@@ -1787,7 +1933,11 @@ export class CopyTraderService {
           solSpent,
           priceSol: entryPriceSol,
           txid: result.txid,
-          fillVerified: Boolean(fill),
+          // Verified means the COST BASIS came from the transaction itself.
+          // A balance-derived quantity is real, but its SOL cost is the size we
+          // ordered rather than the amount the chain took, so it does not earn
+          // the verified badge.
+          fillVerified: Boolean(result.fill) && !result.balanceDerived,
         });
         this.pushFeed(wallet, sig, 'copied',
           `REAL BUY ${copySol} SOL of $${symbol}${existingNow ? ' (added to position)' : ''}${clampNote} @ ${fmtPrice(entryPriceSol)} SOL/token`,
@@ -2380,11 +2530,37 @@ export class CopyTraderService {
         }
       }
 
+      // PERIODIC TRUTH CHECK — the book, against the chain.
+      //
+      // syncPositionsWithOnChainBalances existed but was reachable ONLY from a
+      // button (server.ts POST /api/copy/sync). So a position whose recorded
+      // quantity had drifted from the wallet's real balance stayed wrong
+      // indefinitely, and a position for a bag that was not there was permanent
+      // unless the operator happened to press it. That is what made a phantom
+      // position survive: nothing was ever going to notice.
+      //
+      // Now it runs on its own. Cheap — one balance read per open position, on
+      // a slow cadence, and it only ever CORRECTS the record; it never trades.
+      // Skipped while an exit is in flight (below, inside the sync) so it
+      // cannot race a sell that is mid-settlement.
+      if (this.config.tradingMode === 'real'
+        && Date.now() - this.lastPositionSyncAt > POSITION_SYNC_INTERVAL_MS
+        && !this.positionSyncInFlight) {
+        this.lastPositionSyncAt = Date.now();
+        this.positionSyncInFlight = true;
+        void this.syncPositionsWithOnChainBalances()
+          .catch(() => { /* unreadable now; the next pass retries */ })
+          .finally(() => { this.positionSyncInFlight = false; });
+      }
+
       // No price-based exits here. closePosition is reached from onLeaderSell
       // (when copySells is on) and from the manual sell button; takeProfitPct
       // and maxHoldSeconds stay in the config for compatibility but are inert.
     }, MONITOR_INTERVAL_MS);
   }
+
+  private lastPositionSyncAt = 0;
+  private positionSyncInFlight = false;
 
   // ---------------- FEED / HISTORY / HELPERS ----------------
 

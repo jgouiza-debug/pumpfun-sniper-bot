@@ -68,10 +68,14 @@ function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean })
       className="status-badge"
       style={{ color: verified ? '#00e676' : '#fbbf24', borderColor: verified ? '#00e676' : '#fbbf24', textDecoration: 'none' }}
       title={verified
-        ? 'Confirmed on-chain — quantities read back from the actual fill. Click to view on Solscan.'
-        : 'Submitted and confirmed on-chain — fill details are estimated. Click to view on Solscan.'}
+        ? 'Landed on-chain — quantity AND cost read back from the transaction itself. Click to view on Solscan.'
+        : 'Landed on-chain — the quantity is the wallet\'s real balance, but the transaction could not be parsed, so the cost basis is the size that was ordered rather than the amount actually taken. P&L on this leg is approximate. Click to view on Solscan.'}
     >
-      {verified ? 'ON-CHAIN ✓' : 'ON-CHAIN ↗'}
+      {/* See CopyTradingPage.ExecBadge: both states used to read "ON-CHAIN",
+          and the unverified one was rendered for buys that had never been
+          confirmed. Unproven trades no longer open positions at all, so this
+          badge now distinguishes only how the COST BASIS was established. */}
+      {verified ? 'ON-CHAIN ✓' : 'COST EST. ~'}
     </a>
   );
 }

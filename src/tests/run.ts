@@ -4341,9 +4341,41 @@ console.log('\n-- Copy trader: transfers are not trades, a flip inside our buy i
     assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0.01, venueKnown: false, isTokenSwap: false }), 'trade');
   });
 
-  test('a known venue program in the transaction proves a trade however small; a swap leg has no SOL by nature', () => {
-    assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0.0005, venueKnown: true, isTokenSwap: false }), 'trade');
+  test('a known venue lowers the bar for a small BUY but never removes it; a swap leg has no SOL by nature', () => {
+    // A real venue buy, small: still a trade — the venue lowers the floor.
+    assert.strictEqual(classifyFlow({ side: 'buy', tradeSol: 0.001, venueKnown: true, isTokenSwap: false }), 'trade');
     assert.strictEqual(classifyFlow({ side: 'sell', tradeSol: 0, venueKnown: false, isTokenSwap: true }), 'trade');
+  });
+
+  test('OLD BUG: a venue program merely PRESENT in the transaction made a zero-SOL token inflow a copied BUY', () => {
+    // detectVenue scans ACCOUNT KEYS, so it fires on any transaction that
+    // mentions a DEX program — a bundle, a multi-recipient distribution, an
+    // airdrop routed through a program, another party's swap. The old rule
+    // (`if (isTokenSwap || venueKnown) return 'trade'`) turned every one of
+    // those into a BUY signal carrying solAmount: 0, which nothing downstream
+    // refused: minLeaderBuySol defaults to 0 and split sizing never looks at
+    // the leader's size. The bot bought, at a full slice, a token the leader
+    // had not bought. This is the reported "random buys".
+    assert.strictEqual(
+      classifyFlow({ side: 'buy', tradeSol: 0, venueKnown: true, isTokenSwap: false }), 'transfer',
+      'tokens arriving for NO SOL are not a buy, whatever programs the transaction mentions');
+
+    // The other half of the same hole: isTokenSwap is computed upstream as
+    // "some mint went up and some mint went down in this transaction", which a
+    // bag transferred out alongside an airdrop landing satisfies exactly. It
+    // now needs a recognised venue before it can stand in for payment.
+    assert.strictEqual(
+      classifyFlow({ side: 'buy', tradeSol: 0, venueKnown: false, isTokenSwap: true }), 'transfer',
+      'a token-for-token BUY needs a venue we recognise before it counts as payment');
+    assert.strictEqual(
+      classifyFlow({ side: 'buy', tradeSol: 0, venueKnown: true, isTokenSwap: true }), 'trade',
+      'a genuine token->token swap on a known venue is still copied');
+
+    // SELLS are deliberately untouched: acting on a false sell exits a bag we
+    // already hold, which is far cheaper than buying a token nobody chose.
+    assert.strictEqual(
+      classifyFlow({ side: 'sell', tradeSol: 0, venueKnown: true, isTokenSwap: false }), 'trade',
+      'the sell side keeps its permissive rule — missing a leader exit is the expensive direction');
   });
 
   test('the venue comes from the programs the transaction invoked, in PumpPortal vocabulary', () => {

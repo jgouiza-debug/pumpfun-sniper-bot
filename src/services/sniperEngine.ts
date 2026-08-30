@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import axios from 'axios';
-import { AddressLookupTableAccount, Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { AddressLookupTableAccount, Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import {
   BotConfig,
@@ -40,6 +40,8 @@ import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepaliv
 import {
   EntryRateLimiter, FailureBreaker, FeedFreshnessGate, evaluateGuardrails,
 } from './guardrails';
+import { tradeGovernor } from './tradeGovernor';
+import { settleTransaction, type SettlementOutcome } from './txSettlement';
 import { PositionStore, describeRestoration, type PersistedPosition } from './positionStore';
 import {
   rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth,
@@ -57,18 +59,40 @@ import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } 
  */
 const MIN_CURVE_LIQUIDITY_SOL = 10;
 
+/**
+ * Both SPL token programs. A balance read that only knows about the classic
+ * program reports a Token-2022 bag as absent, and "absent" is the answer that
+ * makes the bot stop trying to sell something it still owns.
+ */
+/** Rent for a token account the buy may have to create. Part of a buy's real cost. */
+const ATA_RENT_SOL = 0.00204;
+
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+
 /** A confirmed real trade: the signature plus what it actually did on-chain. */
 export interface TradeResult {
   txid: string;
   /** Null when the fill could not be read back — callers keep estimates. */
   fill: ActualFill | null;
   /**
-   * External sells only: submitted but unconfirmed at the 30s window. The
-   * transaction can STILL land until its blockhash expires (~60-90s) — the
-   * caller must resolve the outcome (resolveTimedOutSell) before any
-   * resubmit, or a percentage sell executes twice.
+   * Sells only: submitted but still unresolved when polling gave up. The
+   * transaction can STILL land until its blockhash expires — the caller must
+   * resolve the outcome (resolveTimedOutSell) before any resubmit, or a
+   * percentage sell executes twice.
    */
   timedOut?: boolean;
+  /**
+   * The signature could not be confirmed, but the WALLET was read and it holds
+   * the tokens — so the trade demonstrably landed and `fill.tokenDelta` is a
+   * real, on-chain quantity. `fill.solDelta` is the ORDERED size rather than
+   * the measured cost, because the transaction itself stayed unreadable.
+   *
+   * Callers must record the position (the tokens exist) but must NOT claim the
+   * cost basis was verified. Before 2026-08-30 this whole situation produced an
+   * invented token quantity and a position labelled "ON-CHAIN".
+   */
+  balanceDerived?: boolean;
 }
 
 export interface PriceTick {
@@ -723,6 +747,52 @@ export class SniperEngine {
   }
 
   /**
+   * Buys claimed and not yet resolved, ACROSS BOTH ENGINES — the sniper's own
+   * entries and the copy trader's alike, because executeRealMainnetTrade is the
+   * single door to the chain and every order passes through it. They share a
+   * signer, so they must share a concurrency ceiling: counting them separately
+   * would let the pair commit twice what either was allowed.
+   */
+  private inFlightBuyCount = 0;
+
+  /**
+   * Say a governor halt out loud exactly once per trip. A high-frequency leader
+   * would otherwise repeat the same line on every signal, which buries it —
+   * the operator needs to SEE that trading stopped and why.
+   */
+  private announcedHaltReason: string | null = null;
+  private announceGovernorHalt(): void {
+    const reason = tradeGovernor.haltReason();
+    if (!reason || reason === this.announcedHaltReason) return;
+    this.announcedHaltReason = reason;
+    this.log('error', `🛑🛑 TRADING HALTED — ${reason}`);
+    this.log('error', '   Both the sniper and the copy trader are blocked from opening anything new. Exits still work. Clear the halt in the UI once you know what happened.');
+    // A halt means something is wrong with the path, not with one token: stop
+    // the sniper's own loop too so it is not left looking active while refusing
+    // every entry.
+    if (this.config.isBotActive) this.toggleBot(false);
+  }
+
+  /** Operator-facing governor state, for the dashboard and the API. */
+  public getGovernorSnapshot() {
+    return tradeGovernor.snapshot(Date.now());
+  }
+
+  /** Operator action: clear a latched halt and resume trading. */
+  public clearGovernorHalt(): void {
+    tradeGovernor.clearHalt();
+    this.announcedHaltReason = null;
+    this.log('info', '✅ Spend-governor halt cleared by the operator. New entries are allowed again.');
+  }
+
+  /** Operator action: clear the halt AND the rolling/session spend totals. */
+  public resetGovernorSession(): void {
+    tradeGovernor.resetSession();
+    this.announcedHaltReason = null;
+    this.log('info', '✅ Spend-governor session reset — rolling and session totals cleared.');
+  }
+
+  /**
    * Resolve a timed-out external sell before any resubmit. The transaction
    * stays landable until its blockhash expires; polling the signature tells
    * us which world we are in: landed (returns the result with its inspected
@@ -750,6 +820,91 @@ export class SniperEngine {
       await new Promise(res => setTimeout(res, 3000));
     }
     return 'expired';
+  }
+
+  /**
+   * How many of `mint` the wallet actually holds, in UI units. `null` means
+   * UNREADABLE — never zero.
+   *
+   * That distinction is the whole reason this exists. "The wallet holds none"
+   * and "we could not ask" lead to opposite decisions: the first proves a buy
+   * did not land, the second proves nothing at all. Collapsing them is how a
+   * bot decides a position is gone and stops trying to exit a bag it still owns.
+   *
+   * Both token programs are tried, because a launchpad mint is not always
+   * classic SPL Token and a Token-2022 bag read as "absent" would be silently
+   * abandoned.
+   */
+  public async readOwnedTokenAmount(mint: string): Promise<number | null> {
+    const owner = this.wallet.getKeypair()?.publicKey;
+    if (!owner) return null;
+    let sawAnswer = false;
+    let total = 0;
+    for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+      try {
+        const res = await this.solanaConnection.getParsedTokenAccountsByOwner(owner, {
+          mint: new PublicKey(mint),
+          programId,
+        });
+        sawAnswer = true;
+        for (const acc of res.value) {
+          const amt = acc.account.data?.parsed?.info?.tokenAmount?.uiAmount;
+          if (typeof amt === 'number' && Number.isFinite(amt)) total += amt;
+        }
+      } catch {
+        // One program failing is not an answer; the other may still respond.
+      }
+    }
+    return sawAnswer ? total : null;
+  }
+
+  /**
+   * A buy whose outcome we could not determine AND whose balance we could not
+   * read. Nothing is recorded from it — but it is not forgotten either, because
+   * if it did land the wallet now holds a bag with no position behind it, and a
+   * bag nothing tracks is a bag nothing ever sells.
+   *
+   * The reconciler re-reads the balance on a slow cadence until it gets an
+   * answer. Bounded attempts: an RPC that is still refusing after this many
+   * tries is a standing outage the operator has to see, not something to poll
+   * forever.
+   */
+  private unresolvedBuys = new Map<string, { txid: string; attempts: number }>();
+  private unresolvedBuyTimer: NodeJS.Timeout | null = null;
+
+  private queueUnresolvedBuy(mint: string, txid: string): void {
+    this.unresolvedBuys.set(mint, { txid, attempts: 0 });
+    if (this.unresolvedBuyTimer) return;
+    this.unresolvedBuyTimer = setInterval(() => { void this.reconcileUnresolvedBuys(); }, 15_000);
+    if (typeof this.unresolvedBuyTimer.unref === 'function') this.unresolvedBuyTimer.unref();
+  }
+
+  private async reconcileUnresolvedBuys(): Promise<void> {
+    for (const [mint, rec] of [...this.unresolvedBuys]) {
+      rec.attempts++;
+      const owned = await this.readOwnedTokenAmount(mint);
+      if (owned === null) {
+        if (rec.attempts >= 20) {
+          this.unresolvedBuys.delete(mint);
+          this.log('error', `⛔ Gave up reconciling unresolved buy ${rec.txid.slice(0, 8)}… for ${mint.slice(0, 8)}… after ${rec.attempts} attempts — the RPC never answered. CHECK THIS MANUALLY: https://solscan.io/tx/${rec.txid}`, mint);
+        }
+        continue;
+      }
+      this.unresolvedBuys.delete(mint);
+      if (owned <= 0) {
+        this.log('info', `✅ Unresolved buy ${rec.txid.slice(0, 8)}… for ${mint.slice(0, 8)}… never landed — the wallet holds none. Nothing to track.`, mint);
+        continue;
+      }
+      // It landed. Say so loudly rather than quietly opening a position from a
+      // path with no decision context left: the operator gets an exact,
+      // actionable line instead of a bag that silently appears or silently
+      // does not.
+      this.log('error', `🚨 UNTRACKED BAG: the unresolved buy ${rec.txid.slice(0, 8)}… DID land — the wallet holds ${owned.toLocaleString()} of ${mint.slice(0, 8)}… with no position tracking it. Sell it manually or re-add it. https://solscan.io/tx/${rec.txid}`, mint);
+    }
+    if (!this.unresolvedBuys.size && this.unresolvedBuyTimer) {
+      clearInterval(this.unresolvedBuyTimer);
+      this.unresolvedBuyTimer = null;
+    }
   }
 
   public unlinkWallet(deleteFile = false): WalletStatus {
@@ -1453,6 +1608,11 @@ export class SniperEngine {
     retryCount = 0,
     opts: { external?: boolean } = {}
   ): Promise<TradeResult | null> {
+    /** True once THIS call has claimed a concurrency slot. See the finally. */
+    let inFlightCounted = false;
+    /** Undoes the governor claim if this order never reaches the chain. */
+    let releaseReservation: (() => void) | null = null;
+
     const keypair = this.wallet.getKeypair();
     if (!keypair) {
       this.log('error', '❌ Cannot execute real trade: no Photon wallet linked.');
@@ -1471,6 +1631,69 @@ export class SniperEngine {
       ? configured
       : Math.max(configured, this.config.maxSellSlippagePct ?? DEFAULT_SELL_SLIPPAGE_PCT);
     const effectiveSlippage = Math.max(1, Math.min(100, slippageOverride ?? baseSlippage));
+
+    // ---- THE SPEND CEILING -------------------------------------------------
+    //
+    // Deliberately HERE, at the one function every real order passes through,
+    // and not in the callers' gates. The wallet was emptied precisely because
+    // the breakers lived in a caller (sniperEngine's entry gate) and the copy
+    // trader reached this function by another door (executeExternalTrade),
+    // arriving below every single one of them. A ceiling that can be walked
+    // around is decoration. This one cannot be: there is no other path to
+    // sendRawTransaction.
+    //
+    // BUYS ONLY. A governor that could block an exit would strand bags, and a
+    // wallet that has tripped a breaker is exactly the wallet that most needs
+    // to be able to sell. Same posture as guardrails.ts.
+    if (action === 'buy') {
+      // WORST-CASE OUTFLOW, not the nominal stake.
+      //
+      // The stake is not what leaves the wallet. A buy also takes its slippage
+      // headroom, ~1.5% in protocol fees, the priority fee — which with
+      // dynamicPriorityFee on can be anything up to maxPriorityFeeSol, not the
+      // static configured value — and token-account rent. Charging the nominal
+      // figure under-counts every ceiling, and under-counts the wallet floor
+      // most dangerously: a buy sized to leave exactly the reserve behind
+      // actually leaves considerably less, which is how a "floor" still ends in
+      // a wallet too poor to pay for its own exits. copyTraderService reserves
+      // against this same expression for its in-flight accounting.
+      const worstCaseSol = solAmount * (1 + effectiveSlippage / 100 + 0.015)
+        + (this.config.maxPriorityFeeSol ?? this.config.priorityFeeSol ?? 0.001)
+        + ATA_RENT_SOL;
+
+      // Check AND claim in one synchronous step — see tryReserveBuy. Checking
+      // here and recording at submit left the whole build-and-sign path between
+      // them, during which concurrent buys of different mints all passed a
+      // ceiling none of them had yet consumed.
+      const gov = tradeGovernor.tryReserveBuy({
+        now: Date.now(),
+        mint,
+        solAmount: worstCaseSol,
+        walletSol: this.wallet.getSolBalance(),
+        // this.inFlightBuyCount alone IS the cross-engine figure: both engines
+        // reach the chain through this function and nowhere else, so every
+        // order — sniper or copy — is already counted here exactly once.
+        // Adding the copy trader's own in-flight map on top would count copy
+        // orders twice and halve the ceiling for them.
+        inFlightBuys: this.inFlightBuyCount,
+        engine: opts.external ? 'copy' : 'sniper',
+      });
+      if (!gov.allowed) {
+        this.log('error', `🛑 BUY REFUSED by the spend governor — ${gov.reason}`, mint);
+        if (gov.halted) {
+          // A latched halt is not a per-trade refusal; it means the operator
+          // has to look. Say it once per trip rather than on every signal.
+          this.announceGovernorHalt();
+        }
+        return null;
+      }
+      // Held until the order is submitted; released by the finally if this call
+      // never reaches the chain, because an order that spent nothing must not
+      // consume somebody else's budget.
+      releaseReservation = gov.release ?? null;
+      this.inFlightBuyCount++;
+      inFlightCounted = true;
+    }
 
     try {
       this.log('info', `📡 Building ${action.toUpperCase()} for ${mint.slice(0,6)}... (${effectiveSlippage}% slippage) from ${keypair.publicKey.toBase58().slice(0,6)}...`);
@@ -1634,6 +1857,12 @@ export class SniperEngine {
           maxRetries: 3,
         });
         latencyTimeline.stamp(mint, 't6SubmittedMs');
+
+        // The order is on the wire, so its claim on the budget is now
+        // permanent: the fee is spent whatever the chain decides. Dropping the
+        // release handle is what makes it permanent — a ceiling that refunded
+        // failed attempts would never stop a fee-burn loop.
+        if (action === 'buy') releaseReservation = null;
         if (buildSource === 'local') {
           this.log('info', `🛠️ Submitted locally built tx (no trade-local hop).`, mint);
         }
@@ -1650,7 +1879,12 @@ export class SniperEngine {
         }
 
         // A signature is not a fill. Confirm before mutating any state.
-        const confirmed = await this.confirmTransaction(txid);
+        //
+        // The blockhash is handed over so an unlanded transaction can be PROVEN
+        // dead rather than merely abandoned — see txSettlement. Before this,
+        // "we gave up after 30s" and "it never landed" were the same word
+        // ('timeout') and a buy that reached it opened a position anyway.
+        const confirmed = await this.confirmTransaction(txid, 95_000, tx.message.recentBlockhash);
         if (confirmed === 'slippage_failed' || (confirmed === 'failed' && action === 'sell')) {
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain due to Slippage (6004). Inspect: https://solscan.io/tx/${txid}`, mint);
 
@@ -1672,6 +1906,7 @@ export class SniperEngine {
             this.log('warn', `↩️ Buy abandoned rather than re-priced. Filling outside ${effectiveSlippage}% would have cost more than the miss.`, mint);
           }
           this.noteTradeFailure(`${action} exceeded slippage`, opts.external);
+          if (action === 'buy') tradeGovernor.recordBuyOutcome(false, 'exceeded slippage');
           void this.syncLiveWalletBalance();
           return null;
         }
@@ -1681,30 +1916,78 @@ export class SniperEngine {
           // would invent tokens the wallet never bought.
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain — no tokens moved, only the fee was burned. Inspect: https://solscan.io/tx/${txid}`, mint);
           this.noteTradeFailure(`${action} rejected on-chain`, opts.external);
+          if (action === 'buy') tradeGovernor.recordBuyOutcome(false, 'rejected on-chain');
           void this.syncLiveWalletBalance();
           return null;
         }
-        if (confirmed === 'timeout') {
+        if (confirmed === 'expired') {
+          // PROVEN never landed: the blockhash died with the signature still
+          // unknown to the cluster, so the transaction can never execute.
+          // Nothing moved and nothing can move — identical in consequence to an
+          // on-chain rejection, and treated identically. This case used to be
+          // folded into 'timeout', and for a BUY 'timeout' opened a position.
+          this.log('warn', `⌛ ${action.toUpperCase()} ${txid.slice(0, 8)}... expired without landing — no tokens moved, nothing opened.`, mint);
+          this.noteTradeFailure(`${action} expired before landing`, opts.external);
+          if (action === 'buy') tradeGovernor.recordBuyOutcome(false, 'expired before landing');
+          void this.syncLiveWalletBalance();
+          return null;
+        }
+        if (confirmed === 'unknown') {
           if (action === 'sell') {
-            this.log('warn', `⚠️ Sell ${txid.slice(0, 8)}... not confirmed in time. Holdings left untouched.`, mint);
-            // A timed-out sell can still land until its blockhash expires, and a
-            // blind resubmit of a percentage sell executes twice. Hand the
-            // signature back — to external callers (copy exits) AND to the
-            // sniper's own executeSell — so the outcome is resolved before any
-            // retry (sniper-correctness-5). Previously only external callers got
-            // this; the sniper's own path returned null and retried blind.
+            this.log('warn', `⚠️ Sell ${txid.slice(0, 8)}... could not be resolved. Holdings left untouched.`, mint);
+            // A sell we cannot resolve can still land until its blockhash
+            // expires, and a blind resubmit of a percentage sell executes
+            // twice. Hand the signature back — to external callers (copy exits)
+            // AND to the sniper's own executeSell — so the outcome is resolved
+            // before any retry (sniper-correctness-5).
             return { txid, fill: null, timedOut: true };
           }
-          // A buy that can't be confirmed: report the txid so the caller can
-          // still open the position (funds may have moved), but with no fill.
-          this.log('warn', `⚠️ Buy ${txid.slice(0, 8)}... not confirmed in time — accounting will use estimates.`, mint);
+
+          // A BUY WE CANNOT RESOLVE. This is the case that emptied a wallet and
+          // filled the UI with trades that were never on chain, so it gets the
+          // one honest answer available: ask the WALLET.
+          //
+          // The chain would not tell us about the signature, but the wallet's
+          // own token balance is a different question and usually answerable.
+          // Holding the mint proves the buy landed and says exactly how much;
+          // holding none of it, when we held none before, is strong evidence it
+          // did not. Either way the number is READ, never invented.
+          this.log('warn', `⚠️ Buy ${txid.slice(0, 8)}... could not be confirmed — reading the wallet directly before recording anything.`, mint);
+          tradeGovernor.recordBuyOutcome(false, 'buy could not be confirmed');
+          const owned = await this.readOwnedTokenAmount(mint);
           void this.syncLiveWalletBalance();
-          return { txid, fill: null };
+
+          if (owned === null) {
+            // Balance unreadable too. We know nothing, so we record nothing —
+            // a position invented here is exactly the phantom the operator saw.
+            // The mint is queued for reconciliation instead: if the buy did
+            // land, the reconciler finds the bag and adopts it.
+            this.log('error', `⛔ Buy ${txid.slice(0, 8)}... UNRESOLVED and the wallet balance is unreadable — refusing to open a position from a trade we cannot prove. Queued for reconciliation. Check https://solscan.io/tx/${txid}`, mint);
+            this.queueUnresolvedBuy(mint, txid);
+            return null;
+          }
+          if (owned <= 0) {
+            this.log('warn', `✅ Buy ${txid.slice(0, 8)}... did NOT land — the wallet holds none of ${mint.slice(0, 8)}…. Nothing opened; only the fee was spent.`, mint);
+            return null;
+          }
+
+          // It landed after all. Book the REAL quantity the wallet holds.
+          this.log('info', `📗 Buy ${txid.slice(0, 8)}... DID land — the wallet holds ${owned.toLocaleString()} tokens. Recording the real amount, not an estimate.`, mint);
+          tradeGovernor.recordBuyOutcome(true, 'confirmed by balance read');
+          this.failureBreaker.recordSuccess();
+          return {
+            txid,
+            fill: { txid, solDelta: -solAmount, tokenDelta: owned, feeSol: priorityFeeSol, slot: 0 },
+            balanceDerived: true,
+          };
         }
 
         // The transaction landed. Clears the consecutive-failure streak — the
-        // breaker is about a broken path, and this path just worked.
+        // breaker is about a broken path, and this path just worked. The
+        // governor's streak is cleared for the same reason, and only ever by a
+        // transaction that actually confirmed.
         this.failureBreaker.recordSuccess();
+        if (action === 'buy') tradeGovernor.recordBuyOutcome(true, 'confirmed');
         latencyTimeline.stamp(mint, 't7ConfirmedMs');
 
         // Quotes are opinions; balance deltas are facts. Read what the swap
@@ -1730,6 +2013,27 @@ export class SniperEngine {
       }
     } catch (err: any) {
       this.log('error', `❌ Mainnet ${action} failed for ${mint.slice(0, 6)}...: ${err.message}`);
+      // A throw between submit and resolution is still an unlanded buy as far
+      // as the breaker is concerned: a fee may have been spent and no position
+      // exists. Counting it is what stops a crashing path from looping.
+      if (action === 'buy') tradeGovernor.recordBuyOutcome(false, err?.message ?? 'threw during execution');
+    } finally {
+      // Released on EVERY exit path — return, throw, or fall-through. A leaked
+      // in-flight count would ratchet the concurrency ceiling down until it
+      // refused every buy, turning a safety limit into an outage.
+      // An order that never reached the chain spent nothing, so it must not
+      // hold budget. Still set here means we never got as far as submitting.
+      if (releaseReservation) {
+        releaseReservation();
+        releaseReservation = null;
+      }
+      // Scoped to THIS call by the flag: decrementing on a call that never
+      // incremented (the governor refused it before submit) would release some
+      // OTHER order's slot and quietly defeat the concurrency ceiling.
+      if (inFlightCounted) {
+        inFlightCounted = false;
+        this.inFlightBuyCount = Math.max(0, this.inFlightBuyCount - 1);
+      }
     }
     return null;
   }
@@ -1740,34 +2044,43 @@ export class SniperEngine {
    * simply don't know yet; funds may have moved. Callers must treat the two
    * differently: a failed buy must never open a position.
    */
-  private async confirmTransaction(txid: string, timeoutMs = 30000): Promise<'confirmed' | 'failed' | 'slippage_failed' | 'timeout'> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      try {
-        const status = await this.solanaConnection.getSignatureStatus(txid);
-        const value = status?.value;
-        if (value) {
-          if (value.err) {
-            const errStr = JSON.stringify(value.err);
-            const isSlippage = errStr.includes('6004') || errStr.includes('ExceededSlippage') || errStr.includes('SlippageExceeded');
-            if (isSlippage) {
-              this.log('warn', `⚠️ Tx ${txid.slice(0, 8)}... failed on-chain: 6004 ExceededSlippage`);
-              return 'slippage_failed';
-            }
-            this.log('warn', `❌ Tx ${txid.slice(0, 8)}... failed on-chain: ${errStr}`);
-            return 'failed';
-          }
-          if (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized') return 'confirmed';
-        }
-      } catch {
-        // RPC hiccup — keep polling until the deadline.
-      }
-      // 300ms: a confirmation is usually visible within 1–2s, and a queued
-      // copy exit for the same mint waits on this poll before it can start, so
-      // a tighter cadence shortens the gap between one exit and the next.
-      await new Promise(res => setTimeout(res, 300));
+  private async confirmTransaction(
+    txid: string,
+    timeoutMs = 95_000,
+    blockhash?: string
+  ): Promise<'confirmed' | 'failed' | 'slippage_failed' | 'expired' | 'unknown'> {
+    const res = await settleTransaction(this.solanaConnection, txid, {
+      timeoutMs,
+      // 300ms: a confirmation is usually visible within 1–2s, and a queued copy
+      // exit for the same mint waits on this poll before it can start, so a
+      // tighter cadence shortens the gap between one exit and the next.
+      pollMs: 300,
+      // Passing the blockhash is what lets the negative case be PROVEN rather
+      // than guessed — see txSettlement. Without it an unlanded transaction can
+      // only ever come back 'unknown', and 'unknown' is the expensive answer.
+      blockhash,
+      log: (level, msg) => this.log(level, msg),
+    });
+
+    switch (res.outcome) {
+      case 'landed':
+        return 'confirmed';
+      case 'slippage':
+        this.log('warn', `⚠️ Tx ${txid.slice(0, 8)}... failed on-chain: 6004 ExceededSlippage`);
+        return 'slippage_failed';
+      case 'reverted':
+        this.log('warn', `❌ Tx ${txid.slice(0, 8)}... failed on-chain: ${JSON.stringify(res.err)}`);
+        return 'failed';
+      case 'expired':
+        // PROVEN never landed. This used to be indistinguishable from 'unknown'
+        // and both were called 'timeout' — which is how a buy that never
+        // happened became a position. It is now a definitive negative.
+        this.log('warn', `⌛ Tx ${txid.slice(0, 8)}... ${res.detail}`);
+        return 'expired';
+      default:
+        this.log('error', `❓ Tx ${txid.slice(0, 8)}... ${res.detail}`);
+        return 'unknown';
     }
-    return 'timeout';
   }
 
   private safeSendWs(payload: object): boolean {
@@ -2991,6 +3304,33 @@ export class SniperEngine {
         return;
       }
       buyTxid = result.txid;
+
+      // A non-null result now means the buy demonstrably landed. What is still
+      // open is the SIZE — and if that cannot be established, this position
+      // must not be opened at all.
+      //
+      // The estimates seeded at the top of this function (`tokensHeld =
+      // investedUsd / buyPriceUsd`, falling back to a literal 1_000_000 when no
+      // price was known) exist for PAPER mode. In real mode they used to
+      // survive into a live position whenever the fill could not be read —
+      // including, before 2026-08-30, when the buy had never been confirmed at
+      // all. The position was then shown as ON-CHAIN, and its invented token
+      // count sized every subsequent exit.
+      if (!result.fill || !(result.fill.tokenDelta > 0)) {
+        const owned = await this.readOwnedTokenAmount(filterResult.mint);
+        if (owned !== null && owned > 0) {
+          this.log('warn', `⚠️ Fill unreadable for ${buyTxid.slice(0, 8)}… — using the WALLET's real balance (${owned.toLocaleString()} tokens) as the quantity.`, filterResult.mint);
+          tokensHeld = owned;
+          investedSol = solAmount;
+          investedUsd = Number((investedSol * this.config.solPriceUsd).toFixed(2));
+          buyPriceUsd = tokensHeld > 0 ? investedUsd / tokensHeld : buyPriceUsd;
+        } else {
+          this.log('error', `⛔ Buy ${buyTxid.slice(0, 8)}… landed but its size could not be read from the transaction OR the wallet — refusing to open a position with an invented quantity. CHECK https://solscan.io/tx/${buyTxid}`, filterResult.mint);
+          this.queueUnresolvedBuy(filterResult.mint, buyTxid);
+          void this.syncLiveWalletBalance();
+          return;
+        }
+      }
 
       // Replace every estimate with what the chain says actually happened:
       // true cost (slippage + all fees included) and true token quantity.

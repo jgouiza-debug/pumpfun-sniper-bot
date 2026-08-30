@@ -30,6 +30,17 @@ function ExecBadge({ txid, fillVerified }: { txid?: string; fillVerified?: boole
       </span>
     );
   }
+  // BOTH states used to read "ON-CHAIN", and the unverified tooltip actually
+  // said "Submitted and confirmed on-chain". That text was rendered for buys
+  // that had never been confirmed at all — the operator was told a trade was on
+  // chain while it was not, which is the single line that broke their trust in
+  // this bot.
+  //
+  // Nothing unproven can reach this badge any more: a real position is only
+  // opened from a transaction that demonstrably landed. What remains is a
+  // genuine distinction worth showing — whether the COST BASIS was read from
+  // the transaction, or the quantity came from the wallet with the cost taken
+  // from the order size — and the two now say different words.
   return (
     <a
       href={`https://solscan.io/tx/${txid}`}
@@ -38,10 +49,10 @@ function ExecBadge({ txid, fillVerified }: { txid?: string; fillVerified?: boole
       className="status-badge"
       style={{ color: fillVerified ? '#00e676' : '#fbbf24', borderColor: fillVerified ? '#00e676' : '#fbbf24', textDecoration: 'none' }}
       title={fillVerified
-        ? 'Confirmed on-chain — quantities read back from the actual fill. Click for Solscan.'
-        : 'Submitted and confirmed on-chain — fill details estimated. Click for Solscan.'}
+        ? 'Landed on-chain — quantity AND cost read back from the transaction itself. Click for Solscan.'
+        : 'Landed on-chain — the quantity is the wallet\'s real balance, but the transaction could not be parsed, so the cost basis is the size that was ordered rather than the amount actually taken. P&L on this leg is approximate. Click for Solscan.'}
     >
-      {fillVerified ? 'ON-CHAIN ✓' : 'ON-CHAIN ↗'}
+      {fillVerified ? 'ON-CHAIN ✓' : 'COST EST. ~'}
     </a>
   );
 }
