@@ -77,6 +77,77 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
   const feedEndRef = useRef<HTMLDivElement>(null);
 
+  // ── Buy-alert sound ──────────────────────────────────────────────────────
+  // A loud, bass-boosted blast whenever a leader BUY is copied. Played through
+  // WebAudio so it can go past the browser's 1.0 volume ceiling (gain 2.0) and
+  // get a low-shelf bass lift — a plain <audio> caps at 100% and has no EQ.
+  // Browsers block audio until a user gesture, so the context is unlocked on
+  // the first click/keypress. We only fire on feed ids we have not seen, and we
+  // skip the first status frame so restoring history does not blast on load.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const buyAlertBufRef = useRef<AudioBuffer | null>(null);
+  const seenBuyAlertIds = useRef<Set<string>>(new Set());
+  const primedAlertRef = useRef(false);
+
+  useEffect(() => {
+    const prime = () => {
+      if (primedAlertRef.current) return;
+      primedAlertRef.current = true;
+      try {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (!Ctx) return;
+        const ctx: AudioContext = audioCtxRef.current || new Ctx();
+        audioCtxRef.current = ctx;
+        void ctx.resume();
+        fetch(`${location.origin}/buy-alert.mp3`)
+          .then(r => r.arrayBuffer())
+          .then(b => ctx.decodeAudioData(b))
+          .then(buf => { buyAlertBufRef.current = buf; })
+          .catch(() => { /* no alert asset — stay silent */ });
+      } catch { /* WebAudio unavailable */ }
+    };
+    window.addEventListener('pointerdown', prime);
+    window.addEventListener('keydown', prime);
+    return () => {
+      window.removeEventListener('pointerdown', prime);
+      window.removeEventListener('keydown', prime);
+    };
+  }, [apiBase]);
+
+  const playBuyAlert = () => {
+    const ctx = audioCtxRef.current;
+    const buf = buyAlertBufRef.current;
+    if (!ctx || !buf) return;
+    void ctx.resume();
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const gain = ctx.createGain();
+    gain.gain.value = 2.0; // "200%"
+    const bass = ctx.createBiquadFilter();
+    bass.type = 'lowshelf';
+    bass.frequency.value = 200;
+    bass.gain.value = 12; // +12 dB under 200 Hz
+    src.connect(bass); bass.connect(gain); gain.connect(ctx.destination);
+    try { src.start(); } catch { /* start can throw if ctx suspended */ }
+  };
+
+  // Test button: a click IS a user gesture, so create/resume the context and
+  // load the clip on demand, then play — works even before any other click.
+  const testBuyAlert = async () => {
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      const ctx: AudioContext = audioCtxRef.current || new Ctx();
+      audioCtxRef.current = ctx;
+      await ctx.resume();
+      if (!buyAlertBufRef.current) {
+        const b = await fetch(`${location.origin}/buy-alert.mp3`).then(r => r.arrayBuffer());
+        buyAlertBufRef.current = await ctx.decodeAudioData(b);
+      }
+      playBuyAlert();
+    } catch { /* no asset / WebAudio unavailable */ }
+  };
+
   // Same transport strategy as the sniper page: SSE first, tight polling as
   // the degraded path.
   useEffect(() => {
@@ -138,6 +209,19 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
   useEffect(() => {
     feedEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [status?.feed?.length, logClearedAt]);
+
+  // Blast the buy-alert on every NEW copied buy. Seed the seen-set from the
+  // first frame so restoring existing feed history on load stays silent.
+  useEffect(() => {
+    const feedNow = status?.feed;
+    if (!feedNow) return;
+    const first = seenBuyAlertIds.current.size === 0;
+    for (const ev of feedNow) {
+      if (seenBuyAlertIds.current.has(ev.id)) continue;
+      seenBuyAlertIds.current.add(ev.id);
+      if (!first && ev.action === 'copied' && ev.side === 'buy') playBuyAlert();
+    }
+  }, [status?.feed]);
 
   const post = async (url: string, body?: object): Promise<any> => {
     try {
@@ -841,6 +925,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
         mode={mode}
         onToggle={toggleEngine}
         onSettings={() => setShowSettings(true)}
+        onTestAlert={testBuyAlert}
         error={!showSettings ? settingsError : ''}
         onDismissError={() => setSettingsError('')}
       />
@@ -853,11 +938,12 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
  * the top-right under the shared header) so App.tsx's header stays untouched
  * apart from the page switcher.
  */
-function CopyHeaderControls({ enabled, mode, onToggle, onSettings, error, onDismissError }: {
+function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, error, onDismissError }: {
   enabled: boolean;
   mode: 'paper' | 'real';
   onToggle: () => void;
   onSettings: () => void;
+  onTestAlert: () => void;
   error: string;
   onDismissError: () => void;
 }) {
@@ -881,6 +967,9 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, error, onDism
       >
         {mode === 'real' ? '⚠ REAL MONEY' : 'PAPER'}
       </span>
+      <button className="btn-terminal-outline" onClick={onTestAlert} title="Play the buy-alert sound to test it">
+        🔊 TEST SOUND
+      </button>
       <button className="btn-terminal-outline" onClick={onSettings}>
         COPY SETTINGS
       </button>
