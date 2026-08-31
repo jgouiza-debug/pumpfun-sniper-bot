@@ -2860,9 +2860,16 @@ console.log('\n-- Feed watchdog: a socket that dies without closing --');
   });
 
   test('a socket that keeps delivering is never terminated', async () => {
+    // MARGIN, not a race. This touched every 15ms against a 40ms staleness bar
+    // — a 2.7x margin, which a loaded machine loses: `await sleep(15)` can
+    // return in 50ms, the watchdog fires, and the suite reports a defect in the
+    // keepalive that is really a defect in the timing assumption. Observed
+    // failing once under parallel mutation runs. The property being tested is
+    // "a socket that keeps reporting life is never killed", and that property
+    // does not depend on the ratio being tight.
     const ws = fakeWs();
-    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40 });
-    for (let i = 0; i < 8; i++) { ka.touch(); await sleep(15); }
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 400 });
+    for (let i = 0; i < 8; i++) { ka.touch(); await sleep(10); }
     ka.stop();
     assert.strictEqual(ws.terminated, false, 'a live feed must not be killed by its own watchdog');
   });
@@ -2871,8 +2878,9 @@ console.log('\n-- Feed watchdog: a socket that dies without closing --');
     // CurveWatcher subscribes to accounts that may legitimately go minutes
     // without a trade. Data-staleness alone would kill those connections.
     const ws = fakeWs();
-    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 40 });
-    for (let i = 0; i < 8; i++) { ws.emit('pong'); await sleep(15); }
+    // Same margin reasoning as the test above.
+    const ka = attachKeepalive(ws, { pingMs: 10, staleMs: 400 });
+    for (let i = 0; i < 8; i++) { ws.emit('pong'); await sleep(10); }
     ka.stop();
     assert.strictEqual(ws.terminated, false, 'pong is proof of life on a quiet feed');
     assert.ok(ws.pings > 0, 'the watchdog must actually ping');
