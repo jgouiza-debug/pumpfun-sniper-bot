@@ -122,7 +122,24 @@ export function clampPriorityFeeSol(
   positionPct: number = 5
 ): number {
   const positionCap = positionSol * (positionPct / 100);
-  const clamped = Math.max(floorSol, Math.min(computedSol, ceilingSol, positionCap));
+  // ORDER MATTERS, and it was wrong. This read
+  //   Math.max(floorSol, Math.min(computedSol, ceilingSol, positionCap))
+  // so the FLOOR was applied last and overrode everything — including
+  // `ceilingSol`, which is `maxPriorityFeeSol`, the operator's stated hard cap.
+  // An operator who set priorityFeeSol = 0.02 to win races while leaving
+  // maxPriorityFeeSol at 0.005 (both inside clampConfig's accepted band, so
+  // neither is rejected and nothing is logged) paid 0.02 on every trade — four
+  // times the cap they had set, and on a small copy slice more than the
+  // position itself.
+  //
+  // The floor still outranks `positionCap`: that cap can be a few hundred
+  // lamports on a small slice, and a fee too low to land turns "the exit was
+  // expensive" into "the exit never happened", which is strictly worse. But
+  // nothing outranks the ceiling.
+  const clamped = Math.min(
+    ceilingSol,
+    Math.max(floorSol, Math.min(computedSol, ceilingSol, positionCap))
+  );
   // Round to lamport-representable precision so float artifacts (0.05*0.05 =
   // 0.0025000000000000005) never leak into fee fields.
   return Number(clamped.toFixed(9));

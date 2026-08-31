@@ -3571,6 +3571,25 @@ export class SniperEngine {
     // nothing left to compare the fill against — which is precisely why a
     // 2.55x fill once passed unremarked.
     const decisionPriceUsd = buyPriceUsd;
+    /**
+     * Was that price MEASURED, or made up?
+     *
+     * Three sources feed buyPriceUsd above, and only the first is a real quote:
+     * DexScreener's priceUsd, then marketCapUsd/1e9 (which assumes a 1B supply
+     * that not every pump token has), then a hardcoded 0.00005.
+     *
+     * The BAD FILL abort compares the real fill against this number and
+     * LIQUIDATES the position when the ratio exceeds 1.2x. Run against a
+     * fabricated 0.00005 — which is what a migrate payload with no DexScreener
+     * pair yields, i.e. the bot's main strategy — the comparison is
+     * meaningless, and a perfectly good entry gets market-sold seconds after it
+     * lands, paying both fees and the spread for nothing.
+     *
+     * The abort is worth keeping (KINGLON filled at 2.55x and was held for nine
+     * hours), so it is gated on the decision price being real rather than
+     * softened.
+     */
+    const decisionPriceMeasured = featureFlags.get('playbookRouting') && (filterResult.priceUsd ?? 0) > 0;
     let buyTxid: string | undefined;
     let fillVerified = false;
     let simulatedFeesSol = 0;
@@ -3736,7 +3755,7 @@ export class SniperEngine {
      * through the normal accounting and shows up in the trade history as a
      * failed entry, rather than vanishing into an untracked bag.
      */
-    if (fillVerified && decisionPriceUsd > 0 && buyPriceUsd > decisionPriceUsd * MAX_FILL_SLIPPAGE_MULTIPLE) {
+    if (fillVerified && decisionPriceMeasured && decisionPriceUsd > 0 && buyPriceUsd > decisionPriceUsd * MAX_FILL_SLIPPAGE_MULTIPLE) {
       const multiple = (buyPriceUsd / decisionPriceUsd).toFixed(2);
       this.log('error', `🚨 [BAD FILL] $${filterResult.tokenSymbol} filled at ${multiple}x the decision price ($${buyPriceUsd.toFixed(8)} vs $${decisionPriceUsd.toFixed(8)}, limit ${MAX_FILL_SLIPPAGE_MULTIPLE}x). Abandoning the entry.`, filterResult.mint);
       this.emitChange();

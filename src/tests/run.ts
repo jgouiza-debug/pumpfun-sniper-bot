@@ -187,6 +187,20 @@ test('capped by the hard ceiling', () => {
 test('capped at 5% of position size', () => {
   assert.strictEqual(clampPriorityFeeSol(0.004, 0.001, 0.005, 0.05), 0.0025);
 });
+test('OLD BUG: the configured floor overrode the hard ceiling', () => {
+  // priorityFeeSol = 0.02 with maxPriorityFeeSol = 0.005. Both sit inside
+  // clampConfig's accepted band, so neither is rejected and nothing is logged.
+  // The floor used to be applied last and won, so every trade paid 0.02 — four
+  // times the operator's stated cap, and on a small copy slice more than the
+  // position itself.
+  assert.strictEqual(clampPriorityFeeSol(0.001, 0.02, 0.005, 1), 0.005,
+    'the ceiling is absolute — nothing outranks maxPriorityFeeSol');
+});
+test('the floor still outranks the 5%-of-position cap, so small exits can land', () => {
+  // That cap can be a few hundred lamports on a small slice, and a fee too low
+  // to land turns "the exit was expensive" into "the exit never happened".
+  assert.strictEqual(clampPriorityFeeSol(0.004, 0.001, 0.005, 0.005), 0.001);
+});
 
 console.log('\n-- percentile --');
 test('p75 nearest-rank', () => {
