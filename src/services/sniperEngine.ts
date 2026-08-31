@@ -190,6 +190,12 @@ export interface InternalPosition extends Position {
   lastCurvePriceAt?: number;
   /** Consecutive failed real sell attempts; drives the fee-burn backoff. */
   sellFailCount?: number;
+  /**
+   * Consecutive throws out of updateAndCheckPositionExit. A position whose exit
+   * evaluation keeps failing has no working automatic exits, and that used to
+   * be completely silent — see the catch at the end of that method.
+   */
+  exitEvalFailures?: number;
   /** Epoch ms before which no automatic sell retry may be attempted. */
   sellRetryAfterMs?: number;
   /**
@@ -4573,6 +4579,10 @@ export class SniperEngine {
    * outranks taking profit. A drained pool must not wait for the 30-min timer.
    */
   private async updateAndCheckPositionExit(pos: InternalPosition, prefetched?: DexScreenerData): Promise<void> {
+    // Captured on entry and cleared only on a CLEAN return, so the counter in
+    // the catch measures CONSECUTIVE failures: a position that evaluates
+    // successfully once is being managed again.
+    const priorExitEvalFailures = pos.exitEvalFailures ?? 0;
     try {
       const dexData = prefetched ?? await DexScreenerService.getTokenMarketData(pos.mint);
 
@@ -4826,8 +4836,35 @@ export class SniperEngine {
         }
       }
 
+      // Reached only when the whole evaluation ran without throwing.
+      pos.exitEvalFailures = 0;
     } catch (err: any) {
-      // ignore
+      // THE EXIT ENGINE MUST NEVER FAIL SILENTLY.
+      //
+      // This was `catch (err: any) { // ignore }` around the whole of
+      // updateAndCheckPositionExit — every take-profit rung, every trailing
+      // stop, the pool-drain stop, the structural exits and the liquidation
+      // path. One throw anywhere inside (a null field on a partial DexScreener
+      // payload, an RPC error escaping a sell, a TypeError after a refactor)
+      // vanished. The tick returned as if the position had been evaluated and
+      // found fine, and it did so again on every subsequent tick for the same
+      // reason — so the position was left with NO working automatic exits, no
+      // log line, and a UI that showed it as normally managed.
+      //
+      // That is the worst possible failure for this function specifically:
+      // silence here is indistinguishable from "nothing to do", and the cost
+      // is an unmanaged bag riding to zero.
+      //
+      // Still caught, because a throw must not take down the tick for OTHER
+      // positions — but it is now loud, and it counts. A position whose
+      // evaluation keeps throwing is a position the operator must know about.
+      pos.exitEvalFailures = priorExitEvalFailures + 1;
+      this.log('error', `❌ EXIT CHECK FAILED for $${pos.tokenSymbol} (${pos.exitEvalFailures}x): ${err?.message ?? err}. `
+        + 'Automatic exits for this position did not run on this tick.', pos.mint);
+      if (err?.stack && pos.exitEvalFailures === 1) console.error(err.stack);
+      if (pos.exitEvalFailures === 3) {
+        this.log('error', `🛑 $${pos.tokenSymbol}: the exit check has failed ${pos.exitEvalFailures} times in a row — this position is NOT being managed. Use LIQUIDATE to exit it manually.`, pos.mint);
+      }
     }
   }
 

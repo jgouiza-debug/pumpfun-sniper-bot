@@ -27,6 +27,11 @@ import { entryGateV2 } from './services/entryGateV2';
 import { localTxBuilder } from './services/localTxBuilder';
 import { autoUpdateEnabled, updaterService } from './services/updaterService';
 import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
+import { loadGovernorState } from './services/tradeGovernor';
+// Reinstate a spend-governor halt from a previous session BEFORE anything can
+// trade. A restart is the natural response to a runaway, and it must not be the
+// thing that clears the breaker that stopped it.
+loadGovernorState();
 // ─── Hardened crash guards ──────────────────────────────────────────────────
 // @solana/web3.js retries 429 / timeout errors internally then re-throws.
 // Without these guards that unhandled rejection kills the process instantly.

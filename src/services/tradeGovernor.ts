@@ -54,6 +54,9 @@
  *     clears it. Whatever broke at 3am is still broken at 3:01.
  */
 
+import fs from 'fs';
+import { installPath } from './installPaths';
+
 /** A decision. `allowed: false` always carries a reason a human can act on. */
 export interface GovernorDecision {
   allowed: boolean;
@@ -359,6 +362,7 @@ export class TradeGovernor {
     this.prune(now);
     this.buys.push({ at: now, mint, sol: solAmount });
     this.sessionSol += solAmount;
+    this.notifyChanged();
   }
 
   /**
@@ -441,6 +445,7 @@ export class TradeGovernor {
   public recordRealizedPnlSol(pnlSol: number): boolean {
     if (!usable(pnlSol)) return false;
     this.sessionRealizedSol += pnlSol;
+    this.notifyChanged();
     const limit = this.limits.maxSessionLossSol;
     if (limit > 0 && this.sessionRealizedSol <= -limit) {
       this.halt(`realized losses this session are ${this.sessionRealizedSol.toFixed(4)} SOL `
@@ -461,7 +466,36 @@ export class TradeGovernor {
    * consequences.
    */
   public halt(reason: string): void {
-    if (!this.haltedReason) this.haltedReason = reason;
+    if (!this.haltedReason) {
+      this.haltedReason = reason;
+      this.notifyChanged();
+    }
+  }
+
+  /**
+   * Called whenever the latch or the session totals move, so a host can persist
+   * them. Kept as a callback rather than an import so this module stays pure
+   * and unit-testable with no filesystem.
+   */
+  private stateListener: (() => void) | null = null;
+  public onStateChange(fn: () => void): void {
+    this.stateListener = fn;
+  }
+  private notifyChanged(): void {
+    try { this.stateListener?.(); } catch { /* persistence must never break trading */ }
+  }
+
+  /** Reinstate a latch and its totals from storage. */
+  public restore(state: {
+    haltedReason: string | null;
+    sessionSol: number;
+    sessionRealizedSol: number;
+    consecutiveFailures: number;
+  }): void {
+    this.haltedReason = state.haltedReason;
+    this.sessionSol = Math.max(0, state.sessionSol);
+    this.sessionRealizedSol = state.sessionRealizedSol;
+    this.consecutiveFailures = Math.max(0, state.consecutiveFailures);
   }
 
   public isHalted(): boolean {
@@ -476,6 +510,7 @@ export class TradeGovernor {
   public clearHalt(): void {
     this.haltedReason = null;
     this.consecutiveFailures = 0;
+    this.notifyChanged();
   }
 
   /** Operator action only. Clears the latch, the streak AND the session total. */
@@ -484,6 +519,7 @@ export class TradeGovernor {
     this.buys = [];
     this.sessionSol = 0;
     this.sessionRealizedSol = 0;
+    this.notifyChanged();
   }
 
   public consecutiveFailureCount(): number {
@@ -521,6 +557,32 @@ export class TradeGovernor {
 }
 
 /**
+ * Where the latch lives across restarts.
+ *
+ * WHY IT IS ON DISK (found by the error-handling audit lane): the halt was
+ * memory-only, and a restart is the operator's NATURAL response to a bot
+ * behaving badly. So the sequence was: five buys in a row fail, the governor
+ * latches, the operator sees "trading HALTED", restarts the app to fix it —
+ * and the restart silently cleared both the latch AND the session spend total,
+ * handing the runaway a fresh full budget. The breaker that stopped it once was
+ * gone precisely because it worked.
+ *
+ * Only the LATCH and the session totals persist. The rolling-hour history does
+ * not: it is time-relative and a restart is a natural boundary for it, and
+ * carrying stale timestamps across a restart would refuse legitimate trades for
+ * an hour after an unrelated reboot.
+ */
+const GOVERNOR_STATE_FILE = installPath('.trade-governor.json');
+
+interface PersistedGovernorState {
+  haltedReason: string | null;
+  sessionSol: number;
+  sessionRealizedSol: number;
+  consecutiveFailures: number;
+  savedAt: number;
+}
+
+/**
  * The process-wide governor.
  *
  * A singleton on purpose: the sniper and the copy trader sign with the SAME
@@ -528,3 +590,44 @@ export class TradeGovernor {
  * the wallet would see twice what either was allowed. One wallet, one ceiling.
  */
 export const tradeGovernor = new TradeGovernor();
+
+/** Load a persisted latch at startup. Best-effort; a missing file is a clean session. */
+export function loadGovernorState(): void {
+  try {
+    if (!fs.existsSync(GOVERNOR_STATE_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(GOVERNOR_STATE_FILE, 'utf8')) as PersistedGovernorState;
+    tradeGovernor.restore({
+      haltedReason: typeof raw.haltedReason === 'string' ? raw.haltedReason : null,
+      sessionSol: usable(raw.sessionSol) ? raw.sessionSol : 0,
+      sessionRealizedSol: usable(raw.sessionRealizedSol) ? raw.sessionRealizedSol : 0,
+      consecutiveFailures: usable(raw.consecutiveFailures) ? raw.consecutiveFailures : 0,
+    });
+    if (tradeGovernor.isHalted()) {
+      console.error(`[Governor] 🛑 TRADING IS STILL HALTED from a previous session: ${tradeGovernor.haltReason()}`);
+      console.error('[Governor]    A restart does not clear this. Clear it in the UI once you know what happened.');
+    }
+  } catch (err: any) {
+    console.warn(`[Governor] Could not read ${GOVERNOR_STATE_FILE}: ${err?.message ?? err}`);
+  }
+}
+
+/** Persist the latch. Called on every state change that matters. */
+export function saveGovernorState(): void {
+  try {
+    const state: PersistedGovernorState = {
+      haltedReason: tradeGovernor.haltReason(),
+      sessionSol: tradeGovernor.snapshot(Date.now()).solThisSession,
+      sessionRealizedSol: tradeGovernor.sessionRealizedPnlSol(),
+      consecutiveFailures: tradeGovernor.consecutiveFailureCount(),
+      savedAt: Date.now(),
+    };
+    const tmp = `${GOVERNOR_STATE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(tmp, GOVERNOR_STATE_FILE);
+  } catch { /* best effort — an unwritable latch must not stop an exit */ }
+}
+
+// The governor writes itself out whenever it latches or is cleared. Wiring it
+// here rather than inside the class keeps the class pure and testable (no I/O),
+// which is design rule 1 in the header.
+tradeGovernor.onStateChange(saveGovernorState);

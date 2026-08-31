@@ -1937,6 +1937,18 @@ export class CopyTraderService {
       }
 
       if (this.config.tradingMode === 'real') {
+        // STOP MUST MEAN STOP. The enabled check runs when the signal ARRIVES,
+        // but a buy waits in the per-mint queue behind whatever is already
+        // running for that mint — an exit and its retries can hold it for
+        // minutes. executeRealMainnetTrade has no notion of either engine's
+        // run flag, so the operator could switch copy trading off, watch the
+        // feed go quiet, and still get filled. Re-checked HERE, at execution
+        // time, which is the only moment that counts.
+        if (!this.config.enabled) {
+          this.pushFeed(wallet, sig, 'skipped',
+            `Copy trading was switched OFF while this buy was queued — not executed.`);
+          return;
+        }
         const blockers = sniperEngine.getWalletStatus().blockers;
         if (blockers.length) {
           wallet.skippedSignals++;
@@ -2065,6 +2077,26 @@ export class CopyTraderService {
         // bot trades. That fabricated number then sized every later partial
         // sell and every P&L figure the operator was shown.
         let fill = result.fill;
+
+        // A BALANCE-DERIVED fill reports the wallet's TOTAL holding of the mint,
+        // not this trade's delta — the engine could not read the transaction, so
+        // it read the wallet instead. On a REPEAT (DCA) buy the position already
+        // holds most of that total, and recordBuy ADDS what it is given: the
+        // position would gain the whole balance a second time and then try to
+        // sell tokens the wallet does not have.
+        if (fill && result.balanceDerived) {
+          const prior = existingNow ? existingNow.tokensHeld : 0;
+          const gained = fill.tokenDelta - prior;
+          fill = gained > 0 ? { ...fill, tokenDelta: gained } : null;
+          if (!fill) {
+            this.pushFeed(wallet, sig, 'failed',
+              `⚠️ BUY ${result.txid.slice(0, 8)}… landed but the wallet holds no MORE of $${symbol} than the position already records — nothing added rather than double-counting the bag. https://solscan.io/tx/${result.txid}`);
+            this.persist();
+            this.emitChange();
+            return;
+          }
+        }
+
         if (!fill || !(fill.tokenDelta > 0)) {
           // The transaction landed but its fill could not be parsed. Ask the
           // wallet what it holds — a real number, one RPC call away.
