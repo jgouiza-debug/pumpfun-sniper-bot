@@ -354,7 +354,13 @@ test('every settlement marks the balance stale, whatever the outcome', () => {
   // its fee. Stamping only on success would let a wallet drained by a run of
   // failed buys keep reporting its pre-trade balance.
   const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
-  const lines = engine.split('\n');
+  // Strip \r FIRST, for the reason run.ts spells out at hasCwdInCode: on a
+  // Windows (CRLF) checkout the trailing \r left by split('\n') sits between
+  // the comment text and end-of-line, so the /\/\/.*$/ strip below (`.` never
+  // matches \r, `$` needs true end) leaves the comment intact — and the gap
+  // check then fires on the word "return" in the prose that explains the
+  // release runs on "every exit path — return, throw, or fall-through".
+  const lines = engine.replace(/\r/g, '').split('\n');
   // UNCONDITIONAL. Asserted on the whole line, not on a substring: `if (cond)
   // this.lastTradeSettledAt = ...` contains the same text and would satisfy a
   // substring check while marking the balance stale on only some outcomes.
