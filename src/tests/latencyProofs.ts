@@ -29,6 +29,8 @@ import { SlotDeltaTracker } from '../services/slotDelta';
 import { LatencyTimelineLogger } from '../services/latencyTimeline';
 import { clampPriorityFeeSol } from '../services/pipelineUtils';
 import { broadcast, buildRoutes, type BroadcastRoute } from '../services/txBroadcaster';
+import { fitSlotsToWallet, splitWalletIntoSlots } from '../services/pipelineUtils';
+import { breakevenPct } from '../services/paperSimulator';
 
 let passed = 0;
 let failed = 0;
@@ -542,6 +544,48 @@ atest('every route reports its outcome, for the log and the health counters', as
     'a loser must be reported too — Promise.any would discard exactly the failures worth counting');
 });
 
+atest('A HUNG ROUTE CANNOT PIN THE SEND FOREVER', async () => {
+  // The defect this replaces: broadcast rejected only at
+  // `settled === routes.length`, so a route that never settles left the promise
+  // pending indefinitely. That await sits inside the copy trader's per-mint
+  // trade queue, between inFlightBuyCount++ and the finally that releases it —
+  // so one blackholed TCP connection would pin a mint's queue (a leader's
+  // flip-sell never runs), hold a concurrency slot and hold a governor
+  // reservation for the life of the process. Nothing else here makes an
+  // unbounded RPC call; the one that spends money cannot be the exception.
+  const never: BroadcastRoute = { name: 'blackholed', send: () => new Promise(() => {}) };
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => broadcast(new Uint8Array([1]), TXID, [route('primary', { ms: 5, fail: '503' }), never], { deadlineMs: 150 }),
+    /within 150ms/,
+  );
+  assert.ok(Date.now() - startedAt < 1000, 'the caller must be released at the deadline');
+});
+
+atest('the deadline does not claim the transaction was never sent', async () => {
+  // The bytes went to every route; only the acknowledgement is missing. The
+  // caller already holds the signature computed before sending and treats a
+  // throwing send as possibly-landed, so the message must not tell it
+  // otherwise.
+  const never: BroadcastRoute = { name: 'blackholed', send: () => new Promise(() => {}) };
+  await assert.rejects(
+    () => broadcast(new Uint8Array([1]), TXID, [never], { deadlineMs: 100 }),
+    (e: Error) => /may still have been accepted/.test(e.message),
+  );
+});
+
+atest('a slow LOSER does not delay the all-fail verdict past the deadline', async () => {
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => broadcast(new Uint8Array([1]), TXID, [
+      route('fast-fail', { ms: 5, fail: 'boom' }),
+      route('slow-fail', { ms: 5_000, fail: 'timeout' }),
+    ], { deadlineMs: 120 }),
+  );
+  assert.ok(Date.now() - startedAt < 800,
+    'the old code waited for the WORST route before surfacing the primary failure');
+});
+
 atest('no routes at all is an error, never a silent no-op', async () => {
   await assert.rejects(() => broadcast(new Uint8Array([1]), TXID, []), /no routes/);
 });
@@ -550,9 +594,15 @@ test('two routes to the same endpoint is one bet placed twice, not a fan-out', (
   const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
   const idx = engine.indexOf('private rebuildSecondaryConnection(');
   assert.ok(idx > 0, 'the secondary connection must be built somewhere');
-  const body = engine.slice(idx, idx + 900);
-  assert.ok(/url === primaryUrl/.test(body),
-    'the secondary must refuse to duplicate the primary endpoint');
+  // Sliced to the END of the method, not a fixed byte count — a window that
+  // clipped the guard would fail correct code, and worse, a window that
+  // happened to contain it would keep passing after the guard moved.
+  const end = engine.indexOf('private rebindConnection(', idx);
+  assert.ok(end > idx, 'the method must be followed by rebindConnection');
+  const body = engine.slice(idx, end);
+  assert.ok(/host === primaryHost/.test(body),
+    'the secondary must refuse to duplicate the primary endpoint, compared by HOST — a string '
+    + 'compare passes the same endpoint differing only by a trailing slash or a query string');
 });
 
 test('the secondary is rebuilt every time the primary changes', () => {
@@ -572,9 +622,111 @@ test('only the primary route drives RPC failover', () => {
   const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
   const idx = engine.indexOf('onResult: (r) => {');
   assert.ok(idx > 0, 'the broadcast must report per-route outcomes');
-  const body = engine.slice(idx, idx + 300);
-  assert.ok(/r\.name === 'primary'/.test(body),
+  const end = engine.indexOf('const txid = sent.txid;', idx);
+  assert.ok(end > idx, 'the callback must be followed by the send result being read');
+  const body = engine.slice(idx, end);
+  assert.ok(/r\.name !== 'primary'\) return;/.test(body),
     'only the primary route may feed noteRpcOutcome');
+  // AND a single send may not declare the credential dead. rpcHealth latches
+  // credentialRejected on a 401/403-shaped message and maybeFailoverRpc acts on
+  // that latch with no streak requirement, so one proxy hiccup on one
+  // submission would demote the whole session to the public endpoint.
+  assert.ok(/isCredentialError\(/.test(body),
+    'a credential-shaped send failure must be recognised and downgraded');
+  assert.ok(/noteRpcOutcome\(false, new Error\('send route rejected the request'\)\)/.test(body),
+    'and reported as an ordinary transient failure, not as a dead key');
+});
+
+console.log('\n-- The fee ceiling cannot be paid against a position that is not there --');
+
+test('A COPY EXIT IS CAPPED AGAINST ITS OWN BAG, not the sniper\'s configured unit', () => {
+  // The copy trader sells with the amount in `pctParam`, so the SOL argument is
+  // only a sizing hint — and it was passing 0, which fell back to
+  // config.buyAmountSol (0.6 by default). clampPriorityFeeSol then computed its
+  // 5%-of-position cap as 0.03 SOL and never bound, so a 0.02 SOL copy bag
+  // could bid the full ceiling on each of its six exit attempts. The 5% cap is
+  // the ENTIRE safety argument for raising the ceiling, and this was the one
+  // path where it did not apply.
+  const BAG = 0.02;
+  assert.strictEqual(clampPriorityFeeSol(0.01, 0.001, 0.01, 0.6), 0.01, 'the old fallback bid the ceiling');
+  assert.strictEqual(clampPriorityFeeSol(0.01, 0.001, 0.01, BAG), 0.001, 'the real bag is capped to the floor');
+
+  const copy = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  assert.ok(/executeExternalTrade\(\s*'sell', pos\.mint, pos\.investedSol \|\| 0,/.test(copy),
+    'the copy exit must pass its real position size, as the sniper\'s own exits always have');
+});
+
+test('an UNKNOWN position size falls to the floor, never to a borrowed one', () => {
+  // Belt and braces: even if a caller passes 0 again, a sell must not borrow
+  // the sniper's unit. Bidding a ceiling sized for a position we cannot see is
+  // exactly the mistake above.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('const sizingPosition = solAmount > 0');
+  assert.ok(idx > 0, 'the sizing position must be resolved explicitly');
+  const body = engine.slice(idx, idx + 200);
+  assert.ok(/action === 'buy' \? this\.config\.buyAmountSol : 0/.test(body),
+    'only a BUY may fall back to the configured unit; a sell with no size gets the floor');
+  assert.strictEqual(clampPriorityFeeSol(0.01, 0.001, 0.01, 0), 0.001);
+});
+
+console.log('\n-- The funded slot count binds, or the deployment ceiling is decoration --');
+
+test('THE RAISED CEILING MUST NOT COLLAPSE THE SLOT COUNT', () => {
+  // fitSlotsToWallet asks "is this economic?", and charging every hypothetical
+  // trade the worst-case fee made a 2 SOL wallet fail at 3 slots and collapse
+  // to 1. The fee a run typically pays is the floor; the ceiling is a
+  // reservation, not a forecast.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('const economicsFeeSol =');
+  assert.ok(idx > 0, 'the two questions must use two different fees');
+  const body = engine.slice(idx, idx + 300);
+  assert.ok(/economicsFeeSol = this\.config\.priorityFeeSol/.test(body),
+    'the economics question uses the floor');
+  assert.ok(/affordabilityFeeSol = this\.sizingPriorityFee\(\)/.test(body),
+    'the affordability question uses the worst case');
+
+  const budget = engine.slice(engine.indexOf('private computeRunBudget('), engine.indexOf('Links a Photon wallet'));
+  assert.ok(/priorityFeeSol: economicsFeeSol,/.test(budget), 'the fit must use the economics fee');
+  assert.ok(/priorityFeeSol: affordabilityFeeSol,/.test(budget), 'the split must use the affordability fee');
+});
+
+test('a REDUCED slot count is binding, not cosmetic', () => {
+  // When the budget reduces the slots, the stake per slot grows to match — so
+  // admitting the originally configured number of entries stakes the budget
+  // several times over. Measured on a 2 SOL wallet with the raised ceiling:
+  // 42% of the wallet deployed became 133%, defeating maxDeployedFractionPct
+  // and leaving nothing to fund the exits.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('private async withEntrySlot(');
+  assert.ok(idx > 0);
+  const body = engine.slice(idx, engine.indexOf('\n  private ', idx + 10));
+  assert.ok(/Math\.min\(this\.config\.maxActivePositions, this\.runSlots\)/.test(body),
+    'the entry gate must honour the funded slot count as well as the configured one');
+  assert.ok(/committed >= cap/.test(body), 'and gate on the smaller of the two');
+  // Cleared on disarm, or a later run inherits a stale cap.
+  assert.ok((engine.match(/this\.runSlots = 0;/g) || []).length >= 2,
+    'runSlots must be cleared when the run ends');
+});
+
+test('deployment stays under the configured fraction at every wallet size', () => {
+  // The end-to-end property the two fixes above exist for, computed with the
+  // shipped functions rather than asserted about the source.
+  for (const wallet of [0.2, 2, 3, 5, 10]) {
+    const deployed = wallet * 0.5;                       // maxDeployedFractionPct default
+    const fit = fitSlotsToWallet({
+      deployableSol: deployed, maxSlots: 3, maxSlippagePct: 10,
+      priorityFeeSol: 0.001, maxBreakevenPct: 6, breakevenOf: breakevenPct,
+    });
+    const slots = fit.slots || 1;
+    const { stakePerSlotSol } = splitWalletIntoSlots({
+      deployableSol: deployed, slots, maxSlippagePct: 10, priorityFeeSol: 0.01,
+    });
+    const staked = stakePerSlotSol * slots;
+    assert.ok(staked <= deployed + 1e-9,
+      `wallet ${wallet}: ${slots} slots x ${stakePerSlotSol} = ${staked} exceeds the ${deployed} budget`);
+    assert.ok(staked / wallet <= 0.5 + 1e-9,
+      `wallet ${wallet}: deployed ${(staked / wallet * 100).toFixed(0)}% of the wallet, ceiling is 50%`);
+  }
 });
 
 console.log('\n-- The slow lane learns its wait instead of assuming it --');

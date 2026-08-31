@@ -2991,7 +2991,15 @@ export class CopyTraderService {
         // not follow from a stale decision.
         if (this.config.tradingMode !== 'real') return null;
       }
-      const result = await sniperEngine.executeExternalTrade('sell', pos.mint, 0, pctParam, pool, slippage);
+      // THE POSITION SIZE, NOT ZERO. A sell's amount comes from pctParam, so
+      // this argument is only a SIZING HINT — but it is the one the priority-fee
+      // clamp uses for its 5%-of-position cap. Passing 0 fell back to the
+      // SNIPER's configured unit (0.6 SOL by default), so the cap computed
+      // 0.03 SOL and never bound: a 0.02 SOL copy position could bid the full
+      // fee ceiling on every one of its six exit attempts. The sniper's own
+      // exits have always passed pos.investedSol here; this path did not.
+      const result = await sniperEngine.executeExternalTrade(
+        'sell', pos.mint, pos.investedSol || 0, pctParam, pool, slippage);
       if (result && result.timedOut) {
         // The submitted tx can still land until its blockhash expires. A
         // blind resubmit of a percentage sell that then lands TWICE sells

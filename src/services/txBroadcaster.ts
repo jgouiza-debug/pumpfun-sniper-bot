@@ -32,6 +32,20 @@ import type { Connection } from '@solana/web3.js';
  * what is available for free.
  */
 
+/**
+ * How long the whole fan-out may take before the caller is released.
+ *
+ * 8 seconds, chosen against what the send is actually racing: a blockhash lives
+ * ~60-90s and the settlement window is 75s, so a send still unacknowledged
+ * after 8s has already lost most of its value — while the cost of waiting is a
+ * pinned per-mint queue and a held concurrency slot. web3.js supplies no bound
+ * of its own here (undici's default is a 300s headers timeout), and
+ * `connectionConfig()` deliberately leaves `disableRetryOnRateLimit: false`, so
+ * a rate-limited route sleeps through several internal retries before it even
+ * fails. That is the exact shape this ceiling exists to cut short.
+ */
+export const BROADCAST_DEADLINE_MS = 8_000;
+
 export interface BroadcastRoute {
   /** Shown in logs and in the per-route result. */
   name: string;
@@ -67,21 +81,68 @@ export async function broadcast(
   raw: Uint8Array,
   expectedTxid: string,
   routes: readonly BroadcastRoute[],
-  opts: { onResult?: (r: { name: string; ok: boolean; ms: number; error?: string }) => void } = {}
+  opts: {
+    onResult?: (r: { name: string; ok: boolean; ms: number; error?: string }) => void;
+    /** Hard ceiling on the whole fan-out. See BROADCAST_DEADLINE_MS. */
+    deadlineMs?: number;
+  } = {}
 ): Promise<BroadcastOutcome> {
   if (routes.length === 0) throw new Error('broadcast called with no routes');
 
+  const deadlineMs = opts.deadlineMs ?? BROADCAST_DEADLINE_MS;
   const results: BroadcastOutcome['results'] = [];
   let winner: string | null = null;
   let firstError: unknown = null;
   let settled = 0;
 
   return await new Promise<BroadcastOutcome>((resolve, reject) => {
+    let done = false;
+
     const finishOk = (name: string) => {
-      if (winner) return;
+      if (done) return;
+      done = true;
       winner = name;
-      resolve({ txid: expectedTxid, winner: name, results, attempted: routes.length });
+      clearTimeout(timer);
+      resolve({ txid: expectedTxid, winner: name, results: [...results], attempted: routes.length });
     };
+
+    const finishFail = (err: unknown) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(err instanceof Error ? err : new Error(String(err ?? 'every send route failed')));
+    };
+
+    // THE DEADLINE. Without it a route that never settles leaves this promise
+    // pending forever — and this await sits inside the copy trader's per-mint
+    // trade queue, between `inFlightBuyCount++` and the finally that releases
+    // it. One blackholed TCP connection to a public endpoint would therefore
+    // pin a mint's queue (so a leader's flip-sell never runs), hold a
+    // concurrency slot, and hold a governor reservation, for the life of the
+    // process. Nothing else in this codebase makes an unbounded RPC call: the
+    // settlement loop wraps every one at 12s, and refreshWalletBalanceIfOwed
+    // bounds a mere BALANCE READ at 1500ms for exactly this reason. The call
+    // that actually spends money cannot be the one exception.
+    //
+    // Reaching the deadline is NOT "nothing was sent". The bytes went to every
+    // route; we simply have no acknowledgement. The caller already treats a
+    // throwing send as possibly-landed (it holds the signature computed before
+    // sending and hands it to resolveOrphanedSubmission), so the timeout is
+    // reported as an error with that same meaning rather than as a success.
+    const timer = setTimeout(() => {
+      const names = routes.map(r => r.name).join(', ');
+      finishFail(new Error(
+        `no send route acknowledged within ${deadlineMs}ms (${names}). The transaction may still have been `
+        + `accepted — its signature is known and it is treated as unresolved, not as never-sent.`));
+    }, deadlineMs);
+    // NOT unref'd, deliberately. An unref'd timer does not keep the event loop
+    // alive, so if this send were the only pending work the process would exit
+    // before the deadline fired and the promise would never settle at all —
+    // which is the exact failure this timer exists to prevent, reintroduced by
+    // the timer itself. (Found by mutation-testing: with unref, the proof for
+    // this deadline exited 0 without running, and every mutation "passed".)
+    // Telemetry timers are unref'd because nobody should wait on them; this one
+    // guards money in flight and is worth 8 seconds of process lifetime.
 
     for (const route of routes) {
       const startedAt = Date.now();
@@ -104,9 +165,7 @@ export async function broadcast(
           settled++;
           // Only reject once EVERY route has failed. A single failure means
           // nothing when four others are still in flight.
-          if (!winner && settled === routes.length) {
-            reject(firstError instanceof Error ? firstError : new Error(String(firstError ?? 'every send route failed')));
-          }
+          if (settled === routes.length) finishFail(firstError);
         }
       })();
     }

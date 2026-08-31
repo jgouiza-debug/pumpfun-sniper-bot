@@ -53,7 +53,7 @@ import { PositionStore, describeRestoration, type PersistedPosition } from './po
 import {
   rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth,
   probeHeliusKey, markHeliusKeyRejected,
-  resolveRpcEndpoint, normalizeHeliusKey, noteRpcOutcome,
+  resolveRpcEndpoint, normalizeHeliusKey, noteRpcOutcome, isCredentialError,
 } from './rpcHealth';
 import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } from './keyStore';
 
@@ -198,6 +198,14 @@ const RPC_FAILOVER_MIN_STREAK_MS = 5_000;
 /** How long to stay on the fallback before giving the primary another chance. */
 const RPC_PRIMARY_RETRY_MS = 120_000;
 /** How often the promoted roster is re-evaluated and the subscriptions re-synced. */
+/**
+ * How long to wait before logging which send route won.
+ *
+ * broadcast() resolves on the first acknowledgement, so the losing routes have
+ * not reported yet at that instant. Logging then would print "no other route
+ * answered" every single time and make the fan-out look useless.
+ */
+const ROUTE_REPORT_DELAY_MS = 2_000;
 const SMART_MONEY_ROSTER_SYNC_MS = 120_000;
 /** How often one queued research job is attempted. Slow by design. */
 const RESEARCH_TICK_MS = 30_000;
@@ -491,6 +499,20 @@ export class SniperEngine {
    * fall back to config.buyAmountSol.
    */
   private runSlotStakeSol = 0;
+  /**
+   * Slots this RUN is actually funded for, fixed at arm time. 0 = not armed.
+   *
+   * Separate from `config.maxActivePositions`, which is what the operator
+   * ASKED for. When fitSlotsToWallet reduces the count because the wallet
+   * cannot economically carry that many, the reduction used to be cosmetic:
+   * the stake per slot grew to match the smaller count, but withEntrySlot went
+   * on admitting maxActivePositions entries — so a run reduced from 3 slots to
+   * 1 opened three positions each sized as the whole budget. Measured on a
+   * 2 SOL wallet with the raised fee ceiling: 42% of the wallet deployed
+   * became 133%, defeating maxDeployedFractionPct entirely and leaving nothing
+   * to fund the exits.
+   */
+  private runSlots = 0;
 
   /**
    * Mints with an entry in flight — claimed before the first await in
@@ -751,7 +773,22 @@ export class SniperEngine {
     // with a wallet.
     const fraction = this.deployedFractionPct() / 100;
     const deployedSol = deployableSol * fraction;
-    const priorityFeeSol = this.sizingPriorityFee();
+
+    // TWO DIFFERENT QUESTIONS, TWO DIFFERENT FEES.
+    //
+    // "Can this stake AFFORD its worst case?" is an affordability question and
+    // must use the ceiling, or a slot is sized too large to pay for its own
+    // fee when the chain is contended. That is the split below.
+    //
+    // "Is this slot count ECONOMIC?" is a different question, and answering it
+    // with the ceiling is what broke when the ceiling went 0.001 -> 0.01.
+    // fitSlotsToWallet asks whether breakeven fits under maxBreakevenPct, and
+    // charging every hypothetical trade the worst-case fee made a 2 SOL wallet
+    // fail at 3 slots and collapse to 1 — measured: 3 x 0.296 SOL became
+    // 1 x 0.886 SOL. The fee a run TYPICALLY pays is the floor; the ceiling is
+    // a reservation, not a forecast.
+    const economicsFeeSol = this.config.priorityFeeSol;
+    const affordabilityFeeSol = this.sizingPriorityFee();
 
     // Fit the slot count to what the wallet can fund ECONOMICALLY. Fixed fees
     // dominate at small size, so dividing a small balance into more slots makes
@@ -765,7 +802,7 @@ export class SniperEngine {
         deployableSol: deployedSol,
         maxSlots: requestedSlots,
         maxSlippagePct: this.config.maxSlippagePct,
-        priorityFeeSol,
+        priorityFeeSol: economicsFeeSol,
         maxBreakevenPct: this.config.maxBreakevenPct ?? 6,
         breakevenOf: breakevenPct,
       });
@@ -779,7 +816,7 @@ export class SniperEngine {
       deployableSol: deployedSol,
       slots,
       maxSlippagePct: this.config.maxSlippagePct,
-      priorityFeeSol,
+      priorityFeeSol: affordabilityFeeSol,
     });
     return { deployableSol, deployedSol, slots, slotBudgetSol, stakePerSlotSol, requestedSlots, slotsReducedForEconomics };
   }
@@ -1771,6 +1808,7 @@ export class SniperEngine {
       if (this.config.walletSplitSizing) {
         const budget = this.computeRunBudget();
         this.runSlotStakeSol = budget.stakePerSlotSol;
+        this.runSlots = budget.slots;
         if (this.runSlotStakeSol > 0) {
           const be = breakevenPct(this.runSlotStakeSol, this.config.priorityFeeSol);
           const pct = this.deployedFractionPct();
@@ -1794,6 +1832,8 @@ export class SniperEngine {
         }
       } else {
         this.runSlotStakeSol = 0;
+      this.runSlots = 0;
+        this.runSlots = 0;
       }
 
       if (featureFlags.get('playbookRouting') || featureFlags.get('devSellStop')) {
@@ -2279,10 +2319,26 @@ export class SniperEngine {
       let priorityFeeSol = this.config.priorityFeeSol;
       if (featureFlags.get('dynamicPriorityFee')) {
         try {
+          // THE POSITION THE CAP IS MEASURED AGAINST.
+          //
+          // clampPriorityFeeSol caps a fee at 5% of the position, and that cap
+          // is the whole safety argument for raising the ceiling. It only works
+          // if the number handed to it is the real position. `solAmount ||
+          // this.config.buyAmountSol` quietly substituted the SNIPER's unit
+          // whenever a caller passed 0 — which the copy trader's exits did on
+          // every sell, so their cap was computed against 0.6 SOL for a 0.02
+          // SOL bag and never bound.
+          //
+          // A BUY always knows its size. A SELL is told one as a hint, and when
+          // it is not, the honest answer is the floor: bidding a ceiling sized
+          // for a position we cannot see is exactly the mistake above.
+          const sizingPosition = solAmount > 0
+            ? solAmount
+            : (action === 'buy' ? this.config.buyAmountSol : 0);
           const dyn = await this.priorityFeeService.getPriorityFeeSol(
             this.config.priorityFeeSol,
             this.config.maxPriorityFeeSol ?? 0.005,
-            solAmount || this.config.buyAmountSol
+            sizingPosition
           );
           if (dyn.feeSol !== priorityFeeSol) {
             this.log('info', `⛽ Dynamic priority fee: ${dyn.feeSol} SOL (${dyn.source})`, mint);
@@ -2539,18 +2595,59 @@ export class SniperEngine {
           fallback: this.secondaryConnection,
           fallbackName: this.secondaryHost || 'secondary',
         });
+        const routeOutcomes: Array<{ name: string; ok: boolean; ms: number; error?: string }> = [];
         const sent = await broadcast(rawTx, signedTxid, routes, {
           onResult: (r) => {
+            routeOutcomes.push(r);
             // Only the primary's outcome drives failover — a public fallback
             // being rate-limited says nothing about the endpoint we depend on.
-            if (r.name === 'primary') noteRpcOutcome(r.ok, r.error);
+            //
+            // AND ONLY AS A TRANSIENT. noteRpcOutcome latches credentialRejected
+            // on anything that looks like a 401/403, and maybeFailoverRpc treats
+            // that latch as terminal with NO streak requirement — so one
+            // spurious 403 from a proxy or a momentary auth blip on a single
+            // send would demote the whole session to the public endpoint for
+            // two minutes. The key prober and the balance reader are the right
+            // places to judge a credential, because they are not one-shot;
+            // a send is.
+            if (r.name !== 'primary') return;
+            if (r.ok) { noteRpcOutcome(true); return; }
+            // A CREDENTIAL VERDICT IS NOT ONE SEND'S TO MAKE.
+            //
+            // rpcHealth latches `credentialRejected` on a 401/403-shaped
+            // message, and maybeFailoverRpc acts on that latch immediately —
+            // no streak, no duration, unlike every other failure. That is
+            // correct for the key prober, which asks repeatedly and can tell a
+            // dead key from a blip. It is wrong here: one proxy hiccup on one
+            // submission would demote the whole session to the public RPC.
+            // So the failure is still counted, but as an ordinary one, and the
+            // real message is logged rather than hidden.
+            if (isCredentialError(new Error(r.error ?? ''))) {
+              this.log('warn', `⚠️ Send route "${r.name}" answered with a credential-shaped error (${r.error}). `
+                + `Counted as a transient failure — only the key prober may declare a key dead.`, mint);
+              noteRpcOutcome(false, new Error('send route rejected the request'));
+              return;
+            }
+            noteRpcOutcome(false, new Error(r.error ?? 'send failed'));
           },
         });
         const txid = sent.txid;
         if (routes.length > 1) {
-          const losers = sent.results.filter(r => r.name !== sent.winner);
-          this.log('info', `📤 Submitted via ${routes.length} routes — ${sent.winner} answered first`
-            + (losers.length ? ` (${losers.map(r => `${r.name}: ${r.ok ? `${r.ms}ms` : 'failed'}`).join(', ')})` : ''), mint);
+          // Logged on the NEXT tick, not now: `broadcast` resolves the instant
+          // the winner answers, so at this point the losers have not reported
+          // and a line printed here would always claim the fan-out was
+          // pointless. The whole reason for collecting per-route outcomes is to
+          // see which endpoint is slow, and that is knowable only once they
+          // finish.
+          const winnerName = sent.winner;
+          const t = setTimeout(() => {
+            const losers = routeOutcomes.filter(r => r.name !== winnerName);
+            this.log('info', `📤 Submitted via ${routes.length} routes — ${winnerName} answered first`
+              + (losers.length
+                ? ` (${losers.map(r => `${r.name}: ${r.ok ? `${r.ms}ms` : `failed after ${r.ms}ms`}`).join(', ')})`
+                : ' (no other route has answered yet)'), mint);
+          }, ROUTE_REPORT_DELAY_MS);
+          if (typeof (t as any).unref === 'function') (t as any).unref();
         }
         stopRebroadcast = this.rebroadcastUntilSettled(rawTx, txid, mint);
         latencyTimeline.stamp(mint, 't6SubmittedMs');
@@ -4245,9 +4342,20 @@ export class SniperEngine {
       return;
     }
 
+    // THE FUNDED SLOT COUNT BINDS, not just the configured one. When the run
+    // budget reduced the slots because the wallet could not economically carry
+    // what was asked for, the stake per slot grew to match — so admitting the
+    // ORIGINAL number of entries stakes the budget several times over. See
+    // this.runSlots.
+    const cap = this.runSlots > 0
+      ? Math.min(this.config.maxActivePositions, this.runSlots)
+      : this.config.maxActivePositions;
     const committed = this.activePositions.length + this.entriesInFlight.size;
-    if (committed >= this.config.maxActivePositions) {
-      this.log('warn', `⚠️ Position limit reached (${this.activePositions.length} open + ${this.entriesInFlight.size} in flight / ${this.config.maxActivePositions}). Skipping buy for $${symbol}.`);
+    if (committed >= cap) {
+      const why = cap < this.config.maxActivePositions
+        ? ` — this run is funded for ${cap} slot${cap === 1 ? '' : 's'} of the ${this.config.maxActivePositions} configured, because the wallet cannot economically carry more`
+        : '';
+      this.log('warn', `⚠️ Position limit reached (${this.activePositions.length} open + ${this.entriesInFlight.size} in flight / ${cap})${why}. Skipping buy for $${symbol}.`);
       return;
     }
 
@@ -4815,13 +4923,36 @@ export class SniperEngine {
     this.secondaryHost = '';
     const configured = (process.env.SOLANA_RPC_FALLBACK_URL || '').trim();
     const url = configured || 'https://api.mainnet-beta.solana.com';
+    if (!url) return;
     // Two routes to the same node is not a fan-out; it is one bet placed twice.
-    if (!url || url === primaryUrl) return;
+    //
+    // Compared by HOST, not by raw string: the same endpoint differing only in
+    // a trailing slash, a query string, or http vs https would pass a string
+    // compare and produce exactly the duplicate this guard exists to stop.
+    let host: string;
+    let primaryHost: string;
+    try {
+      host = new URL(url).host;
+      primaryHost = new URL(primaryUrl).host;
+    } catch {
+      // A malformed fallback is an operator mistake worth saying out loud —
+      // silently having no second route means the fan-out this session thinks
+      // it has does not exist.
+      this.log('warn', `⚠️ SOLANA_RPC_FALLBACK_URL is not a usable URL ("${url}") — sends will go to one endpoint only.`);
+      return;
+    }
+    if (host === primaryHost) {
+      if (configured) {
+        this.log('warn', `⚠️ SOLANA_RPC_FALLBACK_URL points at the same host as the primary (${host}) — that is one bet placed twice, not a fan-out. Sends will go to one endpoint only.`);
+      }
+      return;
+    }
     try {
       this.secondaryConnection = new Connection(url, connectionConfig());
-      this.secondaryHost = new URL(url).host;
-    } catch {
+      this.secondaryHost = host;
+    } catch (err: any) {
       this.secondaryConnection = null;
+      this.log('warn', `⚠️ Could not open the secondary send route (${host}): ${err?.message ?? err}. Sends will go to one endpoint only.`);
     }
   }
 
