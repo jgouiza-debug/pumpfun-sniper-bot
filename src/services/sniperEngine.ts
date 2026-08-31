@@ -4993,6 +4993,12 @@ export class SniperEngine {
 
     this.pushTrade(record);
 
+    // The shared realized-loss breaker sees BOTH engines: one wallet, one
+    // ceiling. The kill switch below is the sniper's own, gated on its run flag.
+    if (this.config.tradingMode === 'real'
+      && tradeGovernor.recordRealizedPnlSol(Number((finalPnlUsd / (this.config.solPriceUsd || 1)).toFixed(6)))) {
+      this.announceGovernorHalt();
+    }
     this.currentBankrollUsd += finalPnlUsd;
     this.dailyPnlUsd += finalPnlUsd;
 

@@ -102,6 +102,21 @@ export interface GovernorLimits {
    * it is the wrong number, so it refuses.
    */
   maxBalanceAgeMs: number;
+  /**
+   * Realized LOSS, in SOL, allowed in a session before trading latches.
+   *
+   * The existing kill switch (sniperEngine.checkKillSwitch) reads only the
+   * SNIPER's tradeHistory and is gated on `config.isBotActive` — the sniper's
+   * own run flag. Someone who runs copy trading with the sniper stopped, which
+   * is the natural configuration for "I just want to mirror this wallet" and
+   * the one described in the incident, had NO hourly cap, NO daily cap and no
+   * consecutive-loss cap of any kind. A leader trading into rugs could close
+   * copy position after copy position at -90% and nothing would ever stop it.
+   *
+   * Counted across both engines, for the same reason every other ceiling here
+   * is: one wallet.
+   */
+  maxSessionLossSol: number;
 }
 
 /**
@@ -128,6 +143,9 @@ export const DEFAULT_GOVERNOR_LIMITS: GovernorLimits = {
   // it never fires in healthy operation, and decisively shorter than the window
   // in which a frozen balance can fund several phantom-affordable orders.
   maxBalanceAgeMs: 30_000,
+  // Sits below maxSolPerSession: losing the whole session budget should stop
+  // trading well before the budget itself runs out.
+  maxSessionLossSol: 0.5,
 };
 
 /** What the governor needs to know about a proposed buy. */
@@ -180,6 +198,7 @@ function usable(n: unknown): n is number {
 export class TradeGovernor {
   private buys: BuyRecord[] = [];
   private sessionSol = 0;
+  private sessionRealizedSol = 0;
   private consecutiveFailures = 0;
   private haltedReason: string | null = null;
   private limits: GovernorLimits;
@@ -411,6 +430,32 @@ export class TradeGovernor {
   }
 
   /**
+   * Book a CLOSED trade's realized P&L, in SOL, from either engine. Positive is
+   * a gain. Latches the governor when cumulative session losses cross the
+   * ceiling, and returns true when it did.
+   *
+   * Realized only. An open position that is down is not a loss yet, and
+   * force-selling on unrealized drawdown is a risk decision this module does
+   * not make — the same posture guardrails.ts takes.
+   */
+  public recordRealizedPnlSol(pnlSol: number): boolean {
+    if (!usable(pnlSol)) return false;
+    this.sessionRealizedSol += pnlSol;
+    const limit = this.limits.maxSessionLossSol;
+    if (limit > 0 && this.sessionRealizedSol <= -limit) {
+      this.halt(`realized losses this session are ${this.sessionRealizedSol.toFixed(4)} SOL `
+        + `(limit ${limit} SOL). New entries are stopped; exits still work. `
+        + `Review what the leaders are doing before resetting the governor.`);
+      return true;
+    }
+    return false;
+  }
+
+  public sessionRealizedPnlSol(): number {
+    return Number(this.sessionRealizedSol.toFixed(4));
+  }
+
+  /**
    * Latch the governor. Idempotent — the FIRST reason is kept, because it is
    * the one that describes what actually went wrong; later trips are
    * consequences.
@@ -438,6 +483,7 @@ export class TradeGovernor {
     this.clearHalt();
     this.buys = [];
     this.sessionSol = 0;
+    this.sessionRealizedSol = 0;
   }
 
   public consecutiveFailureCount(): number {
@@ -457,6 +503,7 @@ export class TradeGovernor {
     buysThisHour: number;
     solThisHour: number;
     solThisSession: number;
+    realizedPnlSol: number;
     limits: GovernorLimits;
   } {
     if (usable(now)) this.prune(now);
@@ -467,6 +514,7 @@ export class TradeGovernor {
       buysThisHour: this.buys.length,
       solThisHour: Number(this.buys.reduce((a, b) => a + b.sol, 0).toFixed(4)),
       solThisSession: Number(this.sessionSol.toFixed(4)),
+      realizedPnlSol: this.sessionRealizedPnlSol(),
       limits: this.getLimits(),
     };
   }

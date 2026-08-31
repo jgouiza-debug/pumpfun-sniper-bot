@@ -126,6 +126,35 @@ export interface SettleOptions {
 
 const defaultSleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
 
+/**
+ * Bound a single RPC call in wall-clock time.
+ *
+ * `connectionConfig()` sets HTTP timeouts, but a keep-alive socket that dies
+ * without a FIN — a flapping route, a sleeping NIC, an upstream proxy that just
+ * stops — leaves the promise pending forever rather than rejecting. Every loop
+ * in this file checks its deadline at the TOP of the iteration, so one call that
+ * never settles means the deadline is never reached again: settleTransaction
+ * never returns, executeRealMainnetTrade never returns, and the per-mint trade
+ * queue plus the SOL reservation it holds are pinned for the life of the
+ * process. A leader sell queued behind it never runs.
+ *
+ * A rejection here is indistinguishable from any other RPC error and is handled
+ * the same way — counted, and the loop tries again.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    if (typeof (timer as any).unref === 'function') (timer as any).unref();
+    p.then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+/** Per-call ceiling. Generous next to a healthy response, decisive against a dead socket. */
+const RPC_CALL_TIMEOUT_MS = 12_000;
+
 /** Anchor error 6004 in its several on-the-wire spellings. */
 export function isSlippageError(err: unknown): boolean {
   if (err === null || err === undefined) return false;
@@ -178,7 +207,9 @@ export async function settleTransaction(
       // signature that has aged out of the node's recent-status cache reads as
       // null — indistinguishable from "not landed" — which is how a landed
       // trade got reported as a timeout.
-      const res = await connection.getSignatureStatuses([txid], { searchTransactionHistory: true });
+      const res = await withTimeout(
+        connection.getSignatureStatuses([txid], { searchTransactionHistory: true }),
+        RPC_CALL_TIMEOUT_MS, 'getSignatureStatuses');
       const value = res?.value?.[0];
       if (value) {
         if (value.err) {
@@ -215,7 +246,9 @@ export async function settleTransaction(
     if (opts.blockhash && now() - lastBlockhashCheck >= blockhashCheckMs) {
       lastBlockhashCheck = now();
       try {
-        const valid = await connection.isBlockhashValid(opts.blockhash, { commitment: 'finalized' });
+        const valid = await withTimeout(
+          connection.isBlockhashValid(opts.blockhash, { commitment: 'finalized' }),
+          RPC_CALL_TIMEOUT_MS, 'isBlockhashValid');
         const stillValid = typeof valid === 'boolean' ? valid : valid?.value;
         if (stillValid === false) {
           if (sawExpiredOnce) {

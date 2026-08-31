@@ -12,6 +12,7 @@ import {
 } from '../types';
 import { sniperEngine, type TradeResult } from './sniperEngine';
 import { rpcEndpoint, rpcWsEndpoint, connectionConfig, isRateLimitError, isFallbackEndpoint } from './rpcHealth';
+import { tradeGovernor } from './tradeGovernor';
 import { affordableStakeSol, sellAmountParam, splitWalletIntoSlots } from './pipelineUtils';
 import { breakevenPct } from './paperSimulator';
 import { installPath } from './installPaths';
@@ -2502,6 +2503,14 @@ export class CopyTraderService {
         ? Math.max(0, remainingOnChain)
         : Math.max(0, pos.tokensHeld - tokensSold);
       pos.realizedPnlSol += pnlSol;
+      // Report to the shared breaker. The sniper's loss-based kill switch reads
+      // only the sniper's own history and is gated on the sniper being active,
+      // so copy trading with the sniper stopped — the configuration in the
+      // incident — had no loss cap at all.
+      if (realPosition && tradeGovernor.recordRealizedPnlSol(pnlSol)) {
+        this.pushFeed(wallet ?? this.standInWallet(pos), feedSig, 'failed',
+          `🛑 TRADING HALTED — ${tradeGovernor.haltReason()}`);
+      }
       pos.realizedPnlUsd += pnlUsd;
       const emptied = pos.tokensHeld <= 1e-9;
       pos.status = emptied || (isFull && remainingOnChain === null) ? 'CLOSED' : 'PARTIAL';

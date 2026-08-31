@@ -557,6 +557,33 @@ test('the WORST-CASE outflow is what gets charged, not the nominal stake', () =>
     'charging what actually leaves the wallet refuses it');
 });
 
+test('THE MISSING LOSS CAP: realized losses latch the governor, across both engines', () => {
+  // sniperEngine.checkKillSwitch reads only the SNIPER's tradeHistory and is
+  // gated on `config.isBotActive` — the sniper's own run flag. Someone running
+  // copy trading with the sniper stopped (the natural setup for "just mirror
+  // this wallet", and the one described in the incident) had no hourly cap, no
+  // daily cap and no consecutive-loss cap of any kind: a leader trading into
+  // rugs could close copy position after copy position at -90% forever.
+  const g = new TradeGovernor({ maxSessionLossSol: 0.1 });
+  assert.strictEqual(g.recordRealizedPnlSol(-0.04), false);
+  assert.strictEqual(g.recordRealizedPnlSol(0.02), false, 'a win offsets — it is cumulative, not per-trade');
+  assert.strictEqual(g.recordRealizedPnlSol(-0.09), true, 'cumulative -0.11 crosses the 0.1 limit');
+  assert.ok(g.isHalted());
+  assert.ok(/realized losses/.test(g.haltReason()!), g.haltReason()!);
+
+  const d = g.checkBuy(req());
+  assert.strictEqual(d.allowed, false);
+  assert.strictEqual(d.halted, true);
+});
+
+test('an unusable P&L figure is ignored rather than latching or corrupting the total', () => {
+  const g = new TradeGovernor({ maxSessionLossSol: 0.1 });
+  assert.strictEqual(g.recordRealizedPnlSol(NaN), false);
+  assert.strictEqual(g.recordRealizedPnlSol(-Infinity), false);
+  assert.strictEqual(g.sessionRealizedPnlSol(), 0, 'a NaN must not poison the running total');
+  assert.strictEqual(g.isHalted(), false);
+});
+
 test('a STALE wallet balance refuses the buy — a frozen number is the wrong number', () => {
   // walletService keeps the last known balance when a read fails and does NOT
   // advance its timestamp, so under a 429 storm the figure freezes at a value
