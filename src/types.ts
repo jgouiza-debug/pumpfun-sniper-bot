@@ -959,4 +959,16 @@ export interface CopyStatusResponse {
     lossCount: number;
     winRatePct: number;
   };
+  /**
+   * How far behind the leader our fills actually land, in SLOTS.
+   *
+   * The copy trader's entire value is being in the same trade as the leader,
+   * and until this existed nothing in the process measured whether it was. Not
+   * milliseconds: the bonding curve only moves when a block is produced, so
+   * landing 300ms later in the same slot costs nothing and landing 60ms later
+   * across a slot boundary costs a whole candle. See src/services/slotDelta.ts.
+   *
+   * Null until the first copy fill lands with both slots readable.
+   */
+  slotDelta: import('./services/slotDelta').SlotDeltaStats;
 }

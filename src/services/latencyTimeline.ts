@@ -99,6 +99,27 @@ export class LatencyTimelineLogger {
     } as CandidateTimeline);
   }
 
+  /**
+   * Is a record already open for this mint?
+   *
+   * The copy path opens its own record (nothing upstream of it does), and this
+   * is how it avoids clobbering one the sniper's screening pipeline already
+   * started for the same mint — which would reset t1 and make the sniper's
+   * timings read as instantaneous.
+   */
+  public isOpen(mint: string): boolean {
+    return this.open.has(mint);
+  }
+
+  /**
+   * Read the in-progress record. Returns the live object, so callers must treat
+   * it as read-only — it is handed out for measurement (`t6 - t1`), not for
+   * mutation. Use `annotate` to change anything.
+   */
+  public snapshot(mint: string): Readonly<CandidateTimeline> | undefined {
+    return this.open.get(mint);
+  }
+
   public stamp(mint: string, field: keyof CandidateTimeline, value?: number): void {
     const t = this.open.get(mint);
     if (t) (t as any)[field] = value ?? Date.now();

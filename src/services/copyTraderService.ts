@@ -236,6 +236,17 @@ interface LeaderSignal {
   kind?: 'trade' | 'transfer';
   /** Decoded from the log lines at 'processed' — no transaction fetch stood between the leader and our order. */
   fast?: boolean;
+  /**
+   * The slot the leader's transaction was observed in.
+   *
+   * The unit that actually decides the fill price. Milliseconds are what an
+   * engineer tunes, but the curve only moves when a block is produced, so
+   * landing 300ms later in the SAME slot costs nothing while landing 60ms later
+   * across a slot boundary costs a whole candle. Carried from the
+   * logsNotification's `context.slot` so slotDelta can score every fill against
+   * it. See src/services/slotDelta.ts.
+   */
+  leaderSlot?: number;
 }
 
 interface TrackedWalletInternal extends TrackedWalletPublic {
@@ -505,6 +516,7 @@ export class CopyTraderService {
         lossCount,
         winRatePct: winCount + lossCount > 0 ? Math.round((winCount / (winCount + lossCount)) * 100) : 0,
       },
+      slotDelta: sniperEngine.getSlotDeltaStats(),
     };
   }
 
@@ -948,7 +960,7 @@ export class CopyTraderService {
           // Everything else takes the on-chain analysis path.
           // Reuse the decode from just above — do not decode the same log lines twice.
           if (this.handleFastLog(ev, allEvents)) return;
-          void this.handleWalletLog(ev.address, ev.signature);
+          void this.handleWalletLog(ev.address, ev.signature, false, Date.now(), ev.slot);
         },
         log: (level, msg) => (level === 'warn' ? console.warn : console.log)(`[CopyTrader] ${msg}`),
         onStatusChange: () => {
@@ -975,7 +987,7 @@ export class CopyTraderService {
     this.emitChange();
   }
 
-  private async handleWalletLog(leaderAddress: string, signature: string, isRetry = false, observedAt = Date.now()): Promise<void> {
+  private async handleWalletLog(leaderAddress: string, signature: string, isRetry = false, observedAt = Date.now(), leaderSlot = 0): Promise<void> {
     const wallet = this.wallets.get(leaderAddress);
     if (!wallet || !wallet.enabled || !this.config.enabled || !this.heliusConn) return;
     // The retry path re-enters here after a delay — the other lane may have
@@ -1022,7 +1034,7 @@ export class CopyTraderService {
           // The ORIGINAL observation time is carried into the retry — the age
           // that matters is how long ago the leader traded, not how long ago
           // we last tried to read it.
-          void this.handleWalletLog(leaderAddress, signature, true, observedAt);
+          void this.handleWalletLog(leaderAddress, signature, true, observedAt, leaderSlot);
         }, TX_REFETCH_DELAY_MS);
       } else {
         if (shouldPushFeed) {
@@ -1054,6 +1066,9 @@ export class CopyTraderService {
       // Stamp the ORIGINAL observation time so onLeaderBuy can tell how long
       // ago the leader actually traded, not how long ago we managed to read it.
       sig.observedAt = observedAt;
+      // The slot is the notification's, not the fetched transaction's: both
+      // name the block the leader landed in, and this one is already in hand.
+      if (leaderSlot > 0 && sig.leaderSlot === undefined) sig.leaderSlot = leaderSlot;
       // A Helius delivery — fast lane, this analysis path, or the 20s re-read —
       // may match a trade already copied from a PumpPortal payload that carried
       // no signature, the one case signature dedup cannot see. Mirroring it
@@ -1161,6 +1176,14 @@ export class CopyTraderService {
         via: 'helius',
         kind: 'trade',
         fast: true,
+        leaderSlot: ev.slot || undefined,
+        // SET ON THE FAST LANE TOO. Only the slow lane stamped this, so every
+        // fast signal reported an age of 0 — including one that had been
+        // sitting in the per-mint trade queue behind a settling buy, which can
+        // hold it for up to 75 seconds. The staleness guard that exists to stop
+        // us chasing a trade the leader has already left could therefore never
+        // fire on the lane that produces most orders.
+        observedAt: Date.now(),
       });
     }
     for (const [key, value] of tallyUpdates) this.setLeaderBalance(key, value, ev.slot);
@@ -2218,7 +2241,9 @@ export class CopyTraderService {
             // for this mint is already blocked. The confirmation window is 75s;
             // a bag the leader is dumping cannot spend 75s waiting on the
             // entry's book-keeping. The signature is reconciled out of band.
-            () => this.tradeQueue.depth(mint) > 1
+            () => this.tradeQueue.depth(mint) > 1,
+            // What the leader did, so the fill can be scored against it.
+            { leaderSlot: sig.leaderSlot, signalAtMs: sig.observedAt, lane: sig.fast ? 'fast' : 'slow' }
           );
         } finally {
           this.inFlightBuySol.delete(mint);

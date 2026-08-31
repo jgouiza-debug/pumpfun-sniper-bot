@@ -25,6 +25,7 @@ import { ActualFill, inspectFill } from './fillInspector';
 import { RunReport } from '../types';
 import { featureFlags } from './featureFlags';
 import { latencyTimeline } from './latencyTimeline';
+import { slotDelta, SlotDeltaTracker } from './slotDelta';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
@@ -2005,6 +2006,25 @@ export class SniperEngine {
       priorTokenBalance?: number;
       /** See the call site in executeRealMainnetTrade: frees the per-mint queue for a waiting exit. */
       yieldSettlementWhen?: () => boolean;
+      /**
+       * MEASUREMENT INPUTS, copy trades only.
+       *
+       * The sniper's own entries are measured because processIncomingToken
+       * opens a latencyTimeline record for them. A copy trade enters here
+       * through executeExternalTrade, which opened nothing — so every stamp
+       * this function makes (t5BuiltSigned, t6Submitted, t7Confirmed) was
+       * written into a Map that had no entry for the mint and silently
+       * discarded. The copy path, which is the one whose whole value is being
+       * fast, was the one path with no timing data at all.
+       *
+       * `leaderSlot` is the block the leader landed in; `signalAtMs` is when
+       * the notification reached this process. Together with the fill's own
+       * slot they give the only number that decides the fill price: how many
+       * blocks behind the leader we were.
+       */
+      leaderSlot?: number;
+      signalAtMs?: number;
+      lane?: 'fast' | 'slow';
     } = {}
   ): Promise<TradeResult | null> {
     /** True once THIS call has claimed a concurrency slot. See the finally. */
@@ -2025,6 +2045,32 @@ export class SniperEngine {
     if (!keypair) {
       this.log('error', '❌ Cannot execute real trade: no Photon wallet linked.');
       return null;
+    }
+
+    // MEASURE THE COPY PATH. The sniper's entries already have an open
+    // timeline by the time they reach here; a copy trade has none, so every
+    // stamp below this line used to be discarded. Opening one here — and only
+    // here, when nothing else has — makes the copy path visible without
+    // touching how the sniper's own records are built.
+    //
+    // t1/t2/t3 are the signal's arrival, not this function's: the interesting
+    // interval is the leader's transaction appearing on our socket to our bytes
+    // going out, and that starts before this call.
+    const measuringExternal = Boolean(opts.external) && action === 'buy';
+    if (measuringExternal && !latencyTimeline.isOpen(mint)) {
+      const t1 = opts.signalAtMs ?? Date.now();
+      latencyTimeline.begin(mint, {
+        t1ArrivalMs: t1,
+        mode: 'real',
+        symbol: 'COPY',
+        txType: 'copy-buy',
+      });
+      latencyTimeline.stamp(mint, 't2ParsedMs', t1);
+      latencyTimeline.stamp(mint, 't3FiltersDoneMs', t1);
+      // The decision was the leader's; ours is made the moment we start
+      // building. Stamping it now keeps buildSignMs meaning what it says.
+      latencyTimeline.stamp(mint, 't4DecisionMs');
+      if (opts.leaderSlot) latencyTimeline.annotate(mint, { slotAtArrival: opts.leaderSlot });
     }
 
     // Buys and sells get DIFFERENT tolerances, and the buy side is the tight one.
@@ -2538,6 +2584,27 @@ export class SniperEngine {
         // actually did to the wallet and let the accounting use that.
         const fill = await inspectFill(this.solanaConnection, txid, keypair.publicKey.toBase58(), mint);
         if (fill) latencyTimeline.annotate(mint, { landedSlot: fill.slot });
+
+        // HOW FAR BEHIND THE LEADER DID WE LAND? Recorded here because this is
+        // the one place where both numbers exist: the leader's slot came in
+        // with the signal, and the fill just told us ours. Milliseconds are
+        // what gets tuned, but this is the number that decides the price —
+        // the curve only moves when a block is produced.
+        if (measuringExternal && fill && opts.leaderSlot) {
+          const t = latencyTimeline.snapshot(mint);
+          const sample = slotDelta.record({
+            mint,
+            leaderSlot: opts.leaderSlot,
+            landedSlot: fill.slot,
+            wireMs: t?.t6SubmittedMs !== undefined && t?.t1ArrivalMs !== undefined
+              ? t.t6SubmittedMs - t.t1ArrivalMs : null,
+            landMs: t?.t7ConfirmedMs !== undefined && t?.t6SubmittedMs !== undefined
+              ? t.t7ConfirmedMs - t.t6SubmittedMs : null,
+            lane: opts.lane ?? 'fast',
+          });
+          if (sample) this.log('info', `${SlotDeltaTracker.describe(sample)} — ${mint.slice(0, 6)}…`, mint);
+        }
+
         if (fill) {
           this.log('info', `📗 [FILL] ${action.toUpperCase()} ${mint.slice(0, 6)}... | SOL ${fill.solDelta >= 0 ? '+' : ''}${fill.solDelta.toFixed(6)} | tokens ${fill.tokenDelta >= 0 ? '+' : ''}${Math.round(fill.tokenDelta).toLocaleString()} | fee ${fill.feeSol.toFixed(6)} SOL`, mint);
         } else {
@@ -2603,6 +2670,12 @@ export class SniperEngine {
         inFlightCounted = false;
         this.inFlightBuyCount = Math.max(0, this.inFlightBuyCount - 1);
       }
+      // CLOSE THE TIMELINE WE OPENED. `begin()` without a matching `complete()`
+      // leaves the record in an unbounded Map forever — a slow leak in a
+      // process that is meant to run for days, and one entry per copy buy adds
+      // up fast. Only ever closes the record THIS call opened: the sniper's own
+      // pipeline owns its records and completes them itself.
+      if (measuringExternal) latencyTimeline.complete(mint);
     }
     return null;
   }
@@ -5469,12 +5542,28 @@ export class SniperEngine {
      * copy trader passes its own queue depth, so a leader's flip-sell no longer
      * waits out the entry's confirmation window.
      */
-    yieldSettlementWhen?: () => boolean
+    yieldSettlementWhen?: () => boolean,
+    /**
+     * What the leader did and when we heard about it, so the fill can be scored
+     * in SLOTS rather than in hope. Without these the copy path records no
+     * timing at all — see the `leaderSlot` note on executeRealMainnetTrade.
+     */
+    measure?: { leaderSlot?: number; signalAtMs?: number; lane?: 'fast' | 'slow' }
   ): Promise<TradeResult | null> {
     return this.executeRealMainnetTrade(
       action, mint, solAmount, amountPct, pool, slippageOverride, 0,
-      { external: true, priorTokenBalance, ...(yieldSettlementWhen ? { yieldSettlementWhen } : {}) }
+      {
+        external: true,
+        priorTokenBalance,
+        ...(yieldSettlementWhen ? { yieldSettlementWhen } : {}),
+        ...(measure ?? {}),
+      }
     );
+  }
+
+  /** Slot-delta percentiles for the copy path — how far behind the leader we land. */
+  public getSlotDeltaStats() {
+    return slotDelta.stats();
   }
 
   public getSolPriceUsd(): number {
