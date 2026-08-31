@@ -139,6 +139,12 @@ function fakeConn(script: {
 
 const fastOpts = { pollMs: 0, blockhashCheckMs: 0, sleep: async () => {} };
 
+/**
+ * A clock that advances 5s per read, so a test can walk past the minimum age
+ * before expiry may be declared without waiting in real time.
+ */
+const steppingClock = (stepMs = 5_000) => { let t = 0; return () => (t += stepMs); };
+
 test('a confirmed signature lands', async () => {
   const r = await settleTransaction(
     fakeConn({ statuses: [{ err: null, confirmationStatus: 'confirmed' }] }) as any,
@@ -152,7 +158,7 @@ test("a 'processed' status is NOT a landing — it can still be dropped on a for
   // never landed, not that it did.
   const r = await settleTransaction(
     fakeConn({ statuses: [{ err: null, confirmationStatus: 'processed' }], blockhashValid: [false] }) as any,
-    'sig', { ...fastOpts, timeoutMs: 5_000, blockhash: 'bh' });
+    'sig', { ...fastOpts, timeoutMs: 120_000, blockhash: 'bh', now: steppingClock() });
   assert.strictEqual(r.outcome, 'expired');
   assert.strictEqual(didLand(r.outcome), false);
 });
@@ -178,7 +184,7 @@ test('THE FIX: a dead blockhash with no status is PROVEN never to have landed', 
   // guess.
   const r = await settleTransaction(
     fakeConn({ statuses: [null], blockhashValid: [false] }) as any,
-    'sig', { ...fastOpts, timeoutMs: 5_000, blockhash: 'bh' });
+    'sig', { ...fastOpts, timeoutMs: 120_000, blockhash: 'bh', now: steppingClock() });
   assert.strictEqual(r.outcome, 'expired');
   assert.strictEqual(didLand(r.outcome), false);
   assert.ok(provablyDidNothing(r.outcome), 'nothing to reconcile — it cannot land');
@@ -193,8 +199,28 @@ test('expiry needs TWO observations, so a last-slot landing is not called dead',
       statuses: [null, { err: null, confirmationStatus: 'confirmed' }],
       blockhashValid: [false, false],
     }) as any,
-    'sig', { ...fastOpts, timeoutMs: 5_000, blockhash: 'bh' });
+    'sig', { ...fastOpts, timeoutMs: 120_000, blockhash: 'bh', now: steppingClock() });
   assert.strictEqual(r.outcome, 'landed', 'a transaction that landed in the last valid slot must not be declared expired');
+});
+
+test('OLD BUG: a LIVE transaction was declared expired ~3s after submitting it', async () => {
+  // isBlockhashValid was asked at 'finalized'. That bank lags the confirmed tip
+  // by ~32 slots (~13s), so a blockhash that is perfectly alive is simply not
+  // in it yet and the call answers FALSE for the first ~13 seconds of every
+  // transaction's life. Two such observations, a poll apart, declared a live
+  // buy dead — reporting "nothing happened" about a transaction on its way to
+  // landing, which is the exact failure this module exists to stop.
+  //
+  // Two defences: the query moved to 'confirmed', and nothing younger than the
+  // minimum age may be called expired whatever the bank says.
+  const r = await settleTransaction(
+    fakeConn({
+      statuses: [null, null, { err: null, confirmationStatus: 'confirmed' }],
+      blockhashValid: [false, false, true],
+    }) as any,
+    'sig', { ...fastOpts, timeoutMs: 120_000, blockhash: 'bh', now: steppingClock(1_000) });
+  assert.strictEqual(r.outcome, 'landed',
+    'a transaction only seconds old must never be declared expired');
 });
 
 test('THE FIX: an RPC that never answers is UNKNOWN, and unknown is not success', async () => {
@@ -586,11 +612,44 @@ test('the ceilings scale with the wallet — the same defaults fit 0.1 SOL and 1
     assert.strictEqual(d.allowed, true,
       `a ${stake} SOL stake on a ${wallet} SOL wallet must pass: ${d.reason}`);
   }
-  // And a stake that IS most of the wallet is still refused.
-  const g = new TradeGovernor();
-  const d = g.checkBuy(req({ walletSol: 1.2, solAmount: 0.9 }));
-  assert.strictEqual(d.allowed, false);
-  assert.ok(/per mint/.test(d.reason!), d.reason);
+  // The engine's OWN shipped configuration must pass. maxActivePositions 1 with
+  // maxDeployedFractionPct 50 stakes ~48% of the wallet worst-case, and the
+  // first ceilings tried here (34% per mint) refused exactly that — the sniper
+  // would never have opened a position at any wallet size.
+  const stock = new TradeGovernor();
+  assert.strictEqual(stock.checkBuy(req({ walletSol: 1.2, solAmount: 0.597 })).allowed, true,
+    "the engine's own stock stake must not be refused by its own ceiling");
+
+  // An ALL-IN buy must pass the wallet floor too: the engine leaves 0.0055 SOL
+  // behind, and a 0.01 floor double-counted against that and refused it.
+  const allIn = new TradeGovernor();
+  assert.strictEqual(allIn.checkBuy(req({ walletSol: 5, solAmount: 4.9945 })).allowed, true,
+    'the wallet floor must sit below the engine gas float, not above it');
+
+  // What the ceilings DO still stop: turning the wallet over many times.
+  const runaway = new TradeGovernor();
+  for (let i = 0; i < 4; i++) runaway.recordBuy(1_000_000 + i, `Mint${i}`, 1.0);
+  const d = runaway.checkBuy(req({ mint: 'MintZ', walletSol: 1.0, solAmount: 0.5 }));
+  assert.strictEqual(d.allowed, false, 'four wallet-turnovers in an hour is a runaway');
+  assert.ok(/this hour/.test(d.reason!), d.reason);
+});
+
+test('a slippage miss does NOT feed the failure latch', () => {
+  // Missing a fill inside a deliberate tolerance is the tolerance working, not
+  // a broken path. Counting a run of them toward a latch that halts BOTH
+  // engines meant an ordinary bad patch on a busy chain stopped the bot and
+  // demanded a manual reset.
+  const g = new TradeGovernor({ maxConsecutiveFailures: 3 });
+  for (let i = 0; i < 10; i++) {
+    assert.strictEqual(g.recordBuyOutcome(false, 'exceeded slippage'), false);
+  }
+  assert.strictEqual(g.isHalted(), false, 'ten slippage misses must not halt the bot');
+
+  // A real failure still counts.
+  assert.strictEqual(g.recordBuyOutcome(false, 'rejected on-chain'), false);
+  assert.strictEqual(g.recordBuyOutcome(false, 'expired before landing'), false);
+  assert.strictEqual(g.recordBuyOutcome(false, 'rejected on-chain'), true);
+  assert.ok(g.isHalted());
 });
 
 test('a fraction ceiling does not tighten as the balance is spent', () => {

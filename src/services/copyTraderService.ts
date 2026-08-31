@@ -23,8 +23,7 @@ import { WalletLogWatcher, type WalletLogEvent } from './walletLogWatcher';
 import { tradeEventsFromLogs, tradeEventPriceSol, PUMP_TOKEN_DECIMALS, PumpTradeEvent } from './pumpEventDecoder';
 import { bondingCurvePda } from './curveWatcher';
 import {
-  detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, isCopyableMint, resolveBuyPool,
-} from './leaderTxClassifier';
+  detectVenue, classifyFlow, netSolFlowSol, paperExitPrice, isCopyableMint, resolveBuyPool, sawSwapProgram } from './leaderTxClassifier';
 import {
   ExitQueue, leaderSellFraction, sellVenueCandidates, sellRetryDelayMs, copySellSlippagePct,
   COPY_SELL_MAX_ATTEMPTS,
@@ -1491,6 +1490,10 @@ export class CopyTraderService {
     const solReceived = Math.max(0, effSolDelta);
     const isTokenSwap = buys.length > 0 && sells.length > 0;
     const venueKnown = venue !== undefined;
+    // Wider than `venueKnown`: did a swap demonstrably happen at all, on any
+    // venue including ones we cannot execute on. Used only to classify a
+    // token→token BUY leg as a trade rather than a transfer.
+    const swapEvidence = sawSwapProgram(keys);
 
     const signals: LeaderSignal[] = [];
     // Sells first so a token→token swap frees the old bag before the new buy.
@@ -1522,7 +1525,7 @@ export class CopyTraderService {
         pool: venue,
         via: 'helius',
         isTokenSwap: isTokenSwap && solSpent <= TOKEN_DELTA_EPSILON,
-        kind: classifyFlow({ side: 'buy', tradeSol, venueKnown, isTokenSwap }),
+        kind: classifyFlow({ side: 'buy', tradeSol, venueKnown, isTokenSwap, swapEvidence }),
       });
     }
     return signals;

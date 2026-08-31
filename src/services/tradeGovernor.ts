@@ -158,20 +158,45 @@ export interface GovernorLimits {
  */
 export const DEFAULT_GOVERNOR_LIMITS: GovernorLimits = {
   maxBuysPerHour: 60,
-  // A third of the wallet into any one token; one full turnover an hour; two
-  // per session; halt after losing half. All generous next to ordinary use, all
-  // decisive against the mechanisms that actually emptied the wallet.
-  maxWalletFractionPerMint: 0.34,
-  maxWalletFractionPerHour: 1.0,
-  maxWalletFractionPerSession: 2.0,
-  maxWalletFractionSessionLoss: 0.5,
+  // CHOSEN TO NEVER BIND ON A HEALTHY BOT.
+  //
+  // The first values here (0.34 / 1.0 / 2.0) were measured against the engine's
+  // own shipped configuration and REFUSED IT: with maxActivePositions 1 and
+  // maxDeployedFractionPct 50, the sniper's stock stake is ~48% of the wallet
+  // worst-case, so a 34% per-mint ceiling turned away its very first entry at
+  // every wallet size — and the hourly ceiling turned away the fifth buy of a
+  // first, perfectly healthy copy book. A ceiling that refuses ordinary trading
+  // is not a safety feature; it is the "the bot broke again" experience this
+  // module exists to prevent, delivered by the module.
+  //
+  // So the SOL ceilings are deliberately loose. They are the backstop, not the
+  // control: the mechanisms that actually emptied the wallet are bounded
+  // structurally elsewhere — one order can no longer take the whole wallet
+  // (splitStakeSol), repeat buys into one mint are bounded by COUNT
+  // (maxBuysPerMint, the real DCA limit), and a fee-burn loop is bounded by the
+  // failure latch. What these numbers stop is the shape nothing else catches:
+  // a wallet turned over many times in an hour.
+  maxWalletFractionPerMint: 1.0,     // cumulative, per mint — one wallet's worth
+  maxWalletFractionPerHour: 3.0,     // three turnovers an hour is already absurd
+  maxWalletFractionPerSession: 6.0,
+  maxWalletFractionSessionLoss: 0.5, // losing half the wallet DOES stop trading
   // Absolute overrides, off by default — see the interface.
   maxSolPerHour: 0,
   maxSolPerSession: 0,
   maxSolPerMint: 0,
   maxBuysPerMint: 6,
-  maxConsecutiveFailures: 5,
-  minWalletReserveSol: 0.01,
+  // 10, not 5. A run of failures is the fee-burn signal, but SLIPPAGE MISSES
+  // are excluded from it entirely (see recordBuyOutcome): missing a fill inside
+  // a deliberate tolerance is a normal outcome on a busy chain, not a broken
+  // path, and five of them in a row is an ordinary bad patch. Halting both
+  // engines for it — and force-pausing the sniper — was a breaker firing on
+  // the bot working as designed.
+  maxConsecutiveFailures: 10,
+  // BELOW the engine's own 0.005 SOL gas float, deliberately. At 0.01 this
+  // double-counted against that float and refused every ALL-IN-sized buy at any
+  // wallet size — the engine leaves exactly 0.0055 SOL behind, so the floor was
+  // rejecting a trade the engine had already sized to be safe.
+  minWalletReserveSol: 0.003,
   maxConcurrentBuys: 3,
   // 30s: comfortably longer than the 8s balance TTL and any normal refresh, so
   // it never fires in healthy operation, and decisively shorter than the window
@@ -413,7 +438,8 @@ export class TradeGovernor {
     if (solPerSession > 0 && this.sessionSol + req.solAmount > solPerSession) {
       this.halt(`${(this.sessionSol + req.solAmount).toFixed(4)} SOL would be committed this session, `
         + `above the ${solPerSession.toFixed(4)} SOL session budget. Nothing is wrong — this is the budget doing its job. `
-        + `Reset the governor to start a new session, or raise maxSolPerSession if it is too small for your wallet.`);
+        + `Reset the governor to start a new session, or raise maxWalletFractionPerSession `
+        + `(the wallet-scaled knob — maxSolPerSession is an absolute cap that can only ever tighten it).`);
       return { allowed: false, halted: true, reason: this.haltedReason ?? 'session budget reached' };
     }
 
@@ -491,6 +517,17 @@ export class TradeGovernor {
    */
   public recordBuyOutcome(landed: boolean, detail: string): boolean {
     if (landed) {
+      this.consecutiveFailures = 0;
+      return false;
+    }
+    // A SLIPPAGE MISS IS NOT A BROKEN PATH. It is the tolerance doing its job:
+    // the fill was outside the band, so the trade did not happen. On a busy
+    // chain a run of them is ordinary, and counting them toward a latch that
+    // halts BOTH engines meant a normal bad patch stopped the bot and demanded
+    // a manual reset. The streak still exists for the failures that indicate
+    // something is actually wrong — a rejection, an expiry, an unresolvable
+    // outcome — each of which burns a fee for nothing.
+    if (/slippage/i.test(detail)) {
       this.consecutiveFailures = 0;
       return false;
     }

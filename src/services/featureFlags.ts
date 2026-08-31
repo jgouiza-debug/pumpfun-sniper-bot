@@ -200,6 +200,30 @@ export const INTENDED_PACKAGED_DIVERGENCE: Array<keyof FeatureFlagSet> = [
 const IS_PACKAGED = Boolean((process as any).pkg) || process.env.SNIPER_PACKAGED === '1';
 
 /**
+ * SAY WHICH SET IS LIVE, ON EVERY START.
+ *
+ * The two tables differ in eleven flags, and `run bot real.cmd` now sets
+ * SNIPER_PACKAGED=1 — correctly, because that launcher is a real trading
+ * session and DEFAULTS is the "everything off" table. But an operator who has
+ * been running that launcher for weeks would otherwise find, with no line on
+ * screen, that their bot is suddenly using a different entry gate, a different
+ * router, a honeypot check, a kill switch and half the position size. A change
+ * of that size has to announce itself, whatever direction it moves in.
+ */
+function announceFlagSet(): void {
+  const src = IS_PACKAGED ? 'PACKAGED_DEFAULTS (the shipped, guards-on set)' : 'DEFAULTS (dev set — guards OFF)';
+  const why = (process as any).pkg ? 'packaged binary'
+    : process.env.SNIPER_PACKAGED === '1' ? 'SNIPER_PACKAGED=1'
+    : 'neither packaged nor SNIPER_PACKAGED';
+  console.log(`[Flags] Base set: ${src} — because this process is a ${why}.`);
+  if (!IS_PACKAGED) {
+    console.warn('[Flags] ⚠️ Running the DEV flag set: the kill switch, honeypot check, dev-sell stop, '
+      + 'economics gate, playbook routing and honest-paper accounting are all OFF. '
+      + 'Set SNIPER_PACKAGED=1 for the set this project actually operates with.');
+  }
+}
+
+/**
  * Where to look for flags.json, most specific first:
  *   1. beside the executable — how an end user overrides the shipped set
  *   2. the working directory — the dev-machine path
@@ -269,6 +293,7 @@ class FeatureFlags {
       if (env !== undefined) merged[key] = env;
     }
 
+    announceFlagSet();
     const enabled = Object.entries(merged).filter(([, v]) => v).map(([k]) => k);
     console.log(`[Flags] ${enabled.length ? 'Enabled: ' + enabled.join(', ') : 'All feature flags OFF (legacy behavior).'}`);
     return merged;

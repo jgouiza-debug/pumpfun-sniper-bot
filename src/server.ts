@@ -128,6 +128,24 @@ app.get('/api/session-token', (req, res) => {
   res.json({ token: apiToken() });
 });
 
+// The instance switcher's legitimate need, met WITHOUT an open endpoint.
+//
+// Disabling /api/session-token closed a real hole — an unauthenticated GET that
+// handed out the key to every trading endpoint — but it also broke the switcher:
+// the UI on :3001 could still READ :3002's status (GETs are open) while every
+// POST to it came back 401, so a second instance could be watched and never
+// armed. The endpoints are the point of the switcher.
+//
+// This one requires THIS instance's token to hand over its own, so a caller
+// must already be trusted here to learn it. Instances in one install share the
+// token file, so in practice the switcher already holds the right value and
+// this is a fallback for the case where it does not.
+app.get('/api/instance-token', (req, res) => {
+  requireApiToken(req, res, () => {
+    res.json({ token: apiToken() });
+  });
+});
+
 // Every state-changing API call needs the token. Applied by method rather than
 // per-route so an endpoint added later is protected by default instead of by
 // remembering. GETs stay open behind the origin guard — they are status reads.

@@ -1154,21 +1154,35 @@ export class SniperEngine {
         // History search is off here: the signature is seconds old, so the
         // node's recent cache covers it and the expensive path is the
         // settlement loop's job, not this one's.
+        // STATUS FIRST, THEN RESEND, THEN EXPIRY.
+        //
+        // The expiry check used to sit before the resend, and it asked the
+        // FINALIZED bank — which lags the confirmed tip by ~13s, so a
+        // two-slot-old blockhash reads as invalid and this loop returned on its
+        // very first iteration having sent nothing at all. A rebroadcaster that
+        // never rebroadcasts is worse than none: it made the branch's own
+        // commit message untrue.
+        let landed = false;
         try {
           const st = await this.solanaConnection.getSignatureStatuses([txid], { searchTransactionHistory: false });
           const v = st?.value?.[0];
-          if (v && (v.err || v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized')) return;
-          if (blockhash) {
-            const valid = await this.solanaConnection.isBlockhashValid(blockhash, { commitment: 'finalized' });
-            const stillValid = typeof valid === 'boolean' ? valid : valid?.value;
-            if (stillValid === false) return; // it can no longer land
-          }
-        } catch { /* unreadable — fall through and resend */ }
+          landed = Boolean(v && (v.err || v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized'));
+        } catch { /* unreadable — that is a reason to resend, not to stop */ }
+        if (landed || cancelled) return;
 
-        if (cancelled) return;
         try {
           await this.solanaConnection.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 });
         } catch { /* a failed resend is not a failed trade */ }
+
+        // Only now, and only once the transaction is old enough that a lagging
+        // bank cannot be the reason its blockhash looks dead.
+        if (blockhash && Date.now() - startedAt > 20_000) {
+          try {
+            const valid = await this.solanaConnection.isBlockhashValid(blockhash, { commitment: 'confirmed' });
+            const stillValid = typeof valid === 'boolean' ? valid : valid?.value;
+            if (stillValid === false) return; // it can no longer land
+          } catch { /* unreadable — keep resending */ }
+        }
       }
     };
     void tick();

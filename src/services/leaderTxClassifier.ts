@@ -23,6 +23,30 @@ export const VENUE_PROGRAMS: ReadonlyArray<readonly [string, string]> = [
   ['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', 'raydium'],     // Raydium AMM v4
 ];
 
+/**
+ * Programs that PROVE a swap happened, but that this bot cannot execute on.
+ *
+ * detectVenue only lists venues we can route an order to, which made it a poor
+ * proxy for "did the leader actually trade": a leader rotating token→token
+ * through Jupiter, Orca or Meteora produced no recognised program, so the
+ * buy-side rule introduced here read the leg as a transfer and the rotation was
+ * dropped entirely. That is a real copy trader missing real trades.
+ *
+ * These are kept SEPARATE from VENUE_PROGRAMS on purpose: seeing one is
+ * evidence the leader swapped, which is all the buy-side classifier needs, but
+ * it is NOT a venue we can send an order to — resolveBuyPool still decides
+ * that, and a mint we cannot execute on is still skipped downstream.
+ */
+export const SWAP_EVIDENCE_PROGRAMS: ReadonlySet<string> = new Set([
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',  // Jupiter aggregator v6
+  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',  // Jupiter v4
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',  // Orca Whirlpools
+  '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP', // Orca v2
+  'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',  // Meteora DLMM
+  'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB', // Meteora pools
+  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
+]);
+
 /** First venue program present among a transaction's account keys; undefined for an unknown venue or a plain transfer. */
 export function detectVenue(accountKeys: readonly string[]): string | undefined {
   const present = new Set(accountKeys);
@@ -30,6 +54,20 @@ export function detectVenue(accountKeys: readonly string[]): string | undefined 
     if (present.has(program)) return pool;
   }
   return undefined;
+}
+
+/**
+ * Did a SWAP demonstrably happen in this transaction — on any venue, including
+ * ones we cannot execute on? See SWAP_EVIDENCE_PROGRAMS.
+ */
+export function sawSwapProgram(accountKeys: readonly string[]): boolean {
+  for (const k of accountKeys) {
+    if (SWAP_EVIDENCE_PROGRAMS.has(k)) return true;
+  }
+  for (const [program] of VENUE_PROGRAMS) {
+    if (accountKeys.includes(program)) return true;
+  }
+  return false;
 }
 
 /**
@@ -74,6 +112,11 @@ export function classifyFlow(p: {
   venueKnown: boolean;
   /** Leg of a token→token swap — no SOL by nature. */
   isTokenSwap: boolean;
+  /**
+   * A swap program was present — including aggregators and AMMs this bot cannot
+   * route an order to. Evidence that the leader traded, not that we can follow.
+   */
+  swapEvidence?: boolean;
 }): FlowKind {
   // ---- BUY: the leader must have GIVEN SOMETHING UP ----------------------
   //
@@ -95,7 +138,13 @@ export function classifyFlow(p: {
   // So a buy is a trade when SOL actually left, or when it is a token→token
   // swap that at least executed somewhere we recognise.
   if (p.side === 'buy') {
-    if (p.isTokenSwap && p.venueKnown) return 'trade';
+    // A token→token buy needs evidence that a SWAP happened — which is a wider
+    // question than "can we execute here". Requiring an executable venue
+    // dropped every rotation through Jupiter, Orca or Meteora, i.e. most of
+    // them, and a copy trader that misses the leader's real trades is its own
+    // kind of broken. `swapEvidence` covers those; whether we can follow the
+    // trade is decided downstream by resolveBuyPool.
+    if (p.isTokenSwap && (p.venueKnown || p.swapEvidence)) return 'trade';
     const floor = p.venueKnown ? VENUE_TRADE_MIN_SOL_BUY : TRADE_MIN_SOL_BUY;
     return p.tradeSol > floor ? 'trade' : 'transfer';
   }

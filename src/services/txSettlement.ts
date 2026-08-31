@@ -156,6 +156,16 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 /** Per-call ceiling. Generous next to a healthy response, decisive against a dead socket. */
 const RPC_CALL_TIMEOUT_MS = 12_000;
 
+/**
+ * A transaction younger than this is never declared expired.
+ *
+ * 20s comfortably exceeds the confirmed-to-finalized lag and any propagation
+ * delay, while staying far inside a blockhash's ~60s life — so the definitive
+ * negative is still reached long before the transaction could have landed
+ * unnoticed.
+ */
+const MIN_AGE_BEFORE_EXPIRY_MS = 20_000;
+
 /** Anchor error 6004 in its several on-the-wire spellings. */
 export function isSlippageError(err: unknown): boolean {
   if (err === null || err === undefined) return false;
@@ -250,11 +260,26 @@ export async function settleTransaction(
     // ---- 2. Can it still land? -------------------------------------------
     // Proving the negative is what makes "no position" a safe decision instead
     // of a guess. Only consulted when we were given the blockhash.
-    if (opts.blockhash && now() - lastBlockhashCheck >= blockhashCheckMs) {
+    // MINIMUM AGE. Expiry is a claim about a transaction that has had time to
+    // land and did not; nothing that young can be declared dead, whatever a
+    // lagging bank says. Belt and braces alongside the commitment fix above.
+    const oldEnoughToExpire = now() - started >= MIN_AGE_BEFORE_EXPIRY_MS;
+    if (opts.blockhash && oldEnoughToExpire && now() - lastBlockhashCheck >= blockhashCheckMs) {
       lastBlockhashCheck = now();
       try {
+        // 'confirmed', NOT 'finalized'.
+        //
+        // The blockhash was fetched at 'confirmed'; the FINALIZED bank lags the
+        // confirmed tip by roughly 32 slots (~13s), so a blockhash that is
+        // perfectly alive is simply not in the finalized bank yet and
+        // isBlockhashValid answers FALSE for the first ~13 seconds of every
+        // transaction's life. Two such observations, a poll apart, then
+        // declared a live transaction 'expired' about three seconds after
+        // submitting it — reporting "nothing happened" about a buy that was on
+        // its way to landing, which is the very failure this module exists to
+        // stop, produced by the check meant to prevent it.
         const valid = await withTimeout(
-          connection.isBlockhashValid(opts.blockhash, { commitment: 'finalized' }),
+          connection.isBlockhashValid(opts.blockhash, { commitment: 'confirmed' }),
           RPC_CALL_TIMEOUT_MS, 'isBlockhashValid');
         const stillValid = typeof valid === 'boolean' ? valid : valid?.value;
         if (stillValid === false) {

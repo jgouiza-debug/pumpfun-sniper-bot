@@ -68,6 +68,13 @@ REM honeypot check, the dev-sell stop, the economics gate, playbook routing
 REM and honest paper accounting are ALL OFF. That table was never meant for a
 REM real trading session; PACKAGED_DEFAULTS is "the flags the project actually
 REM operates with", and this launcher is a real trading session.
+echo.
+echo   Running with the SHIPPED safety flags (kill switch, honeypot check,
+echo   dev-sell stop, economics gate, playbook routing, honest paper).
+echo   Previously this launcher used the DEV set, which has all of those OFF
+echo   and all-in position sizing ON. Entries will be more selective and
+echo   positions smaller than you may be used to. See audit\INCIDENT-2026-08-30.md
+echo.
 set "SNIPER_PACKAGED=1"
 node "dist\server.js"
 
