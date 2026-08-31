@@ -175,6 +175,19 @@ const DEFAULT_MAX_ENTRIES_PER_HOUR = 30;
 const DEFAULT_MAX_CONSECUTIVE_TX_FAILURES = 5;
 /** Consecutive hot-path RPC failures before failing over to the backup endpoint. */
 const RPC_FAILOVER_FAILURE_THRESHOLD = 5;
+/**
+ * ...AND the streak has to have lasted this long.
+ *
+ * The count alone is not evidence of an outage. Once settlement polling began
+ * feeding the health counters, the busiest loop on the trading path (a status
+ * poll every 300ms) could ring up five consecutive 429s in 1.5 seconds — a
+ * burst a shared Helius key produces routinely — and demote the entire session
+ * to the public RPC for two minutes. The public endpoint then slows balance
+ * reads, `lastCheckedAt` stops advancing, and the governor starts refusing
+ * buys against a stale balance: a momentary rate limit turned into an outage.
+ * A real outage has no trouble lasting five seconds.
+ */
+const RPC_FAILOVER_MIN_STREAK_MS = 5_000;
 /** How long to stay on the fallback before giving the primary another chance. */
 const RPC_PRIMARY_RETRY_MS = 120_000;
 /** ~150 slots at ~400ms. Past this the feed's state is of unknown age. */
@@ -1987,7 +2000,12 @@ export class SniperEngine {
     pool?: string,
     slippageOverride?: number,
     retryCount = 0,
-    opts: { external?: boolean; priorTokenBalance?: number } = {}
+    opts: {
+      external?: boolean;
+      priorTokenBalance?: number;
+      /** See the call site in executeRealMainnetTrade: frees the per-mint queue for a waiting exit. */
+      yieldSettlementWhen?: () => boolean;
+    } = {}
   ): Promise<TradeResult | null> {
     /** True once THIS call has claimed a concurrency slot. See the finally. */
     let inFlightCounted = false;
@@ -2366,7 +2384,18 @@ export class SniperEngine {
         // this branch exists for, the poll runs to its ceiling. 75s covers a
         // blockhash lifetime for the common case while expiry detection ends it
         // sooner whenever isBlockhashValid can be read at all.
-        const confirmed = await this.confirmTransaction(txid, 75_000, tx.message.recentBlockhash);
+        // YIELD. The window is 75s, but the per-mint queue it holds is not
+        // this buy's to keep: if a leader's flip-sell for the same mint is
+        // already waiting, the exit matters more than resolving the entry's
+        // book-keeping in-line. Buys only — a sell must never hand its queue to
+        // anything, and there is nothing behind it that could ask.
+        let settlementYielded = false;
+        const confirmed = await this.confirmTransaction(
+          txid, 75_000, tx.message.recentBlockhash,
+          action === 'buy' && opts.yieldSettlementWhen
+            ? { yieldWhen: opts.yieldSettlementWhen, onYield: () => { settlementYielded = true; } }
+            : {}
+        );
         // The verdict is in: nothing may keep pushing this transaction.
         stopRebroadcast?.();
         stopRebroadcast = null;
@@ -2467,6 +2496,15 @@ export class SniperEngine {
           const gained = owned - prior;
           if (gained <= Math.max(1e-9, prior * 1e-6)) {
             tradeGovernor.recordBuyOutcome(false, 'buy did not land (wallet holds no more than before)');
+            if (settlementYielded) {
+              // "Has not landed YET" — the poll stopped early to free the queue,
+              // not because the transaction ran out of road. Writing this off
+              // here would recreate the incident in mirror image: a buy lands
+              // seconds later and nothing in the process is tracking it.
+              this.log('warn', `⏳ Buy ${txid.slice(0, 8)}... has not landed yet and the queue was needed elsewhere — the wallet holds no more of ${mint.slice(0, 8)}… than before. Handed to reconciliation; a position opens only if it actually lands.`, mint);
+              this.maybeQueueUnresolvedBuy(mint, txid);
+              return null;
+            }
             this.log('warn', `✅ Buy ${txid.slice(0, 8)}... did NOT land — the wallet holds no more of ${mint.slice(0, 8)}… than before (${owned.toLocaleString()} vs ${prior.toLocaleString()}). Nothing opened; only the fee was spent.`, mint);
             return null;
           }
@@ -2578,10 +2616,12 @@ export class SniperEngine {
   private async confirmTransaction(
     txid: string,
     timeoutMs = 95_000,
-    blockhash?: string
+    blockhash?: string,
+    settleOpts: { yieldWhen?: () => boolean; onYield?: () => void } = {}
   ): Promise<'confirmed' | 'failed' | 'slippage_failed' | 'expired' | 'unknown'> {
     const res = await settleTransaction(this.solanaConnection, txid, {
       timeoutMs,
+      ...(settleOpts.yieldWhen ? { yieldWhen: settleOpts.yieldWhen } : {}),
       // 300ms: a confirmation is usually visible within 1–2s, and a queued copy
       // exit for the same mint waits on this poll before it can start, so a
       // tighter cadence shortens the gap between one exit and the next.
@@ -2609,7 +2649,11 @@ export class SniperEngine {
         this.log('warn', `⌛ Tx ${txid.slice(0, 8)}... ${res.detail}`);
         return 'expired';
       default:
-        this.log('error', `❓ Tx ${txid.slice(0, 8)}... ${res.detail}`);
+        // A YIELD IS NOT A TIMEOUT. Both come back 'unknown', but only one of
+        // them describes a transaction that can still land, and the caller has
+        // to reconcile that one instead of writing it off.
+        if (res.yielded) settleOpts.onYield?.();
+        this.log(res.yielded ? 'warn' : 'error', `❓ Tx ${txid.slice(0, 8)}... ${res.detail}`);
         return 'unknown';
     }
   }
@@ -4210,7 +4254,14 @@ export class SniperEngine {
   private maybeFailoverRpc(): void {
     const primary = resolveRpcEndpoint(this.config.heliusApiKey);
     const health = rpcHealth();
-    const primaryDown = health.credentialRejected || health.consecutiveFailures >= RPC_FAILOVER_FAILURE_THRESHOLD;
+    const streakMs = health.consecutiveFailuresSince === null
+      ? 0
+      : Date.now() - health.consecutiveFailuresSince;
+    const sustainedFailures = health.consecutiveFailures >= RPC_FAILOVER_FAILURE_THRESHOLD
+      && streakMs >= RPC_FAILOVER_MIN_STREAK_MS;
+    // A rejected credential still fails over immediately: it is terminal, not
+    // a burst, and every further call fails identically.
+    const primaryDown = health.credentialRejected || sustainedFailures;
 
     if (!this.onFallbackRpc) {
       if (!primaryDown) return;
@@ -4222,7 +4273,7 @@ export class SniperEngine {
       this.onFallbackRpc = true;
       this.lastPrimaryRetryAt = Date.now();
       resetRpcHealth();
-      this.log('warn', `🔀 Primary RPC (${primary.host}) is down (${health.credentialRejected ? 'credential rejected' : health.consecutiveFailures + ' consecutive failures'}) — switched to fallback ${fbHost}. Open positions can still be priced and exited; retrying the primary every ${RPC_PRIMARY_RETRY_MS / 1000}s.`);
+      this.log('warn', `🔀 Primary RPC (${primary.host}) is down (${health.credentialRejected ? 'credential rejected' : `${health.consecutiveFailures} consecutive failures over ${Math.round(streakMs / 1000)}s`}) — switched to fallback ${fbHost}. Open positions can still be priced and exited; retrying the primary every ${RPC_PRIMARY_RETRY_MS / 1000}s.`);
       return;
     }
 
@@ -5411,11 +5462,18 @@ export class SniperEngine {
      * unresolved-buy recovery path, where "the wallet holds some" is not
      * evidence a buy landed if it already held some.
      */
-    priorTokenBalance?: number
+    priorTokenBalance?: number,
+    /**
+     * Called while a BUY is still settling. Returning true frees the per-mint
+     * trade queue immediately and hands the signature to reconciliation — the
+     * copy trader passes its own queue depth, so a leader's flip-sell no longer
+     * waits out the entry's confirmation window.
+     */
+    yieldSettlementWhen?: () => boolean
   ): Promise<TradeResult | null> {
     return this.executeRealMainnetTrade(
       action, mint, solAmount, amountPct, pool, slippageOverride, 0,
-      { external: true, priorTokenBalance }
+      { external: true, priorTokenBalance, ...(yieldSettlementWhen ? { yieldSettlementWhen } : {}) }
     );
   }
 

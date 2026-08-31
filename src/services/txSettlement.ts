@@ -97,6 +97,14 @@ export interface SettlementResult {
   rpcErrors: number;
   /** Human-readable, safe to log verbatim. */
   detail: string;
+  /**
+   * True when polling stopped because `yieldWhen` asked it to, NOT because the
+   * window ran out. The distinction matters: a yielded transaction is still
+   * perfectly able to land, so the caller owes it a reconciliation, whereas a
+   * transaction that exhausted a window longer than its blockhash lifetime is
+   * very probably dead. Only ever set alongside `outcome: 'unknown'`.
+   */
+  yielded?: boolean;
 }
 
 export interface SettleOptions {
@@ -123,6 +131,21 @@ export interface SettleOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Optional progress logging. */
   log?: (level: 'info' | 'warn' | 'error', msg: string) => void;
+  /**
+   * Stop polling early and hand the transaction to background reconciliation.
+   *
+   * WHY: this poll runs INSIDE the per-mint trade queue, so everything else for
+   * that mint waits on it — including a leader's flip-sell. The window is 75s
+   * because that is what it takes to resolve a buy definitively, but a bag the
+   * leader is dumping cannot wait 75s for an answer that only affects
+   * book-keeping. When this predicate returns true the loop returns
+   * `{outcome: 'unknown', yielded: true}` immediately, the queue is freed, and
+   * the caller reconciles the signature out of band.
+   *
+   * Never consulted before the first status poll: yielding without having
+   * asked the chain even once would give up an answer that was already there.
+   */
+  yieldWhen?: () => boolean;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
@@ -295,6 +318,16 @@ export async function settleTransaction(
         rpcErrors++;
         // Unreadable blockhash validity is not evidence of anything.
       }
+    }
+
+    // ---- 3. Is someone waiting on this queue? ----------------------------
+    // Checked LAST, so a poll and an expiry check always precede it: whatever
+    // the chain was ready to tell us, we have already heard.
+    if (opts.yieldWhen?.()) {
+      return done('unknown',
+        `still unresolved after ${Math.round((now() - started) / 1000)}s and something is waiting on `
+        + `this mint — releasing the queue and reconciling this signature in the background`,
+        { yielded: true });
     }
 
     await sleep(pollMs);

@@ -2950,6 +2950,89 @@ console.log('\n-- RPC: transient failure is not a honeypot verdict --');
     }
   });
 
+  test('a BURST of failures does not fail over — a real outage lasts longer than a poll loop', async () => {
+    // REGRESSION GUARD. Once settlement polling began feeding the health
+    // counters, the busiest loop on the trading path (a status poll every
+    // 300ms) could ring up five consecutive 429s in 1.5 SECONDS — a burst a
+    // shared Helius key produces routinely — and that was enough to demote the
+    // whole session to the public RPC for two minutes. The public endpoint then
+    // slows balance reads, `lastCheckedAt` stops advancing, and the governor
+    // starts refusing buys against a stale balance. A momentary rate limit
+    // became an outage, caused by the failover meant to prevent one.
+    //
+    // The rule is now count AND duration. A count alone says nothing about how
+    // long the failures took to accumulate.
+    const { noteRpcOutcome } = require('../services/rpcHealth');
+    const { sniperEngine } = require('../services/sniperEngine');
+    const eng = sniperEngine as any;
+    const savedFallback = process.env.SOLANA_RPC_FALLBACK_URL;
+    const savedKey = eng.config.heliusApiKey;
+    const savedOverride = process.env.SOLANA_RPC_URL;
+    try {
+      delete process.env.SOLANA_RPC_URL;
+      eng.config.heliusApiKey = 'k'.repeat(20);
+      process.env.SOLANA_RPC_FALLBACK_URL = 'https://backup.example.com';
+      eng.onFallbackRpc = false;
+      resetRpcHealth();
+
+      // Eight consecutive failures, all of them just now — the 300ms-poll shape.
+      for (let i = 0; i < 8; i++) noteRpcOutcome(false, new Error('429 Too Many Requests'));
+      assert.ok(rpcHealth().consecutiveFailures >= 5, 'the count alone clears the old threshold');
+      eng.maybeFailoverRpc();
+      assert.strictEqual(eng.onFallbackRpc, false,
+        'a sub-second burst must NOT demote the session — that is the outage, not the cure');
+
+      // The same streak, aged past the minimum duration. Now it is an outage.
+      assert.ok(typeof rpcHealth().consecutiveFailuresSince === 'number',
+        'the streak has to record WHEN it started or duration cannot be tested');
+
+      // The sustained case cannot be produced without waiting 5s of real time,
+      // so the AND itself is asserted against the shipped source. Weaker than a
+      // behavioural check, and still strong enough to fail if either half of
+      // the condition is dropped — which is the mutation this guards.
+      const engineSrc = require('fs').readFileSync(
+        require('path').join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+      const idx = engineSrc.indexOf('const sustainedFailures =');
+      assert.ok(idx > 0, 'the failover predicate must name a sustained-failure condition');
+      const pred = engineSrc.slice(idx, idx + 260);
+      assert.ok(pred.includes('RPC_FAILOVER_FAILURE_THRESHOLD') && pred.includes('RPC_FAILOVER_MIN_STREAK_MS'),
+        'failover must require BOTH a count and a duration; a count alone is what a 300ms poll loop defeats');
+      assert.ok(/&&/.test(pred), 'the two conditions must be ANDed, not ORed');
+
+      // A rejected credential still fails over at once: terminal, not a burst.
+      resetRpcHealth();
+      await assert.rejects(async () => {
+        await withRpcRetry(async () => { throw new Error('Unauthorized: 401'); }, { attempts: 2, baseDelayMs: 1 });
+      });
+      eng.maybeFailoverRpc();
+      assert.strictEqual(eng.onFallbackRpc, true,
+        'a dead key is not a burst — every further call fails identically, so waiting 5s buys nothing');
+    } finally {
+      if (savedFallback === undefined) delete process.env.SOLANA_RPC_FALLBACK_URL; else process.env.SOLANA_RPC_FALLBACK_URL = savedFallback;
+      if (savedOverride === undefined) delete process.env.SOLANA_RPC_URL; else process.env.SOLANA_RPC_URL = savedOverride;
+      eng.config.heliusApiKey = savedKey;
+      eng.onFallbackRpc = false;
+      resetRpcHealth();
+      const { resolveRpcEndpoint } = require('../services/rpcHealth');
+      eng.rebindConnection(resolveRpcEndpoint(savedKey).url);
+    }
+  });
+
+  test('a success clears the streak START, not just the count', () => {
+    // If the count resets but the start timestamp does not, the NEXT streak
+    // inherits an ancient start and passes the duration test on its first
+    // failure — turning the duration rule into no rule at all.
+    const { noteRpcOutcome } = require('../services/rpcHealth');
+    resetRpcHealth();
+    noteRpcOutcome(false, new Error('boom'));
+    assert.ok(rpcHealth().consecutiveFailuresSince !== null, 'a failure opens a streak');
+    noteRpcOutcome(true);
+    assert.strictEqual(rpcHealth().consecutiveFailures, 0);
+    assert.strictEqual(rpcHealth().consecutiveFailuresSince, null,
+      'a success must close the streak completely, or the next one starts pre-aged');
+    resetRpcHealth();
+  });
+
   test('a not-yet-visible account is retried rather than read as absent', async () => {
     // The case that cost entries: getAccountInfo returns null for a few hundred
     // ms on a mint that is 400ms old, and null was treated as "unverifiable".

@@ -2212,7 +2212,13 @@ export class CopyTraderService {
             // wallet holds some" is not evidence a buy landed if it already
             // held some — and a repeat buy is the DEFAULT here
             // (blockRepeatBuys is false), so that case is the common one.
-            existingNow ? existingNow.tokensHeld : 0
+            existingNow ? existingNow.tokensHeld : 0,
+            // FREE THE QUEUE FOR AN EXIT. depth() counts this buy plus anything
+            // waiting behind it, so >1 means a leader sell (or a second signal)
+            // for this mint is already blocked. The confirmation window is 75s;
+            // a bag the leader is dumping cannot spend 75s waiting on the
+            // entry's book-keeping. The signature is reconciled out of band.
+            () => this.tradeQueue.depth(mint) > 1
           );
         } finally {
           this.inFlightBuySol.delete(mint);

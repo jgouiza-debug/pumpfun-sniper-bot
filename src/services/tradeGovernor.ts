@@ -197,7 +197,15 @@ export const DEFAULT_GOVERNOR_LIMITS: GovernorLimits = {
   // wallet size — the engine leaves exactly 0.0055 SOL behind, so the floor was
   // rejecting a trade the engine had already sized to be safe.
   minWalletReserveSol: 0.003,
-  maxConcurrentBuys: 3,
+  // 6, not 3, because the settlement window that a slot is held for is now
+  // 75s rather than master's 30s. A ceiling of 3 against a 2.5x longer window
+  // is a tighter constraint than it looks: under the degraded RPC this branch
+  // exists for, three unresolved buys stop BOTH engines from buying anything
+  // for over a minute — the safety limit becoming the outage. The SOL ceilings
+  // above are what actually bound outflow; this one only bounds the stampede
+  // in which per-trade sizing is blind to trades that have not resolved yet,
+  // and 6 x worst-case still lands inside them.
+  maxConcurrentBuys: 6,
   // 30s: comfortably longer than the 8s balance TTL and any normal refresh, so
   // it never fires in healthy operation, and decisively shorter than the window
   // in which a frozen balance can fund several phantom-affordable orders.

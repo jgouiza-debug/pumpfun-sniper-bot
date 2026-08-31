@@ -29,6 +29,18 @@ export interface RpcHealthSnapshot {
   ok: number;
   failed: number;
   consecutiveFailures: number;
+  /**
+   * When the CURRENT failure streak began, or null when the last call worked.
+   *
+   * A bare count is not evidence of an outage, because it says nothing about
+   * how long the failures took to accumulate. The settlement loop polls every
+   * 300ms, so five consecutive 429s there is 1.5 SECONDS of rate limiting —
+   * and that was enough to demote the whole session to the public RPC, which
+   * then slowed balance reads until the governor started refusing buys for a
+   * stale balance. Failover needs to see a streak that has LASTED, not one
+   * that a fast loop rang up in under two seconds.
+   */
+  consecutiveFailuresSince: number | null;
   /** Latched once the provider rejects the credential itself. */
   credentialRejected: boolean;
   lastError: string | null;
@@ -41,6 +53,7 @@ const state = {
   ok: 0,
   failed: 0,
   consecutiveFailures: 0,
+  consecutiveFailuresSince: null as number | null,
   credentialRejected: false,
   lastError: null as string | null,
   lastErrorAt: null as number | null,
@@ -96,6 +109,21 @@ export interface RpcRetryOptions {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** One place that owns the streak, so no call site can update half of it. */
+function recordFailure(err: unknown): void {
+  state.failed++;
+  state.consecutiveFailures++;
+  if (state.consecutiveFailuresSince === null) state.consecutiveFailuresSince = Date.now();
+  state.lastError = err instanceof Error ? err.message : String(err ?? 'unknown');
+  state.lastErrorAt = Date.now();
+}
+
+function recordSuccess(): void {
+  state.ok++;
+  state.consecutiveFailures = 0;
+  state.consecutiveFailuresSince = null;
+}
+
 /**
  * Runs an RPC call with bounded retry, recording health either way.
  * Throws the last error if every attempt fails.
@@ -119,10 +147,7 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
         continue;
       }
 
-      if (countHealth) {
-        state.ok++;
-        state.consecutiveFailures = 0;
-      }
+      if (countHealth) recordSuccess();
       return value;
     } catch (err) {
       lastErr = err;
@@ -147,12 +172,7 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
     }
   }
 
-  if (countHealth) {
-    state.failed++;
-    state.consecutiveFailures++;
-    state.lastError = lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'unknown');
-    state.lastErrorAt = Date.now();
-  }
+  if (countHealth) recordFailure(lastErr);
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'RPC call failed'));
 }
 
@@ -172,15 +192,11 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
  */
 export function noteRpcOutcome(ok: boolean, err?: unknown): void {
   if (ok) {
-    state.ok++;
-    state.consecutiveFailures = 0;
+    recordSuccess();
     return;
   }
   if (isCredentialError(err)) state.credentialRejected = true;
-  state.failed++;
-  state.consecutiveFailures++;
-  state.lastError = err instanceof Error ? err.message : String(err ?? 'unknown');
-  state.lastErrorAt = Date.now();
+  recordFailure(err);
 }
 
 export function rpcHealth(): RpcHealthSnapshot {
@@ -189,6 +205,7 @@ export function rpcHealth(): RpcHealthSnapshot {
     ok: state.ok,
     failed: state.failed,
     consecutiveFailures: state.consecutiveFailures,
+    consecutiveFailuresSince: state.consecutiveFailuresSince,
     credentialRejected: state.credentialRejected,
     lastError: state.lastError,
     lastErrorAt: state.lastErrorAt,
@@ -479,6 +496,7 @@ export function resetRpcHealth(): void {
   state.ok = 0;
   state.failed = 0;
   state.consecutiveFailures = 0;
+  state.consecutiveFailuresSince = null;
   state.credentialRejected = false;
   state.lastError = null;
   state.lastErrorAt = null;

@@ -324,6 +324,135 @@ async function main(): Promise<void> {
       `ordered ${ordered} SOL of a 0.5 SOL deployable balance (the old divisor gave the lot)`);
   }
 
+  // ------------------------------------------------------------------ R
+  console.log('\n-- R. The automatic on-chain position sync (it can CLOSE positions) --');
+  {
+    // WHY THIS SECTION EXISTS. This branch put syncPositionsWithOnChainBalances
+    // on a 90-second timer. Before that it was reachable only from a button, so
+    // an operator chose each run; now it closes positions unattended, on the
+    // strength of one balance read. Nothing tested it. A reconciler that closes
+    // a position it should have left alone strands a live bag, which is the
+    // same loss as a phantom position wearing the opposite sign.
+    const OLD = Date.now() - 10 * 60_000;   // comfortably past POSITION_SYNC_MIN_AGE_MS
+    const mkPos = (svcRef: any, mint: string, held: number, over: Record<string, any> = {}) => {
+      const pos = {
+        id: `sync_${mint}`, mint, tokenSymbol: 'SYNC', leaderWallet: LEADER,
+        leaderNickname: 'drill-leader', status: 'OPEN', buyTxid: `sig_${mint}`,
+        entryTime: OLD, tokensHeld: held, investedSol: 0.05, entryPriceSol: 0.000005,
+        currentPriceSol: 0.000005, realizedPnlUsd: 0, realizedPnlSol: 0,
+        lastPriceAt: Date.now(), ...over,
+      } as any;
+      svcRef.positions.push(pos);
+      return pos;
+    };
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncGoneAAAAAAAAAAAAAAAAAAAAAAAAAApump';
+      mkPos(svc, MINT, 10_000);
+      stub.ownedByMint.set(MINT, 0);
+      const r = await svc.syncPositionsWithOnChainBalances();
+      const pos = svc.positions.find((p: any) => p.mint === MINT);
+      check('a bag that is genuinely gone is closed as externally exited',
+        r.closed === 1 && pos?.status === 'CLOSED', `closed=${r.closed} status=${pos?.status}`);
+    }
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncBlindBBBBBBBBBBBBBBBBBBBBBBBBBpump';
+      mkPos(svc, MINT, 10_000);
+      // null = "could not ask", which is what a 429 storm produces — the exact
+      // weather the incident happened in. Reading it as zero would close every
+      // open position in the book at once.
+      stub.ownedByMint.set(MINT, null);
+      const r = await svc.syncPositionsWithOnChainBalances();
+      const pos = svc.positions.find((p: any) => p.mint === MINT);
+      check('an UNREADABLE balance closes nothing and is reported as unreadable',
+        r.closed === 0 && r.unreadable === 1 && pos?.status === 'OPEN',
+        `closed=${r.closed} unreadable=${r.unreadable} status=${pos?.status}`);
+      check('the position keeps its recorded quantity when the chain could not be asked',
+        pos?.tokensHeld === 10_000, `tokensHeld=${pos?.tokensHeld}`);
+    }
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncDriftCCCCCCCCCCCCCCCCCCCCCCCCCpump';
+      const pos = mkPos(svc, MINT, 10_000);
+      stub.ownedByMint.set(MINT, 8_000);   // 20% drift — the chain is the truth
+      const r = await svc.syncPositionsWithOnChainBalances();
+      check('a drifted quantity is corrected to the chain, not closed',
+        r.corrected === 1 && r.closed === 0 && pos.tokensHeld === 8_000,
+        `corrected=${r.corrected} closed=${r.closed} tokensHeld=${pos.tokensHeld}`);
+    }
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncExitingDDDDDDDDDDDDDDDDDDDDDDDpump';
+      mkPos(svc, MINT, 10_000, { exitInFlight: true });
+      // A sell mid-settlement has already moved part of the bag. Correcting to
+      // the interim balance mis-sizes the rest of the exit; reading it as empty
+      // closes a position that is still selling.
+      stub.ownedByMint.set(MINT, 0);
+      const r = await svc.syncPositionsWithOnChainBalances();
+      const pos = svc.positions.find((p: any) => p.mint === MINT);
+      check('a position with an exit IN FLIGHT is not touched',
+        r.checked === 0 && pos?.status === 'OPEN' && pos?.tokensHeld === 10_000,
+        `checked=${r.checked} status=${pos?.status}`);
+    }
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncYoungEEEEEEEEEEEEEEEEEEEEEEEEEpump';
+      // Five seconds old, not zero seconds old. `entryTime: Date.now()` would
+      // be excluded by `age > 0` even with the minimum age set to nothing, so
+      // the test would pass against a build that had no age rule at all —
+      // which is exactly what mutation-testing this file caught it doing.
+      mkPos(svc, MINT, 10_000, { entryTime: Date.now() - 5_000 });
+      // A token account can lag a landed buy by seconds. Zero on a brand-new
+      // position is propagation, not absence — and treating it as absence
+      // deletes a real position moments after opening it.
+      stub.ownedByMint.set(MINT, 0);
+      const r = await svc.syncPositionsWithOnChainBalances();
+      const pos = svc.positions.find((p: any) => p.mint === MINT);
+      check('a position younger than the minimum age is not touched',
+        r.checked === 0 && pos?.status === 'OPEN', `checked=${r.checked} status=${pos?.status}`);
+    }
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncPaperFFFFFFFFFFFFFFFFFFFFFFFFFpump';
+      mkPos(svc, MINT, 10_000, { buyTxid: 'sim_paper_1' });
+      stub.ownedByMint.set(MINT, 0);
+      const r = await svc.syncPositionsWithOnChainBalances();
+      const pos = svc.positions.find((p: any) => p.mint === MINT);
+      check('a PAPER position is skipped — it has no on-chain balance to read',
+        r.checked === 0 && pos?.status === 'OPEN', `checked=${r.checked}`);
+    }
+
+    {
+      resetService(svc);
+      const MINT = 'DrillSyncRaceGGGGGGGGGGGGGGGGGGGGGGGGGpump';
+      const pos = mkPos(svc, MINT, 10_000);
+      // THE RACE THE RE-CHECK EXISTS FOR. The exclusions are a snapshot, and
+      // the loop awaits a balance read per position. A leader sell arriving
+      // mid-read sets exitInFlight on a position this loop is about to act on.
+      // Without the re-check AFTER the await, the interim balance is written
+      // back as truth or read as empty and the position closed mid-exit.
+      stub.ownedByMint.set(MINT, 0);
+      const engineAny: any = sniperEngine;
+      const realReader = engineAny.readOwnedTokenAmount;
+      engineAny.readOwnedTokenAmount = async (m: string) => {
+        pos.exitInFlight = true;             // the sell starts while we are asking
+        return realReader.call(engineAny, m);
+      };
+      const r = await svc.syncPositionsWithOnChainBalances();
+      engineAny.readOwnedTokenAmount = realReader;
+      check('an exit that starts DURING the balance read still protects the position',
+        r.closed === 0 && pos.status === 'OPEN' && pos.tokensHeld === 10_000,
+        `closed=${r.closed} status=${pos.status} tokensHeld=${pos.tokensHeld}`);
+    }
+  }
+
   console.log(`\n==== COPY REAL-BUY DRILL: ${passed} passed, ${failed} failed ====`);
   console.log(`(state written under ${drillDir})`);
   process.exit(failed > 0 ? 1 : 0);

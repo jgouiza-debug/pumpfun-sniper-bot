@@ -817,6 +817,176 @@ test('the governor never blocks a SELL — a halted wallet is the one that most 
     'adding a sell gate would let a breaker strand bags');
 });
 
+// ===========================================================================
+// MUTATION-PROOFING THE SETTLEMENT INVARIANTS
+// ===========================================================================
+//
+// WHY THIS SECTION EXISTS. Every fix above was mutation-tested: the fix was
+// reverted in the source, the whole suite was re-run, and the mutation was
+// only considered guarded if something went red. Three settlement invariants
+// SURVIVED that — the suite stayed green with the bug put back:
+//
+//   1. `searchTransactionHistory: true`  →  `false`
+//   2. `isBlockhashValid` at 'confirmed' →  'finalized'
+//   3. expiry needing TWO observations   →  one
+//
+// All three survived for the same reason: the fake connection above ignores
+// the ARGUMENTS it is called with and the tests only ever looked at the return
+// value. So the tests were asserting the outcome of a policy without asserting
+// the policy. These three do watch the calls. If any of the three fixes is
+// reverted, one of these fails — which is the only property that makes a
+// regression test worth having.
+console.log('\n-- Settlement invariants, asserted at the RPC call itself --');
+
+/** Like fakeConn, but it RECORDS what settlement asked the node. */
+function recordingConn(script: {
+  statuses?: Array<any | 'throw'>;
+  blockhashValid?: Array<boolean | 'throw'>;
+}) {
+  let si = 0;
+  let bi = 0;
+  const statusOpts: any[] = [];
+  const blockhashOpts: any[] = [];
+  return {
+    statusOpts,
+    blockhashOpts,
+    conn: {
+      getSignatureStatuses: async (_sigs: string[], opts?: any) => {
+        statusOpts.push(opts);
+        const v = script.statuses?.[Math.min(si, (script.statuses?.length ?? 1) - 1)];
+        si++;
+        if (v === 'throw') throw new Error('429 Too Many Requests');
+        return { value: [v ?? null] } as any;
+      },
+      isBlockhashValid: async (_bh: string, opts?: any) => {
+        blockhashOpts.push(opts);
+        const v = script.blockhashValid?.[Math.min(bi, (script.blockhashValid?.length ?? 1) - 1)];
+        bi++;
+        if (v === 'throw') throw new Error('rpc down');
+        return { value: v ?? true } as any;
+      },
+    },
+  };
+}
+
+test('INVARIANT 1: the status query always sets searchTransactionHistory', async () => {
+  // THE HEADLINE CAUSE OF "it says on chain but its not". A node keeps recent
+  // signature statuses in memory only. Without history search, a signature that
+  // has aged out of that cache answers `null` FOREVER — indistinguishable from
+  // "never landed" — and under the old rules a buy in that state became a
+  // phantom position. The flag is not an optimisation; it is the difference
+  // between asking the chain and asking a cache.
+  const rec = recordingConn({ statuses: [{ err: null, confirmationStatus: 'confirmed' }] });
+  const r = await settleTransaction(rec.conn as any, 'sig', { ...fastOpts, timeoutMs: 5_000 });
+  assert.strictEqual(r.outcome, 'landed');
+  assert.ok(rec.statusOpts.length > 0, 'the status must actually be queried');
+  for (const opts of rec.statusOpts) {
+    assert.strictEqual(opts?.searchTransactionHistory, true,
+      'getSignatureStatuses must search transaction history — without it an aged-out '
+      + 'signature reads as "never landed" and a real buy becomes a phantom');
+  }
+});
+
+test("INVARIANT 2: blockhash validity is read at 'confirmed', never 'finalized'", async () => {
+  // The finalized bank lags the confirmed tip by ~32 slots (~13s), so a
+  // perfectly live blockhash is simply not in it yet and the call answers FALSE
+  // for the first ~13 seconds of every transaction's life. Read at 'finalized',
+  // this check declares live transactions dead — the module's own failure mode,
+  // produced by the guard meant to prevent it.
+  //
+  // The minimum-age rule also defends against this, which is exactly why the
+  // commitment needs its OWN assertion: with both in place, a test that only
+  // watches the outcome passes either way and proves nothing.
+  const rec = recordingConn({ statuses: [null], blockhashValid: [false] });
+  const r = await settleTransaction(rec.conn as any, 'sig',
+    { ...fastOpts, timeoutMs: 120_000, blockhash: 'bh', now: steppingClock() });
+  assert.strictEqual(r.outcome, 'expired');
+  assert.ok(rec.blockhashOpts.length > 0, 'validity must actually be queried');
+  for (const opts of rec.blockhashOpts) {
+    assert.strictEqual(opts?.commitment, 'confirmed',
+      "isBlockhashValid must be read at 'confirmed' — the finalized bank lags ~13s "
+      + 'behind, so it reports a live transaction as expired');
+  }
+});
+
+test('INVARIANT 3: expiry is never declared on a single observation', async () => {
+  // A blockhash can go invalid in the very moment the transaction lands on a
+  // node we have not asked yet. One observation is therefore a race with the
+  // cluster; the rule is two, with a status poll in between.
+  //
+  // Asserted by COUNTING the observations rather than by the outcome, because
+  // the outcome is 'expired' either way — which is precisely how a one-shot
+  // expiry rule slipped past the earlier test.
+  const rec = recordingConn({ statuses: [null], blockhashValid: [false] });
+  const r = await settleTransaction(rec.conn as any, 'sig',
+    { ...fastOpts, timeoutMs: 120_000, blockhash: 'bh', now: steppingClock() });
+  assert.strictEqual(r.outcome, 'expired');
+  assert.ok(rec.blockhashOpts.length >= 2,
+    `expiry was declared after ${rec.blockhashOpts.length} observation(s); it takes two, `
+    + 'or a transaction landing in its last valid slot is called dead');
+  assert.ok(rec.statusOpts.length >= 2,
+    'a status poll must sit BETWEEN the two observations — otherwise both look at the '
+    + 'same instant and the second one proves nothing');
+});
+
+test('INVARIANT 4: nothing younger than the minimum age can be called expired', async () => {
+  // Belt to invariant 2's braces. A transaction seconds old has not had time to
+  // land; whatever a lagging bank says about its blockhash, "it expired" is not
+  // a claim that can be true yet.
+  const rec = recordingConn({ statuses: [null], blockhashValid: [false] });
+  const r = await settleTransaction(rec.conn as any, 'sig',
+    // 250ms per clock read, so the 10s window never reaches the minimum age.
+    { ...fastOpts, timeoutMs: 10_000, blockhash: 'bh', now: steppingClock(250) });
+  assert.strictEqual(r.outcome, 'unknown',
+    'a young transaction must come back UNPROVEN, never "expired"');
+  assert.strictEqual(rec.blockhashOpts.length, 0,
+    'validity should not even be consulted before the minimum age — the answer could not be acted on');
+});
+
+console.log('\n-- Yielding the per-mint queue to a waiting exit --');
+
+test('a settling BUY hands back the queue when an exit is waiting behind it', async () => {
+  // The confirmation window is 75s and it runs INSIDE the per-mint trade queue,
+  // so a leader's flip-sell for the same mint waits behind it. A bag being
+  // dumped cannot wait 75s for an answer that only affects book-keeping.
+  let waiting = false;
+  const rec = recordingConn({ statuses: [null], blockhashValid: [true] });
+  const r = await settleTransaction(rec.conn as any, 'sig', {
+    ...fastOpts,
+    timeoutMs: 120_000,
+    blockhash: 'bh',
+    now: steppingClock(1_000),
+    // Nothing is waiting for the first two polls; then an exit queues up.
+    yieldWhen: () => { const w = waiting; waiting = true; return w; },
+  });
+  assert.strictEqual(r.outcome, 'unknown');
+  assert.strictEqual(r.yielded, true,
+    'a yield must be distinguishable from a timeout — the transaction can still land');
+  assert.ok(rec.statusOpts.length >= 1,
+    'the chain must be asked at least once before the queue is handed over: yielding '
+    + 'without polling would give up an answer that was already available');
+});
+
+test('a yield is NOT a timeout — the caller owes it a reconciliation', async () => {
+  // The two outcomes share the word 'unknown' and mean opposite things. A
+  // timeout has outlived its blockhash and is very probably dead; a yield was
+  // cut short and is still perfectly able to land. Booking the second one off
+  // as "did not land" would recreate the incident in mirror image: a buy lands
+  // seconds later and nothing in the process is tracking it.
+  const timedOut = await settleTransaction(
+    fakeConn({ statuses: ['throw'], blockhashValid: ['throw'] }) as any,
+    'sig', { ...fastOpts, timeoutMs: 300, blockhash: 'bh', now: steppingClock(100) });
+  assert.strictEqual(timedOut.outcome, 'unknown');
+  assert.ok(!timedOut.yielded, 'an exhausted window is not a yield');
+
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const yieldBranch = engine.indexOf('if (settlementYielded) {');
+  assert.ok(yieldBranch > 0, 'the buy path must branch on a yielded settlement');
+  const branchBody = engine.slice(yieldBranch, yieldBranch + 900);
+  assert.ok(branchBody.includes('maybeQueueUnresolvedBuy'),
+    'a yielded buy whose balance has not moved must be QUEUED for reconciliation, not written off');
+});
+
 void (async () => {
   if (pending.length) console.log(`\n-- Async proofs (${pending.length}, run sequentially) --`);
   for (const t of pending) {
