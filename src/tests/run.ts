@@ -3744,6 +3744,66 @@ console.log('\n-- The router is allowed, the drain protection is NOT --');
     assert.ok(/above the .* SOL this trade was sized for/.test(v.reason || ''), v.reason);
   });
 
+  test('a plain createAccount cannot even be attempted — it needs a second signer', () => {
+    // SystemProgram.createAccount requires the NEW account to sign, so the
+    // sole-signer rule refuses it before any lamport arithmetic runs. Worth
+    // pinning: it is why the seeded form below is the one that matters.
+    const newAcct = Keypair.generate();
+    const tx = mk([
+      SystemProgram.createAccount({
+        fromPubkey: owner2,
+        newAccountPubkey: newAcct.publicKey,
+        lamports: 900_000_000,
+        space: 0,
+        programId: SystemProgram.programId,
+      }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false);
+    assert.ok(/required signer/.test(v.reason || ''), v.reason);
+  });
+
+  test('createAccountWithSeed lamports COUNT toward the outflow ceiling', () => {
+    // The seeded form needs only the BASE authority — us — so it is signable
+    // with our single signature. It moves lamports, and allow-listing it (to
+    // close the Assign hole) without counting them would have opened a way to
+    // send an arbitrary amount to an account the caller chose, with no Transfer
+    // instruction anywhere in sight.
+    const derived = Keypair.generate().publicKey;
+    const drain = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+      SystemProgram.createAccountWithSeed({
+        fromPubkey: owner2,
+        newAccountPubkey: derived,
+        basePubkey: owner2,
+        seed: 'drain',
+        lamports: 900_000_000,
+        space: 0,
+        programId: SystemProgram.programId,
+      }),
+    ]);
+    const v = assertOutboundTradeTx(drain, owner2, undefined, { maxLamportsOut: 30_000_000n });
+    assert.strictEqual(v.ok, false, '0.9 SOL through createAccountWithSeed must not pass a 0.03 SOL ceiling');
+    assert.ok(/moves .* out of our wallet/.test(v.reason || ''), v.reason);
+  });
+
+  test('a rent-sized createAccountWithSeed still passes — the ceiling is a ceiling, not a ban', () => {
+    const derived = Keypair.generate().publicKey;
+    const wrap = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+      SystemProgram.createAccountWithSeed({
+        fromPubkey: owner2,
+        newAccountPubkey: derived,
+        basePubkey: owner2,
+        seed: 'wsol',
+        lamports: 2_039_280,           // token-account rent
+        space: 165,
+        programId: SystemProgram.programId,
+      }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(wrap, owner2, undefined, { maxLamportsOut: 30_000_000n }).ok, true);
+  });
+
   test('authority theft is still refused even for the router', () => {
     // SetAuthority (tag 6) must never be signable, no matter who invokes it.
     const victimAta = Keypair.generate().publicKey;

@@ -313,6 +313,37 @@ export function assertOutboundTradeTx(
           // wallet over. Nothing outside the small known set belongs on a trade.
           return { ok: false, reason: `System instruction type ${type} is not part of a trade (only create/allocate/transfer are)` };
         }
+        // CreateAccount MOVES LAMPORTS. Allow-listing it without counting them
+        // would have opened, in the act of closing another hole, a way to send
+        // an arbitrary amount to an account the caller chose — no Transfer
+        // instruction anywhere in sight. Both forms carry a lamports field; the
+        // seeded one carries it after a variable-length seed, so it is parsed
+        // rather than assumed.
+        if (type === SYS_CREATE_ACCOUNT || type === SYS_CREATE_ACCOUNT_WITH_SEED) {
+          const from = keys[ix.accountKeyIndexes[0]]?.toBase58();
+          let lamports = 0n;
+          if (type === SYS_CREATE_ACCOUNT) {
+            // u32 type | u64 lamports | u64 space | pubkey owner
+            if (data.length >= 12) lamports = data.readBigUInt64LE(4);
+          } else {
+            // u32 type | pubkey base | u64 seedLen | seed | u64 lamports | ...
+            if (data.length >= 44) {
+              const seedLen = Number(data.readBigUInt64LE(36));
+              const at = 44 + seedLen;
+              if (Number.isFinite(seedLen) && seedLen >= 0 && data.length >= at + 8) {
+                lamports = data.readBigUInt64LE(at);
+              } else {
+                // Unparseable: fail CLOSED rather than let an unmeasured
+                // lamport movement through.
+                return { ok: false, reason: 'System createAccountWithSeed has an unreadable layout — refusing rather than signing an unmeasured lamport movement' };
+              }
+            } else {
+              return { ok: false, reason: 'System createAccountWithSeed is truncated' };
+            }
+          }
+          if (from === ownerB58) totalLamportsOut += lamports;
+        }
+
         if (type === SYS_TRANSFER || type === SYS_TRANSFER_WITH_SEED) {
           const from = keys[ix.accountKeyIndexes[0]]?.toBase58();
           const to = keys[ix.accountKeyIndexes[1]]?.toBase58();
