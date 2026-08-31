@@ -2115,8 +2115,13 @@ export class CopyTraderService {
       const deployableSol = sniperEngine.getWalletStatus().deployableSol;
       // A leader top-up on a mint already held is a REPEAT buy — sized at one
       // full-book slice, never at whatever is left of the wallet.
+      // The stake basis this fee will be paid against, so the clamp's
+      // 5%-of-position cap applies. Without it every slot budgeted the bare
+      // ceiling and a small wallet reserved a quarter of itself for fees it
+      // would never pay.
+      const slotBasisSol = deployableSol / Math.max(1, Math.floor(this.config.maxOpenPositions));
       const stakeSol = this.splitStakeSol(
-        deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol(),
+        deployableSol, openNow, sniperEngine.getSizingPriorityFeeSol(slotBasisSol),
         Boolean(this.mergeablePositionFor(mint))
       );
       // Paper must not need a funded wallet. Split sizing returns 0 both with
@@ -2264,9 +2269,14 @@ export class CopyTraderService {
         const reservedBySniper = sniperEngine.getInFlightEntryReservedSol();
         // Worst-case fee: with dynamicPriorityFee on, execution can pay up
         // to maxPriorityFeeSol — budgeting the static value eats the float.
-        const sizingFeeSol = sniperEngine.getSizingPriorityFeeSol();
         const deployableSol = Math.max(0,
           sniperEngine.getWalletStatus().deployableSol - reservedForExits - reservedInFlight - reservedBySniper);
+        // Worst-case fee, but measured against the stake it will be paid
+        // against: the clamp caps a fee at 5% of the position, and budgeting
+        // the bare ceiling per slot on a small wallet reserves a quarter of it
+        // for fees that will actually be the floor.
+        const sizingFeeSol = sniperEngine.getSizingPriorityFeeSol(
+          deployableSol / Math.max(1, Math.floor(this.config.maxOpenPositions)));
         // SPLIT re-slices HERE, against the balance that actually exists now
         // (post-reserves, post-settlement) rather than the pre-queue snapshot.
         if (this.config.buySizeMode === 'split') {

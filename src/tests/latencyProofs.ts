@@ -207,12 +207,35 @@ test('THE LEAK: an opened copy record is always completed', () => {
   const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
   const openIdx = engine.indexOf('if (measuringExternal && !latencyTimeline.isOpen(mint))');
   assert.ok(openIdx > 0, 'the copy path must open a timeline');
-  const completeIdx = engine.indexOf('if (measuringExternal) latencyTimeline.complete(mint);');
+  const completeIdx = engine.indexOf('if (openedTimeline) latencyTimeline.complete(mint);');
   assert.ok(completeIdx > openIdx, 'and must complete it afterwards');
+
+  // COMPLETED ONLY BY THE CALL THAT OPENED IT. `measuringExternal` says only
+  // that this is a copy buy — the record may belong to the sniper's screening
+  // pipeline for the same mint, and completing one we did not open writes it
+  // out mid-flight and deletes it, so the sniper's own record is gone and its
+  // wireMs is measured off the copy path's clock.
+  assert.ok(/openedTimeline = true;/.test(engine),
+    'the opening call must mark itself, or the completion cannot tell whose record it is');
+  assert.ok(!/if \(measuringExternal\) latencyTimeline\.complete\(mint\);/.test(engine),
+    'completing on measuringExternal alone truncates a record this call did not open');
+
   // The completion has to be in the finally, not on the success path.
   const finallyIdx = engine.lastIndexOf('} finally {', completeIdx);
   assert.ok(finallyIdx > openIdx && finallyIdx < completeIdx,
     'the completion must sit inside the finally, or a thrown order leaks its record forever');
+
+  // AND THE OPENING HAS TO BE INSIDE THE TRY THAT FINALLY BELONGS TO. It used
+  // to sit above the spend governor, whose refusal returns before the try is
+  // entered — so every governor-refused copy buy leaked its record and the next
+  // buy for that mint inherited a stale t1. This test greped for a `finally`
+  // and passed over that leak for a whole commit.
+  const tryIdx = engine.lastIndexOf('    try {', openIdx);
+  assert.ok(tryIdx > 0 && tryIdx < openIdx,
+    'the timeline must be opened INSIDE the try, or an early return skips the completion');
+  const govIdx = engine.indexOf('tradeGovernor.tryReserveBuy(');
+  assert.ok(govIdx > 0 && govIdx < tryIdx,
+    'the governor gate must sit BEFORE that try, which is exactly why the open cannot precede it');
 });
 
 test('the fast lane stamps observedAt, or the staleness guard cannot fire on it', () => {
@@ -667,6 +690,50 @@ test('an UNKNOWN position size falls to the floor, never to a borrowed one', () 
   assert.ok(/action === 'buy' \? this\.config\.buyAmountSol : 0/.test(body),
     'only a BUY may fall back to the configured unit; a sell with no size gets the floor');
   assert.strictEqual(clampPriorityFeeSol(0.01, 0.001, 0.01, 0), 0.001);
+});
+
+test('COPY SIZING BUDGETS WHAT IT CAN PAY, not the bare ceiling', () => {
+  // getSizingPriorityFeeSol() with no stake returns the unclamped worst case —
+  // right for a RESERVE (under-reserving exit gas is what stranded positions on
+  // 2026-08-23) and wrong for SIZING. Budgeting 0.01 per slot on a 0.2 SOL
+  // wallet with 5 slots sets aside a quarter of the wallet for fees the clamp
+  // would cap at the floor, shrinking or killing every copy buy on exactly the
+  // wallets the position cap already protects.
+  const copy = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  // Multiline-aware: one of these calls spans two lines, and a line-based
+  // pattern silently skipped it — which would have let a sizing site go back to
+  // the bare ceiling with this test still green.
+  const calls = [...copy.matchAll(/getSizingPriorityFeeSol\(([\s\S]*?)\)/g)]
+    .map(m => ({ arg: m[1].trim(), at: m.index ?? 0 }));
+  assert.ok(calls.length >= 3, `expected three sizing-fee calls, found ${calls.length}`);
+
+  for (const c of calls) {
+    // The exit-gas RESERVE is deliberately unclamped and must stay that way:
+    // under-reserving exit gas is what stranded positions on 2026-08-23, so
+    // the conservative worst case is the right answer there.
+    const context = copy.slice(Math.max(0, c.at - 40), c.at);
+    if (/copyExitGasReserveSol\($/.test(context.trim() + '(')  || /copyExitGasReserveSol\(/.test(context)) {
+      assert.strictEqual(c.arg, '', 'the exit-gas reserve must keep the unclamped worst case');
+      continue;
+    }
+    assert.ok(c.arg.length > 0,
+      'a sizing call site must pass a stake basis, or the 5%-of-position cap cannot apply');
+  }
+  // And whatever basis they pass must be derived from the slot count rather
+  // than being some other number that happens to be in scope.
+  assert.ok(/const slotBasisSol = deployableSol \/ Math\.max\(1, Math\.floor\(this\.config\.maxOpenPositions\)\)/.test(copy),
+    'the pre-queue basis must be one slot of the deployable balance');
+  assert.ok(/getSizingPriorityFeeSol\(\s*\n?\s*deployableSol \/ Math\.max\(1, Math\.floor\(this\.config\.maxOpenPositions\)\)\)/.test(copy),
+    'and so must the in-queue one');
+
+  // And the engine must honour a stake when given one.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('public getSizingPriorityFeeSol(');
+  assert.ok(idx > 0);
+  assert.ok(/getSizingPriorityFeeSol\(stakeSol\?: number\)/.test(engine.slice(idx, idx + 120)),
+    'the public helper must accept a stake');
+  assert.ok(/return this\.sizingPriorityFee\(stakeSol\)/.test(engine.slice(idx, idx + 200)),
+    'and pass it through to the clamp');
 });
 
 console.log('\n-- The funded slot count binds, or the deployment ceiling is decoration --');

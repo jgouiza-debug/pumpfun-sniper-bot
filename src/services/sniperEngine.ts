@@ -911,8 +911,22 @@ export class SniperEngine {
    * lets each buy eat the difference out of the gas float (the engine's own
    * sizing already budgets this way; external sizers must match).
    */
-  public getSizingPriorityFeeSol(): number {
-    return this.sizingPriorityFee();
+  /**
+   * @param stakeSol the position this fee will be paid against, when known.
+   *
+   * WITH a stake, the answer is what execution can actually pay for a position
+   * that size — the ceiling run through the same clamp, so the two cannot
+   * drift. WITHOUT one it is the unclamped worst case, which is the
+   * conservative answer and the right default for a reserve: under-reserving
+   * exit gas is the failure that stranded positions on 2026-08-23.
+   *
+   * The copy trader's SIZING passes a stake, because budgeting the bare 0.01
+   * ceiling per slot on a 0.2 SOL wallet reserves a quarter of it for fees that
+   * will actually be 0.001 — shrinking or killing every copy buy on exactly the
+   * wallets the position cap already protects.
+   */
+  public getSizingPriorityFeeSol(stakeSol?: number): number {
+    return this.sizingPriorityFee(stakeSol);
   }
 
   /**
@@ -2223,21 +2237,18 @@ export class SniperEngine {
     // interval is the leader's transaction appearing on our socket to our bytes
     // going out, and that starts before this call.
     const measuringExternal = Boolean(opts.external) && action === 'buy';
-    if (measuringExternal && !latencyTimeline.isOpen(mint)) {
-      const t1 = opts.signalAtMs ?? Date.now();
-      latencyTimeline.begin(mint, {
-        t1ArrivalMs: t1,
-        mode: 'real',
-        symbol: 'COPY',
-        txType: 'copy-buy',
-      });
-      latencyTimeline.stamp(mint, 't2ParsedMs', t1);
-      latencyTimeline.stamp(mint, 't3FiltersDoneMs', t1);
-      // The decision was the leader's; ours is made the moment we start
-      // building. Stamping it now keeps buildSignMs meaning what it says.
-      latencyTimeline.stamp(mint, 't4DecisionMs');
-      if (opts.leaderSlot) latencyTimeline.annotate(mint, { slotAtArrival: opts.leaderSlot });
-    }
+    /**
+     * Did THIS call open the timeline record?
+     *
+     * `measuringExternal` says only that this is a copy buy. The record may
+     * already belong to the sniper's screening pipeline for the same mint, and
+     * completing one we did not open truncates it — it would be written out
+     * mid-flight with the copy path's clock, so the sniper's own wireMs is
+     * measured from the wrong t1 and the record it later tries to complete is
+     * gone. Open and complete have to be the same call's decision.
+     */
+    let openedTimeline = false;
+
 
     // Buys and sells get DIFFERENT tolerances, and the buy side is the tight one.
     //
@@ -2322,6 +2333,28 @@ export class SniperEngine {
     }
 
     try {
+      // OPENED INSIDE THE TRY, so the finally that completes it always runs.
+      // It used to sit above the spend governor, whose refusal returns before
+      // the try is even entered — so every governor-refused copy buy leaked its
+      // record, and the next buy for that mint inherited a stale t1 and
+      // reported a wireMs measured from an order that never happened.
+      if (measuringExternal && !latencyTimeline.isOpen(mint)) {
+        const t1 = opts.signalAtMs ?? Date.now();
+        latencyTimeline.begin(mint, {
+          t1ArrivalMs: t1,
+          mode: 'real',
+          symbol: 'COPY',
+          txType: 'copy-buy',
+        });
+        latencyTimeline.stamp(mint, 't2ParsedMs', t1);
+        latencyTimeline.stamp(mint, 't3FiltersDoneMs', t1);
+        // The decision was the leader's; ours is made the moment we start
+        // building. Stamping it now keeps buildSignMs meaning what it says.
+        latencyTimeline.stamp(mint, 't4DecisionMs');
+        if (opts.leaderSlot) latencyTimeline.annotate(mint, { slotAtArrival: opts.leaderSlot });
+        openedTimeline = true;
+      }
+
       this.log('info', `📡 Building ${action.toUpperCase()} for ${mint.slice(0,6)}... (${effectiveSlippage}% slippage) from ${keypair.publicKey.toBase58().slice(0,6)}...`);
 
       // Dynamic priority fee (flag dynamicPriorityFee): p75 of recent fees,
@@ -2942,7 +2975,13 @@ export class SniperEngine {
       // process that is meant to run for days, and one entry per copy buy adds
       // up fast. Only ever closes the record THIS call opened: the sniper's own
       // pipeline owns its records and completes them itself.
-      if (measuringExternal) latencyTimeline.complete(mint);
+      // Completed only by the call that opened it. This ran on every copy buy,
+      // so a copy trade that merely coincided with a sniper candidate for the
+      // same mint deleted the sniper's in-flight record; and a copy buy the
+      // GOVERNOR refused returned before this line existed to run at all,
+      // leaking the record so the next buy for that mint inherited a stale t1
+      // and reported a fabricated wireMs.
+      if (openedTimeline) latencyTimeline.complete(mint);
     }
     return null;
   }
