@@ -27,7 +27,8 @@ import { featureFlags } from './featureFlags';
 import { latencyTimeline } from './latencyTimeline';
 import { slotDelta, SlotDeltaTracker } from './slotDelta';
 import { broadcast, buildRoutes } from './txBroadcaster';
-import { walletLedger } from './walletLedger';
+import { walletLedger, WalletLedger, flushWalletLedger, loadWalletLedger } from './walletLedger';
+import { WalletHarvester } from './walletHarvester';
 import { smartMoneyDetector, type SmartMoneySignal } from './smartMoneySignal';
 import { WalletLogWatcher } from './walletLogWatcher';
 import { tradeEventsFromLogs } from './pumpEventDecoder';
@@ -198,6 +199,20 @@ const RPC_FAILOVER_MIN_STREAK_MS = 5_000;
 const RPC_PRIMARY_RETRY_MS = 120_000;
 /** How often the promoted roster is re-evaluated and the subscriptions re-synced. */
 const SMART_MONEY_ROSTER_SYNC_MS = 120_000;
+/** How often one queued research job is attempted. Slow by design. */
+const RESEARCH_TICK_MS = 30_000;
+/** A refused job waits this long before being tried again. */
+const RESEARCH_RETRY_DELAY_MS = 5 * 60_000;
+const RESEARCH_QUEUE_MAX = 100;
+/** Fresh creates sampled as possible duds: roughly one in this many. */
+const DUD_SAMPLE_ONE_IN = 12;
+const DUD_CANDIDATES_MAX = 300;
+/**
+ * How long a sampled create is given to graduate before it is judged a dud.
+ * A token minutes old has not had time to fail yet, and calling it early would
+ * credit everyone who was right about a slow winner with a loss.
+ */
+const DUD_VERDICT_DELAY_MS = 45 * 60_000;
 /**
  * Smallest share of a slot a smart-money entry may be sized to.
  *
@@ -1798,11 +1813,16 @@ export class SniperEngine {
       // subscriptions open, and an armed one should not be waiting on a timer
       // to notice the roster.
       this.startSmartMoneyWatcher();
+      this.startResearch();
       this.announceSmartMoneyRoster();
     } else {
       this.config.isBotActive = false;
       this.unsubscribeStream();
       this.stopSmartMoneyWatcher();
+      this.stopResearch();
+      // The evidence is the point of the whole lane; losing a session of it to
+      // an unclean shutdown would mean starting the roster over.
+      flushWalletLedger();
       realModeLock.release('sniper');
       // Armed snipes die with the run — a wakeup should never fire a buy that
       // was armed before the pause.
@@ -2960,6 +2980,12 @@ export class SniperEngine {
 
           if (payload.txType === 'migrate') {
             this.migrationSeenAt.set(payload.mint, arrivalMs);
+            // A GRADUATED TOKEN IS A WINNER, BY DEFINITION AND FOR FREE.
+            // Completing the bonding curve means it reached roughly $69k of
+            // market cap, which is exactly the outcome the roster is trying to
+            // find people who predict. This event is already subscribed, so it
+            // costs nothing to learn from.
+            this.enqueueResearch(payload.mint, true);
             // Bound the map: a migration older than ~10 min is well past any Play-3
             // window and will never be acted on, so it is dead weight (sniper-correctness-7).
             if (this.migrationSeenAt.size > 200) {
@@ -2992,6 +3018,13 @@ export class SniperEngine {
           // the RugCheck/DexScreener round trips — those cost seconds and have
           // nothing real to say about a seconds-old mint. Creates the lane
           // declines fall through to the normal screen-and-watchlist path.
+          // The other half of the ratio. A roster built only from winners would
+          // promote whichever bot buys the first block of everything; the duds
+          // are what separate a good eye from high volume. Sampled, not taken
+          // wholesale — there are orders of magnitude more of these, and they
+          // are checked later, once it is clear they went nowhere.
+          if (payload.txType === 'create') this.considerDudSample(payload.mint, arrivalMs);
+
           if (payload.txType === 'create' && featureFlags.get('launchSnipe')) {
             const handled = await this.handleLaunchCreate(payload, arrivalMs);
             if (handled) return;
@@ -3499,6 +3532,141 @@ export class SniperEngine {
   }
 
   // ---------------- SMART-MONEY LANE (flag smartMoneySniper) ----------------
+
+  // ---------------- RESEARCH: who was early to the tokens that ran ----------
+
+  /**
+   * The queue the harvester drains. Small, and drained slowly on purpose.
+   *
+   * This is the only thing that ever produces evidence, so without it the whole
+   * smart-money lane is inert — the roster stays empty forever and the flag
+   * does nothing. It is also the part most able to hurt the trading path, since
+   * it makes RPC calls on the same key, which is why it is a QUEUE drained on a
+   * timer rather than a call made when the event arrives.
+   */
+  private researchQueue: Array<{ mint: string; wasWinner: boolean; readyAt: number }> = [];
+  private researchTimer: NodeJS.Timeout | null = null;
+  private harvester: WalletHarvester | null = null;
+  /** Mints sampled as possible duds, with when they were created. */
+  private dudCandidates = new Map<string, number>();
+
+  private enqueueResearch(mint: string, wasWinner: boolean, delayMs = 0): void {
+    if (!featureFlags.get('smartMoneySniper')) return;
+    if (!mint) return;
+    if (this.researchQueue.some(r => r.mint === mint)) return;
+    if (this.harvester?.hasHarvested(mint)) return;
+    if (this.researchQueue.length >= RESEARCH_QUEUE_MAX) {
+      // Winners displace duds rather than being dropped: a graduated token is
+      // the scarce, high-value sample, and there is never a shortage of duds.
+      const dudIdx = this.researchQueue.findIndex(r => !r.wasWinner);
+      if (!wasWinner || dudIdx < 0) return;
+      this.researchQueue.splice(dudIdx, 1);
+    }
+    this.researchQueue.push({ mint, wasWinner, readyAt: Date.now() + delayMs });
+  }
+
+  /**
+   * Sample a fresh create as a possible dud, to be confirmed later.
+   *
+   * Deferred rather than judged now: a token minutes old has not had time to
+   * fail yet, and recording it as a dud immediately would credit every wallet
+   * that was early to an eventual winner with a loss. DUD_VERDICT_DELAY_MS
+   * later, if it never graduated, the verdict is safe to make.
+   */
+  private considerDudSample(mint: string, atMs: number): void {
+    if (!featureFlags.get('smartMoneySniper')) return;
+    if (!mint) return;
+    // One in N. Duds outnumber winners by orders of magnitude and the read
+    // budget is small; sampling keeps the ratio meaningful without spending the
+    // whole budget on tokens nobody cared about.
+    if (Math.floor(atMs / 1000) % DUD_SAMPLE_ONE_IN !== 0) return;
+    if (this.dudCandidates.size >= DUD_CANDIDATES_MAX) return;
+    this.dudCandidates.set(mint, atMs);
+  }
+
+  /** Promote aged dud candidates that never graduated into the research queue. */
+  private sweepDudCandidates(now = Date.now()): void {
+    for (const [mint, at] of this.dudCandidates) {
+      if (now - at < DUD_VERDICT_DELAY_MS) continue;
+      this.dudCandidates.delete(mint);
+      // Graduated in the meantime? Then it is a winner and already queued as
+      // one by the migrate handler; nothing to do.
+      if (this.migrationSeenAt.has(mint)) continue;
+      this.enqueueResearch(mint, false);
+    }
+  }
+
+  private startResearch(): void {
+    if (!featureFlags.get('smartMoneySniper')) return;
+    if (!this.harvester) {
+      this.harvester = new WalletHarvester({
+        getConnection: () => this.solanaConnection,
+        // THE YIELD. Research must never be the reason an order is slow. Any
+        // entry in flight, or any position being managed through an exit, and
+        // the walk stops where it is and resumes on a later tick.
+        isBusy: () => this.entriesInFlight.size > 0 || this.activePositions.some(p => p.exitInFlight),
+        log: (level, msg) => this.log(level, msg),
+      });
+    }
+    if (this.researchTimer) return;
+    this.researchTimer = setInterval(() => { void this.drainResearchQueue(); }, RESEARCH_TICK_MS);
+    this.researchTimer.unref?.();
+  }
+
+  private stopResearch(): void {
+    if (this.researchTimer) clearInterval(this.researchTimer);
+    this.researchTimer = null;
+  }
+
+  private async drainResearchQueue(): Promise<void> {
+    if (!featureFlags.get('smartMoneySniper') || !this.harvester) return;
+    this.sweepDudCandidates();
+    const now = Date.now();
+    // Winners first: the scarce sample, and the one whose wallets are worth
+    // subscribing to soonest.
+    const idx = this.researchQueue.findIndex(r => r.wasWinner && r.readyAt <= now);
+    const pick = idx >= 0 ? idx : this.researchQueue.findIndex(r => r.readyAt <= now);
+    if (pick < 0) return;
+    const [job] = this.researchQueue.splice(pick, 1);
+    const result = await this.harvester.harvest(job.mint, job.wasWinner);
+    if (result === null) {
+      // Refused (busy, no budget, already in flight). Put it back so the work
+      // is deferred rather than discarded — silently dropping it is how the
+      // roster quietly stops growing.
+      this.enqueueResearch(job.mint, job.wasWinner, RESEARCH_RETRY_DELAY_MS);
+      return;
+    }
+    const changes = walletLedger.reevaluate();
+    for (const c of changes) {
+      if (c.to === 'promoted' || c.from === 'promoted') {
+        this.log('info', `🧠 ${c.address.slice(0, 6)}… ${c.from} → ${c.to}: ${c.reason}`);
+      }
+    }
+    if (changes.length) this.syncSmartMoneyRoster();
+  }
+
+  /** Research state for the API — what it has queued and what budget is left. */
+  public getSmartMoneyStatus() {
+    return {
+      enabled: featureFlags.get('smartMoneySniper'),
+      roster: walletLedger.promoted().map(w => ({
+        ...WalletLedger.scoreOf(w),
+        state: w.state,
+        stateReason: w.stateReason,
+        lastSeenAt: w.lastSeenAt,
+        pinned: w.pinned ?? null,
+      })),
+      walletsSeen: walletLedger.size(),
+      thresholds: walletLedger.getThresholds(),
+      confluence: smartMoneyDetector.getConfig(),
+      pendingSignals: smartMoneyDetector.pending(),
+      research: {
+        queued: this.researchQueue.length,
+        dudCandidates: this.dudCandidates.size,
+        readBudgetRemaining: this.harvester?.budgetRemaining() ?? 0,
+      },
+    };
+  }
 
   /** Watch-only subscriptions over the promoted roster. Never places an order itself. */
   private smartMoneyWatcher: WalletLogWatcher | null = null;

@@ -28,6 +28,8 @@ import { localTxBuilder } from './services/localTxBuilder';
 import { autoUpdateEnabled, updaterService } from './services/updaterService';
 import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
 import { flushGovernorState, loadGovernorState, setGovernorWalletProvider } from './services/tradeGovernor';
+import { flushWalletLedger, loadWalletLedger, walletLedger, WalletLedger } from './services/walletLedger';
+import { smartMoneyDetector } from './services/smartMoneySignal';
 // Reinstate a spend-governor halt from a previous session BEFORE anything can
 // trade. A restart is the natural response to a runaway, and it must not be the
 // thing that clears the breaker that stopped it.
@@ -36,6 +38,16 @@ import { flushGovernorState, loadGovernorState, setGovernorWalletProvider } from
 // incident must not inherit the old one's halt.
 setGovernorWalletProvider(() => sniperEngine.getWalletStatus().address ?? null);
 loadGovernorState();
+// The smart-money roster is EARNED from chain evidence over days, so losing it
+// on a restart would mean starting the research over every time the bot is
+// relaunched — and a restart is a routine thing an operator does.
+{
+  const restored = loadWalletLedger();
+  if (restored > 0) {
+    const promoted = walletLedger.promotedAddresses().length;
+    console.log(`🧠 Wallet ledger restored: ${restored} wallet(s) known, ${promoted} promoted.`);
+  }
+}
 // ─── Hardened crash guards ──────────────────────────────────────────────────
 // @solana/web3.js retries 429 / timeout errors internally then re-throws.
 // Without these guards that unhandled rejection kills the process instantly.
@@ -306,6 +318,63 @@ app.post('/api/bot/toggle', (req, res) => {
 // bot breaking again, which is the trust problem this whole change addresses.
 
 // GET where the wallet stands against every ceiling.
+// ---------------- SMART MONEY ----------------
+//
+// The roster is EARNED from chain evidence rather than configured, which makes
+// it the one part of the bot an operator cannot inspect by reading their own
+// settings. These endpoints are how they see who the bot decided to follow and
+// why — and how they overrule it.
+
+app.get('/api/smart-money', (req, res) => {
+  res.json(sniperEngine.getSmartMoneyStatus());
+});
+
+/** Every wallet the ledger knows, not just the promoted ones — for auditing a decision. */
+app.get('/api/smart-money/wallets', (req, res) => {
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+  const state = typeof req.query.state === 'string' ? req.query.state : null;
+  const all = walletLedger.all()
+    .filter(w => !state || w.state === state)
+    .map(w => ({ ...WalletLedger.scoreOf(w), state: w.state, stateReason: w.stateReason, lastSeenAt: w.lastSeenAt, pinned: w.pinned ?? null }))
+    .sort((a, b) => (b.conviction ?? -1) - (a.conviction ?? -1))
+    .slice(0, limit);
+  res.json({ wallets: all, total: walletLedger.size() });
+});
+
+/**
+ * Pin a wallet on or off, overruling the ladder in either direction.
+ *
+ * Token-gated like every other mutation: this decides whose transactions our
+ * money follows, which is not something an open tab should be able to change.
+ */
+app.post('/api/smart-money/pin', requireApiToken, (req, res) => {
+  const { address, mode } = req.body || {};
+  if (typeof address !== 'string' || !address) {
+    return res.status(400).json({ ok: false, error: 'address is required' });
+  }
+  if (mode !== 'always' && mode !== 'never' && mode !== null) {
+    return res.status(400).json({ ok: false, error: "mode must be 'always', 'never' or null" });
+  }
+  const ok = walletLedger.pin(address, mode);
+  if (!ok) return res.status(404).json({ ok: false, error: 'no such wallet in the ledger' });
+  flushWalletLedger();
+  res.json({ ok: true, smartMoney: sniperEngine.getSmartMoneyStatus() });
+});
+
+/** Adjust the promotion bar and the confluence rule. */
+app.post('/api/smart-money/config', requireApiToken, (req, res) => {
+  const { thresholds, confluence } = req.body || {};
+  const applied = {
+    thresholds: thresholds ? walletLedger.setThresholds(thresholds) : walletLedger.getThresholds(),
+    confluence: confluence ? smartMoneyDetector.setConfig(confluence) : smartMoneyDetector.getConfig(),
+  };
+  // Re-run the ladder immediately: a raised bar that only takes effect on the
+  // next timer tick leaves wallets promoted that no longer qualify.
+  walletLedger.reevaluate();
+  flushWalletLedger();
+  res.json({ ok: true, ...applied });
+});
+
 app.get('/api/governor', (req, res) => {
   res.json(sniperEngine.getGovernorSnapshot());
 });
@@ -1066,6 +1135,7 @@ function gracefulShutdown(reason: string, server?: http.Server): void {
     // The governor's write is debounced off the order hot path; flush whatever
     // is pending so a halt or a spend total is never lost on the way out.
     try { flushGovernorState(); } catch { /* best effort */ }
+    try { flushWalletLedger(); } catch { /* best effort */ }
     sniperEngine.markCleanShutdown();
   } catch { /* best effort on the way out */ }
   const done = () => process.exit(0);

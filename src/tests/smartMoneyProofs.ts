@@ -768,6 +768,111 @@ test('the flag ships OFF and is declared, or the flag suite fails', () => {
   }
 });
 
+console.log('\n-- The research scheduler: without it the whole lane is inert --');
+
+test('WINNERS AND DUDS BOTH FEED THE LEDGER, or the ratio is meaningless', () => {
+  // A roster built only from winners promotes whichever bot buys the first
+  // block of everything. The duds are what separate a good eye from volume —
+  // so both must reach the queue, from events the engine already receives.
+  const src = engineSrc();
+  assert.ok(/this\.enqueueResearch\(payload\.mint, true\)/.test(src),
+    'a graduation must be recorded as a winner — it is the free, definitive signal');
+  assert.ok(/this\.considerDudSample\(payload\.mint, arrivalMs\)/.test(src),
+    'fresh creates must be sampled as possible duds');
+});
+
+test('a dud verdict is DEFERRED, never made on a token minutes old', () => {
+  // A token that has not run yet has not failed yet. Judging it immediately
+  // would credit everyone who was right about a slow winner with a loss.
+  const src = engineSrc();
+  const idx = src.indexOf('private sweepDudCandidates(');
+  assert.ok(idx > 0, 'dud candidates must be swept on a delay, not judged on arrival');
+  const body = src.slice(idx, src.indexOf('\n  private ', idx + 10));
+  assert.ok(/now - at < DUD_VERDICT_DELAY_MS/.test(body), 'the delay must be enforced');
+  assert.ok(/this\.migrationSeenAt\.has\(mint\)/.test(body),
+    'and a token that graduated while waiting must NOT be recorded as a dud');
+  // Written as `45 * 60_000` in the source, so evaluate the expression rather
+  // than matching the first integer — which would read 45 and pass on a delay
+  // of 45 milliseconds.
+  const expr = /DUD_VERDICT_DELAY_MS = ([^;]+);/.exec(src)?.[1] ?? '';
+  const delay = Number(expr.replace(/_/g, '').split('*').map(Number).reduce((a, b) => a * b, 1));
+  assert.ok(Number.isFinite(delay) && delay >= 20 * 60_000,
+    `the delay must be generous, parsed ${delay}ms from "${expr}"`);
+});
+
+test('A REFUSED HARVEST IS RE-QUEUED, NOT DROPPED', () => {
+  // The harvester returns null when it is busy, out of budget, or already
+  // running — all temporary. Discarding the job on any of those is how the
+  // roster quietly stops growing while everything still looks healthy.
+  const src = engineSrc();
+  const idx = src.indexOf('private async drainResearchQueue(');
+  assert.ok(idx > 0);
+  const body = src.slice(idx, src.indexOf('\n  /** Research state', idx));
+  assert.ok(/if \(result === null\)/.test(body), 'a refusal must be handled explicitly');
+  assert.ok(/this\.enqueueResearch\(job\.mint, job\.wasWinner, RESEARCH_RETRY_DELAY_MS\)/.test(body),
+    'and the job must go back on the queue with a delay');
+});
+
+test('winners are drained before duds', () => {
+  const src = engineSrc();
+  const idx = src.indexOf('private async drainResearchQueue(');
+  const body = src.slice(idx, src.indexOf('\n  /** Research state', idx));
+  assert.ok(/findIndex\(r => r\.wasWinner && r\.readyAt <= now\)/.test(body),
+    'a graduated token is the scarce, high-value sample and must be read first');
+});
+
+test('the research queue is bounded, and a winner displaces a dud rather than being dropped', () => {
+  const src = engineSrc();
+  const idx = src.indexOf('private enqueueResearch(');
+  assert.ok(idx > 0);
+  const body = src.slice(idx, src.indexOf('\n  /**', idx + 10));
+  assert.ok(/RESEARCH_QUEUE_MAX/.test(body), 'the queue must be bounded');
+  assert.ok(/findIndex\(r => !r\.wasWinner\)/.test(body),
+    'a full queue must make room for a winner by dropping a dud, not by dropping the winner');
+});
+
+test('research yields to anything the trading path is doing', () => {
+  const src = engineSrc();
+  const idx = src.indexOf('private startResearch()');
+  assert.ok(idx > 0);
+  const body = src.slice(idx, src.indexOf('\n  private stopResearch', idx));
+  assert.ok(/isBusy: \(\) =>/.test(body), 'the harvester must be given a busy predicate');
+  assert.ok(/entriesInFlight\.size > 0/.test(body), 'an entry in flight must stop research');
+  assert.ok(/exitInFlight/.test(body), 'and so must a position being exited');
+});
+
+test('every research entry point is gated on the flag', () => {
+  // With the flag off this must cost nothing at all — no queue growth, no
+  // timer, no reads. A research job that runs regardless is a research job the
+  // operator did not consent to.
+  const src = engineSrc();
+  for (const fn of ['private enqueueResearch(', 'private considerDudSample(', 'private startResearch()']) {
+    const idx = src.indexOf(fn);
+    assert.ok(idx > 0, `${fn} must exist`);
+    const head = src.slice(idx, idx + 320);
+    assert.ok(/featureFlags\.get\('smartMoneySniper'\)/.test(head),
+      `${fn} must return early when the flag is off`);
+  }
+});
+
+test('the ledger is loaded at startup and flushed on the way out', () => {
+  // Days of gathered evidence, in a process an operator restarts routinely.
+  const server = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+  assert.ok(/loadWalletLedger\(\)/.test(server), 'the roster must survive a restart');
+  assert.ok(/flushWalletLedger\(\)/.test(server), 'and be written on shutdown');
+});
+
+test('the pin endpoint is token-gated — it decides whose trades we follow', () => {
+  const server = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+  const idx = server.indexOf("app.post('/api/smart-money/pin'");
+  assert.ok(idx > 0, 'the pin endpoint must exist');
+  assert.ok(/requireApiToken/.test(server.slice(idx, idx + 120)),
+    'an open browser tab must not be able to change whose transactions our money follows');
+  const cfgIdx = server.indexOf("app.post('/api/smart-money/config'");
+  assert.ok(/requireApiToken/.test(server.slice(cfgIdx, cfgIdx + 120)),
+    'nor to lower the promotion bar');
+});
+
 console.log('\n-- The design promise: no addresses are shipped --');
 
 test('NO WALLET ADDRESS IS HARDCODED ANYWHERE IN THE SMART-MONEY PATH', () => {
