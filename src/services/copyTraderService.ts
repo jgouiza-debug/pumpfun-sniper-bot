@@ -704,7 +704,23 @@ export class CopyTraderService {
     // sync that found nothing wrong.
     let unreadable = 0;
     for (const pos of open) {
+      // RE-CHECKED PER POSITION, immediately before acting on it.
+      //
+      // The exclusions above are a snapshot, and this loop awaits a balance
+      // read per position — hundreds of milliseconds each, so a book of eight
+      // spans seconds. A leader sell arriving mid-loop sets exitInFlight and
+      // starts moving tokens for a position this loop is about to read, and the
+      // interim balance would then be written back as the truth or read as
+      // empty and the position closed while its exit was still running.
+      // The cast is load-bearing: TypeScript narrowed `status` from the filter
+      // above and would otherwise call these comparisons impossible — but the
+      // whole point is that another task can change it while this loop awaits.
+      const busy = (): boolean =>
+        (pos.status as string) === 'CLOSED' || Boolean(pos.exitInFlight) || this.tradeQueue.isBusy(pos.mint);
+      if (busy()) continue;
       const held = await this.getOwnedTokenAmount(pos.mint);
+      // And again after the await, for the same reason.
+      if (busy()) continue;
       if (held === null) { unreadable++; continue; } // unreadable — never treat as zero
       const expected = pos.tokensHeld || 0;
       if (held <= Math.max(0, expected * 0.05)) {
@@ -1184,7 +1200,8 @@ export class CopyTraderService {
   }
 
   /**
-   * Did the leader's transaction — the one we already copied — actually land?
+   * Did the leader's transaction — the one we already copied, buy OR sell —
+   * actually land?
    *
    * THE TRADE-OFF THIS MANAGES. The fast lane subscribes at commitment
    * 'processed', which is the whole reason it is fast: a node has EXECUTED the
@@ -1252,11 +1269,15 @@ export class CopyTraderService {
     why: string
   ): void {
     const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
-    this.pushFeed(wallet, sig, 'failed',
-      `⚠️ The leader transaction this copy was based on did not survive — ${why}. `
-      + (held
+    // A false SELL signal is the more expensive of the two: we have already
+    // dumped a real bag on the strength of it, and the leader may still be in.
+    const consequence = sig.side === 'sell'
+      ? `We already SOLD $${this.symbolFor(sig)} on the strength of it — the leader may still be holding. `
+      : (held
         ? `We are holding $${this.symbolFor(sig)} on a trade the leader may never have made. Review it. `
-        : 'Nothing is open for it. ')
+        : 'Nothing is open for it. ');
+    this.pushFeed(wallet, sig, 'failed',
+      `⚠️ The leader transaction this copy was based on did not survive — ${why}. ${consequence}`
       + `https://solscan.io/tx/${signature}`);
     this.emitChange();
   }
@@ -1869,6 +1890,26 @@ export class CopyTraderService {
       maxSlippagePct: this.config.maxSlippagePct,
       priorityFeeSol,
     });
+
+    // (c) NO SINGLE COPY TAKES MORE THAN THE PER-MINT CEILING.
+    //
+    // The divisor fix removed the whole-wallet case for a FULL book, but a NEW
+    // entry with one free slot still divides by 1 — "the last slot gets what is
+    // left", which is the design when the earlier slots were funded from the
+    // same balance. It stops being reasonable the moment the balance GREW after
+    // those slots were filled: four positions opened cheaply (restored from
+    // disk, or opened when the wallet was smaller, or the operator just lowered
+    // maxOpenPositions) and then a top-up, and the fifth copy takes most of the
+    // wallet in one order.
+    //
+    // Bounded by the SAME fraction the spend governor enforces per mint, so
+    // sizing agrees with the ceiling instead of proposing an order the governor
+    // will refuse — a refusal the operator would read as the bot breaking.
+    const perMintFraction = tradeGovernor.getLimits().maxWalletFractionPerMint;
+    if (perMintFraction > 0) {
+      const cap = Math.max(0, deployableSol) * perMintFraction;
+      if (cap > 0 && stakePerSlotSol > cap) return round4(cap);
+    }
     return stakePerSlotSol;
   }
 
@@ -2047,6 +2088,18 @@ export class CopyTraderService {
         if (!this.config.enabled) {
           this.pushFeed(wallet, sig, 'skipped',
             `Copy trading was switched OFF while this buy was queued — not executed.`);
+          return;
+        }
+        // STALENESS, RE-CHECKED HERE. The arrival-time check cannot see how
+        // long this order then waited: the per-mint queue serialises it behind
+        // whatever is running for the mint, and an exit's retry loop alone can
+        // hold it for well over a minute. Entering on a signal that old is not
+        // copying the leader, it is buying whatever the price has become.
+        const queuedAgeMs = sig.observedAt ? Date.now() - sig.observedAt : 0;
+        if (queuedAgeMs > MAX_BUY_SIGNAL_AGE_MS) {
+          wallet.skippedSignals++;
+          this.pushFeed(wallet, sig, 'skipped',
+            `This buy waited ${Math.round(queuedAgeMs / 1000)}s in the queue behind other work for $${symbol} (max ${MAX_BUY_SIGNAL_AGE_MS / 1000}s) — the price has moved, not chased.`);
           return;
         }
         const blockers = sniperEngine.getWalletStatus().blockers;
@@ -2465,7 +2518,18 @@ export class CopyTraderService {
     await this.tradeQueue.run(sig.mint, async () => {
       // Resolve the position NOW — it may have been opened by the buy this
       // sell waited for, or emptied by an exit ahead of it in the queue.
-      const pos = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+      // RESOLVED AGAIN HERE, with the same real-first rule — this is the one
+      // that decides what actually gets sold.
+      //
+      // The pre-queue resolution above only feeds the feed text and the
+      // nothing-held check; a buy queued ahead of this exit can have opened a
+      // position in the meantime, so re-resolving is required anyway. Applying
+      // the rule only to the earlier variable left the real bug in place: this
+      // line was an unfiltered `.find()`, so it still took whichever position
+      // sat first in the list — and a paper twin created after a mode flip is
+      // unshifted to the HEAD.
+      const openNow = this.positions.filter(p => p.mint === sig.mint && p.status !== 'CLOSED');
+      const pos = openNow.find(p => !this.isPaperPos(p)) ?? openNow[0];
       if (!pos) {
         this.pushFeed(wallet, sig, 'skipped', `${describeLeader} — our buy did not land, nothing to sell.`);
         return;
@@ -2643,7 +2707,21 @@ export class CopyTraderService {
           const heldAfter = await this.getOwnedTokenAmount(pos.mint);
           if (heldAfter !== null) {
             const measuredSold = Math.max(0, (pos.tokensHeld || 0) - heldAfter);
-            if (measuredSold > 0) tokensSold = measuredSold;
+            if (measuredSold <= 0) {
+              // The transaction landed but the bag did not move. Booking the
+              // REQUESTED size as proceeds here would credit a sale that did
+              // not happen, and writing the unchanged balance back as
+              // tokensHeld would then mark the position closed or partial on
+              // the strength of it. Keep the position exactly as it is and let
+              // the retry path or the periodic sync settle it.
+              if (wallet) {
+                this.pushFeed(wallet, feedSig, 'failed',
+                  `$${pos.tokenSymbol}: the exit landed but the wallet still holds the same ${heldAfter} tokens — nothing was sold. Position kept unchanged.`);
+              }
+              pos.exitInFlight = false;
+              return;
+            }
+            tokensSold = measuredSold;
             // The remaining bag is now known from the chain rather than from
             // the requested fraction, so a sell that moved less than asked
             // leaves the rest tracked instead of being written off.
@@ -3097,11 +3175,18 @@ export class CopyTraderService {
     const tmp = `${STATE_FILE}.${process.pid}.tmp`;
     try {
       fs.writeFileSync(tmp, payload, { encoding: 'utf8' });
-      // Keep the last good file before replacing it. A backup is what turns
-      // "the state file is unreadable" from data loss into a rollback.
+      // Keep the last good file before replacing it — but ONLY if it is
+      // actually good. Copying blindly meant that after a boot which had
+      // already recovered from the backup (leaving a corrupt STATE_FILE in
+      // place), the very first persist() copied that corruption OVER the one
+      // surviving good copy. A backup that can be destroyed by the thing it is
+      // backing up is not a backup.
       try {
-        if (fs.existsSync(STATE_FILE)) fs.copyFileSync(STATE_FILE, `${STATE_FILE}.bak`);
-      } catch { /* a missing backup must never block the real write */ }
+        if (fs.existsSync(STATE_FILE)) {
+          JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));   // throws if unusable
+          fs.copyFileSync(STATE_FILE, `${STATE_FILE}.bak`);
+        }
+      } catch { /* the current file is not worth backing up — keep the older .bak */ }
       fs.renameSync(tmp, STATE_FILE);
     } catch (err: any) {
       console.error(`[CopyTrader] ⚠️ Could not write ${STATE_FILE}: ${err?.message ?? err}. `
