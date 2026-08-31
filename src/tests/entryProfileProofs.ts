@@ -26,7 +26,7 @@ import {
   type TokenSnapshot,
 } from '../services/entryProfile';
 import {
-  routePlay, playbookConfigFor, PROFILE_MIN_SCORE, PROFILE_MIN_RULES,
+  routePlay, playbookConfigFor, PROFILE_MIN_SCORE, PROFILE_MIN_RULES, bondingProgressPct,
 } from '../services/playbookRouter';
 
 let passed = 0;
@@ -408,6 +408,25 @@ test('THE SNAPSHOT IS TAKEN AFTER ENRICHMENT, NOT BEFORE', () => {
   const recorded = src.indexOf('const snapshot = this.snapshotFor(mint, launchData);');
   assert.ok(enriched > 0 && recorded > 0);
   assert.ok(recorded > enriched, 'the vector is only true once enrichment has completed');
+});
+
+test('OLD BUG: the learner recorded curve progress on its own scale', () => {
+  // Shipped in the previous commit. snapshotFor inlined `(vSol - 30) / 55`
+  // while the whole rest of the repo divides by GRADUATION_SOL = 85. A token
+  // the router placed at 50% up the curve was filed by the learner at 77%.
+  // The band was therefore unreadable against the router's own phase
+  // boundaries, and — the reason it matters now — a snapshot rebuilt from
+  // chain history sits on the canonical axis, so mixing the two populations
+  // would have widened every curve-progress band with pure unit error.
+  const src = engineSrc();
+  const idx = src.indexOf('private snapshotFor(');
+  const body = src.slice(idx, idx + 1800);
+  assert.ok(/curveProgressPct: bondingProgressPct\(/.test(body),
+    'the shared function is the only definition of where a token sits on the curve');
+  assert.ok(!/\/ 55\)/.test(body), 'the local formula must be gone, not merely shadowed');
+  // And the shared function is the one the router routes on.
+  assert.strictEqual(bondingProgressPct(30 + 85 / 2), 50, 'half the graduation raise is 50%');
+  assert.strictEqual(bondingProgressPct(30), 0);
 });
 
 test('an asserted liquidity figure is never learned from', () => {

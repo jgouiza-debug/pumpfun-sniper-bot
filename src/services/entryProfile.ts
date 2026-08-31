@@ -78,6 +78,49 @@ export interface TokenSnapshot {
   socialCount?: number;
   /** How many distinct wallets bought before this one. Their position in the queue. */
   buyerRank?: number;
+
+  // ---- chain-derived, from curveHistory.readCurveMoment ------------------
+  //
+  // Deliberately NOT folded into the market-data fields above, however similar
+  // they look. `buyPressurePct` comes from DexScreener; `windowBuyPressurePct`
+  // is computed from decoded TradeEvents on the bonding curve. Filing the
+  // second under the first's name would produce bands describing the gap
+  // between two vendors rather than anyone's judgement — which is exactly the
+  // kind of confident nonsense this file exists to refuse.
+  /** Curve transactions that landed before this moment. */
+  curveTxRank?: number;
+  /** SOL bought on the curve in the 5 minutes before this moment. */
+  windowBuySol?: number;
+  /** SOL sold on the curve in the same window. */
+  windowSellSol?: number;
+  /** Buys as a share of window flow, 0-100. */
+  windowBuyPressurePct?: number;
+  /** Distinct wallets that bought in the window. */
+  windowBuyers?: number;
+  /** Curve transactions in the window, per minute. */
+  windowTradesPerMin?: number;
+
+  /**
+   * HOW this snapshot was measured. The one field that is not about the token.
+   *
+   * 'live' is taken in the screening pipeline the instant the bot sees a
+   * launch. 'backfill' is rebuilt from chain history at the moment a trade
+   * actually happened. Both are honest; they are not COMPARABLE, and mixing
+   * them is the subtlest way this whole method can produce a confident lie.
+   *
+   * The reason is timing, not accuracy. Every live snapshot is taken seconds
+   * after launch, because that is when the pipeline runs. Every backfilled
+   * entry is taken whenever the trader actually bought — ten minutes in, an
+   * hour in. Pool them and `ageSeconds` separates the two groups almost
+   * perfectly, and the deriver reports a beautiful rule ("they buy tokens
+   * older than 4 minutes") that is a fact about WHEN WE LOOKED and contains no
+   * information about anyone's strategy. Every other feature is contaminated
+   * the same way, more quietly.
+   *
+   * So `derive` picks one source and uses only that. Missing means 'live',
+   * for profiles saved before this field existed.
+   */
+  source?: 'live' | 'backfill';
 }
 
 /** Which side of the comparison a snapshot belongs to. */
@@ -111,6 +154,8 @@ export interface LearnedProfile {
   enteredSamples: number;
   skippedSamples: number;
   builtAt: number;
+  /** Which measurement method the rules were derived from. Never a mixture. */
+  source: 'live' | 'backfill';
   /** False until there is enough of both classes for the comparison to mean anything. */
   usable: boolean;
   /** Why it is not usable, when it is not. Shown to the operator verbatim. */
@@ -164,6 +209,12 @@ const FEATURES: Array<{ key: keyof TokenSnapshot; label: string; unit: string }>
   { key: 'liquidityUsd', label: 'Liquidity', unit: '$' },
   { key: 'socialCount', label: 'Socials present', unit: '' },
   { key: 'buyerRank', label: 'Position in the buy queue', unit: 'th' },
+  { key: 'curveTxRank', label: 'Trades ahead of them', unit: '' },
+  { key: 'windowBuySol', label: 'SOL bought (5m, on-chain)', unit: ' SOL' },
+  { key: 'windowSellSol', label: 'SOL sold (5m, on-chain)', unit: ' SOL' },
+  { key: 'windowBuyPressurePct', label: 'Buy pressure (5m, on-chain)', unit: '%' },
+  { key: 'windowBuyers', label: 'Distinct buyers (5m, on-chain)', unit: '' },
+  { key: 'windowTradesPerMin', label: 'Trades per minute (5m, on-chain)', unit: '' },
 ];
 
 export class EntryProfileLearner {
@@ -227,20 +278,43 @@ export class EntryProfileLearner {
    * no engine, no clock and no files — which is what makes the rules that spend
    * money checkable.
    */
-  public static derive(entered: TokenSnapshot[], skipped: TokenSnapshot[]): LearnedProfile {
+  public static derive(allEntered: TokenSnapshot[], allSkipped: TokenSnapshot[]): LearnedProfile {
+    // ---- ONE MEASUREMENT METHOD AT A TIME --------------------------------
+    //
+    // See TokenSnapshot.source. Pooling live and backfilled snapshots makes
+    // every feature separate on WHEN THE SNAPSHOT WAS TAKEN rather than on
+    // what the token was, and the deriver cannot tell the difference — it
+    // would report the artifact as the strongest rule it had ever found.
+    //
+    // So the two populations are derived from separately and the better-
+    // evidenced one wins. "Better" is judged on the ENTERED side because that
+    // is the scarce half; skipped tokens are free on either method.
+    const bySource = (list: TokenSnapshot[], src: 'live' | 'backfill') =>
+      list.filter(s => (s.source ?? 'live') === src);
+    // 'live' first so a tie — including a fresh install with nothing at all —
+    // resolves to the method the bot uses by default, rather than naming a
+    // backfill the operator may never have run.
+    const candidates = (['live', 'backfill'] as const)
+      .map(src => ({ src, entered: bySource(allEntered, src), skipped: bySource(allSkipped, src) }))
+      .sort((a, b) => b.entered.length - a.entered.length);
+    const chosen = candidates[0];
+    const entered = chosen.entered;
+    const skipped = chosen.skipped;
+
     const base: LearnedProfile = {
       rules: [],
       enteredSamples: entered.length,
       skippedSamples: skipped.length,
+      source: chosen.src,
       builtAt: Date.now(),
       usable: false,
     };
 
     if (entered.length < MIN_ENTERED_SAMPLES) {
-      return { ...base, notReady: `only ${entered.length} observed entries; ${MIN_ENTERED_SAMPLES} needed before a band means anything` };
+      return { ...base, notReady: `only ${entered.length} observed entries (${chosen.src}); ${MIN_ENTERED_SAMPLES} needed before a band means anything` };
     }
     if (skipped.length < MIN_SKIPPED_SAMPLES) {
-      return { ...base, notReady: `only ${skipped.length} observed skips; ${MIN_SKIPPED_SAMPLES} needed for the comparison to have a control group` };
+      return { ...base, notReady: `only ${skipped.length} observed skips (${chosen.src}); ${MIN_SKIPPED_SAMPLES} needed for the comparison to have a control group` };
     }
 
     const rules: FeatureRule[] = [];

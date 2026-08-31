@@ -39,7 +39,7 @@ import { localTxBuilder } from './localTxBuilder';
 import { assertOutboundTradeTx } from './txIntentGuard';
 import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, affordableSellPriorityFeeSol, FEE_PAYER_RESERVE_SOL, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots, clampPriorityFeeSol } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
-import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
+import { routePlay, describeRoute, bondingProgressPct, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
 import { inspectMintSafety, simulateSellPath } from './honeypotDetector';
 import { devSellMonitor } from './devSellMonitor';
@@ -3887,9 +3887,15 @@ export class SniperEngine {
       mint,
       at: Date.now(),
       ageSeconds: measured(launchData.ageSeconds),
-      curveProgressPct: typeof launchData.vSolInBondingCurve === 'number'
-        ? Math.max(0, Math.min(100, ((launchData.vSolInBondingCurve - 30) / 55) * 100))
-        : undefined,
+      // bondingProgressPct, NOT a local formula. This inlined `(vSol - 30) / 55`
+      // against the repo's own `(vSol - 30) / GRADUATION_SOL` where
+      // GRADUATION_SOL is 85 — so a token the router called 50% up the curve
+      // was recorded by the learner at 77%. Two consequences, both bad: the
+      // learned band could never be read against the router's phase
+      // boundaries, and a snapshot rebuilt from chain history (which uses the
+      // canonical function) would sit on a different axis from a live one and
+      // silently widen every band it touched.
+      curveProgressPct: bondingProgressPct(launchData.vSolInBondingCurve) ?? undefined,
       marketCapUsd: measured(launchData.marketCapUsd),
       devBuySol: measured(launchData.initialBuy),
       devHoldingsPct: launchData.devHoldingsPct,
