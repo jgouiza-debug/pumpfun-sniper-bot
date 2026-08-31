@@ -30,6 +30,10 @@ import { LatencyTimelineLogger } from '../services/latencyTimeline';
 import { clampPriorityFeeSol } from '../services/pipelineUtils';
 import { broadcast, buildRoutes, type BroadcastRoute } from '../services/txBroadcaster';
 import { fitSlotsToWallet, splitWalletIntoSlots } from '../services/pipelineUtils';
+import {
+  CONFIRM_WAIT_ALPHA, CONFIRM_WAIT_FRACTION, CONFIRM_WAIT_PRIORITY_FRACTION,
+  CONFIRM_WAIT_MIN_MS, CONFIRM_WAIT_MAX_MS,
+} from '../services/copyTraderService';
 import { breakevenPct } from '../services/paperSimulator';
 
 let passed = 0;
@@ -95,6 +99,45 @@ test('an empty tracker reports no percentiles rather than zeros', () => {
   assert.strictEqual(s.slotDelta, null, 'no samples means no percentile, not a perfect one');
   assert.strictEqual(s.wireMs, null);
   assert.strictEqual(s.landMs, null);
+});
+
+test('THE PRODUCER EXISTS — the maths is useless about a structure nothing fills', () => {
+  // The nine tests above operate on trackers this file constructs and feeds by
+  // hand. Deleting the block in the engine that actually calls record() left
+  // every one of them green: the suite proved the percentile arithmetic was
+  // correct about a window that would be permanently empty, which is the whole
+  // of Part A's headline fix removed with nothing noticing.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const calls = engine.split('slotDelta.record(').length - 1;
+  assert.strictEqual(calls, 1, `exactly one producer expected, found ${calls}`);
+
+  const idx = engine.indexOf('slotDelta.record(');
+  const block = engine.slice(Math.max(0, idx - 400), idx + 500);
+  // It has to be fed the two numbers it cannot compute for itself, from the
+  // two places they actually come from.
+  assert.ok(/leaderSlot: opts\.leaderSlot/.test(block),
+    "the leader's slot must come from the signal that started the trade");
+  assert.ok(/landedSlot: fill\.slot/.test(block),
+    'our slot must come from the fill, which is the only place it is readable');
+  // And it must sit behind the fill check, or it records a delta against slot 0.
+  assert.ok(/if \(measuringExternal && fill && opts\.leaderSlot\)/.test(block),
+    'the producer must require both a fill and a leader slot before recording');
+
+  const reader = engine.split('slotDelta.stats()').length - 1;
+  assert.ok(reader >= 1, 'and something must read the stats back out, or nobody sees them');
+});
+
+test('the engine opens a copy timeline, or every stamp it makes is discarded', () => {
+  // Same failure shape one level down: the LatencyTimelineLogger tests below
+  // build their own logger and never touch the engine, so the begin() that
+  // makes the engine's stamps land is pinned by nothing behavioural.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  assert.ok(/latencyTimeline\.begin\(mint, \{\s*\n\s*t1ArrivalMs: t1,/.test(engine),
+    'the copy path must open a record seeded with the signal arrival time');
+  for (const stamp of ['t5BuiltSignedMs', 't6SubmittedMs', 't7ConfirmedMs']) {
+    assert.ok(engine.includes(`latencyTimeline.stamp(mint, '${stamp}')`),
+      `${stamp} must still be stamped, or the record it opens carries nothing`);
+  }
 });
 
 console.log('\n-- Percentiles are nearest-rank over things that happened --');
@@ -318,17 +361,51 @@ test('every settlement marks the balance stale, whatever the outcome', () => {
   const stampLines = lines
     .map((l, i) => ({ i, t: l.trim() }))
     .filter(x => x.t.includes('lastTradeSettledAt = Date.now()'));
-  assert.strictEqual(stampLines.length, 1, 'exactly one place may mark the balance stale');
-  assert.strictEqual(stampLines[0].t, 'this.lastTradeSettledAt = Date.now();',
-    'the stamp must be an unconditional statement — a guard in front of it means some settlement '
-    + 'outcomes leave the cached balance looking fresh when the fee has already been burned');
+  assert.ok(stampLines.length >= 2,
+    'the balance must be marked stale on the verdict path AND on the throw path');
 
+  // (a) The verdict path: unconditional, and immediately after the verdict, so
+  // it covers a reverted or slippage-rejected trade — both burned their fee.
   const confirmIdx = lines.findIndex(l => l.includes('const confirmed = await this.confirmTransaction('));
-  assert.ok(confirmIdx >= 0 && stampLines[0].i > confirmIdx,
-    'the stamp must come after the verdict, so it covers every outcome rather than only the happy path');
-  const between = lines.slice(confirmIdx, stampLines[0].i).join('\n');
+  assert.ok(confirmIdx >= 0, 'the settlement verdict must exist');
+  const afterVerdict = stampLines.find(x => x.i > confirmIdx);
+  assert.ok(afterVerdict, 'a stamp must follow the verdict');
+  assert.strictEqual(afterVerdict!.t, 'this.lastTradeSettledAt = Date.now();',
+    'the verdict stamp must be unconditional — a guard means some outcomes leave the cached '
+    + 'balance looking fresh when the fee has already been burned');
+  const between = lines.slice(confirmIdx, afterVerdict!.i).join('\n');
   assert.ok(!/if \(confirmed ===/.test(between),
-    'no outcome branch may sit between the verdict and the stamp, or some outcomes would not mark it');
+    'no outcome branch may sit between the verdict and the stamp');
+
+  // (b) THE THROW PATH. A throw between signing and the verdict skips (a)
+  // entirely — and the catch above it says the transaction "may be ON CHAIN
+  // even though the call that sent it threw", which is why it starts
+  // resolveOrphanedSubmission. Leaving the balance looking fresh there is the
+  // 2026-08-23 double-spend shape. Guarded on signedTxid, because an order
+  // refused before signing spent nothing.
+  const guarded = stampLines.find(x => /^if \(signedTxid\) this\.lastTradeSettledAt = Date\.now\(\);$/.test(x.t));
+  assert.ok(guarded, 'a signed-but-unresolved order must also mark the balance stale, guarded on signedTxid');
+  // It has to be in THIS function's finally — located by walking back from the
+  // stamp rather than by taking the file's first `} finally {`, which belongs
+  // to an unrelated function hundreds of lines earlier. (That is exactly the
+  // mistake the first version of this assertion made.)
+  const finallyIdx = lines.slice(0, guarded!.i).map(l => l.trim()).lastIndexOf('} finally {');
+  assert.ok(finallyIdx > confirmIdx,
+    'the guarded stamp must sit in the finally of the function that sent the transaction');
+  const fnEndIdx = lines.slice(0, guarded!.i).map(l => l.trim()).lastIndexOf('private async executeRealMainnetTrade(');
+  void fnEndIdx;
+  // Nothing may return between the finally opening and the stamp, or a path
+  // through the finally still skips it.
+  // Comments stripped first. The block between them explains WHY the release
+  // runs on "every exit path — return, throw, or fall-through", and matching
+  // that prose would fail correct code — which is precisely the "regex matches
+  // a comment rather than the code" trap this file is being audited for.
+  const gap = lines.slice(finallyIdx, guarded!.i)
+    .map(l => l.replace(/\/\/.*$/, '').trim())
+    .filter(Boolean)
+    .join('\n');
+  assert.ok(!/\breturn\b/.test(gap),
+    `no early return may sit between the finally and the stamp; found:\n${gap}`);
 });
 
 console.log('\n-- The dashboard is not allowed to sit on the trading path --');
@@ -803,7 +880,16 @@ console.log('\n-- The slow lane learns its wait instead of assuming it --');
  * service methods are four lines around exactly this; the source assertions
  * below pin that they still are.
  */
-const ALPHA = 0.2, FRACTION = 0.8, PRIORITY_FRACTION = 0.6, MIN_MS = 80, MAX_MS = 800;
+// IMPORTED, NEVER RE-DECLARED. These were local copies of the shipped numbers,
+// so every test below was checking the test file's own arithmetic: setting
+// CONFIRM_WAIT_PRIORITY_FRACTION to 1.6, MIN to 0 and MAX to 8000 in production
+// inverted every property these tests are named after and the suite stayed
+// green. A constant a test asserts about has to be the constant that ships.
+const ALPHA = CONFIRM_WAIT_ALPHA;
+const FRACTION = CONFIRM_WAIT_FRACTION;
+const PRIORITY_FRACTION = CONFIRM_WAIT_PRIORITY_FRACTION;
+const MIN_MS = CONFIRM_WAIT_MIN_MS;
+const MAX_MS = CONFIRM_WAIT_MAX_MS;
 function ewma(seed: number, samples: number[]): number {
   let v = seed;
   for (const raw of samples) v = v * (1 - ALPHA) + Math.min(raw, MAX_MS) * ALPHA;

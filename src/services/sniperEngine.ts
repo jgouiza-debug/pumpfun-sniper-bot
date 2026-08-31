@@ -2981,6 +2981,20 @@ export class SniperEngine {
       // GOVERNOR refused returned before this line existed to run at all,
       // leaking the record so the next buy for that mint inherited a stale t1
       // and reported a fabricated wireMs.
+      // A SIGNED TRANSACTION MAY HAVE LANDED EVEN IF THIS CALL THREW.
+      //
+      // The stamp after the settlement verdict covers every outcome the verdict
+      // reaches — but a throw between signing and that line skips it entirely,
+      // and the catch above says in as many words that the transaction "may be
+      // ON CHAIN even though the call that sent it threw" (it starts
+      // resolveOrphanedSubmission for exactly that reason). Leaving the cached
+      // balance looking fresh on that path is the 2026-08-23 double-spend
+      // shape: the next buy sizes against a balance that no longer exists.
+      //
+      // Guarded on `signedTxid`, not unconditional: an order refused before
+      // signing spent nothing, and marking the balance stale for it would force
+      // a pointless RPC read on the next buy.
+      if (signedTxid) this.lastTradeSettledAt = Date.now();
       if (openedTimeline) latencyTimeline.complete(mint);
     }
     return null;

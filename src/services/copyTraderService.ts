@@ -141,12 +141,12 @@ const TX_FETCH_INTERVAL_MS = 250;
  * which is a coin flip. Waking a little early costs one wasted call; waking
  * late costs latency on every single trade this lane handles.
  */
-const CONFIRM_WAIT_ALPHA = 0.2;
-const CONFIRM_WAIT_FRACTION = 0.8;
+export const CONFIRM_WAIT_ALPHA = 0.2;
+export const CONFIRM_WAIT_FRACTION = 0.8;
 /** A live exit is worth one more speculative read than an entry is. */
-const CONFIRM_WAIT_PRIORITY_FRACTION = 0.6;
-const CONFIRM_WAIT_MIN_MS = 80;
-const CONFIRM_WAIT_MAX_MS = 800;
+export const CONFIRM_WAIT_PRIORITY_FRACTION = 0.6;
+export const CONFIRM_WAIT_MIN_MS = 80;
+export const CONFIRM_WAIT_MAX_MS = 800;
 /** One paced re-read of a leader tx that outlived the polling budget — long enough for an RPC 429 storm to pass. */
 const TX_REFETCH_DELAY_MS = 20_000;
 /**

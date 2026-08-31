@@ -453,6 +453,71 @@ async function main(): Promise<void> {
     }
   }
 
+  // ------------------------------------------------------------------ W
+  console.log('\n-- W. The conditional balance read, driven through the REAL method --');
+  {
+    // WHY THIS IS HERE AND NOT IN latencyProofs. The proofs for this rule were
+    // written against a local `owed(a, b)` helper that reimplemented the
+    // condition inside the test file. That helper agreed with the shipped
+    // method by coincidence, not by construction: deleting the `lastRead > 0 &&`
+    // half from sniperEngine left the whole suite green, even though the test
+    // named after that exact case was passing. This drill already loads the
+    // real engine in a temp directory, so the shipped method can be called.
+    const e: any = sniperEngine;
+    const savedReadAt = e.wallet.balanceReadAt;
+    const savedRefresh = e.refreshWalletBalance;
+    let refreshes = 0;
+    e.refreshWalletBalance = async () => { refreshes++; };
+
+    const drive = async (lastReadAt: number, lastSettledAt: number) => {
+      e.wallet.balanceReadAt = () => lastReadAt;
+      e.lastTradeSettledAt = lastSettledAt;
+      refreshes = 0;
+      const outcome = await e.refreshWalletBalanceIfOwed(50);
+      return { outcome, refreshes };
+    };
+
+    try {
+      const quiet = await drive(10_000, 9_000);
+      check('nothing settled since the last read → no RPC at all',
+        quiet.outcome === 'cached' && quiet.refreshes === 0, `${quiet.outcome}, ${quiet.refreshes} reads`);
+
+      const same = await drive(10_000, 10_000);
+      check('a read at the same instant already reflects the settlement',
+        same.outcome === 'cached' && same.refreshes === 0, same.outcome);
+
+      const owed = await drive(10_000, 10_001);
+      check('THE 2026-08-23 DOUBLE-SPEND: a settlement after the read forces one',
+        owed.outcome === 'refreshed' && owed.refreshes === 1, `${owed.outcome}, ${owed.refreshes} reads`);
+
+      // The case the local helper was named after and the shipped method was
+      // never asked about: lastCheckedAt is 0 before the first successful
+      // balance call and is reset to 0 when the wallet is re-linked. Treating
+      // "never read" as "up to date" sizes the first buy after a re-link
+      // against a balance of zero.
+      const never = await drive(0, 0);
+      check('A WALLET NEVER READ IS ALWAYS OWED A READ',
+        never.outcome === 'refreshed' && never.refreshes === 1, `${never.outcome}, ${never.refreshes} reads`);
+
+      const neverButSettled = await drive(0, 5_000);
+      check('and still owed one when something has settled',
+        neverButSettled.outcome === 'refreshed', neverButSettled.outcome);
+
+      // Bounded: a hung read must not pin the caller, because this sits inside
+      // the per-mint trade queue while a leader's flip-sell waits behind it.
+      e.refreshWalletBalance = () => new Promise(() => {});
+      e.wallet.balanceReadAt = () => 0;
+      e.lastTradeSettledAt = 1;
+      const startedAt = Date.now();
+      const timedOut = await e.refreshWalletBalanceIfOwed(60);
+      check('a hung balance read is bounded, not awaited forever',
+        timedOut === 'timed-out' && Date.now() - startedAt < 1500, `${timedOut} after ${Date.now() - startedAt}ms`);
+    } finally {
+      e.wallet.balanceReadAt = savedReadAt;
+      e.refreshWalletBalance = savedRefresh;
+    }
+  }
+
   console.log(`\n==== COPY REAL-BUY DRILL: ${passed} passed, ${failed} failed ====`);
   console.log(`(state written under ${drillDir})`);
   process.exit(failed > 0 ? 1 : 0);
