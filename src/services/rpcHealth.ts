@@ -156,6 +156,33 @@ export async function withRpcRetry<T>(fn: () => Promise<T>, opts: RpcRetryOption
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'RPC call failed'));
 }
 
+/**
+ * Record the outcome of an RPC call made OUTSIDE withRpcRetry.
+ *
+ * The health counters drive the failover/degraded reporting, and until now
+ * only two call sites fed them: the honeypot mint read and the wallet-balance
+ * probe. Every RPC call on the TRADING path — confirmation polling, fill
+ * inspection, the copy trader's parsed-transaction fetches — bypassed them
+ * entirely. So the health signal was measuring a corner of the system while a
+ * 429 storm on the hot path went unrecorded: the operator saw a healthy RPC
+ * pill during exactly the outage that was turning every trade into a timeout.
+ *
+ * A credential error latches the rejected-key flag here too, so a key that
+ * dies mid-session demotes every consumer instead of only the prober.
+ */
+export function noteRpcOutcome(ok: boolean, err?: unknown): void {
+  if (ok) {
+    state.ok++;
+    state.consecutiveFailures = 0;
+    return;
+  }
+  if (isCredentialError(err)) state.credentialRejected = true;
+  state.failed++;
+  state.consecutiveFailures++;
+  state.lastError = err instanceof Error ? err.message : String(err ?? 'unknown');
+  state.lastErrorAt = Date.now();
+}
+
 export function rpcHealth(): RpcHealthSnapshot {
   const total = state.ok + state.failed;
   return {

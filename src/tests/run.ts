@@ -2371,6 +2371,26 @@ console.log('\n-- Security: API origin/auth, key handling, lock atomicity --');
     assert.ok(!isLoopbackOrigin('file://'), '');
   });
 
+  test('a DNS-rebinding request is refused even though it carries no Origin', () => {
+    const { isLoopbackHost } = require('../services/apiAuth');
+    // A browser omits Origin on same-origin GETs, which is exactly what a
+    // rebinding attack produces: the page loads from attacker.example, its DNS
+    // then resolves to 127.0.0.1, and the fetches look same-origin. The Host
+    // header still names what the browser resolved, so it is the discriminator
+    // Origin cannot be.
+    assert.strictEqual(isLoopbackHost('attacker.example:3001'), false);
+    assert.strictEqual(isLoopbackHost('bot.evil.com'), false);
+    assert.strictEqual(isLoopbackHost('localhost.evil.com:3001'), false, 'suffix must not be enough');
+    assert.strictEqual(isLoopbackHost(undefined), false, 'HTTP/1.1 requires Host; absent is not a pass');
+    // Everything a real local client sends still works.
+    for (const h of ['localhost:3001', 'localhost', '127.0.0.1:3001', '127.0.0.1', '[::1]:3001', '::1']) {
+      assert.strictEqual(isLoopbackHost(h), true, h);
+    }
+    const guard = src('services/apiAuth.ts');
+    assert.ok(/isLoopbackHost\(req\.headers\.host\)/.test(guard),
+      'originGuard must check the Host header, not only Origin');
+  });
+
   test('every mutating API call requires the token, by method not by memory', () => {
     const server = src('server.ts');
     assert.ok(/app\.use\(originGuard\)/.test(server), 'the origin guard must run before any handler');

@@ -1,4 +1,5 @@
 import type { Connection } from '@solana/web3.js';
+import { noteRpcOutcome } from './rpcHealth';
 
 /**
  * DID IT LAND? — the one place that answers that question, and the only answer
@@ -210,6 +211,11 @@ export async function settleTransaction(
       const res = await withTimeout(
         connection.getSignatureStatuses([txid], { searchTransactionHistory: true }),
         RPC_CALL_TIMEOUT_MS, 'getSignatureStatuses');
+      // The confirmation loop is the busiest RPC consumer on the trading path
+      // and fed the health counters nothing, so a 429 storm here left the UI
+      // reporting a healthy RPC during exactly the outage that was turning
+      // every trade into a timeout.
+      noteRpcOutcome(true);
       const value = res?.value?.[0];
       if (value) {
         if (value.err) {
@@ -232,6 +238,7 @@ export async function settleTransaction(
       }
     } catch (err: any) {
       rpcErrors++;
+      noteRpcOutcome(false, err);
       // Deliberately does NOT return. An RPC that will not answer says nothing
       // about the chain; the loop keeps trying and, if it never recovers, the
       // caller gets 'unknown' rather than a fabricated verdict.

@@ -107,11 +107,51 @@ export function isLoopbackOrigin(origin: string): boolean {
  * at all (curl, the packaged window's navigations) pass here and are caught by
  * the token check if they mutate.
  */
+/**
+ * A Host header that names a loopback address.
+ *
+ * THE GAP THIS CLOSES (DNS rebinding). originGuard reads only `Origin`, and a
+ * browser omits that header on same-origin GETs — which is exactly what a
+ * rebinding attack produces. An attacker page loads from their domain, the
+ * domain's DNS then resolves to 127.0.0.1, and the page's subsequent fetches are
+ * "same-origin" from the browser's point of view: no Origin header, so the guard
+ * waved them through. The requests still carry `Host: attacker.example`, because
+ * the browser sends the NAME it resolved, not the address.
+ *
+ * So the Host header is the discriminator the Origin header cannot be. A real
+ * local client always addresses the server as localhost or 127.0.0.1; nothing
+ * legitimate reaches it under someone else's domain name.
+ */
+export function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return false;                       // HTTP/1.1 requires Host; absent is not a pass
+  const raw = host.trim().toLowerCase();
+  let name: string;
+  if (raw.startsWith('[')) {
+    // Bracketed IPv6, optionally with a port: [::1] or [::1]:3001.
+    name = raw.slice(1, raw.indexOf(']') === -1 ? undefined : raw.indexOf(']'));
+  } else if ((raw.match(/:/g) || []).length > 1) {
+    // A bare IPv6 literal carries several colons and cannot carry a port —
+    // stripping ":<digits>" from it would eat the last group and turn '::1'
+    // into ':'.
+    name = raw;
+  } else {
+    name = raw.replace(/:\d+$/, '');
+  }
+  return name === 'localhost' || name === '127.0.0.1' || name === '::1' || name === '0:0:0:0:0:0:0:1';
+}
+
 export function originGuard(req: Request, res: Response, next: NextFunction): void {
   const origin = req.headers.origin;
   if (typeof origin === 'string' && !isLoopbackOrigin(origin)) {
     console.warn(`⛔ [API] Refused cross-origin ${req.method} ${req.path} from ${origin}`);
     res.status(403).json({ error: 'Cross-origin requests are not permitted.' });
+    return;
+  }
+  // Checked even when Origin is absent — that absence is the attack, not the
+  // exemption. See isLoopbackHost.
+  if (!isLoopbackHost(req.headers.host)) {
+    console.warn(`⛔ [API] Refused ${req.method} ${req.path} addressed to Host "${req.headers.host}" — not a loopback name (DNS rebinding).`);
+    res.status(403).json({ error: 'This server only answers requests addressed to localhost.' });
     return;
   }
   next();

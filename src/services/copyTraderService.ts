@@ -2581,13 +2581,31 @@ export class CopyTraderService {
           // wallet on-chain no longer holds it; otherwise leave the position open
           // for the SELL button to retry. Closing blind here zeroed tokensHeld
           // and dropped a real bag from tracking to ride to zero unwatched (H2).
-          if (isManual) {
+          // CHECKED FOR AUTOMATIC EXITS TOO, not only manual ones.
+          //
+          // The gate used to be `if (isManual)`. So a position whose bag was
+          // already gone — sold by hand on Photon, or exited by an earlier
+          // attempt that landed after we gave up — stayed OPEN forever, held a
+          // slot and its exit-gas reserve, and re-ran the whole six-attempt
+          // sell loop on EVERY subsequent leader signal. Each attempt either
+          // errors at trade-local or lands and reverts, burning a priority fee
+          // (default 0.001 SOL, up to 0.05 by config) for a bag that does not
+          // exist. That is the fee-burn grind with an empty trade ledger, which
+          // is exactly the shape of the reported drain.
+          //
+          // One balance read per FAILED exit is a negligible cost next to the
+          // loop it ends.
+          {
             const held = await this.getOwnedTokenAmount(pos.mint);
             const expected = pos.tokensHeld || 0;
             const effectivelyGone = held !== null && held <= Math.max(0, expected * 0.05);
             if (effectivelyGone) {
               this.closeAsExternallyExited(pos);
-            } else if (wallet) {
+              if (wallet) {
+                this.pushFeed(wallet, feedSig, 'skipped',
+                  `$${pos.tokenSymbol}: the exit failed, but the wallet no longer holds it — the bag was already gone. Position closed instead of retrying into a fee burn.`);
+              }
+            } else if (isManual && wallet) {
               const note = held === null
                 ? 'on-chain balance could not be read'
                 : `${held} tokens are still in the wallet`;
