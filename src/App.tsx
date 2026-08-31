@@ -174,6 +174,8 @@ export function App() {
     // A FULL unit; the router halves it until a candidate clears the full-unit
     // score band, so the real per-trade stake is 0.3 SOL.
     buyAmountSol: 0.6,
+    priorityFeeSol: 0.001,
+    maxPriorityFeeSol: 0.01,
     // On by default: the stake is one slot of the run budget, not this number.
     walletSplitSizing: true,
     takeProfitPct: 100,
@@ -1757,6 +1759,49 @@ export function App() {
                       value={configForm.maxActivePositions}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxActivePositions: Number(e.target.value) })}
                     />
+                  </div>
+                </div>
+
+                {/* PRIORITY FEE — surfaced because it is the single biggest
+                    lever on whether a transaction lands, and it is the one
+                    setting here that costs SOL on every trade whether the trade
+                    wins or loses. It was previously pinned (floor == ceiling)
+                    with no way to change it outside a config file. */}
+                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(255,193,7,0.05)', border: '1px solid rgba(255,193,7,0.2)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#ffc107', marginBottom: '6px' }}>
+                    ⚡ Priority Fee — what you pay to land
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div className="form-group">
+                      <label className="form-label">Fee Floor (SOL)</label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        className="form-input"
+                        value={configForm.priorityFeeSol ?? 0.001}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, priorityFeeSol: Number(e.target.value) })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Fee Ceiling (SOL)</label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        className="form-input"
+                        value={configForm.maxPriorityFeeSol ?? 0.01}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxPriorityFeeSol: Number(e.target.value) })}
+                      />
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '9px', color: '#8a8a8a', marginTop: '6px', lineHeight: 1.5 }}>
+                    Paid on <strong>every</strong> transaction, win or lose. The floor is what you always pay;
+                    with dynamic fees on, a congested slot can bid up to the ceiling.
+                    A fee too low simply does not land — and a send that does not land still burns its base fee.
+                    <br />
+                    Whatever you set here, a single fee is never more than <strong>5% of the position</strong>,
+                    so on a {(configForm.buyAmountSol ?? 0.6).toFixed(3)} SOL position the most one trade can pay is{' '}
+                    <strong>{Math.min(configForm.maxPriorityFeeSol ?? 0.01, (configForm.buyAmountSol ?? 0.6) * 0.05).toFixed(4)} SOL</strong>
+                    {' '}(~{((Math.min(configForm.maxPriorityFeeSol ?? 0.01, (configForm.buyAmountSol ?? 0.6) * 0.05) * 2 / (configForm.buyAmountSol || 1)) * 100).toFixed(1)}% of the position for a round trip).
                   </div>
                 </div>
 

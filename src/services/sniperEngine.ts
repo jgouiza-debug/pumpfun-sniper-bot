@@ -30,7 +30,7 @@ import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
 import { assertOutboundTradeTx } from './txIntentGuard';
-import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, affordableSellPriorityFeeSol, FEE_PAYER_RESERVE_SOL, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots } from './pipelineUtils';
+import { computeAgeSeconds, detectMigration, realizedPnlInWindowUsd, computeEntrySizeSol, affordableStakeSol, affordableSellPriorityFeeSol, FEE_PAYER_RESERVE_SOL, sellAmountParam, isPoolDrained, acceptPeakUpdate, trailingStopTargetUsd, splitWalletIntoSlots, classifyExitReason, fitSlotsToWallet, minWalletForSlots, clampPriorityFeeSol } from './pipelineUtils';
 import { breakevenPct, poolFromLaunch, simulateBuy, simulateSell, PoolSnapshot } from './paperSimulator';
 import { routePlay, describeRoute, RouteDecision, PLAYBOOK_DEFAULTS, PlaybookConfig, playbookConfigFor } from './playbookRouter';
 import { tokenWatchlist } from './tokenWatchlist';
@@ -335,13 +335,25 @@ export class SniperEngine {
     // and migrations are the only entry type this bot produces. Cheaper fills
     // mean fewer fills. Raise this once the stake is large enough to absorb it.
     priorityFeeSol: 0.001,
-    // Ceiling == floor, so the fee is PINNED at 0.001 unless the operator
-    // raises this. With dynamicPriorityFee on, the old 0.005 ceiling let a
-    // congested slot bid up to 5x — which on a 0.02 SOL slice is a quarter of
-    // the position in fees, each way. Small wallets cannot pay a variable fee.
-    // Raise it (Settings) if fills start missing: a fee too low simply does not
-    // land, and a failed send still burns its base fee.
-    maxPriorityFeeSol: 0.001,
+    // 0.01, not 0.001. Ceiling == floor PINNED the fee: dynamicPriorityFee
+    // sampled the p75 of real contention on the pump.fun program, computed a
+    // number, and clampPriorityFeeSol then threw it away because the ceiling it
+    // had to fit under was the floor. The whole dynamic-fee mechanism was
+    // inert, and the comment above ("a 0.001 priority fee loses races on
+    // congested slots… Cheaper fills mean fewer fills") described the result.
+    //
+    // WHY RAISING THIS IS SAFE FOR A SMALL WALLET, which is what the old
+    // ceiling was protecting. clampPriorityFeeSol also caps the fee at 5% OF
+    // THE POSITION, and that cap binds first on exactly the stakes the old
+    // comment worried about: on a 0.02 SOL slice, 5% is 0.001, so the fee is
+    // still pinned to the floor no matter what this says. The position cap is
+    // the protection; the ceiling is the ceiling. Above roughly a 0.2 SOL stake
+    // this number starts to bind instead, which is where paying to land is
+    // worth it.
+    //
+    // Sizing budgets the worst case this permits (see sizingPriorityFee), so a
+    // higher ceiling reserves more gas rather than overdrafting the float.
+    maxPriorityFeeSol: 0.01,
     maxSlippagePct: DEFAULT_BUY_SLIPPAGE_PCT,
     maxSellSlippagePct: DEFAULT_SELL_SLIPPAGE_PCT,
     // jitoTipSol is GONE (2026-08-13). It was a number in the config, a field
@@ -650,13 +662,30 @@ export class SniperEngine {
    */
   private reservedPerEntrySol(): number {
     const stake = this.runSlotStakeSol > 0 ? this.runSlotStakeSol : this.config.buyAmountSol;
-    return stake * (1 + this.config.maxSlippagePct / 100 + 0.015) + this.sizingPriorityFee() + 0.0025;
+    return stake * (1 + this.config.maxSlippagePct / 100 + 0.015) + this.sizingPriorityFee(stake) + 0.0025;
   }
 
-  private sizingPriorityFee(): number {
-    return featureFlags.get('dynamicPriorityFee')
-      ? Math.max(this.config.priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005)
-      : this.config.priorityFeeSol;
+  /**
+   * What to BUDGET for the priority fee — the worst case execution can pay.
+   *
+   * With a stake, this runs the ceiling through the very same clamp execution
+   * uses, so the two cannot drift: whatever number the buy path is capable of
+   * paying is the number sizing set aside. That matters now the ceiling is 10x
+   * the floor. Budgeting the bare ceiling instead would over-reserve on a small
+   * slice — where the clamp's 5%-of-position cap means execution can never
+   * actually pay it — and refuse trades the wallet could afford, which is the
+   * same "safety limit becomes an outage" shape the ceiling itself had.
+   *
+   * Without a stake the caller gets the unclamped worst case, which is the
+   * conservative answer and the right one for the copy trader's exit-gas
+   * reserve: it sizes its own positions and must not under-reserve for them.
+   */
+  private sizingPriorityFee(stakeSol?: number): number {
+    if (!featureFlags.get('dynamicPriorityFee')) return this.config.priorityFeeSol;
+    const floor = this.config.priorityFeeSol;
+    const ceiling = Math.max(floor, this.config.maxPriorityFeeSol ?? floor);
+    if (!stakeSol || stakeSol <= 0) return ceiling;
+    return clampPriorityFeeSol(ceiling, floor, ceiling, stakeSol);
   }
 
   /**

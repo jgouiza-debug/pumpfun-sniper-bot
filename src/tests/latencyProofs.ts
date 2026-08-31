@@ -27,6 +27,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { SlotDeltaTracker } from '../services/slotDelta';
 import { LatencyTimelineLogger } from '../services/latencyTimeline';
+import { clampPriorityFeeSol } from '../services/pipelineUtils';
 
 let passed = 0;
 let failed = 0;
@@ -337,6 +338,68 @@ test('the coalesce window stays under the server\'s own SSE gap', () => {
   assert.ok(Number.isFinite(copyMs) && Number.isFinite(serverMs), 'both windows must be declared as constants');
   assert.ok(copyMs <= serverMs,
     `the copy coalesce (${copyMs}ms) must not exceed the server's SSE gap (${serverMs}ms)`);
+});
+
+console.log('\n-- The priority fee is no longer pinned, and small stakes are still safe --');
+
+test('OLD BUG: ceiling == floor made the whole dynamic-fee mechanism inert', () => {
+  // priorityFeeSol and maxPriorityFeeSol were both 0.001. priorityFeeService
+  // sampled the p75 of real contention on the pump.fun program, computed a
+  // number, and clampPriorityFeeSol threw it away because the ceiling it had to
+  // fit under WAS the floor. Reproduced with the shipped clamp.
+  const pinned = clampPriorityFeeSol(0.004 /* what the sampler said */, 0.001, 0.001, 0.5);
+  assert.strictEqual(pinned, 0.001, 'with ceiling == floor no computed fee can ever be paid');
+});
+
+test('fixed: with a real ceiling, a contended slot can actually be paid for', () => {
+  const paid = clampPriorityFeeSol(0.004, 0.001, 0.01, 0.5);
+  assert.strictEqual(paid, 0.004, 'the sampled fee is now what gets paid');
+});
+
+test('THE SMALL-WALLET PROTECTION: 5% of position binds before the ceiling does', () => {
+  // This is why raising the ceiling is safe. The old comment worried that a
+  // variable fee "on a 0.02 SOL slice is a quarter of the position in fees" —
+  // but the clamp already caps a fee at 5% of the position, and on that slice
+  // 5% IS the floor, so the fee stays pinned however high the ceiling goes.
+  for (const ceiling of [0.01, 0.05, 1]) {
+    const onTinySlice = clampPriorityFeeSol(0.02, 0.001, ceiling, 0.02);
+    assert.strictEqual(onTinySlice, 0.001,
+      `a 0.02 SOL slice must still pay the floor with a ${ceiling} ceiling — the position cap is the protection`);
+  }
+});
+
+test('the ceiling binds on the stakes where paying to land is worth it', () => {
+  // Above roughly 0.2 SOL the 5% cap stops being the binding constraint and the
+  // operator's stated ceiling takes over, which is the intended shape.
+  assert.strictEqual(clampPriorityFeeSol(0.05, 0.001, 0.01, 0.5), 0.01, 'ceiling binds on a large stake');
+  assert.strictEqual(clampPriorityFeeSol(0.05, 0.001, 0.01, 0.1), 0.005, '5% binds on a small one');
+});
+
+test('sizing budgets exactly what execution can pay, never more', () => {
+  // Sizing used to budget the bare ceiling. Now the ceiling is 10x the floor,
+  // that would over-reserve on a small slice — where execution can never
+  // actually pay it — and refuse trades the wallet could afford: the same
+  // "safety limit becomes an outage" shape the pinned ceiling itself had. The
+  // fix is that sizing runs the ceiling through the SAME clamp, so the two
+  // cannot drift.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('private sizingPriorityFee(');
+  assert.ok(idx > 0, 'the sizing fee helper must exist');
+  const body = engine.slice(idx, idx + 600);
+  assert.ok(/clampPriorityFeeSol\(/.test(body),
+    'sizing must use the execution clamp, not re-derive the worst case with its own arithmetic');
+  assert.ok(/stakeSol/.test(body), 'and it must be told the stake, or the position cap cannot apply');
+});
+
+test('the shipped defaults leave the ceiling above the floor', () => {
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const floor = Number(/^\s*priorityFeeSol: ([\d.]+),/m.exec(engine)?.[1]);
+  const ceiling = Number(/^\s*maxPriorityFeeSol: ([\d.]+),/m.exec(engine)?.[1]);
+  assert.ok(Number.isFinite(floor) && Number.isFinite(ceiling), 'both defaults must be declared');
+  assert.ok(ceiling > floor,
+    `ceiling ${ceiling} must exceed floor ${floor} — equal values re-pin the fee and make dynamicPriorityFee inert again`);
+  // Inside clampConfig's accepted band, or updateConfig would silently rewrite it.
+  assert.ok(ceiling <= 0.05, 'the default must sit inside the config band [0, 0.05]');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
