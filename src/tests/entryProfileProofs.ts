@@ -25,6 +25,9 @@ import {
   EntryProfileLearner, MIN_ENTERED_SAMPLES, MIN_SKIPPED_SAMPLES, MIN_SEPARATION,
   type TokenSnapshot,
 } from '../services/entryProfile';
+import {
+  routePlay, playbookConfigFor, PROFILE_MIN_SCORE, PROFILE_MIN_RULES,
+} from '../services/playbookRouter';
 
 let passed = 0;
 let failed = 0;
@@ -292,6 +295,207 @@ test('the file admits what it cannot learn', () => {
   const src = readFileSync(join(__dirname, '..', 'services', 'entryProfile.ts'), 'utf8');
   assert.ok(/DESCRIPTIVE, NOT CAUSAL/.test(src), 'the correlation/causation limit must be stated');
   assert.ok(/MECHANICAL PART ONLY/.test(src), 'and that it cannot learn what is not in a feature vector');
+});
+
+
+// ---------------------------------------------------------------------------
+// THE PROFILE AS AN ENTRY REASON
+//
+// Everything above proves the profile is honest about what it knows. This
+// section proves the sniper acts on it — which is the whole point of the ask.
+// The confluence lane buys what a proven wallet just bought, always second.
+// This buys what the profile says they WOULD buy, found by us, with nobody
+// having to move first.
+// ---------------------------------------------------------------------------
+console.log('\n-- The learned profile can trigger an entry on its own --');
+
+/** A mid-curve token the generic proxies refuse: real, unremarkable, no demand yet. */
+function midCurve(extra: Record<string, unknown> = {}): any {
+  return {
+    ageSeconds: 3600, isMigrationEvent: false, vSolInBondingCurve: 70, hasDexPair: false,
+    score: 60, marketCapUsd: 40000, liquidityUsd: 20000, volume5mUsd: 8000,
+    uniqueBuyers5m: 0, buyPressurePct: 0, solPriceUsd: 200,
+    ...extra,
+  };
+}
+
+test('a strong profile match is an entry reason with nobody buying first', () => {
+  // The ask, restated as a test: the sniper finds the token itself.
+  const cfg = playbookConfigFor('strict');
+  assert.strictEqual(routePlay(midCurve(), cfg).eligible, false,
+    'a score-60 token with no demand evidence is refused, as it should be');
+  const matched = routePlay(midCurve({ profileMatch: { score: 0.92, scoredOn: 6 } }), cfg);
+  assert.strictEqual(matched.eligible, true,
+    'a token matching what the proven wallets select on is an entry, with no wallet buying it');
+  assert.strictEqual(matched.play, 'PLAY_2');
+});
+
+test('A MATCH ON TWO RULES IS NOT A MATCH', () => {
+  // The failure this guards is subtle and would look like success: a fresh
+  // token has values for very few features, so it can score a perfect 1.0 on
+  // the two rules it happens to be scoreable on. That is not agreement with
+  // the strategy, it is a small sample dressed as certainty.
+  const cfg = playbookConfigFor('strict');
+  assert.ok(PROFILE_MIN_RULES >= 3, 'fewer than three rules cannot describe a selection');
+  const thin = routePlay(midCurve({ profileMatch: { score: 1, scoredOn: PROFILE_MIN_RULES - 1 } }), cfg);
+  assert.strictEqual(thin.eligible, false, '100% of two rules is not the profile agreeing');
+});
+
+test('a near miss is refused, and the refusal says how near', () => {
+  const cfg = playbookConfigFor('strict');
+  const near = routePlay(midCurve({ profileMatch: { score: PROFILE_MIN_SCORE - 0.05, scoredOn: 6 } }), cfg);
+  assert.strictEqual(near.eligible, false);
+  const why = near.reasons.join(' ');
+  assert.ok(/[Ll]earned-profile match/.test(why), 'the operator must see that the profile was consulted');
+  assert.ok(/on 6 rules/.test(why), 'and how much evidence the token actually offered');
+});
+
+test('THE PROFILE SUBSTITUTES FOR DEMAND EVIDENCE ONLY — never for a phase rule', () => {
+  // Same line the quorum is held to. A profile match says "this looks like the
+  // tokens they buy". It says nothing about the insider exit window or the
+  // rug density of the early curve, which are facts about the token, so it may
+  // not pass either of them. A learned rule that could unlock block-0 would be
+  // a second door into the wallet.
+  const cfg = playbookConfigFor('strict');
+  const perfect = { score: 1, scoredOn: 9 };
+  const blockZero = routePlay(midCurve({ ageSeconds: 10, profileMatch: perfect }), cfg);
+  assert.strictEqual(blockZero.phase, 'BLOCK_0');
+  assert.strictEqual(blockZero.eligible, false, 'the insider window is not negotiable by statistics');
+  const early = routePlay(midCurve({ vSolInBondingCurve: 33, profileMatch: perfect }), cfg);
+  assert.strictEqual(early.phase, 'EARLY_CURVE');
+  assert.strictEqual(early.eligible, false, '~70% of these die on day one, however well they match');
+});
+
+test('the profile does not lower the safety reasons a token still has to clear', () => {
+  // A match must not paper over a stated problem. Anything already in
+  // `reasons` for a non-demand cause survives it.
+  const cfg = playbookConfigFor('strict');
+  const late = routePlay(midCurve({ vSolInBondingCurve: 105, profileMatch: { score: 1, scoredOn: 9 } }), cfg);
+  assert.strictEqual(late.eligible, false, 'the late-curve refusal is about the curve, not about demand');
+  assert.ok(late.reasons.length > 0, 'and it still explains itself');
+});
+
+console.log('\n-- The engine feeds it, screens against it, and cannot be told to lie --');
+
+function engineSrc(): string {
+  return readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+}
+/** Source with comments stripped: prose about a rule is not the rule. */
+function code(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
+}
+
+test('EVERY screened token is recorded, on one side or the other', () => {
+  // Entries alone would teach the bot that good traders buy tokens with a
+  // creator and a bonding curve. The launches they passed on are what make the
+  // comparison say anything, and they are free — the bot sees every one.
+  const src = code(engineSrc());
+  const idx = src.indexOf('const snapshot = this.snapshotFor(mint, launchData);');
+  assert.ok(idx > 0, 'the learner must be fed from the screening path');
+  const body = src.slice(idx, idx + 300);
+  assert.ok(/entryProfile\.recordEntry\(snapshot\)/.test(body), 'tokens a proven wallet is buying are the entries');
+  assert.ok(/entryProfile\.recordSkipped\(snapshot\)/.test(body), 'and everything else is the control group');
+  assert.ok(/this\.pendingSmartMoney\.has\(mint\)/.test(body),
+    'the label must come from a quorum the detector formed, not from the payload');
+});
+
+test('THE SNAPSHOT IS TAKEN AFTER ENRICHMENT, NOT BEFORE', () => {
+  // A feature vector read before the enrichment calls return is mostly
+  // undefined, and undefined values are skipped rather than scored — so the
+  // profile would silently be learned from two or three fields and look fine.
+  const src = code(engineSrc());
+  const enriched = src.indexOf("latencyTimeline.stamp(mint, 't3FiltersDoneMs')");
+  const recorded = src.indexOf('const snapshot = this.snapshotFor(mint, launchData);');
+  assert.ok(enriched > 0 && recorded > 0);
+  assert.ok(recorded > enriched, 'the vector is only true once enrichment has completed');
+});
+
+test('an asserted liquidity figure is never learned from', () => {
+  // The migration constant is identical on every migration, so a band built on
+  // it would look like a razor-sharp criterion and be a property of our own
+  // code. This is the one place a fabricated number could become a "rule".
+  const src = engineSrc();
+  const idx = src.indexOf('private snapshotFor(');
+  const body = src.slice(idx, idx + 1800);
+  assert.ok(/liquidityUsd: asserted \? undefined :/.test(body),
+    'an asserted figure must be withheld from the learner, not passed through');
+  assert.ok(/hasLiveMarketData \? measured\(launchData\.volume5mUsd\)/.test(body),
+    'and volume without a live market is not a measurement either');
+});
+
+test('the profile score is computed from engine state and gated on the lane flag', () => {
+  const src = code(engineSrc());
+  const idx = src.indexOf('const profileMatch = ');
+  assert.ok(idx > 0, 'the router must be given a profile score');
+  const body = src.slice(idx, idx + 300);
+  assert.ok(/featureFlags\.get\('smartMoneySniper'\)/.test(body),
+    'the profile lane is the same strategy and ships behind the same flag');
+  assert.ok(/entryProfile\.score\(this\.snapshotFor\(/.test(body),
+    'scored from the engine’s own snapshot, never from a field on the payload');
+});
+
+test('A SCORE ON ZERO RULES IS NOT SENT TO THE ROUTER AS A ZERO', () => {
+  // scoredOn 0 means "nothing could be evaluated", which is not the same as
+  // "matched nothing". Passing it through as { score: 0 } would be indistinct
+  // from a token that failed every rule, and the router's refusal message would
+  // report a criterion it never applied.
+  const src = code(engineSrc());
+  const idx = src.indexOf('profileMatch: { score: profileMatch.score');
+  assert.ok(idx > 0, 'the router input must carry both the score and its basis');
+  const body = src.slice(Math.max(0, idx - 200), idx + 200);
+  assert.ok(/profileMatch && profileMatch\.scoredOn > 0/.test(body),
+    'an unevaluable score must be omitted rather than sent as 0');
+});
+
+console.log('\n-- The operator can read what the bot decided the strategy is --');
+
+function serverSrc(): string {
+  return readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+}
+
+test('the evidence survives a restart', () => {
+  // 40 entries at a handful of smart entries a day is weeks of observation.
+  // Dropping it on every restart would mean the profile never becomes usable
+  // at all, and a restart is a routine thing an operator does.
+  const src = serverSrc();
+  assert.ok(/loadEntryProfile\(\)/.test(src), 'the profile must be restored at boot');
+  assert.ok(/flushEntryProfile\(\)/.test(src), 'and flushed on the way out');
+  const shutdown = src.slice(src.indexOf('flushWalletLedger(); } catch'));
+  assert.ok(/flushEntryProfile\(\); } catch/.test(shutdown),
+    'flushed in the shutdown path beside the ledger, not only on a debounce timer');
+});
+
+test('the endpoint reports the derived rules and the evidence behind them', () => {
+  const src = serverSrc();
+  const idx = src.indexOf("app.get('/api/entry-profile'");
+  assert.ok(idx > 0, 'the derived strategy must be readable');
+  const body = src.slice(idx, src.indexOf('});', idx) + 3);
+  for (const field of ['rules', 'separation', 'enteredSamples', 'skippedSamples', 'notReady', 'skippedMedian']) {
+    assert.ok(body.includes(field), `${field} is part of judging whether a rule means anything`);
+  }
+});
+
+test('THE PANEL QUOTES THE REAL THRESHOLDS, IT DOES NOT RESTATE THEM', () => {
+  // A UI that hardcodes "needs 75%" beside a router that has moved to 0.8 is
+  // worse than no UI: it reports a rule the bot is not following. The endpoint
+  // must import the router's own constants.
+  const src = serverSrc();
+  assert.ok(/import \{ PROFILE_MIN_RULES, PROFILE_MIN_SCORE \} from '\.\/services\/playbookRouter'/.test(src),
+    'the thresholds must come from the module that enforces them');
+  assert.ok(/minScore: PROFILE_MIN_SCORE/.test(src) && /minRules: PROFILE_MIN_RULES/.test(src),
+    'and be surfaced as those values, not as literals that drift');
+});
+
+test('the panel shows the not-ready state instead of fabricating rules', () => {
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  const idx = app.indexOf('function EntryProfileSection()');
+  assert.ok(idx > 0, 'the learned profile needs a panel of its own');
+  const body = app.slice(idx);
+  assert.ok(/!ep\.usable/.test(body), 'an unusable profile must render as unusable');
+  assert.ok(/notReady/.test(body), 'and say exactly why, verbatim from the deriver');
+  assert.ok(/needEntered/.test(body) && /needSkipped/.test(body),
+    'with the distance to usable, so waiting reads as progress rather than as a broken feature');
+  assert.ok(/separation/.test(body), 'and the discrimination behind each rule, not just the band');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

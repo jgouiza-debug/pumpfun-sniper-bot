@@ -29,6 +29,8 @@ import { autoUpdateEnabled, updaterService } from './services/updaterService';
 import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
 import { flushGovernorState, loadGovernorState, setGovernorWalletProvider } from './services/tradeGovernor';
 import { flushWalletLedger, loadWalletLedger, walletLedger, WalletLedger } from './services/walletLedger';
+import { entryProfile, flushEntryProfile, loadEntryProfile, MIN_ENTERED_SAMPLES, MIN_SEPARATION, MIN_SKIPPED_SAMPLES } from './services/entryProfile';
+import { PROFILE_MIN_RULES, PROFILE_MIN_SCORE } from './services/playbookRouter';
 import { smartMoneyDetector } from './services/smartMoneySignal';
 // Reinstate a spend-governor halt from a previous session BEFORE anything can
 // trade. A restart is the natural response to a runaway, and it must not be the
@@ -46,6 +48,19 @@ loadGovernorState();
   if (restored > 0) {
     const promoted = walletLedger.promotedAddresses().length;
     console.log(`🧠 Wallet ledger restored: ${restored} wallet(s) known, ${promoted} promoted.`);
+  }
+}
+// The entry profile is slower to earn than the roster: it needs 40 tokens the
+// proven wallets actually took and 200 they passed on. At a handful of smart
+// entries a day that is weeks of observation, so dropping it on every restart
+// would mean the profile never becomes usable at all.
+{
+  const restored = loadEntryProfile();
+  if (restored > 0) {
+    const p = entryProfile.profile();
+    console.log(p.usable
+      ? `🔬 Entry profile restored: ${restored} snapshot(s), ${p.rules.length} rule(s) learned.`
+      : `🔬 Entry profile restored: ${restored} snapshot(s) — ${p.notReady}`);
   }
 }
 // ─── Hardened crash guards ──────────────────────────────────────────────────
@@ -373,6 +388,55 @@ app.post('/api/smart-money/config', requireApiToken, (req, res) => {
   walletLedger.reevaluate();
   flushWalletLedger();
   res.json({ ok: true, ...applied });
+});
+
+/**
+ * WHAT THE BOT THINKS THE STRATEGY IS.
+ *
+ * The roster endpoint answers "whose trades are we watching". This one answers
+ * the question the operator actually asked for: what do those traders LOOK FOR,
+ * expressed as numbers, so the sniper can find the same tokens on its own
+ * instead of waiting for someone else to buy first.
+ *
+ * Everything here is derived, never configured. `notReady` is returned verbatim
+ * rather than hidden, because "the profile is not driving anything yet and here
+ * is exactly how far off it is" is the honest state for most of the first
+ * fortnight, and a panel that showed plausible-looking rules built on nine
+ * samples would be worse than one that showed nothing.
+ */
+app.get('/api/entry-profile', (req, res) => {
+  const p = entryProfile.profile();
+  const counts = entryProfile.counts();
+  res.json({
+    enabled: featureFlags.get('smartMoneySniper'),
+    usable: p.usable,
+    notReady: p.notReady ?? null,
+    builtAt: p.builtAt,
+    enteredSamples: p.enteredSamples,
+    skippedSamples: p.skippedSamples,
+    needEntered: MIN_ENTERED_SAMPLES,
+    needSkipped: MIN_SKIPPED_SAMPLES,
+    minSeparation: MIN_SEPARATION,
+    // The bar a live token has to clear to be bought on the profile alone.
+    // Surfaced beside the rules so a 62%-on-4-rules candidate in the log reads
+    // as "close, and correctly refused" rather than as the bot ignoring itself.
+    minScore: PROFILE_MIN_SCORE,
+    minRules: PROFILE_MIN_RULES,
+    stored: counts,
+    rules: p.rules.map(r => ({
+      feature: r.feature,
+      label: r.label,
+      low: r.low,
+      high: r.high,
+      median: r.median,
+      // The contrast is the point: their median beside the median of what they
+      // walked past is what makes a band read as a choice rather than a range.
+      skippedMedian: r.skippedMedian,
+      separation: r.separation,
+      samples: r.samples,
+    })),
+    sentences: entryProfile.describe(),
+  });
 });
 
 app.get('/api/governor', (req, res) => {
@@ -1141,6 +1205,7 @@ function gracefulShutdown(reason: string, server?: http.Server): void {
     // is pending so a halt or a spend total is never lost on the way out.
     try { flushGovernorState(); } catch { /* best effort */ }
     try { flushWalletLedger(); } catch { /* best effort */ }
+    try { flushEntryProfile(); } catch { /* best effort */ }
     sniperEngine.markCleanShutdown();
   } catch { /* best effort on the way out */ }
   const done = () => process.exit(0);

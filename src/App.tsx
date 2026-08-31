@@ -230,6 +230,130 @@ function SmartMoneyPanel() {
         <br />
         Every entry from this lane still passes the same rug, honeypot and spend-governor checks as any other.
       </div>
+
+      <EntryProfileSection />
+    </div>
+  );
+}
+
+/**
+ * WHAT THE BOT LEARNED THEY LOOK FOR.
+ *
+ * The roster above answers "who". This answers "what for" — and it is the part
+ * that lets the sniper find a token BEFORE any of them buys it, instead of
+ * following one of them into a candle they already moved.
+ *
+ * Every number here is derived from tokens the bot watched: the bands are the
+ * middle of what the proven wallets took, and `separation` is the share of the
+ * launches they PASSED ON that fall outside that band. A rule with low
+ * separation describes tokens in general rather than their choices, which is why
+ * the derivation throws those away rather than showing them here.
+ *
+ * The not-ready state is shown in full rather than hidden. For most of the first
+ * fortnight that is the true state, and a table of confident-looking rules built
+ * on nine samples would be a worse lie than an empty panel.
+ */
+interface EntryProfileRule {
+  feature: string;
+  label: string;
+  low: number;
+  high: number;
+  median: number;
+  skippedMedian: number;
+  separation: number;
+  samples: number;
+}
+interface EntryProfileStatus {
+  enabled: boolean;
+  usable: boolean;
+  notReady: string | null;
+  enteredSamples: number;
+  skippedSamples: number;
+  needEntered: number;
+  needSkipped: number;
+  minScore: number;
+  minRules: number;
+  rules: EntryProfileRule[];
+}
+
+function EntryProfileSection() {
+  const [ep, setEp] = useState<EntryProfileStatus | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await apiFetch('/api/entry-profile');
+        if (r.ok && alive) setEp(await r.json());
+      } catch { /* backend unreachable — the RPC pill already says so */ }
+    };
+    pull();
+    // Slower than the roster poll: the profile only changes when a token is
+    // screened, and re-deriving fourteen percentile bands is not free.
+    const iv = setInterval(pull, 60_000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  if (!ep || !ep.enabled) return null;
+
+  const num = (n: number) => {
+    if (!Number.isFinite(n)) return '—';
+    if (Math.abs(n) >= 1000) return Math.round(n).toLocaleString();
+    if (Math.abs(n) >= 1) return String(Math.round(n * 10) / 10);
+    return String(Math.round(n * 1000) / 1000);
+  };
+
+  return (
+    <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(124,77,255,0.2)' }}>
+      <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#b388ff', marginBottom: '6px' }}>
+        🔬 What they look for — learned, then applied to every launch
+      </div>
+
+      {!ep.usable ? (
+        <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6 }}>
+          Not driving entries yet: {ep.notReady}.
+          <br />
+          Evidence so far: <strong>{ep.enteredSamples}</strong>/{ep.needEntered} tokens they bought,
+          {' '}<strong>{ep.skippedSamples}</strong>/{ep.needSkipped} they passed on. Both sides are needed —
+          the tokens they skipped are what make the comparison say anything.
+        </div>
+      ) : (
+        <>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', fontSize: '10px', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ color: '#8a8a8a', textAlign: 'left' }}>
+                  <th style={{ padding: '3px 6px' }}>They buy when</th>
+                  <th style={{ padding: '3px 6px' }}>Their band</th>
+                  <th style={{ padding: '3px 6px' }}>Their median</th>
+                  <th style={{ padding: '3px 6px' }}>Skipped median</th>
+                  <th style={{ padding: '3px 6px' }} title="Share of the launches they passed on that fall outside this band">Separation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ep.rules.map(r => (
+                  <tr key={r.feature} style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                    <td style={{ padding: '3px 6px' }}>{r.label}</td>
+                    <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{num(r.low)} – {num(r.high)}</td>
+                    <td style={{ padding: '3px 6px' }}>{num(r.median)}</td>
+                    <td style={{ padding: '3px 6px', color: '#8a8a8a' }}>{num(r.skippedMedian)}</td>
+                    <td style={{ padding: '3px 6px', color: r.separation >= 0.6 ? '#00e676' : '#ffab40' }}>
+                      {Math.round(r.separation * 100)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: '9px', color: '#8a8a8a', marginTop: '6px', lineHeight: 1.5 }}>
+            Built from {ep.enteredSamples} of their entries against {ep.skippedSamples} launches they passed on.
+            A fresh token is bought on this profile alone when it matches at least{' '}
+            <strong>{Math.round(ep.minScore * 100)}%</strong> of these rules by weight, on{' '}
+            <strong>{ep.minRules}</strong> or more of them — no wallet has to buy first.
+            Rules that fail to separate their picks from the rest are dropped rather than shown.
+          </div>
+        </>
+      )}
     </div>
   );
 }

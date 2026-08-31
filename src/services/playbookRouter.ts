@@ -78,6 +78,26 @@ function qualifyingSmartMoney(input: RouteInput, _config: PlaybookConfig): boole
   return true;
 }
 
+/**
+ * Does this token match the learned entry profile well enough to stand in for
+ * the demand evidence?
+ *
+ * TWO BARS, AND THE SECOND IS THE IMPORTANT ONE. A high score computed from a
+ * single rule is not a match — it is one coincidence. Requiring several rules
+ * to have been evaluable is what stops a token with almost no known features
+ * sailing through on the one field that happened to be present.
+ */
+export const PROFILE_MIN_SCORE = 0.75;
+export const PROFILE_MIN_RULES = 3;
+
+function qualifyingProfileMatch(input: RouteInput): boolean {
+  const pm = input.profileMatch;
+  if (!pm) return false;
+  if (!Number.isFinite(pm.score) || pm.score < PROFILE_MIN_SCORE) return false;
+  if (!Number.isFinite(pm.scoredOn) || pm.scoredOn < PROFILE_MIN_RULES) return false;
+  return true;
+}
+
 export function classifyPhase(
   input: PhaseInput,
   /** MIGRATION->POST_MIGRATION boundary. Risk tiers widen it (strict 90s, normal 180s). */
@@ -176,6 +196,29 @@ export interface RouteInput extends PhaseInput {
     wallets: number;
     /** 0-1, from the ledger's measured conviction in those wallets. */
     strength: number;
+  };
+  /**
+   * How well this token matches the entry criteria LEARNED from what proven
+   * traders actually buy. See entryProfile.
+   *
+   * This is the difference between following and finding. `smartMoney` above
+   * requires those wallets to have bought THIS token — we arrive after them,
+   * on a price their buying moved. This arrives from the same evidence without
+   * waiting for anybody: the bot screens every launch against the shape of
+   * token they select, and can be there first.
+   *
+   * It substitutes for exactly what `smartMoney` substitutes for — the demand
+   * proxies and the score tier — and for nothing else. The phase rules,
+   * liquidity floors, market-cap ceilings and every safety verdict are
+   * untouched. A learned profile says "this looks like the tokens they buy"; it
+   * says nothing about whether the token can be sold, which is what the safety
+   * gates are for.
+   */
+  profileMatch?: {
+    /** 0-1 weighted share of learned rules this token satisfies. */
+    score: number;
+    /** How many rules could be evaluated. A perfect score on one rule is not a match. */
+    scoredOn: number;
   };
 }
 
@@ -305,7 +348,10 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
       // therefore a no-op against the STRICT numbers.
       // A proven-wallet quorum IS the demand signal these proxies approximate,
       // so it stands in for them — and only for them. See RouteInput.smartMoney.
-      const smart = qualifyingSmartMoney(input, config);
+      // Either kind of proven-trader evidence stands in for the anonymous
+      // proxies: that they bought THIS token, or that this token matches what
+      // they buy. The second is the one that does not require arriving late.
+      const smart = qualifyingSmartMoney(input, config) || qualifyingProfileMatch(input);
       if (!smart) {
         const buyers2 = input.uniqueBuyers5m ?? 0;
         if (buyers2 > 1) {
@@ -318,7 +364,21 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
         }
       }
       const ok2 = reasons.length === 0 && (smart || scoreTier === 1);
-      if (!smart && scoreTier !== 1 && reasons.length === 0) reasons.push(`Play 2 requires score >= ${config.minScoreFullUnit}`);
+      if (!smart && scoreTier !== 1 && reasons.length === 0) {
+        reasons.push(`Play 2 requires score >= ${config.minScoreFullUnit}, or a learned-profile match`);
+      }
+      // The near miss is printed even when something else refused the token
+      // first, and deliberately so. A candidate the profile scored at 62% on
+      // four rules is the profile working and correctly declining; without the
+      // line it is indistinguishable in the log from a token the profile never
+      // looked at, which is what an operator would read as the feature being
+      // dead. Appended AFTER `ok2` is computed — a reason that could change
+      // eligibility by being logged would be a gate, not an explanation.
+      if (!ok2 && input.profileMatch && !qualifyingProfileMatch(input)) {
+        reasons.push(`Learned-profile match ${Math.round(input.profileMatch.score * 100)}%`
+          + ` on ${input.profileMatch.scoredOn} rules`
+          + ` — needs ${Math.round(PROFILE_MIN_SCORE * 100)}% on ${PROFILE_MIN_RULES}`);
+      }
       return { ...base, play: 'PLAY_2', eligible: ok2, sizeMultiplier: ok2 ? 1 : 0, reasons };
     }
 

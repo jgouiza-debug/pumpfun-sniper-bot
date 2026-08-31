@@ -30,6 +30,7 @@ import { broadcast, buildRoutes } from './txBroadcaster';
 import { walletLedger, WalletLedger, flushWalletLedger, loadWalletLedger } from './walletLedger';
 import { WalletHarvester, bondingCurveFor } from './walletHarvester';
 import { smartMoneyDetector, type SmartMoneySignal } from './smartMoneySignal';
+import { entryProfile, flushEntryProfile, type TokenSnapshot } from './entryProfile';
 import { WalletLogWatcher } from './walletLogWatcher';
 import { tradeEventsFromLogs } from './pumpEventDecoder';
 import { entryGateV2 } from './entryGateV2';
@@ -3451,6 +3452,19 @@ export class SniperEngine {
     latencyTimeline.annotate(mint, { liquidityIsAsserted: Boolean(launchData.liquidityIsAsserted) });
     latencyTimeline.stamp(mint, 't3FiltersDoneMs');
 
+    // ---- LEARNING WHAT THE GOOD TRADERS SELECT ON ------------------------
+    //
+    // Enrichment is complete here and nowhere earlier, so this is the only
+    // place the feature vector is true. Recorded on EVERY screened token, and
+    // classified by whether a proven wallet is buying this one right now.
+    //
+    // Both halves matter. The entries alone would teach the bot that good
+    // traders buy tokens with a creator and a bonding curve; it is the
+    // launches they passed on that make the comparison say anything.
+    const snapshot = this.snapshotFor(mint, launchData);
+    if (this.pendingSmartMoney.has(mint)) entryProfile.recordEntry(snapshot);
+    else entryProfile.recordSkipped(snapshot);
+
     // Sell-path safety. Replaces the hardcoded sellSimPassed/notHoneypot stubs
     // with an actual look at the mint: freeze authority, Token-2022 hooks/fees,
     // and RugCheck's own danger flags. Only runs for candidates that are still
@@ -3854,6 +3868,42 @@ export class SniperEngine {
         dudCandidates: this.dudCandidates.size,
         readBudgetRemaining: this.harvester?.budgetRemaining() ?? 0,
       },
+    };
+  }
+
+  /**
+   * What a token looks like right now, in the features the profile learns on.
+   *
+   * Every field is taken from measured enrichment, never from the placeholder
+   * constants the legacy gate uses when no DexScreener pair exists — a profile
+   * trained on `liquidityUsd: 3500` would learn the fabrication rather than the
+   * market. `undefined` is the honest answer for anything unmeasured, and the
+   * learner treats an absent feature as unknown rather than as zero.
+   */
+  private snapshotFor(mint: string, launchData: Partial<PumpTokenLaunch>): TokenSnapshot {
+    const asserted = Boolean(launchData.liquidityIsAsserted);
+    const measured = (v: number | undefined) => (typeof v === 'number' && v > 0 ? v : undefined);
+    return {
+      mint,
+      at: Date.now(),
+      ageSeconds: measured(launchData.ageSeconds),
+      curveProgressPct: typeof launchData.vSolInBondingCurve === 'number'
+        ? Math.max(0, Math.min(100, ((launchData.vSolInBondingCurve - 30) / 55) * 100))
+        : undefined,
+      marketCapUsd: measured(launchData.marketCapUsd),
+      devBuySol: measured(launchData.initialBuy),
+      devHoldingsPct: launchData.devHoldingsPct,
+      top10Pct: launchData.top10Pct,
+      bundledSupplyPct: launchData.bundledSupplyPct,
+      uniqueBuyers5m: launchData.uniqueBuyers5m,
+      buyPressurePct: launchData.buyPressurePct,
+      progressVelocity5m: launchData.progressVelocity5m,
+      volume5mUsd: launchData.hasLiveMarketData ? measured(launchData.volume5mUsd) : undefined,
+      // Never learn on an ASSERTED liquidity figure. It is the migration
+      // constant, identical on every migration, so it would look like a
+      // razor-sharp criterion and be a property of our own code.
+      liquidityUsd: asserted ? undefined : (launchData.hasLiveMarketData ? measured(launchData.liquidityUsd) : undefined),
+      socialCount: launchData.socialCount,
     };
   }
 
@@ -4567,6 +4617,23 @@ export class SniperEngine {
       const ageSeconds = launchData.ageSeconds ?? 0;
       const migratedAt = this.migrationSeenAt.get(filterResult.mint);
       const smartForRouter = this.pendingSmartMoney.get(filterResult.mint);
+      // ---- THE LEARNED PROFILE AS AN ENTRY REASON --------------------------
+      //
+      // This is the half of the strategy that does not need anyone else to act
+      // first. The confluence lane waits for proven wallets to buy and then
+      // buys the same mint — always second, always into the move they already
+      // made. The profile is what they were looking AT: the bands their own
+      // entries fall inside, derived from the tokens they took versus the
+      // hundreds they walked past. A token matching those bands is a token
+      // they would plausibly take, found by us, at whatever moment WE see it.
+      //
+      // Gated on the flag because it is the same strategy: with the lane off
+      // nothing is ever labelled an entry, so the profile stays unusable and
+      // scores 0 anyway. The explicit check makes that a decision rather than
+      // a coincidence of how the samples happen to be collected.
+      const profileMatch = featureFlags.get('smartMoneySniper')
+        ? entryProfile.score(this.snapshotFor(filterResult.mint, launchData))
+        : null;
       const decision: RouteDecision = routePlay({
         isMigrationEvent: isMigration,
         secondsSinceMigration: migratedAt ? (Date.now() - migratedAt) / 1000 : undefined,
@@ -4590,6 +4657,12 @@ export class SniperEngine {
         // fabricate `__smartMoney` on it. pendingSmartMoney is written only by
         // onSmartMoneySignal, from a quorum the detector actually formed.
         ...(smartForRouter ? { smartMoney: { wallets: smartForRouter.wallets.length, strength: smartForRouter.strength } } : {}),
+        // scoredOn is passed through because a score is meaningless without
+        // it: 100% on one evaluable rule is not a match, and the router is the
+        // place that refuses it rather than this call site pre-judging.
+        ...(profileMatch && profileMatch.scoredOn > 0
+          ? { profileMatch: { score: profileMatch.score, scoredOn: profileMatch.scoredOn } }
+          : {}),
       }, this.activePlaybook());
 
       latencyTimeline.annotate(filterResult.mint, {
