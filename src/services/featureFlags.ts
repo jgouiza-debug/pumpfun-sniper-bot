@@ -72,6 +72,19 @@ export interface FeatureFlagSet {
    * the highest rug density — opt-in, owner decision 2026-08-12.
    */
   launchSnipe: boolean;
+  /**
+   * Smart-money sniper: enter when several INDEPENDENTLY-PROVEN wallets buy the
+   * same token inside a short window.
+   *
+   * Off by default and it must stay that way until an operator has looked at
+   * the roster. The wallets are earned from chain evidence rather than pasted
+   * in (see walletLedger), which means a fresh install has NO promoted wallets
+   * and this flag does nothing at all until the harvester has gathered days of
+   * history. Turning it on before that is not dangerous, just inert — and
+   * turning it on after that spends real money on strangers the bot chose, so
+   * it is a decision, not a default.
+   */
+  smartMoneySniper: boolean;
 }
 
 /**
@@ -110,6 +123,7 @@ export const DEFAULTS: FeatureFlagSet = {
   // wrong to run.
   allInSizing: false,
   launchSnipe: false,
+  smartMoneySniper: false,
 };
 
 /**

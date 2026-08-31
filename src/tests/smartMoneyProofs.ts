@@ -19,6 +19,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { WalletLedger, DEFAULT_PROMOTION_THRESHOLDS } from '../services/walletLedger';
 import { WalletHarvester, HARVESTER_LIMITS, bondingCurveFor } from '../services/walletHarvester';
+import { SmartMoneyDetector, DEFAULT_CONFLUENCE } from '../services/smartMoneySignal';
 
 let passed = 0;
 let failed = 0;
@@ -475,6 +476,296 @@ test('the same mint is never harvested twice', async () => {
   const before = calls;
   await h.harvest(MINT, true);
   assert.strictEqual(calls, before, 're-reading a harvested mint buys nothing and costs the budget');
+});
+
+console.log('\n-- Confluence: several proven wallets agreeing, not one wallet mirrored --');
+
+const MINT = 'MintZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZpump';
+
+/** A ledger with `n` promoted wallets, named P0..Pn-1. */
+function promotedLedger(n: number): WalletLedger {
+  const l = new WalletLedger();
+  for (let i = 0; i < n; i++) withRecord(l, `P${i}`, 12, 9);
+  l.reevaluate(T0 + 10_000);
+  for (let i = 0; i < n; i++) {
+    assert.strictEqual(l.get(`P${i}`)!.state, 'promoted', `P${i} should be promoted`);
+  }
+  return l;
+}
+
+const buy = (wallet: string, at: number, solIn = 1, mint = MINT) => ({ wallet, mint, solIn, at });
+
+test('one promoted wallet buying is not a signal', () => {
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  assert.strictEqual(d.observe(buy('P0', T0)), null);
+});
+
+test('two promoted wallets inside the window fire once', () => {
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  assert.strictEqual(d.observe(buy('P0', T0)), null);
+  const sig = d.observe(buy('P1', T0 + 5_000));
+  assert.ok(sig, 'quorum should fire');
+  assert.deepStrictEqual(sig!.wallets.sort(), ['P0', 'P1']);
+  assert.strictEqual(sig!.totalSolIn, 2);
+});
+
+test('ONE WALLET CANNOT BE ITS OWN QUORUM', () => {
+  // A DCA ladder, or a bot splitting one order across five transactions to hide
+  // its size, is ONE opinion. Counting it as five is how a "confluence"
+  // detector fires on a single participant — the defect that would make this
+  // whole idea worthless, and the easiest one to write by accident.
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  for (let i = 0; i < 6; i++) {
+    assert.strictEqual(d.observe(buy('P0', T0 + i * 1000, 1)), null,
+      `buy ${i + 1} from the same wallet must not build a quorum`);
+  }
+});
+
+test('an UNPROMOTED wallet contributes nothing, however much it buys', () => {
+  const l = promotedLedger(1);
+  l.recordBuy('Stranger', MINT, 50, T0);   // exists in the ledger, not promoted
+  const d = new SmartMoneyDetector(l);
+  assert.strictEqual(d.observe(buy('Stranger', T0, 50)), null);
+  assert.strictEqual(d.observe(buy('P0', T0 + 1_000)), null,
+    'the stranger must not have counted toward the quorum');
+});
+
+test('an unpromoted wallet is not even TRACKED — the front door is a real guard', () => {
+  // The quorum is guarded twice: once when a buy arrives and again when the
+  // signal fires. The second alone keeps the RULE correct, which is why
+  // removing the first passed every behavioural test — so this pins the first
+  // on its own observable effect. Without it the detector accumulates a buy
+  // from every wallet on the chain, and its bounded map fills with noise that
+  // evicts the mints actually being watched.
+  const l = promotedLedger(1);
+  l.recordBuy('Stranger', MINT, 50, T0);
+  const d = new SmartMoneyDetector(l);
+  d.observe(buy('Stranger', T0, 50));
+  assert.deepStrictEqual(d.pending(T0 + 1), [],
+    'an unproven wallet must not occupy a slot in the tracker at all');
+});
+
+test('a wallet DEMOTED between its buy and the quorum does not count', () => {
+  // A signal is only as good as the wallets standing behind it at the moment it
+  // fires, not at the moment each of them bought.
+  const l = promotedLedger(2);
+  const d = new SmartMoneyDetector(l);
+  assert.strictEqual(d.observe(buy('P0', T0)), null);
+  l.pin('P0', 'never', T0 + 1_000);
+  assert.strictEqual(l.get('P0')!.state, 'demoted');
+  assert.strictEqual(d.observe(buy('P1', T0 + 2_000)), null,
+    'quorum must be re-checked against current standing');
+});
+
+test('agreement outside the window is not agreement', () => {
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  assert.strictEqual(d.observe(buy('P0', T0)), null);
+  const late = T0 + DEFAULT_CONFLUENCE.windowMs + 5_000;
+  assert.strictEqual(d.observe(buy('P1', late), late), null,
+    'two wallets minutes apart are two opinions, not a convergence');
+});
+
+test('a dust buy does not count toward the quorum', () => {
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  assert.strictEqual(d.observe(buy('P0', T0, 0.001)), null);
+  assert.strictEqual(d.observe(buy('P1', T0 + 1000, 1)), null,
+    'a wallet that risked nothing has not expressed a view');
+});
+
+test('THE SIGNAL FIRES ONCE — the third and fourth wallet do not re-fire it', () => {
+  // Without a cooldown, wallets 3, 4 and 5 arriving a second later each produce
+  // another signal and the engine sees several entries for one event.
+  const d = new SmartMoneyDetector(promotedLedger(5));
+  d.observe(buy('P0', T0));
+  assert.ok(d.observe(buy('P1', T0 + 1_000)), 'first quorum fires');
+  assert.strictEqual(d.observe(buy('P2', T0 + 2_000)), null, 'a third wallet must not re-fire');
+  assert.strictEqual(d.observe(buy('P3', T0 + 3_000)), null);
+  assert.strictEqual(d.observe(buy('P4', T0 + 4_000)), null);
+});
+
+test('after the cooldown the same mint may fire again', () => {
+  const d = new SmartMoneyDetector(promotedLedger(4));
+  d.observe(buy('P0', T0));
+  assert.ok(d.observe(buy('P1', T0 + 1_000)));
+  const later = T0 + DEFAULT_CONFLUENCE.cooldownMs + 60_000;
+  d.observe(buy('P2', later));
+  assert.ok(d.observe(buy('P3', later + 1_000), later + 1_000),
+    'a genuinely new convergence later is a new signal');
+});
+
+test('strength is bounded, and measured against the configured bar', () => {
+  const l = promotedLedger(4);
+
+  const fireAt = (minWallets: number, mint: string) => {
+    const d = new SmartMoneyDetector(l);
+    d.setConfig({ minWallets });
+    let sig = null;
+    for (let i = 0; i < minWallets; i++) sig = d.observe(buy(`P${i}`, T0 + i * 1000, 1, mint));
+    return sig!;
+  };
+
+  const two = fireAt(2, 'MintTwo');
+  const four = fireAt(4, 'MintFour');
+  for (const s of [two, four]) {
+    assert.ok(s && s.strength > 0 && s.strength <= 1, `strength out of range: ${s?.strength}`);
+  }
+  // Both fired at exactly their configured minimum, so neither earns an excess
+  // bonus and the two strengths match. That is the intended property: strength
+  // measures how far past the BAR the agreement went, not the raw wallet count.
+  // Rewarding the raw count would rate a lax config higher than a strict one on
+  // identical evidence.
+  assert.strictEqual(two.strength, four.strength,
+    'agreement is measured against the configured minimum, not in absolute wallets');
+});
+
+test('agreement beyond the minimum raises strength, with diminishing weight', () => {
+  // The signal fires on the TRANSITION into quorum, so a fire with more wallets
+  // than the minimum cannot be produced by feeding buys one at a time — the
+  // quorum completes at the minimum every time. The decay rule is therefore
+  // asserted against the shipped source; its bounds are covered behaviourally
+  // by the test above.
+  const src = readFileSync(join(__dirname, '..', 'services', 'smartMoneySignal.ts'), 'utf8');
+  const idx = src.indexOf('const excess =');
+  assert.ok(idx > 0, 'strength must account for agreement beyond the minimum');
+  const body = src.slice(idx, idx + 400);
+  assert.ok(/Math\.pow\(0\.6, excess\)/.test(body),
+    'the bonus must decay — four wallets is better than two, not twice as good');
+  assert.ok(/clamp01\(/.test(body), 'and the result must be bounded to 0-1');
+});
+
+test('nonsense observations are refused rather than tracked', () => {
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  assert.strictEqual(d.observe({ wallet: '', mint: MINT, solIn: 1, at: T0 }), null);
+  assert.strictEqual(d.observe({ wallet: 'P0', mint: '', solIn: 1, at: T0 }), null);
+  assert.strictEqual(d.observe({ wallet: 'P0', mint: MINT, solIn: NaN, at: T0 }), null);
+});
+
+test('the pending view shows what is accumulating without firing anything', () => {
+  const d = new SmartMoneyDetector(promotedLedger(3));
+  d.observe(buy('P0', T0));
+  const p = d.pending(T0 + 1000);
+  assert.strictEqual(p.length, 1);
+  assert.strictEqual(p[0].wallets, 1);
+  assert.strictEqual(p[0].needed, DEFAULT_CONFLUENCE.minWallets);
+});
+
+console.log('\n-- The entry path: no shortcut, no second door --');
+
+const engineSrc = () => readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+
+test('THE SMART-MONEY LANE DOES NOT FABRICATE A PASSING GATE RESULT', () => {
+  // fireLaunchSnipe, a few lines away in the same file, constructs a
+  // `FilterResult { isSafe: true, score: 0 }` and goes straight to commitEntry.
+  // That is defensible for a block-0 launch snipe, where no data about the
+  // token exists yet. It is NOT defensible here: a confluence signal arrives on
+  // a token several wallets have already bought, so RugCheck, DexScreener, the
+  // honeypot inspection and the entry gate all have real data. Skipping them
+  // would let this lane buy a honeypot every other lane refuses — and "someone
+  // good bought it" is not evidence that the sell path works.
+  const src = engineSrc();
+  const start = src.indexOf('private async onSmartMoneySignal(');
+  assert.ok(start > 0, 'the signal handler must exist');
+  const body = src.slice(start, src.indexOf('\n  private ', start + 10));
+  assert.ok(/await this\.processIncomingToken\(/.test(body),
+    'the lane must enter through the full screening pipeline');
+  assert.ok(!/isSafe:\s*true/.test(body),
+    'it must never construct its own passing verdict');
+  assert.ok(!/commitEntry\(/.test(body),
+    'and it must not call commitEntry directly, which would skip the gate entirely');
+});
+
+test('it invents no curve numbers for the gate to decide on', () => {
+  // handleWatchedTrade legitimately passes real curve state it has been
+  // tracking. This lane has none, and the audit already found what happens when
+  // a gate decides against an asserted rather than measured liquidity figure.
+  const src = engineSrc();
+  const start = src.indexOf('private async onSmartMoneySignal(');
+  const body = src.slice(start, src.indexOf('\n  private ', start + 10));
+  for (const field of ['vSolInBondingCurve', 'vTokensInBondingCurve', 'marketCapSol', 'bondingProgress']) {
+    assert.ok(!new RegExp(`${field}\\s*:`).test(body),
+      `${field} must not be fabricated here — processIncomingToken fetches real data for a token this age`);
+  }
+});
+
+test('conviction sizing can only shrink a slot, never grow one', () => {
+  // The run budget already decided what a safe position is. A signal being
+  // strong is not a reason to exceed it, and a rule that could would let a run
+  // of confident-looking signals talk the engine into a bet the wallet was
+  // never sized for.
+  const src = engineSrc();
+  const idx = src.indexOf('const smartSignal = entryMint');
+  assert.ok(idx > 0, 'the sizing hook must exist');
+  const body = src.slice(idx, idx + 900);
+  assert.ok(/if \(scaled < unitSizeSol\)/.test(body),
+    'the scaled size must only be applied when it is SMALLER than the slot');
+  assert.ok(/SMART_MONEY_MIN_SIZE_FRACTION/.test(body),
+    'and there must be a floor, or a weak signal produces an order too small to clear its fees');
+
+  // The scale must be bounded to (0, 1]: derive it the way the engine does and
+  // check the endpoints.
+  const FLOOR = Number(/SMART_MONEY_MIN_SIZE_FRACTION = ([\d.]+)/.exec(src)?.[1]);
+  assert.ok(Number.isFinite(FLOOR) && FLOOR > 0 && FLOOR < 1, `bad floor: ${FLOOR}`);
+  const scaleFor = (strength: number) => FLOOR + (1 - FLOOR) * Math.max(0, Math.min(1, strength));
+  assert.strictEqual(scaleFor(1), 1, 'a maximal signal takes exactly one slot, never more');
+  assert.strictEqual(scaleFor(0), FLOOR, 'a zero-strength signal is floored, not zeroed');
+  assert.ok(scaleFor(2) <= 1, 'an out-of-range strength cannot exceed a full slot');
+});
+
+test('the watch feed is watch-only — it places no orders of its own', () => {
+  const src = engineSrc();
+  const start = src.indexOf('private startSmartMoneyWatcher()');
+  assert.ok(start > 0);
+  const body = src.slice(start, src.indexOf('private syncSmartMoneyRoster', start));
+  for (const forbidden of ['executeRealMainnetTrade', 'executeExternalTrade', 'commitEntry', 'sendRawTransaction']) {
+    assert.ok(!body.includes(forbidden),
+      `the wallet feed must not reach ${forbidden} — it observes, the engine decides`);
+  }
+  assert.ok(/tradeEventsFromLogs\(/.test(body),
+    'and it must decode from the log lines it already has, with no RPC per event');
+});
+
+test('the roster feed subscribes ONLY to promoted wallets', () => {
+  const src = engineSrc();
+  const idx = src.indexOf('private syncSmartMoneyRoster()');
+  assert.ok(idx > 0);
+  const body = src.slice(idx, idx + 400);
+  assert.ok(/walletLedger\.promotedAddresses\(\)/.test(body),
+    'the subscription set must come from the promoted list, not from every wallet seen');
+});
+
+test('the lane is tied to the RUN, not to the process', () => {
+  // A paused bot holding open wallet subscriptions is a bot that looks off and
+  // is not, and an armed one waiting on a two-minute timer to notice its roster
+  // misses the first signals of the session.
+  const src = engineSrc();
+  assert.ok(/this\.startSmartMoneyWatcher\(\);/.test(src), 'arming must start the feed');
+  assert.ok(/this\.stopSmartMoneyWatcher\(\);/.test(src), 'disarming must stop it');
+});
+
+test('an empty roster is announced, not left silent', () => {
+  // A fresh install has no promoted wallets by construction — the roster is
+  // earned, not shipped. An operator who turns the flag on and hears nothing
+  // will assume it is broken, or worse assume it is working.
+  const src = engineSrc();
+  const idx = src.indexOf('private announceSmartMoneyRoster()');
+  assert.ok(idx > 0, 'the lane must say what it will actually do at arm time');
+  const body = src.slice(idx, src.indexOf('\n  private ', idx + 10));
+  assert.ok(/roster\.length === 0/.test(body), 'the empty case must be handled explicitly');
+  assert.ok(/'warn'/.test(body), 'and said at a level the operator will notice');
+});
+
+test('the flag ships OFF and is declared, or the flag suite fails', () => {
+  const flags = readFileSync(join(__dirname, '..', 'services', 'featureFlags.ts'), 'utf8');
+  assert.ok(/smartMoneySniper: boolean;/.test(flags), 'the flag must be declared on the type');
+  assert.ok(/smartMoneySniper: false,/.test(flags), 'and default to off');
+  // If it were ever added to PACKAGED_DEFAULTS it must also be declared in
+  // INTENDED_PACKAGED_DIVERGENCE — run.ts enforces that, and this records why.
+  const packagedIdx = flags.indexOf('PACKAGED_DEFAULTS');
+  const packagedBlock = flags.slice(packagedIdx, flags.indexOf('INTENDED_PACKAGED_DIVERGENCE'));
+  if (/smartMoneySniper: true/.test(packagedBlock)) {
+    assert.ok(/'smartMoneySniper'/.test(flags.slice(flags.indexOf('INTENDED_PACKAGED_DIVERGENCE'))),
+      'a flag turned on in the packaged set must be declared as intended divergence');
+  }
 });
 
 console.log('\n-- The design promise: no addresses are shipped --');

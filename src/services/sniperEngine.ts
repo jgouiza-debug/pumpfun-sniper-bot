@@ -27,6 +27,10 @@ import { featureFlags } from './featureFlags';
 import { latencyTimeline } from './latencyTimeline';
 import { slotDelta, SlotDeltaTracker } from './slotDelta';
 import { broadcast, buildRoutes } from './txBroadcaster';
+import { walletLedger } from './walletLedger';
+import { smartMoneyDetector, type SmartMoneySignal } from './smartMoneySignal';
+import { WalletLogWatcher } from './walletLogWatcher';
+import { tradeEventsFromLogs } from './pumpEventDecoder';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
@@ -192,6 +196,16 @@ const RPC_FAILOVER_FAILURE_THRESHOLD = 5;
 const RPC_FAILOVER_MIN_STREAK_MS = 5_000;
 /** How long to stay on the fallback before giving the primary another chance. */
 const RPC_PRIMARY_RETRY_MS = 120_000;
+/** How often the promoted roster is re-evaluated and the subscriptions re-synced. */
+const SMART_MONEY_ROSTER_SYNC_MS = 120_000;
+/**
+ * Smallest share of a slot a smart-money entry may be sized to.
+ *
+ * A weak signal takes a smaller position; it does not take a meaningless one.
+ * Below roughly this fraction the fees on both legs eat the trade, so an order
+ * that small is a donation to the network rather than a position.
+ */
+const SMART_MONEY_MIN_SIZE_FRACTION = 0.4;
 /** ~150 slots at ~400ms. Past this the feed's state is of unknown age. */
 const DEFAULT_MAX_FEED_STALE_SLOTS = 150;
 
@@ -1780,9 +1794,15 @@ export class SniperEngine {
 
       this.log('info', `🚀 SMART SNIPER BOT STARTED! Listening for ${this.config.leniencyMode.toUpperCase()} mode sniping opportunities... (run ${reportService.getRunId()})`);
       this.subscribeStream();
+      // Tied to the run, not to the process: a paused bot must not keep
+      // subscriptions open, and an armed one should not be waiting on a timer
+      // to notice the roster.
+      this.startSmartMoneyWatcher();
+      this.announceSmartMoneyRoster();
     } else {
       this.config.isBotActive = false;
       this.unsubscribeStream();
+      this.stopSmartMoneyWatcher();
       realModeLock.release('sniper');
       // Armed snipes die with the run — a wakeup should never fire a buy that
       // was armed before the pause.
@@ -3478,6 +3498,159 @@ export class SniperEngine {
     }, arrivalMs);
   }
 
+  // ---------------- SMART-MONEY LANE (flag smartMoneySniper) ----------------
+
+  /** Watch-only subscriptions over the promoted roster. Never places an order itself. */
+  private smartMoneyWatcher: WalletLogWatcher | null = null;
+  private smartMoneyRosterTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * Subscribe to the promoted roster and keep the subscription set in step with
+   * the ledger.
+   *
+   * WATCH-ONLY, and that distinction is the whole design. The copy trader
+   * subscribes to wallets in order to MIRROR them — one leader buys, we buy.
+   * This subscribes in order to LISTEN: nothing here places an order, it only
+   * feeds observations to the confluence detector, which fires only when
+   * several independently-proven wallets converge. A second WalletLogWatcher
+   * instance rather than sharing the copy trader's, because the two have
+   * different rosters and different lifecycles, and `setAddresses` was written
+   * to hot-diff exactly this way — new addresses subscribe, dropped ones
+   * unsubscribe, no reconnect.
+   */
+  private startSmartMoneyWatcher(): void {
+    if (!featureFlags.get('smartMoneySniper')) return;
+    if (!this.config.heliusApiKey) {
+      this.log('warn', '🧠 Smart-money sniper is on but there is no Helius key — the wallet feed needs one. Nothing will be watched.');
+      return;
+    }
+    if (!this.smartMoneyWatcher) {
+      this.smartMoneyWatcher = new WalletLogWatcher({
+        getWsUrl: () => rpcWsEndpoint(this.config.heliusApiKey),
+        // 'processed', same as the copy trader's lane: the point is to hear
+        // about a buy while it still matters, and a confluence that arrives at
+        // 'confirmed' has already been front-run by everyone else watching.
+        commitment: 'processed',
+        onLog: (ev) => {
+          if (ev.err) return;                       // a failed tx moved nothing
+          // Zero RPC: the buy is fully described by the log lines already in
+          // hand. Same decoder the copy trader's fast lane runs.
+          for (const t of tradeEventsFromLogs(ev.logs)) {
+            if (!t.isBuy || t.user !== ev.address) continue;
+            const solIn = Number(t.solLamports) / 1e9;
+            walletLedger.recordBuy(t.user, t.mint, solIn);
+            const sig = smartMoneyDetector.observe(
+              { wallet: t.user, mint: t.mint, solIn, at: Date.now(), slot: ev.slot || undefined },
+            );
+            if (sig) void this.onSmartMoneySignal(sig);
+          }
+        },
+        log: (level, msg) => this.log(level === 'warn' ? 'warn' : 'info', `[SmartMoney] ${msg}`),
+      });
+    }
+    this.syncSmartMoneyRoster();
+    this.smartMoneyWatcher.start();
+
+    if (!this.smartMoneyRosterTimer) {
+      // The roster changes when the ladder re-evaluates, which is not on this
+      // clock — so it is re-synced on a timer rather than pushed. Cheap:
+      // setAddresses diffs and does nothing when nothing changed.
+      this.smartMoneyRosterTimer = setInterval(() => {
+        walletLedger.reevaluate();
+        this.syncSmartMoneyRoster();
+      }, SMART_MONEY_ROSTER_SYNC_MS);
+      this.smartMoneyRosterTimer.unref?.();
+    }
+  }
+
+  /**
+   * Say what the lane will actually do, at arm time.
+   *
+   * A fresh install has NO promoted wallets — the roster is earned from chain
+   * evidence, so on day one this lane is inert by construction. That is the
+   * correct behaviour and the worst possible thing to leave silent: an operator
+   * who turned the flag on and hears nothing will assume it is broken, or worse
+   * assume it is working.
+   */
+  private announceSmartMoneyRoster(): void {
+    if (!featureFlags.get('smartMoneySniper')) return;
+    const roster = walletLedger.promotedAddresses();
+    const total = walletLedger.size();
+    if (roster.length === 0) {
+      this.log('warn',
+        `🧠 Smart-money sniper is ON but no wallet has earned promotion yet `
+        + `(${total} seen, 0 promoted). This lane will produce nothing until the harvester has `
+        + `gathered enough history — that is by design: the roster is proven from chain data, not pasted in.`);
+      return;
+    }
+    const cfg = smartMoneyDetector.getConfig();
+    this.log('info',
+      `🧠 Smart-money sniper watching ${roster.length} promoted wallet(s) of ${total} seen. `
+      + `An entry needs ${cfg.minWallets} of them to buy the same token within ${cfg.windowMs / 1000}s.`);
+  }
+
+  private syncSmartMoneyRoster(): void {
+    if (!this.smartMoneyWatcher) return;
+    const roster = walletLedger.promotedAddresses();
+    this.smartMoneyWatcher.setAddresses(roster);
+  }
+
+  private stopSmartMoneyWatcher(): void {
+    this.smartMoneyWatcher?.stop();
+    this.smartMoneyWatcher = null;
+    if (this.smartMoneyRosterTimer) clearInterval(this.smartMoneyRosterTimer);
+    this.smartMoneyRosterTimer = null;
+  }
+
+  /**
+   * Several proven wallets just converged on a mint. Turn that into a candidate
+   * — through the SAME door every other entry uses.
+   *
+   * NO SHORTCUT. `fireLaunchSnipe` exists a few lines below and fabricates a
+   * `FilterResult { isSafe: true, score: 0 }` to skip the gate entirely, which
+   * is defensible for a block-0 launch snipe where no data exists yet. It is
+   * NOT defensible here: a smart-money signal arrives on a token that has been
+   * trading long enough for several wallets to have bought it, so RugCheck,
+   * DexScreener, the honeypot inspection and the entry gate all have real data
+   * to work with. Skipping them because a promoted wallet bought would mean
+   * this lane can buy a honeypot that every other lane would refuse — and
+   * "someone good bought it" is not evidence the sell path works.
+   */
+  private async onSmartMoneySignal(sig: SmartMoneySignal): Promise<void> {
+    if (!this.config.isBotActive) return;
+    if (this.activePositions.some(p => p.mint === sig.mint)) return;
+    if (this.entriesInFlight.has(sig.mint)) return;
+
+    this.log('snipe',
+      `🧠 [SMART MONEY] ${sig.wallets.length} proven wallets bought ${sig.mint.slice(0, 8)}… within `
+      + `${Math.round((sig.lastAt - sig.firstAt) / 1000)}s (${sig.totalSolIn} SOL between them, `
+      + `strength ${(sig.strength * 100).toFixed(0)}%). Screening it.`, sig.mint);
+
+    this.pendingSmartMoney.set(sig.mint, sig);
+    try {
+      // The same synthetic-create injection handleWatchedTrade uses. The curve
+      // fields are left undefined deliberately: processIncomingToken fetches
+      // real DexScreener and RugCheck data for a token this age, and inventing
+      // curve numbers here would give the gate a fabricated liquidity figure to
+      // decide on — the exact defect the audit found in the migration path.
+      await this.processIncomingToken({
+        mint: sig.mint,
+        txType: 'create',
+        symbol: undefined,
+        __smartMoney: {
+          wallets: sig.wallets.length,
+          strength: sig.strength,
+          totalSolIn: sig.totalSolIn,
+        },
+      }, Date.now());
+    } finally {
+      this.pendingSmartMoney.delete(sig.mint);
+    }
+  }
+
+  /** Signals being screened right now, keyed by mint — read by the sizing path. */
+  private pendingSmartMoney = new Map<string, SmartMoneySignal>();
+
   /**
    * Launch-snipe fast lane (Play 1, flag launchSnipe). Decides on the create
    * payload alone — the only data that exists within the first second of a
@@ -4025,6 +4198,39 @@ export class SniperEngine {
           buyAmountSol: this.config.buyAmountSol,
           sizeMultiplier,
         });
+
+    // CONVICTION SIZING, SMART-MONEY LANE ONLY, AND ONLY DOWNWARDS.
+    //
+    // computeRunBudget's rule stands and is not being overturned: "a slot
+    // already IS the per-trade risk unit… conviction belongs in the decision to
+    // enter, not in shaving an already-sized bet." That reasoning is about the
+    // ROUTER's 1 / 0.5 tier, which is a guess dressed as a number.
+    //
+    // This lane is different in one specific way: its conviction is not a guess.
+    // It is the measured record of the wallets that agreed — win rates and
+    // realized PnL this bot computed from chain history, weighted by sample
+    // size. Ignoring that would mean betting the same amount on two wallets
+    // scraping past the bar as on five with long records.
+    //
+    // Deliberately one-directional. Strength can only REDUCE a slot, never
+    // raise it above the size the run budget already decided is safe — so the
+    // worst this can do is take a smaller position than planned, and no
+    // combination of strong signals can talk the engine into a larger bet than
+    // the wallet was sized for. The floor keeps a weak-but-passing signal from
+    // becoming an order too small to clear its own fees.
+    const entryMint = launchData.mint || '';
+    const smartSignal = entryMint ? this.pendingSmartMoney.get(entryMint) : undefined;
+    if (smartSignal) {
+      const strength = Math.max(0, Math.min(1, smartSignal.strength));
+      const scale = SMART_MONEY_MIN_SIZE_FRACTION + (1 - SMART_MONEY_MIN_SIZE_FRACTION) * strength;
+      const scaled = Number((unitSizeSol * scale).toFixed(6));
+      if (scaled < unitSizeSol) {
+        this.log('info',
+          `🧠 Sizing this entry at ${(scale * 100).toFixed(0)}% of a slot `
+          + `(${scaled} SOL of ${unitSizeSol}) — signal strength ${(smartSignal.strength * 100).toFixed(0)}%.`, entryMint);
+        unitSizeSol = scaled;
+      }
+    }
 
     // Never order more than the balance can actually fund, fees and the
     // slippage buffer included.
