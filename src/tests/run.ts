@@ -2375,9 +2375,24 @@ console.log('\n-- Security: API origin/auth, key handling, lock atomicity --');
     const server = src('server.ts');
     assert.ok(/app\.use\(originGuard\)/.test(server), 'the origin guard must run before any handler');
     assert.ok(!/app\.use\(cors\(\)\)/.test(server), 'wildcard CORS must be gone');
-    const gate = server.slice(server.indexOf("app.use('/api'"), server.indexOf("app.use('/api'") + 400);
+
+    // CORS is scoped to /api, so the document that carries the injected bearer
+    // token is same-origin-only. A wildcard app.use(cors(...)) reflected every
+    // loopback origin on THAT page too, which let any page served from any
+    // other local port fetch '/' , read __SNIPER_API_TOKEN__ out of the HTML,
+    // and then drive the trading endpoints with full authority.
+    assert.ok(/app\.use\('\/api', cors\(/.test(server),
+      'CORS must not apply to the document that carries the API token');
+
+    // Locate the token gate itself rather than the first /api middleware —
+    // there is now more than one.
+    const gateAt = server.indexOf('return requireApiToken(req, res, next)');
+    assert.ok(gateAt > 0, 'the token gate must exist');
+    const gate = server.slice(Math.max(0, gateAt - 600), gateAt + 100);
     assert.ok(/requireApiToken/.test(gate) && /req\.method === 'GET'/.test(gate),
       'non-GET /api traffic must be token-gated wholesale');
+    assert.ok(!/req\.path === '\/server\/shutdown'/.test(gate),
+      'shutdown must NOT be exempt — killing the process abandons open positions mid-flight');
   });
 
   test('process faults are never swallowed silently', () => {

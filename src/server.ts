@@ -67,7 +67,21 @@ app.use(originGuard);
 
 // CORS headers still matter for the instance switcher: the UI served by :3001
 // reads responses from the API on :3002. Loopback only, mirroring the guard.
-app.use(cors({
+//
+// SCOPED TO /api. It used to be app.use(cors(...)) — every route, including the
+// one that serves index.html with this instance's bearer token injected into it.
+// Reflecting every loopback origin on that document meant any page served from
+// ANY other local port (a vite dev server, a docs site, another tool's
+// dashboard, a local game) could do
+//
+//     fetch('http://localhost:3001/').then(r => r.text())
+//
+// read the response, pull __SNIPER_API_TOKEN__ out of it, and then drive the
+// trading endpoints with full authority. The token gate was not a gate.
+//
+// The document is same-origin-only now; the API keeps the loopback CORS the
+// instance switcher needs.
+app.use('/api', cors({
   origin: (origin, cb) => cb(null, !origin || isLoopbackOrigin(origin)),
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Sniper-Token'],
 }));
@@ -101,7 +115,14 @@ app.get('/api/session-token', (req, res) => {
 // remembering. GETs stay open behind the origin guard — they are status reads.
 app.use('/api', (req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
-  if (req.path === '/heartbeat' || req.path === '/server/shutdown') return next();
+  // The heartbeat is a liveness ping with no authority and is left open so a
+  // page that has lost its token cannot make the server think every UI is gone.
+  //
+  // /server/shutdown is NOT exempt any more. Killing the process while it holds
+  // open positions abandons them mid-flight — there is no more destructive call
+  // in this API — and it was reachable, unauthenticated, from any local page or
+  // any process on the machine.
+  if (req.path === '/heartbeat') return next();
   return requireApiToken(req, res, next);
 });
 
