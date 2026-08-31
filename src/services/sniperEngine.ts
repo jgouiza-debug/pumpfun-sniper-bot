@@ -2901,9 +2901,17 @@ export class SniperEngine {
       if (this.curveWatcher.watch(mint)) {
         ownsCurveSub = true;
       } else {
-        const evicted = this.curveWatcher.evictOldest();
+        // Open positions are exempt: they are the oldest entries by
+        // construction (watched while still candidates), so unguarded
+        // oldest-first eviction targets them FIRST.
+        const evicted = this.curveWatcher.evictOldest(new Set([
+          ...this.activePositions.map(p => p.mint),
+          ...this.copyHeldMintsProvider(),
+        ]));
         if (evicted) tokenWatchlist.remove(evicted);
-        ownsCurveSub = this.curveWatcher.watch(mint);
+        // A null eviction means every slot is held by a live position. Watching
+        // anyway would exceed the cap; the candidate simply goes unwatched.
+        ownsCurveSub = evicted ? this.curveWatcher.watch(mint) : false;
       }
     }
     this.pendingSnipes.set(mint, {
@@ -3180,7 +3188,26 @@ export class SniperEngine {
 
     if (!this.watchlistPruneInterval) {
       this.watchlistPruneInterval = setInterval(() => {
-        for (const mint of tokenWatchlist.prune()) this.curveWatcher.unwatch(mint);
+        // NEVER unwatch a mint we HOLD.
+        //
+        // prune() drops every token whose `triggered` flag is set, and buying
+        // is what sets it — so within 60 seconds of every entry this line
+        // cancelled the bonding-curve subscription of the position that had
+        // just been opened. For a pre-migration position that feed is the only
+        // real-time price it has, so the position went price-blind and
+        // stop-blind (POOL_DRAINED, the dev-sell stop and every structural exit
+        // are driven from curve updates) about a minute after it was bought —
+        // exactly the window in which a fresh launch does its worst.
+        //
+        // The copy trader's bags count too: it prices from its own feeds, but a
+        // shared mint's curve subscription is the engine's to keep alive.
+        const held = new Set([
+          ...this.activePositions.map(p => p.mint),
+          ...this.copyHeldMintsProvider(),
+        ]);
+        for (const mint of tokenWatchlist.prune()) {
+          if (!held.has(mint)) this.curveWatcher.unwatch(mint);
+        }
       }, 60_000);
       this.watchlistPruneInterval.unref?.();
     }
@@ -3481,14 +3508,36 @@ export class SniperEngine {
       // including, before 2026-08-30, when the buy had never been confirmed at
       // all. The position was then shown as ON-CHAIN, and its invented token
       // count sized every subsequent exit.
-      if (!result.fill || !(result.fill.tokenDelta > 0)) {
-        const owned = await this.readOwnedTokenAmount(filterResult.mint);
+      // THREE CASES, and the difference between them is what the operator is
+      // told about this position. Exactly one of them may claim a verified fill.
+      //
+      //  (a) The transaction was PARSED — quantity and cost both measured.
+      //      fillVerified: true. Handled below.
+      //  (b) The transaction was not parseable, but the WALLET was read — the
+      //      quantity is real, the cost is the size we ordered. fillVerified
+      //      stays FALSE: the position is real, its cost basis is an estimate,
+      //      and the badge says so.
+      //  (c) Neither — nothing may be recorded.
+      //
+      // `balanceDerived` marks (b) from executeRealMainnetTrade's own
+      // wallet-read recovery; the branch here covers (b) arising from an
+      // unreadable fill on an otherwise confirmed transaction. Both land in the
+      // same place on purpose.
+      const measuredFill = result.fill && result.fill.tokenDelta > 0 && !result.balanceDerived
+        ? result.fill
+        : null;
+
+      if (!measuredFill) {
+        const owned = result.balanceDerived && result.fill
+          ? result.fill.tokenDelta
+          : await this.readOwnedTokenAmount(filterResult.mint);
         if (owned !== null && owned > 0) {
-          this.log('warn', `⚠️ Fill unreadable for ${buyTxid.slice(0, 8)}… — using the WALLET's real balance (${owned.toLocaleString()} tokens) as the quantity.`, filterResult.mint);
+          this.log('warn', `⚠️ Fill unreadable for ${buyTxid.slice(0, 8)}… — using the WALLET's real balance (${owned.toLocaleString()} tokens) as the quantity. The cost basis is the size ordered, not the amount taken, so this leg's P&L is approximate.`, filterResult.mint);
           tokensHeld = owned;
           investedSol = solAmount;
           investedUsd = Number((investedSol * this.config.solPriceUsd).toFixed(2));
           buyPriceUsd = tokensHeld > 0 ? investedUsd / tokensHeld : buyPriceUsd;
+          // fillVerified deliberately left FALSE.
         } else {
           this.log('error', `⛔ Buy ${buyTxid.slice(0, 8)}… landed but its size could not be read from the transaction OR the wallet — refusing to open a position with an invented quantity. CHECK https://solscan.io/tx/${buyTxid}`, filterResult.mint);
           this.queueUnresolvedBuy(filterResult.mint, buyTxid);
@@ -3499,10 +3548,10 @@ export class SniperEngine {
 
       // Replace every estimate with what the chain says actually happened:
       // true cost (slippage + all fees included) and true token quantity.
-      if (result.fill && result.fill.tokenDelta > 0) {
-        investedSol = Number((-result.fill.solDelta).toFixed(6));
+      if (measuredFill) {
+        investedSol = Number((-measuredFill.solDelta).toFixed(6));
         investedUsd = Number((investedSol * this.config.solPriceUsd).toFixed(2));
-        tokensHeld = result.fill.tokenDelta;
+        tokensHeld = measuredFill.tokenDelta;
         buyPriceUsd = investedUsd / tokensHeld;
         fillVerified = true;
 

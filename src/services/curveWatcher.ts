@@ -247,11 +247,26 @@ export class CurveWatcher {
     return this.entries.get(mint)?.last;
   }
 
-  /** Oldest-first eviction so a full watchlist still admits fresh candidates. */
-  public evictOldest(): string | null {
-    const first = this.entries.keys().next();
-    if (first.done) return null;
-    this.unwatch(first.value);
-    return first.value;
+  /**
+   * Oldest-first eviction so a full watchlist still admits fresh candidates.
+   *
+   * `protectedMints` are never evicted — pass the mints of OPEN POSITIONS.
+   * Without it, eviction walked Map insertion order and an open position is
+   * among the OLDEST entries by construction (it was watched when it was still
+   * a candidate, before every subsequent create). So a stream of screening
+   * candidates would evict the subscription of a live position and hand its
+   * slot to a token the bot had not even decided to buy: the position went
+   * price-blind, and every curve-driven stop with it.
+   *
+   * Returns null when nothing is evictable, which the caller must treat as "no
+   * slot" rather than assuming one was freed.
+   */
+  public evictOldest(protectedMints?: ReadonlySet<string>): string | null {
+    for (const mint of this.entries.keys()) {
+      if (protectedMints?.has(mint)) continue;
+      this.unwatch(mint);
+      return mint;
+    }
+    return null;
   }
 }

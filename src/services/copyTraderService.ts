@@ -107,6 +107,11 @@ const POSITION_SYNC_INTERVAL_MS = 90_000;
  * acting on it would delete real positions seconds after opening them.
  */
 const POSITION_SYNC_MIN_AGE_MS = 60_000;
+
+/** Host of a URL, for log lines. Never throws on a malformed value. */
+function hostOf(url: string): string {
+  try { return new URL(url).host; } catch { return url; }
+}
 const PROCESSED_SIG_LIMIT = 3000;
 
 /**
@@ -304,6 +309,11 @@ export class CopyTraderService {
   // Helius on-chain watcher
   private heliusConn: Connection | null = null;
   private heliusKeyInUse: string | null = null;
+  /**
+   * The RESOLVED endpoint URL currently in use. Tracked separately from the key
+   * because a rejected key changes the endpoint without changing the key.
+   */
+  private heliusEndpointInUse: string | null = null;
   /** Latches the no-key warning so it is stated once per start, not per poll. */
   private warnedNoHeliusKey = false;
   /** Our own logsSubscribe socket — see WalletLogWatcher for why not Connection.onLogs. */
@@ -851,12 +861,26 @@ export class CopyTraderService {
     }
     this.warnedNoHeliusKey = false;
 
-    // Rebuild both the HTTP connection and the socket when the operator
-    // changed the key in settings.
-    if (!this.heliusConn || this.heliusKeyInUse !== key) {
+    // Rebuild both the HTTP connection and the socket when the ENDPOINT changes
+    // — not merely when the operator edits the key.
+    //
+    // The old condition compared the key string, so a key that was REJECTED
+    // (401, quota exhausted) never triggered a rebuild: the key text is
+    // unchanged, while resolveRpcEndpoint has since demoted every caller to the
+    // public endpoint. The sniper recovered because it rebinds on the resolved
+    // URL; the copy trader stayed pinned to the dead Helius endpoint, so every
+    // getParsedTransaction threw, every slow-lane leader signal came back
+    // 'fetch_failed', and leader sells were dropped — a copy trader that looked
+    // connected and mirrored nothing.
+    const endpoint = rpcEndpoint(key);
+    if (!this.heliusConn || this.heliusEndpointInUse !== endpoint) {
+      if (this.heliusEndpointInUse && this.heliusEndpointInUse !== endpoint) {
+        console.warn(`[CopyTrader] RPC endpoint changed (${hostOf(this.heliusEndpointInUse)} → ${hostOf(endpoint)}) — rebuilding the connection and the leader watcher.`);
+      }
       this.stopHeliusWatcher();
-      this.heliusConn = new Connection(rpcEndpoint(key), connectionConfig());
+      this.heliusConn = new Connection(endpoint, connectionConfig());
       this.heliusKeyInUse = key;
+      this.heliusEndpointInUse = endpoint;
       this.refreshFetchConcurrency();
     }
 
@@ -2716,6 +2740,16 @@ export class CopyTraderService {
           this.feed = this.feed.filter(ev => ev.timestamp >= cutoff);
           this.emitChange();
         }
+      }
+
+      // ENDPOINT DRIFT. Nothing calls startHeliusWatcher again when a key is
+      // rejected MID-SESSION — the operator did not change anything, so no
+      // settings event fires. Without this check the connection stayed pinned
+      // to the dead endpoint for the rest of the run while the sniper, which
+      // rebinds on the resolved URL, quietly recovered on its own.
+      if (this.config.enabled && this.heliusEndpointInUse) {
+        const currentEndpoint = rpcEndpoint(sniperEngine.getConfig().heliusApiKey || process.env.HELIUS_API_KEY || '');
+        if (currentEndpoint !== this.heliusEndpointInUse) this.startHeliusWatcher();
       }
 
       // PERIODIC TRUTH CHECK — the book, against the chain.

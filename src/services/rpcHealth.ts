@@ -409,7 +409,14 @@ export function rpcWsEndpoint(heliusKey: string | undefined | null): string {
   const httpOverride = (process.env.SOLANA_RPC_URL || '').trim();
   if (httpOverride) return httpOverride.replace(/^http/, 'ws');
 
-  const key = normalizeHeliusKey(heliusKey).key;
+  // A key the server REFUSED is not a key — the same rule resolveRpcEndpoint
+  // applies. Without this check the HTTP side demoted to the public endpoint on
+  // a 401 while every websocket kept dialling the rejected Helius URL forever:
+  // the reconnect loop retried on schedule, each attempt was rejected, and the
+  // copy trader's leader watcher was simply deaf. Silently — the socket layer
+  // reports "reconnecting", not "your key is dead", so the UI showed a bot that
+  // looked alive and saw nothing.
+  const key = isHeliusKeyRejected(heliusKey) ? '' : normalizeHeliusKey(heliusKey).key;
   if (key) return `wss://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
 
   const fallback = (process.env.SOLANA_RPC_FALLBACK_URL || '').trim();
