@@ -58,6 +58,22 @@ const FEE_CONFIG_SEED = Buffer.from('0156e0f693665acf44db1568bf175baa5189cb97f5d
  * "creator-vault".
  */
 const BONDING_CURVE_V2_SEED = 'bonding-curve-v2';
+
+/** How often the cached blockhash is refreshed in the background. */
+const BLOCKHASH_REFRESH_MS = 2_000;
+/**
+ * How old the cached blockhash may be before a build refuses to use it.
+ *
+ * Was 60s, which is most or all of a blockhash's ~60-90s validity — a
+ * transaction built at that age can expire before it lands. 20s leaves the
+ * large majority of the window intact for the send, the rebroadcast and the
+ * confirmation poll. With a 2s refresh this bar is only ever reached when the
+ * refresher itself has been failing, which is exactly when falling back to
+ * trade-local (whose blockhash comes from PumpPortal's own server) is right.
+ */
+const BLOCKHASH_MAX_AGE_MS = 20_000;
+/** Mint -> owning token program. Immutable per mint; bounded so it cannot grow forever. */
+const TOKEN_PROGRAM_CACHE_MAX = 2_000;
 /** Offset of the 8-entry buyback-recipient array inside the pump `global` account. */
 const GLOBAL_BUYBACK_OFFSET = 741;
 const GLOBAL_BUYBACK_COUNT = 8;
@@ -109,7 +125,16 @@ export class LocalTxBuilder {
       } catch { /* keep last */ }
     };
     void refresh();
-    this.refresher = setInterval(refresh, 20_000);
+    // 2s, not 20s. A blockhash is only valid for ~150 slots (~60-90s), so one
+    // fetched 20s ago has already spent a third of its life before the buy that
+    // uses it is even built — and under the old 60s staleness bar, up to ALL of
+    // it. A transaction signed against a nearly-dead blockhash does not fail
+    // loudly; it simply never lands, and settlement correctly reports 'expired'
+    // some seconds later. That is a missed fill with no error attached to it.
+    //
+    // The cost of the tighter cadence is one getLatestBlockhash every 2s on a
+    // connection that is already open, which is nothing next to a lost entry.
+    this.refresher = setInterval(refresh, BLOCKHASH_REFRESH_MS);
     this.refresher.unref?.();
   }
 
@@ -200,14 +225,37 @@ export class LocalTxBuilder {
     return this.feeRecipient ?? all[0];
   }
 
-  /** The token program that actually owns this mint (legacy SPL or Token-2022). */
+  /**
+   * The token program that actually owns this mint (legacy SPL or Token-2022).
+   *
+   * Memoised, because a mint account's owner is fixed at creation and cannot
+   * change — so this was one guaranteed-identical getAccountInfo per build, on
+   * the buy path, for an answer we already had. Only SUCCESSFUL lookups are
+   * cached: a null can mean the RPC would not answer, and caching that would
+   * strand a tradable mint on the fallback path for the life of the process.
+   *
+   * Bounded, evicting oldest-first. An unbounded map keyed by mint in a process
+   * that sees thousands of new tokens a day is a leak with a long fuse.
+   */
+  private tokenProgramCache = new Map<string, PublicKey>();
+
   private async getTokenProgram(mint: PublicKey): Promise<PublicKey | null> {
     if (!this.connection) return null;
+    const key = mint.toBase58();
+    const cached = this.tokenProgramCache.get(key);
+    if (cached) return cached;
     try {
       const info = await this.connection.getAccountInfo(mint, 'confirmed');
       if (!info) return null;
       const owner = info.owner;
-      if (owner.equals(TOKEN_PROGRAM) || owner.equals(TOKEN_2022_PROGRAM)) return owner;
+      if (owner.equals(TOKEN_PROGRAM) || owner.equals(TOKEN_2022_PROGRAM)) {
+        if (this.tokenProgramCache.size >= TOKEN_PROGRAM_CACHE_MAX) {
+          const oldest = this.tokenProgramCache.keys().next().value;
+          if (oldest) this.tokenProgramCache.delete(oldest);
+        }
+        this.tokenProgramCache.set(key, owner);
+        return owner;
+      }
       return null; // some other program owns it — not a token we can trade
     } catch {
       return null;
@@ -276,7 +324,7 @@ export class LocalTxBuilder {
   }, feeRecipientOverride: PublicKey | null): Promise<{ tx: VersionedTransaction; tokensOutRaw: bigint; detail: string } | null> {
     try {
       if (!this.connection) return null;
-      if (!this.blockhash || Date.now() - this.blockhashFetchedAt > 60_000) return null;
+      if (!this.blockhash || Date.now() - this.blockhashFetchedAt > BLOCKHASH_MAX_AGE_MS) return null;
 
       const mint = new PublicKey(params.mint);
       const [defaultFeeRecipient, curve, tokenProgram, buybackRecipient] = await Promise.all([
@@ -387,7 +435,7 @@ export class LocalTxBuilder {
   }, withCashback: boolean, feeRecipientOverride: PublicKey | null = null): Promise<{ tx: VersionedTransaction; minSolOutRaw: bigint; detail: string } | null> {
     try {
       if (!this.connection) return null;
-      if (!this.blockhash || Date.now() - this.blockhashFetchedAt > 60_000) return null;
+      if (!this.blockhash || Date.now() - this.blockhashFetchedAt > BLOCKHASH_MAX_AGE_MS) return null;
       if (params.tokenAmountRaw <= 0n) return null;
 
       const mint = new PublicKey(params.mint);
@@ -483,7 +531,7 @@ export class LocalTxBuilder {
     tokenAmountRaw: bigint;
     slippagePct: number;
     priorityFeeSol: number;
-  }): Promise<{ tx: VersionedTransaction; minSolOutRaw: bigint; detail: string } | null> {
+  }): Promise<{ tx: VersionedTransaction; minSolOutRaw: bigint; detail: string; simulated: true } | null> {
     const candidates = await this.getFeeRecipients();
     const ordered = this.feeRecipient
       ? [this.feeRecipient, ...candidates.filter((k) => !k.equals(this.feeRecipient!))]
@@ -496,7 +544,7 @@ export class LocalTxBuilder {
         const sim = await this.simulateOk(built.tx);
         if (sim.ok) {
           this.feeRecipient = fr;
-          return built;
+          return { ...built, simulated: true as const };
         }
         this.lastParityDetail = `sell ${withCashback ? 'cashback' : 'short'} form: ${sim.detail}`;
         if (!/6000|NotAuthorized|InvalidAccountForFee/.test(sim.detail)) break; // wrong FORM, try the other one
@@ -572,7 +620,7 @@ export class LocalTxBuilder {
     solAmount: number;
     slippagePct: number;
     priorityFeeSol: number;
-  }): Promise<{ tx: VersionedTransaction; tokensOutRaw: bigint; detail: string } | null> {
+  }): Promise<{ tx: VersionedTransaction; tokensOutRaw: bigint; detail: string; simulated: true } | null> {
     const candidates = await this.getFeeRecipients();
     if (!candidates.length) return null;
     // Whatever worked last time first — pump.fun does not rotate these often.
@@ -586,7 +634,11 @@ export class LocalTxBuilder {
       const sim = await this.simulateOk(built.tx);
       if (sim.ok) {
         this.feeRecipient = fr;
-        return built;
+        // SIMULATED, and the caller is told so. The engine used to simulate the
+        // returned transaction a second time — a full extra RPC round trip on
+        // the buy path, re-asking a question this loop had just answered about
+        // these exact bytes. See the `simulated` check in sniperEngine.
+        return { ...built, simulated: true as const };
       }
       // Only a credential-shaped rejection is worth another recipient; a
       // slippage or economics failure would fail identically for all of them.

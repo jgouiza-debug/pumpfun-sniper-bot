@@ -2291,7 +2291,7 @@ export class SniperEngine {
         // and no HTTP hop on the critical path. It only covers the bonding
         // curve: a migrated token returns null here and still uses trade-local,
         // because the AMM route is not implemented locally.
-        let built: { tx: VersionedTransaction } | null = null;
+        let built: { tx: VersionedTransaction; simulated?: boolean } | null = null;
 
         if (action === 'buy') {
           built = await localTxBuilder.buildBuy({
@@ -2320,7 +2320,17 @@ export class SniperEngine {
         }
 
         if (built) {
-          const sim = await localTxBuilder.simulateOk(built.tx);
+          // NOT SIMULATED TWICE. buildBuy/buildSell only return a transaction
+          // whose simulation they have already seen come back clean — that is
+          // how they pick the fee recipient and the sell form. Re-simulating
+          // the same bytes here was a second full RPC round trip on the buy
+          // path, asking a question that had just been answered, and it made
+          // the local build slower than the trade-local HTTP hop it exists to
+          // replace. The fallback stays for a builder that ever returns an
+          // unproven transaction.
+          const sim = built.simulated
+            ? { ok: true, detail: 'simulated during build' }
+            : await localTxBuilder.simulateOk(built.tx);
           if (sim.ok) {
             tx = built.tx;
             buildSource = 'local';

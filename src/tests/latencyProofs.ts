@@ -402,5 +402,72 @@ test('the shipped defaults leave the ceiling above the floor', () => {
   assert.ok(ceiling <= 0.05, 'the default must sit inside the config band [0, 0.05]');
 });
 
+console.log('\n-- The local builder: cheaper per build, and a blockhash with life left --');
+
+const builderSrc = () => readFileSync(join(__dirname, '..', 'services', 'localTxBuilder.ts'), 'utf8');
+
+test('OLD BUG: a build could carry a blockhash with none of its life left', () => {
+  // A blockhash is valid for ~150 slots (~60-90s). The refresher ran every 20s
+  // and a build refused only past 60s, so a transaction could be signed against
+  // one that had already spent its whole window. That does not fail loudly — it
+  // simply never lands, and settlement reports 'expired' some seconds later. A
+  // missed fill with no error attached to it.
+  const src = builderSrc();
+  const refresh = Number(/BLOCKHASH_REFRESH_MS = ([\d_]+)/.exec(src)?.[1].replace(/_/g, ''));
+  const maxAge = Number(/BLOCKHASH_MAX_AGE_MS = ([\d_]+)/.exec(src)?.[1].replace(/_/g, ''));
+  assert.ok(Number.isFinite(refresh) && Number.isFinite(maxAge), 'both must be named constants');
+
+  // A blockhash's shortest realistic life. The bar has to leave most of it for
+  // the send, the paced rebroadcast and the confirmation poll.
+  const SHORTEST_BLOCKHASH_LIFE_MS = 60_000;
+  assert.ok(maxAge <= SHORTEST_BLOCKHASH_LIFE_MS / 2,
+    `a build may not use a blockhash older than half its shortest life; bar is ${maxAge}ms`);
+  assert.ok(refresh * 2 <= maxAge,
+    `the refresher (${refresh}ms) must cycle well inside the staleness bar (${maxAge}ms), or the bar is reachable in normal operation`);
+});
+
+test('the staleness bar is actually consulted on both build paths', () => {
+  const src = builderSrc();
+  const uses = [...src.matchAll(/blockhashFetchedAt > BLOCKHASH_MAX_AGE_MS/g)];
+  assert.strictEqual(uses.length, 2, 'both the buy and the sell build must refuse a stale blockhash');
+  assert.ok(!/blockhashFetchedAt > \d/.test(src),
+    'no hardcoded staleness bar may survive next to the constant — that is how the two drift apart');
+});
+
+test('the token program is memoised, but only when the answer was real', () => {
+  // A mint account's owner is fixed at creation, so this was one
+  // guaranteed-identical getAccountInfo per build on the buy path. Caching a
+  // NULL would be the dangerous version: null can mean "the RPC would not
+  // answer", and remembering that strands a tradable mint on the fallback path
+  // for the life of the process.
+  const src = builderSrc();
+  const idx = src.indexOf('private async getTokenProgram(');
+  assert.ok(idx > 0);
+  const body = src.slice(idx, src.indexOf('\n  }', src.indexOf('catch', idx)));
+  assert.ok(/tokenProgramCache\.get\(/.test(body), 'it must consult a cache');
+  const setIdx = body.indexOf('tokenProgramCache.set(');
+  assert.ok(setIdx > 0, 'it must populate the cache');
+  // The set must sit inside the branch that proved the owner is a token program.
+  const beforeSet = body.slice(0, setIdx);
+  assert.ok(/owner\.equals\(TOKEN_PROGRAM\) \|\| owner\.equals\(TOKEN_2022_PROGRAM\)/.test(beforeSet),
+    'only a verified token-program owner may be cached — never a null or an unknown owner');
+  assert.ok(/TOKEN_PROGRAM_CACHE_MAX/.test(body),
+    'the cache must be bounded: a map keyed by mint, in a process that sees thousands of new tokens a day, is a leak');
+});
+
+test('the same bytes are not simulated twice on the buy path', () => {
+  // buildBuy/buildSell simulate in order to CHOOSE the fee recipient and the
+  // sell form, so the transaction they return has already been proven. The
+  // engine re-simulating it was a second full RPC round trip on the hot path —
+  // and it is those extra round trips that got local building demoted after it
+  // rate-limited a shared Helius key.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('const sim = built.simulated');
+  assert.ok(idx > 0, 'the engine must skip a simulation the builder already performed');
+  const block = engine.slice(idx, idx + 220);
+  assert.ok(/await localTxBuilder\.simulateOk\(built\.tx\)/.test(block),
+    'and must still simulate a build that does NOT claim to have been — fail closed');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

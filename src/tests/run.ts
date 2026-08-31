@@ -2218,11 +2218,29 @@ console.log('\n-- A packaged exe must not ship with every safety flag off --');
       'the shadow compare also builds locally per trade — off by default too');
 
     // The capability must still EXIST and stay simulation-gated for opt-in use.
+    //
+    // The simulation MOVED (it now happens inside the builder, which is how the
+    // builder picks its fee recipient and sell form — the engine re-simulating
+    // the same bytes afterwards was a second full RPC round trip on the buy
+    // path). The property being guarded is unchanged and is asserted at both
+    // ends: the engine may only accept a transaction the builder marked as
+    // simulated, and the builder may only mark one it saw simulate clean.
     const engineSrc = require('fs').readFileSync(require.resolve('../services/sniperEngine.ts'), 'utf8');
-    assert.ok(/const sim = await localTxBuilder\.simulateOk\(built\.tx\)/.test(engineSrc),
-      'when enabled, a locally built tx must still be simulated before it is used');
+    assert.ok(/built\.simulated[\s\S]{0,160}await localTxBuilder\.simulateOk\(built\.tx\)/.test(engineSrc),
+      'a locally built tx must be simulation-proven — either by the builder, or by the engine as a fallback');
     assert.ok(/if \(sim\.ok\) \{[\s\S]{0,120}buildSource = 'local'/.test(engineSrc),
       'only a CLEANLY simulating build may be signed — anything else falls back');
+
+    const builderSrcSim = require('fs').readFileSync(require.resolve('../services/localTxBuilder.ts'), 'utf8');
+    // `simulated: true` may only be set where a clean simulation was just seen.
+    for (const m of builderSrcSim.matchAll(/simulated: true as const/g)) {
+      // Wide enough to span an explanatory comment between the simulation and
+      // the return — this codebase writes long ones, and a window that clipped
+      // one would fail a correct build.
+      const before = builderSrcSim.slice(Math.max(0, (m.index ?? 0) - 900), m.index);
+      assert.ok(/const sim = await this\.simulateOk\(built\.tx\);[\s\S]*if \(sim\.ok\) \{/.test(before),
+        'the builder may only claim a transaction is simulated directly after seeing it simulate clean');
+    }
 
     const builderSrc = require('fs').readFileSync(require.resolve('../services/localTxBuilder.ts'), 'utf8');
     assert.ok(/if \(res\.value\.err\)/.test(builderSrc), 'a simulation error must be treated as failure');
