@@ -4599,7 +4599,7 @@ export class SniperEngine {
                 await this.executeSell(pos, `SOLD ALL — ${flowReason} (second trigger)`);
                 return;
               }
-              const sale = await this.sellPctReal(pos, 50);
+              const sale = await this.sellPartialGuarded(pos, 50);
               if (sale !== null) {
                 pos.sellFlowPartialTaken = true;
                 // Reset the counter so the second trigger needs a FRESH run of
@@ -4650,7 +4650,7 @@ export class SniperEngine {
 
         // Pullback Take Profit Rung (only in positive PnL >= 60%)
         if (pos.pnlPct >= 60 && pullbackFromPeakPct >= 15 && !pos.pullbackRungTaken) {
-          const sale = await this.sellPctReal(pos, 50);
+          const sale = await this.sellPartialGuarded(pos, 50);
           if (sale !== null) {
             pos.pullbackRungTaken = true;
             pos.principalRecovered = true;
@@ -4663,7 +4663,7 @@ export class SniperEngine {
 
         // Take Profit 1 (TP1)
         if (pos.pnlPct >= this.config.takeProfitPct && !pos.tp1Taken) {
-          const sale = await this.sellPctReal(pos, 50);
+          const sale = await this.sellPartialGuarded(pos, 50);
           if (sale !== null) {
             pos.tp1Taken = true;
             pos.principalRecovered = true;
@@ -4676,7 +4676,7 @@ export class SniperEngine {
 
         // Take Profit 2 (TP2)
         if (pos.pnlPct >= this.config.takeProfitRung2Pct && !pos.moonbagRiding) {
-          const sale = await this.sellPctReal(pos, 50);
+          const sale = await this.sellPartialGuarded(pos, 50);
           if (sale !== null) {
             pos.moonbagRiding = true;
             this.recordPartialSell(pos, 0.5, `hit second take-profit target of +${this.config.takeProfitRung2Pct}%`, sale.actual, 'TP2');
@@ -4695,7 +4695,7 @@ export class SniperEngine {
             return;
           }
 
-          const sale = await this.sellPctReal(pos, 50);
+          const sale = await this.sellPartialGuarded(pos, 50);
           if (sale !== null) {
             pos.status = 'PARTIAL_PROFIT';
             this.recordPartialSell(pos, 0.5, trailReason, sale.actual, 'TRAILING_PARTIAL');
@@ -4707,6 +4707,36 @@ export class SniperEngine {
 
     } catch (err: any) {
       // ignore
+    }
+  }
+
+  /**
+   * A PARTIAL exit, holding the same one-exit-at-a-time slot as executeSell.
+   *
+   * The five take-profit / structural rungs called sellPctReal directly and
+   * never touched `pos.exitInFlight`, so the guard on executeSell only covered
+   * full exits. The websocket handler is `on('message', async …)` and is not
+   * awaited, so a structural alert could fire a 100% exit while a monitor-tick
+   * take-profit was still inside its confirmation poll: two sells in flight on
+   * one position, both sized as a PERCENTAGE OF THE WALLET's balance of the
+   * mint, and the second booking against a position the first had already
+   * reduced or closed. That double-credits realized P&L, the bankroll and the
+   * kill-switch window — the exact failure the executeSell guard was written
+   * for, reachable through the door next to it.
+   *
+   * Returns null when another exit already holds the slot, which every caller
+   * already treats as "the sell did not happen".
+   */
+  private async sellPartialGuarded(
+    pos: InternalPosition,
+    pct: number
+  ): Promise<{ txid?: string; actual?: { proceedsSol: number; tokensSold: number; txid: string } } | null> {
+    if (pos.exitInFlight) return null;
+    pos.exitInFlight = true;
+    try {
+      return await this.sellPctReal(pos, pct);
+    } finally {
+      pos.exitInFlight = false;
     }
   }
 
@@ -4741,6 +4771,33 @@ export class SniperEngine {
     // open — closing it here strands a real bag behind a closed trade and
     // prices the whole cost basis against a sliver of proceeds (measured
     // 2026-08-09: 100 of 2206 $GREEN sold, reported as a closed -96.8%).
+    // When the fill could not be READ, ask the WALLET before closing anything.
+    //
+    // The guard below was conditional on `sale.actual`, so it was disabled in
+    // exactly the conditions it exists for: inspectFill gives up after ~2s, and
+    // an RPC storm is both the reason a fill is unreadable AND the reason an
+    // exit only partially lands. With no `actual`, the position was closed
+    // unconditionally and its proceeds invented from `pos.currentPriceUsd` — a
+    // price that can be stale by the whole dump this exit was reacting to.
+    // A real bag was left in the wallet behind a trade the books called closed.
+    if (!sale.actual && pos.tokensHeld > 0) {
+      const stillHeld = await this.readOwnedTokenAmount(pos.mint);
+      if (stillHeld !== null && stillHeld > pos.tokensHeld * 0.05) {
+        const soldFraction = Math.max(0, 1 - stillHeld / pos.tokensHeld);
+        this.log('error',
+          `❌ [PARTIAL EXIT] $${pos.tokenSymbol}: the fill could not be read, and the wallet still holds ${Math.round(stillHeld).toLocaleString()} of ${Math.round(pos.tokensHeld).toLocaleString()} tokens. Position stays OPEN with the remainder — it was NOT closed.`,
+          pos.mint);
+        if (soldFraction > 0.01) {
+          this.recordPartialSell(pos, soldFraction, `${reason} [partial fill — ${(soldFraction * 100).toFixed(1)}%, measured from the wallet]`, undefined, 'PARTIAL_FILL');
+        } else {
+          // Nothing moved. Keep the position exactly as it was and let the
+          // normal retry path try again rather than booking a phantom exit.
+          pos.tokensHeld = stillHeld;
+        }
+        return;
+      }
+    }
+
     if (sale.actual && pos.tokensHeld > 0) {
       const soldFraction = sale.actual.tokensSold / pos.tokensHeld;
       if (soldFraction < 0.95) {
