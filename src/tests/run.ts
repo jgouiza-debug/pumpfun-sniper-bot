@@ -3588,6 +3588,127 @@ console.log('\n-- The router is allowed, the drain protection is NOT --');
     assert.strictEqual(v.ok, false, '2 x 0.006 SOL exceeds the 0.01 SOL allowance in total');
   });
 
+  test('OLD BUG: SystemProgram.assign handed the WALLET to an attacker and the guard passed it', () => {
+    // The System check inspected exactly two instruction types (Transfer and
+    // TransferWithSeed) and let every other value fall through UNCHECKED.
+    // Assign (type 1) reassigns the OWNER PROGRAM of an account — applied to
+    // our own wallet, it hands the wallet over outright. One 36-byte
+    // instruction, no transfer in sight, and the guard returned ok:true.
+    const attackerProgram = Keypair.generate().publicKey;
+    const data = Buffer.alloc(36);
+    data.writeUInt32LE(1, 0);                        // type = Assign
+    attackerProgram.toBuffer().copy(data, 4);        // new owner program
+    const tx = mk([new TransactionInstruction({
+      programId: SystemProgram.programId,
+      keys: [{ pubkey: owner2, isSigner: true, isWritable: true }],
+      data,
+    })]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false, 'Assign must never be signable');
+    assert.ok(/System instruction type 1/.test(v.reason || ''), v.reason);
+  });
+
+  test('the System check is an ALLOW-list, so a future instruction type is refused, not ignored', () => {
+    const data = Buffer.alloc(8);
+    data.writeUInt32LE(12, 0); // UpgradeNonceAccount — legitimate, but not part of a trade
+    const tx = mk([new TransactionInstruction({
+      programId: SystemProgram.programId,
+      keys: [{ pubkey: owner2, isSigner: true, isWritable: true }],
+      data,
+    })]);
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, false);
+  });
+
+  test('OLD BUG: a top-level SPL Token Transfer moved the whole bag and the guard passed it', () => {
+    // A pump / PumpSwap trade moves tokens inside the program's own CPI, never
+    // as a bare top-level Transfer. Only Approve / Revoke / SetAuthority /
+    // CloseAccount were checked, so Transfer (tag 3) — source = our ATA,
+    // destination = the attacker's, authority = our wallet — sailed through.
+    const ourAta = Keypair.generate().publicKey;
+    const attackerAta = Keypair.generate().publicKey;
+    const data = Buffer.alloc(9);
+    data[0] = 3;                                  // Transfer
+    data.writeBigUInt64LE(999_999_999n, 1);       // amount
+    const tx = mk([new TransactionInstruction({
+      programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      keys: [
+        { pubkey: ourAta, isSigner: false, isWritable: true },
+        { pubkey: attackerAta, isSigner: false, isWritable: true },
+        { pubkey: owner2, isSigner: true, isWritable: false },
+      ],
+      data,
+    })]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false, 'a bare token Transfer to an unrelated account must be refused');
+    assert.ok(/top-level token Transfer/.test(v.reason || ''), v.reason);
+  });
+
+  test('OLD BUG: ComputeBudget was allow-listed and its DATA never read — an unbounded fee passed', () => {
+    // Fee = unitPrice (microLamports/CU) x unitLimit / 1e6 lamports, and both
+    // came from a response we did not build. An otherwise perfect buy carrying
+    // SetComputeUnitLimit(1_400_000) and a large price burned the wallet to the
+    // block leader, with no instruction resembling a transfer.
+    const limitData = Buffer.alloc(5);
+    limitData[0] = 2;
+    limitData.writeUInt32LE(1_400_000, 1);
+    const priceData = Buffer.alloc(9);
+    priceData[0] = 3;
+    priceData.writeBigUInt64LE(14_285_714_285n, 1); // ~20 SOL of priority fee
+    const cb = new PublicKey('ComputeBudget111111111111111111111111111111');
+    const tx = mk([
+      new TransactionInstruction({ programId: cb, keys: [], data: limitData }),
+      new TransactionInstruction({ programId: cb, keys: [], data: priceData }),
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false, 'an unbounded priority fee must be refused');
+    assert.ok(/priority fee/.test(v.reason || ''), v.reason);
+  });
+
+  test('an ordinary priority fee still passes', () => {
+    const limitData = Buffer.alloc(5);
+    limitData[0] = 2;
+    limitData.writeUInt32LE(200_000, 1);
+    const priceData = Buffer.alloc(9);
+    priceData[0] = 3;
+    priceData.writeBigUInt64LE(5_000n, 1);          // 200k CU x 5000 / 1e6 = 1000 lamports
+    const cb = new PublicKey('ComputeBudget111111111111111111111111111111');
+    const tx = mk([
+      new TransactionInstruction({ programId: cb, keys: [], data: limitData }),
+      new TransactionInstruction({ programId: cb, keys: [], data: priceData }),
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, true);
+  });
+
+  test('OLD BUG: naming the attacker inside a trade instruction whitelisted the drain', () => {
+    // tradeAccountSet is built from the accounts of every non-System
+    // instruction, so anyone who could shape the response simply listed their
+    // own address among a router instruction's accounts — and their address
+    // became "part of the trade", after which a full-balance transfer to it
+    // passed the unrelated-lamports cap untouched.
+    const attacker = Keypair.generate().publicKey;
+    const tx = mk([
+      new TransactionInstruction({
+        programId: ROUTER,
+        keys: [
+          { pubkey: owner2, isSigner: true, isWritable: true },
+          { pubkey: attacker, isSigner: false, isWritable: true },   // <- the naming trick
+        ],
+        data: Buffer.from([1]),
+      }),
+      SystemProgram.transfer({ fromPubkey: owner2, toPubkey: attacker, lamports: 900_000_000 }),
+    ]);
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, true,
+      'reproduced: with no total to measure against, the naming trick still passes');
+
+    // The caller now tells the guard what the trade was sized for, so the total
+    // is checked regardless of who is named.
+    const v = assertOutboundTradeTx(tx, owner2, undefined, { maxLamportsOut: 30_000_000n });
+    assert.strictEqual(v.ok, false);
+    assert.ok(/above the .* SOL this trade was sized for/.test(v.reason || ''), v.reason);
+  });
+
   test('authority theft is still refused even for the router', () => {
     // SetAuthority (tag 6) must never be signable, no matter who invokes it.
     const victimAta = Keypair.generate().publicKey;

@@ -88,9 +88,64 @@ const TOKEN_SET_AUTHORITY = 6;
 const TOKEN_CLOSE_ACCOUNT = 9;
 const TOKEN_APPROVE_CHECKED = 13;
 
-// System instruction type (first 4 bytes, little-endian).
+// SPL Token instructions that MOVE tokens at the top level. A pump/PumpSwap
+// trade moves tokens inside the program's own CPI, never as a bare top-level
+// Transfer — so one appearing here is not part of the trade. Left unchecked, a
+// single appended Transfer(source = our ATA, destination = attacker's ATA,
+// authority = our wallet) empties the whole bag, and the guard returned ok.
+const TOKEN_TRANSFER = 3;
+const TOKEN_TRANSFER_CHECKED = 12;
+const TOKEN_BURN = 8;
+const TOKEN_BURN_CHECKED = 15;
+
+/**
+ * System instruction types, as an ALLOW-list.
+ *
+ * It used to be a block-list that inspected exactly two types (Transfer and
+ * TransferWithSeed) and let every other value fall through unchecked —
+ * including `Assign` (1), which reassigns the OWNER PROGRAM of an account. One
+ * appended `SystemProgram.assign({accountPubkey: ourWallet, programId:
+ * attacker})` handed the signing wallet to an attacker outright, and the guard
+ * returned ok:true.
+ *
+ * An allow-list is the correct shape here: the set of System instructions a
+ * trade legitimately needs is small and known, and anything outside it is a
+ * refusal rather than an unchecked pass. Assign, AssignWithSeed, AdvanceNonce,
+ * WithdrawNonce, Authorize* and everything added to the System program in
+ * future are all refused by construction.
+ */
+const SYS_CREATE_ACCOUNT = 0;
 const SYS_TRANSFER = 2;
+const SYS_CREATE_ACCOUNT_WITH_SEED = 3;
+const SYS_ALLOCATE = 8;
+const SYS_ALLOCATE_WITH_SEED = 9;
 const SYS_TRANSFER_WITH_SEED = 11;
+const ALLOWED_SYSTEM_TYPES = new Set<number>([
+  SYS_CREATE_ACCOUNT,
+  SYS_TRANSFER,
+  SYS_CREATE_ACCOUNT_WITH_SEED,
+  SYS_ALLOCATE,
+  SYS_ALLOCATE_WITH_SEED,
+  SYS_TRANSFER_WITH_SEED,
+]);
+
+// ComputeBudget instruction tags.
+const CB_SET_UNIT_LIMIT = 2;
+const CB_SET_UNIT_PRICE = 3;
+
+/**
+ * Hardest ceiling on what a priority fee may cost, in lamports.
+ *
+ * ComputeBudget was on the allowed-program list and its DATA was never read, so
+ * an otherwise perfect pump.fun buy carrying SetComputeUnitLimit(1_400_000) and
+ * a large SetComputeUnitPrice passed the guard and was signed and broadcast
+ * with skipPreflight — burning the wallet to the block leader in one
+ * transaction, with no instruction that looks remotely like a transfer.
+ *
+ * The caller passes its own tighter figure (maxPriorityFeeSol); this is the
+ * backstop for a caller that passes nothing.
+ */
+const MAX_PRIORITY_FEE_LAMPORTS = 50_000_000; // 0.05 SOL
 
 export interface TxIntentVerdict {
   ok: boolean;
@@ -106,6 +161,23 @@ export function assertOutboundTradeTx(
   tx: VersionedTransaction,
   owner: PublicKey,
   lookupAccounts?: readonly AddressLookupTableAccount[],
+  opts: {
+    /**
+     * Worst-case lamports this trade is allowed to move OUT of our wallet in
+     * top-level System transfers. The caller knows the size it ordered; the
+     * guard cannot infer it.
+     *
+     * This closes the naming bypass: `tradeAccountSet` is built from the
+     * accounts of every non-System instruction, so anyone who could shape the
+     * response simply listed their own address among a router instruction's
+     * accounts and their address became "part of the trade" — after which a
+     * full-balance SystemProgram.transfer to it passed the unrelated-lamports
+     * cap untouched. A total ceiling applies regardless of who is named.
+     */
+    maxLamportsOut?: bigint;
+    /** Ceiling on the priority fee the ComputeBudget instructions may set, in lamports. */
+    maxPriorityFeeLamports?: bigint;
+  } = {},
 ): TxIntentVerdict {
   try {
     const msg: any = tx.message;
@@ -173,14 +245,38 @@ export function assertOutboundTradeTx(
     // ATA). A legitimate SOL wrap or rent payment goes to one of these; a siphon
     // goes to a fresh external address that appears nowhere else.
     const tradeAccountSet = new Set<string>();
+    /** Accounts named by the VENUE instructions only — see the loop below. */
+    const venueAccountSet = new Set<string>();
     /** Total lamports leaving our wallet to addresses outside the trade. */
     let unrelatedLamports = 0n;
+    /** Total lamports leaving our wallet in top-level System transfers, to anyone but us. */
+    let totalLamportsOut = 0n;
+    /** ComputeBudget settings, checked as a product once all instructions are read. */
+    let cbUnitLimit = 0n;
+    let cbUnitPrice = 0n;
     for (const ix of instructions) {
       const program = keys[ix.programIdIndex]?.toBase58();
       if (program && program !== SYSTEM_PROGRAM && program !== COMPUTE_BUDGET) {
         for (const idx of ix.accountKeyIndexes) {
           const k = keys[idx];
           if (k) tradeAccountSet.add(k.toBase58());
+        }
+        // A SECOND, narrower set that excludes the token programs.
+        //
+        // tradeAccountSet has to include token-instruction accounts — a
+        // legitimate SOL wrap references its WSOL ATA only from SyncNative, and
+        // the System-transfer check needs to recognise that ATA. But using the
+        // same set to police a token TRANSFER is self-defeating: the accounts
+        // of a token instruction are exactly what is being policed, so a
+        // hostile `Transfer(our ATA -> attacker ATA)` added its OWN destination
+        // and then passed the "is this destination part of the trade?" test it
+        // had just satisfied. An instruction may not vouch for itself, so a
+        // token transfer's destination must be named by the VENUE.
+        if (!TOKEN_PROGRAMS.has(program)) {
+          for (const idx of ix.accountKeyIndexes) {
+            const k = keys[idx];
+            if (k) venueAccountSet.add(k.toBase58());
+          }
         }
       }
     }
@@ -194,21 +290,43 @@ export function assertOutboundTradeTx(
 
       const data = Buffer.from(ix.data);
 
+      // ComputeBudget was allow-listed and its DATA never read. Fee =
+      // unitPrice (microLamports per CU) x unitLimit / 1e6 lamports, and both
+      // are attacker-chosen in a response we did not build. Capture them here
+      // and check the product once every instruction has been seen.
+      if (program === COMPUTE_BUDGET && data.length >= 1) {
+        if (data[0] === CB_SET_UNIT_LIMIT && data.length >= 5) cbUnitLimit = BigInt(data.readUInt32LE(1));
+        if (data[0] === CB_SET_UNIT_PRICE && data.length >= 9) cbUnitPrice = data.readBigUInt64LE(1);
+      }
+
       // System: block any transfer of OUR lamports to an address that is not part
       // of the trade (and is not us). WSOL wrapping sends to our own WSOL ATA,
       // which the swap instruction references, so it stays in tradeAccountSet.
-      if (program === SYSTEM_PROGRAM && data.length >= 4) {
+      if (program === SYSTEM_PROGRAM) {
+        if (data.length < 4) {
+          return { ok: false, reason: 'System instruction with no readable type' };
+        }
         const type = data.readUInt32LE(0);
+        if (!ALLOWED_SYSTEM_TYPES.has(type)) {
+          // Assign (1) is the one that matters most: it reassigns the OWNER
+          // PROGRAM of an account, and applied to our wallet it hands the
+          // wallet over. Nothing outside the small known set belongs on a trade.
+          return { ok: false, reason: `System instruction type ${type} is not part of a trade (only create/allocate/transfer are)` };
+        }
         if (type === SYS_TRANSFER || type === SYS_TRANSFER_WITH_SEED) {
           const from = keys[ix.accountKeyIndexes[0]]?.toBase58();
           const to = keys[ix.accountKeyIndexes[1]]?.toBase58();
+          const lamportsOut = from === ownerB58 && data.length >= 12 ? data.readBigUInt64LE(4) : 0n;
+          // TOTAL out of our wallet, to anyone but ourselves — counted whether
+          // or not the destination is "part of the trade", because who is named
+          // in the trade is exactly what a hostile response controls.
+          if (from === ownerB58 && to && to !== ownerB58) totalLamportsOut += lamportsOut;
           if (from === ownerB58 && to && to !== ownerB58 && !tradeAccountSet.has(to)) {
             // Refusing this outright also refused the routing fee PumpPortal
             // collects, which is a legitimate part of every real trade. Cap it
             // instead: a fee is a slice, a drain is the balance. Amounts are
             // SUMMED so many small transfers cannot add up to a drain.
-            const lamports = data.length >= 12 ? data.readBigUInt64LE(4) : 0n;
-            unrelatedLamports += lamports;
+            unrelatedLamports += lamportsOut;
             if (unrelatedLamports > BigInt(MAX_UNRELATED_LAMPORTS)) {
               return {
                 ok: false,
@@ -229,6 +347,21 @@ export function assertOutboundTradeTx(
         if (tag === TOKEN_SET_AUTHORITY) {
           return { ok: false, reason: 'token SetAuthority instruction present (reassigns account ownership)' };
         }
+        if (tag === TOKEN_TRANSFER || tag === TOKEN_TRANSFER_CHECKED) {
+          // A pump / PumpSwap trade moves tokens inside the program's own CPI,
+          // never as a bare top-level Transfer. One appearing here is not part
+          // of the trade — and Transfer(source = our ATA, destination =
+          // attacker's ATA, authority = our wallet) empties the whole bag.
+          // Permitted only when the destination is an account the trade itself
+          // already references AND is not a fresh external address.
+          const dest = keys[ix.accountKeyIndexes[tag === TOKEN_TRANSFER ? 1 : 2]]?.toBase58();
+          if (!dest || (dest !== ownerB58 && !venueAccountSet.has(dest))) {
+            return { ok: false, reason: `top-level token Transfer to ${dest ?? 'an unreadable account'} — a trade moves tokens through the program, not directly` };
+          }
+        }
+        if (tag === TOKEN_BURN || tag === TOKEN_BURN_CHECKED) {
+          return { ok: false, reason: 'token Burn instruction present — a trade never burns our tokens' };
+        }
         if (tag === TOKEN_CLOSE_ACCOUNT) {
           // CloseAccount accounts: [account, destination, owner, ...]. The rent
           // refund destination must be us.
@@ -237,6 +370,30 @@ export function assertOutboundTradeTx(
             return { ok: false, reason: `token CloseAccount refunds to unrelated account ${dest}` };
           }
         }
+      }
+    }
+
+    // ---- WHOLE-TRANSACTION CEILINGS -------------------------------------
+    // Checked after every instruction, because both are about the TOTAL a
+    // transaction can cost, and any single instruction can look reasonable.
+    if (opts.maxLamportsOut !== undefined && totalLamportsOut > opts.maxLamportsOut) {
+      return {
+        ok: false,
+        reason: `transaction moves ${Number(totalLamportsOut) / 1e9} SOL out of our wallet, above the `
+          + `${Number(opts.maxLamportsOut) / 1e9} SOL this trade was sized for`,
+      };
+    }
+
+    if (cbUnitPrice > 0n && cbUnitLimit > 0n) {
+      // microLamports/CU x CU / 1e6 = lamports.
+      const feeLamports = (cbUnitPrice * cbUnitLimit) / 1_000_000n;
+      const cap = opts.maxPriorityFeeLamports ?? BigInt(MAX_PRIORITY_FEE_LAMPORTS);
+      if (feeLamports > cap) {
+        return {
+          ok: false,
+          reason: `ComputeBudget sets a priority fee of ${Number(feeLamports) / 1e9} SOL `
+            + `(${cbUnitPrice} microLamports/CU x ${cbUnitLimit} CU), above the ${Number(cap) / 1e9} SOL ceiling`,
+        };
       }
     }
 

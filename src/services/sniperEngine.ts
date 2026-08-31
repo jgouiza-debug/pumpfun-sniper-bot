@@ -2077,7 +2077,24 @@ export class SniperEngine {
         // the guard check the COMPLETE account list. A table we cannot fetch
         // stays unresolved and the guard refuses, which is the safe direction.
         const lookupAccounts = await this.resolveLookupTables(tx);
-        const intent = assertOutboundTradeTx(tx, keypair.publicKey, lookupAccounts);
+        // The guard is told what THIS trade was sized for, so its ceilings are
+        // exact rather than generic. Without a figure it can only apply the
+        // module's absolute backstops, and the naming bypass (an attacker
+        // listing themselves among a router instruction's accounts) has no
+        // total to be measured against.
+        //
+        // A SELL moves no SOL out of the wallet beyond fees, so its allowance is
+        // just the fee headroom.
+        const maxLamportsOut = BigInt(Math.ceil(
+          ((action === 'buy' ? solAmount * (1 + effectiveSlippage / 100 + 0.015) : 0)
+            + priorityFeeSol + ATA_RENT_SOL + 0.01) * 1e9
+        ));
+        const intent = assertOutboundTradeTx(tx, keypair.publicKey, lookupAccounts, {
+          maxLamportsOut,
+          maxPriorityFeeLamports: BigInt(Math.ceil(
+            Math.max(priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005) * 1e9
+          )),
+        });
         if (!intent.ok) {
           this.log('error', `⛔ Refusing to sign ${action} for ${mint.slice(0, 8)}… — ${intent.reason} (source: ${buildSource}). No transaction was sent.`, mint);
           return null;
