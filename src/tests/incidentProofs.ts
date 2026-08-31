@@ -314,10 +314,25 @@ test('the ceiling is enforced INSIDE executeRealMainnetTrade, before anything is
   assert.ok(!/tradeGovernor\.checkBuy\(/.test(fnSrc),
     'the engine must reserve atomically, never check-then-act');
 
-  // Both engines reach the chain through this one function, and there is no
-  // other sendRawTransaction anywhere in the engine.
-  const sends = engineSrc.split(SEND_CALL).length - 1;
-  assert.strictEqual(sends, 1, 'a second send path would be a second door around the ceiling');
+  // Exactly one send INSIDE this function: both engines reach the chain through
+  // it, and a second send here would be a second door around the ceiling.
+  assert.strictEqual(fnSrc.split(SEND_CALL).length - 1, 1,
+    'a second send inside executeRealMainnetTrade would bypass the reservation');
+
+  // Elsewhere in the engine, the ONLY other send is the rebroadcast helper —
+  // which resends bytes that were already governed and already signed, and is
+  // idempotent because the cluster dedupes by signature. Anything else placing
+  // an order would be a new spend the ceiling never saw.
+  const otherSends = engineSrc.split(SEND_CALL).length - 1 - 1;
+  if (otherSends > 0) {
+    const rebroadcastAt = engineSrc.indexOf('private rebroadcastUntilSettled');
+    assert.ok(rebroadcastAt > 0, 'the only other send must be the rebroadcast helper');
+    const rebroadcastSrc = engineSrc.slice(rebroadcastAt, engineSrc.indexOf('\n  private ', rebroadcastAt + 10));
+    assert.strictEqual(otherSends, rebroadcastSrc.split(SEND_CALL).length - 1,
+      'every send outside executeRealMainnetTrade must be inside rebroadcastUntilSettled');
+    assert.ok(!/tradeGovernor/.test(rebroadcastSrc),
+      'the rebroadcast must not claim budget again — it resends bytes already charged');
+  }
 
   // Outcomes must be reported, or the failure breaker never trips.
   assert.ok(/tradeGovernor\.recordBuyOutcome\(false/.test(fnSrc), 'failures must be reported');

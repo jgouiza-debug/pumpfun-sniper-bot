@@ -1143,6 +1143,9 @@ export class CopyTraderService {
     // the transaction is readable, the leader's real post-trade balances
     // replace whatever was inferred here.
     this.scheduleReconcile(ev.address, ev.signature);
+    // And check, AFTER the fact, that the leader's transaction actually
+    // survived. See verifyFastSignal.
+    this.verifyFastSignal(wallet, ev.signature, signals);
     void (async () => {
       for (const sig of signals) {
         // The tally above is already updated (the leader's balance is real
@@ -1171,6 +1174,72 @@ export class CopyTraderService {
       }
     })();
     return true;
+  }
+
+  /**
+   * Did the leader's transaction — the one we already copied — actually land?
+   *
+   * THE TRADE-OFF THIS MANAGES. The fast lane subscribes at commitment
+   * 'processed', which is the whole reason it is fast: a node has EXECUTED the
+   * transaction but nothing has voted on it yet, so we learn about the trade
+   * ~0.5-1.2s before it is readable at 'confirmed'. A processed transaction can
+   * still be dropped or lost on a fork, and when that happens the leader never
+   * traded at all — while we have already sent a real buy against it. That is a
+   * "random buy" with a completely innocent-looking feed line behind it.
+   *
+   * Waiting for 'confirmed' before copying would remove the risk and remove the
+   * product with it. So the order still goes at 'processed', and the leader's
+   * signature is checked afterwards: it costs nothing on the hot path, and it
+   * turns a silent bad copy into a named one the operator can act on.
+   *
+   * A signature seen at 'processed' that still has NO status after this window
+   * did not land — a real one confirms in a second or two.
+   */
+  private verifyFastSignal(wallet: TrackedWalletInternal, signature: string, signals: LeaderSignal[]): void {
+    const conn = this.heliusConn;
+    if (!conn || !signals.length) return;
+    const started = Date.now();
+    const WINDOW_MS = 20_000;
+
+    const poll = async (): Promise<void> => {
+      while (Date.now() - started < WINDOW_MS) {
+        try {
+          const res = await conn.getSignatureStatuses([signature], { searchTransactionHistory: true });
+          const v = res?.value?.[0];
+          if (v) {
+            if (v.err) {
+              this.warnFastSignalLost(wallet, signals, signature,
+                `it FAILED on-chain (${JSON.stringify(v.err)})`);
+              return;
+            }
+            if (v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized') return; // healthy
+          }
+        } catch { /* transient — keep polling inside the window */ }
+        await sleep(1500);
+      }
+      this.warnFastSignalLost(wallet, signals, signature,
+        `it never reached a confirmed status within ${WINDOW_MS / 1000}s — it was most likely dropped`);
+    };
+    void poll();
+  }
+
+  private warnFastSignalLost(
+    wallet: TrackedWalletInternal,
+    signals: LeaderSignal[],
+    signature: string,
+    why: string
+  ): void {
+    const copiedBuys = signals.filter(s => s.side === 'buy');
+    for (const sig of copiedBuys) {
+      const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+      this.pushFeed(wallet, sig, 'failed',
+        `⚠️ The leader transaction this copy was based on did not survive — ${why}. `
+        + (held
+          ? `We are holding $${this.symbolFor(sig)} on a trade the leader may never have made. Review it. `
+          : 'Nothing was opened for it. ')
+        + `https://solscan.io/tx/${signature}`);
+    }
+    if (copiedBuys.length) this.emitChange();
   }
 
   /**
@@ -2322,7 +2391,21 @@ export class CopyTraderService {
    * landing, find no position, and be dropped as "nothing held".
    */
   private async onLeaderSell(wallet: TrackedWalletInternal, sig: LeaderSignal): Promise<void> {
-    const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+    // REAL BAGS WIN. This used to be a bare `.find()` over the whole list with
+    // no provenance filter, while the BUY side (mergeablePositionFor) filters by
+    // paper/real. After a mode flip the two diverge: loadState forces
+    // enabled=false for a restored real config, so the operator re-arms in
+    // paper, the leader re-buys the same mint, and a NEW paper position is
+    // unshifted to the HEAD of the list. The next leader exit then found the
+    // paper twin first and spent the signal on it — while the real tokens sat
+    // in the wallet with the leader already gone.
+    //
+    // A real position is the one with money in it, so it is resolved first
+    // whatever the current mode. If the mode is paper, runExit refuses it with
+    // "switch back to REAL mode to exit it" — visible and recoverable, unlike
+    // silently exiting a simulation and stranding the bag.
+    const open = this.positions.filter(p => p.mint === sig.mint && p.status !== 'CLOSED');
+    const held = open.find(p => !this.isPaperPos(p)) ?? open[0];
     const buyInFlight = !held && this.tradeQueue.isBusy(sig.mint);
 
     if (!held && !buyInFlight) {

@@ -1055,6 +1055,48 @@ export class SniperEngine {
     this.log('info', `✅ ${action.toUpperCase()} ${txid.slice(0, 8)}… ${res.detail} — nothing landed, nothing to track.`, mint);
   }
 
+  /**
+   * Keep resending the same signed transaction while it could still land.
+   *
+   * Idempotent by construction: the cluster dedupes by signature, so a resend
+   * either reaches a node that had not seen it or is discarded. It cannot cause
+   * a second execution — which is what makes this safe for a percentage SELL as
+   * well as a buy.
+   *
+   * Bounded by the blockhash: once that is dead the transaction cannot land, so
+   * there is nothing left to push. Fire-and-forget — it must never add latency
+   * to the order or hold the trade queue.
+   */
+  private rebroadcastUntilSettled(rawTx: Uint8Array, txid: string, mint: string): void {
+    const blockhash = (() => {
+      try { return VersionedTransaction.deserialize(rawTx).message.recentBlockhash; } catch { return undefined; }
+    })();
+    let sends = 0;
+    const tick = async (): Promise<void> => {
+      // Ten resends over ~45s covers a blockhash lifetime at a cadence that
+      // costs the RPC nothing next to the confirmation poll already running.
+      while (sends < 10) {
+        await new Promise(res => setTimeout(res, 4_500));
+        sends++;
+        try {
+          const st = await this.solanaConnection.getSignatureStatuses([txid], { searchTransactionHistory: true });
+          const v = st?.value?.[0];
+          if (v && (v.err || v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized')) return;
+          if (blockhash) {
+            const valid = await this.solanaConnection.isBlockhashValid(blockhash, { commitment: 'finalized' });
+            const stillValid = typeof valid === 'boolean' ? valid : valid?.value;
+            if (stillValid === false) return; // it can no longer land
+          }
+          await this.solanaConnection.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 });
+        } catch {
+          // A failed resend is not a failed trade — the confirmation loop owns
+          // the verdict. Stay quiet and try again.
+        }
+      }
+    };
+    void tick();
+  }
+
   private queueUnresolvedBuy(mint: string, txid: string): void {
     this.unresolvedBuys.set(mint, { txid, attempts: 0 });
     if (this.unresolvedBuyTimer) return;
@@ -2116,10 +2158,21 @@ export class SniperEngine {
         signedTxid = bs58.encode(tx.signatures[0]);
         signedBlockhash = tx.message.recentBlockhash;
 
-        const txid = await this.solanaConnection.sendRawTransaction(tx.serialize(), {
+        // maxRetries is the RPC NODE's own rebroadcast count. Pinned at 3, the
+        // node stopped resending within a second or two while the blockhash
+        // stayed valid for another minute — so a transaction dropped by a busy
+        // leader was simply abandoned, and nothing on our side resent it either.
+        // That is one of the ways a buy "never lands" for no on-chain reason.
+        //
+        // Left to the node's own default (until blockhash expiry) rather than
+        // capped, and backed by our own paced rebroadcast below: resending the
+        // SAME signed bytes is idempotent — the network dedupes by signature, so
+        // it can only help it land, never execute twice.
+        const rawTx = tx.serialize();
+        const txid = await this.solanaConnection.sendRawTransaction(rawTx, {
           skipPreflight: true,
-          maxRetries: 3,
         });
+        this.rebroadcastUntilSettled(rawTx, txid, mint);
         latencyTimeline.stamp(mint, 't6SubmittedMs');
 
         // The order is on the wire, so its claim on the budget is now
