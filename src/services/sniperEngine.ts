@@ -2717,6 +2717,31 @@ export class SniperEngine {
     let activeIsSafe = useV2 && v2 ? v2.isSafe : filterResult.isSafe;
     let activeReasons = useV2 && v2 ? v2.reasons : filterResult.reasons;
 
+    // SAFETY VERDICTS ARE ADDITIVE. Swapping in Gate V2's verdict wholesale
+    // DISCARDED the two checks computed above it — the sell-path / mint
+    // authority inspection (honeypotBlocked) and the market-cap-to-liquidity
+    // ratio (mcapRatioBlocked). Both were folded into `filterResult`, and
+    // `filterResult` is exactly what this line replaces when entryGateV2 is on,
+    // which is the PACKAGED DEFAULT.
+    //
+    // So on a shipped install: a mint with a live freeze authority, an
+    // unrenounced mint authority or a Token-2022 transfer hook was detected,
+    // the "🍯 [SELL-PATH RISK]" line was printed to the log — and then the
+    // token was bought anyway, because Gate V2 grades holder distribution and
+    // market context and had no complaint. A honeypot check whose result is
+    // logged and dropped is worse than none: it tells the operator the token
+    // was screened.
+    //
+    // Two gates, and EITHER may refuse. Nothing may overrule a refusal — the
+    // same principle the removed score override was deleted for.
+    if (honeypotBlocked.length > 0 || mcapRatioBlocked.length > 0) {
+      if (activeIsSafe) {
+        this.log('warn', `⛔ $${payload.symbol ?? mint.slice(0, 6)} passed the entry gate but FAILED a safety check — refusing: ${[...honeypotBlocked, ...mcapRatioBlocked][0]}`, mint);
+      }
+      activeIsSafe = false;
+      activeReasons = [...honeypotBlocked, ...mcapRatioBlocked, ...(activeReasons || [])];
+    }
+
     // THE SCORE OVERRIDE IS GONE (2026-08-13).
     //
     // A block here used to flip an UNSAFE verdict to safe whenever
