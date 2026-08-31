@@ -1693,9 +1693,43 @@ console.log('\n-- Creator resolution and the real sell simulation (audit #22, #4
   });
 
   test('#4: an inconclusive simulation does NOT exit the position', () => {
-    const block = engineSrc.slice(engineSrc.indexOf('private async verifySellPath'), engineSrc.indexOf('private async verifySellPath') + 2600);
+    // Sliced to the END of the method rather than to a fixed character count.
+    // The old version took the first 2600 characters, so adding anything to
+    // verifySellPath pushed the very assertion out of the window and the test
+    // failed for a reason unrelated to what it checks.
+    const start = engineSrc.indexOf('private async verifySellPath');
+    assert.ok(start > 0, 'verifySellPath must exist');
+    const after = engineSrc.indexOf('\n  private ', start + 10);
+    const block = engineSrc.slice(start, after > 0 ? after : start + 6000);
     assert.ok(/null = could not simulate/.test(block),
       'an unknown result must leave the position alone rather than acting on it');
+  });
+
+  test('#4: a honeypot verdict is RE-SIMULATED before it can dump the position', () => {
+    // The response to a confirmed honeypot is an immediate market sell of the
+    // whole position, so a false positive realises a loss on a token that was
+    // fine. This runs a few seconds after the buy, against whatever node is
+    // bound — after a failover, the public endpoint, which lags. A node that
+    // has not yet materialised our fresh token account reverts the sell for a
+    // reason that has nothing to do with the token.
+    const start = engineSrc.indexOf('private async verifySellPath');
+    const after = engineSrc.indexOf('\n  private ', start + 10);
+    const block = engineSrc.slice(start, after > 0 ? after : start + 6000);
+    const firstFalse = block.indexOf('result === false');
+    assert.ok(firstFalse > 0, 'the reverting branch must exist');
+    const branch = block.slice(firstFalse);
+    assert.ok(/SELL SIM RECHECK/.test(branch), 'a second simulation must run before acting');
+    assert.ok(branch.indexOf('second !== false') < branch.indexOf('honeypotConfirmed = true'),
+      'the recheck must be able to CANCEL the verdict, so it has to come first');
+  });
+
+  test('#4: an environmental revert is reported as UNKNOWN, not as a honeypot', () => {
+    const { readFileSync } = require('fs');
+    const detectorSrc = readFileSync(require('path').join(__dirname, '../services/honeypotDetector.ts'), 'utf8');
+    for (const marker of ['AccountNotFound', 'BlockhashNotFound']) {
+      assert.ok(detectorSrc.includes(marker),
+        `${marker} must be classified as environmental — a lagging node is not a blocked sell`);
+    }
   });
 }
 

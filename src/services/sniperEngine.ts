@@ -4412,6 +4412,40 @@ export class SniperEngine {
     );
 
     if (result === false) {
+      // CONFIRM BEFORE DUMPING. A single reverting simulation is not proof: the
+      // node may lag, the route may be momentarily wrong, the curve may be
+      // mid-migration. The response here is to market-sell the entire position
+      // immediately, which on a false positive realises a loss on a token that
+      // was fine — so it costs one re-simulation, a few seconds later, to make
+      // sure. A real honeypot fails both times; a lagging node stops failing.
+      await new Promise(res => setTimeout(res, 4000));
+      const second = await simulateSellPath(
+        this.solanaConnection,
+        async () => {
+          try {
+            const response = await axios.post('https://pumpportal.fun/api/trade-local', {
+              publicKey: keypair.publicKey.toBase58(),
+              action: 'sell',
+              mint: pos.mint,
+              denominatedInSol: 'false',
+              amount: sellAmountParam('100%'),
+              slippage: this.config.maxSlippagePct,
+              priorityFee: this.config.priorityFeeSol,
+              pool: pos.venue || 'auto',
+            }, { responseType: 'arraybuffer', timeout: 8000 });
+            if (response.status !== 200) return null;
+            return VersionedTransaction.deserialize(new Uint8Array(response.data));
+          } catch {
+            return null;
+          }
+        },
+        (msg: string) => this.log('warn', `🍯 [SELL SIM RECHECK] $${pos.tokenSymbol}: ${msg}`, pos.mint)
+      );
+      if (second !== false) {
+        this.log('warn', `🍯 [SELL SIM] $${pos.tokenSymbol} — the first sell simulation reverted but the recheck did not (${second === true ? 'clean' : 'unknown'}). NOT treating this as a honeypot; the position is left alone.`, pos.mint);
+        return;
+      }
+
       pos.honeypotConfirmed = true;
       if (this.config.exitOnHoneypot) {
         // Try immediately. It may not land — if the sell truly reverts, nothing

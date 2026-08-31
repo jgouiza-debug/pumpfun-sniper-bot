@@ -218,7 +218,26 @@ export async function simulateSellPath(
     const sim = await connection.simulateTransaction(vtx, { sigVerify: false, replaceRecentBlockhash: true });
 
     if (sim.value.err) {
-      log?.(`sell simulation FAILED: ${JSON.stringify(sim.value.err)} | ${(sim.value.logs || []).slice(-3).join(' | ')}`);
+      const detail = `${JSON.stringify(sim.value.err)} | ${(sim.value.logs || []).slice(-3).join(' | ')}`;
+
+      // NOT EVERY REVERT IS A HONEYPOT. This simulation runs a few seconds
+      // after the buy confirms, and it is run against whatever node the client
+      // is currently bound to — which, after a failover, is the public endpoint
+      // and can lag meaningfully. On a node that has not yet materialised our
+      // freshly created token account, the sell reverts for a reason that has
+      // nothing to do with the token: the account is not there YET.
+      //
+      // Reporting that as `false` means "proven honeypot", and the caller's
+      // response to a proven honeypot is to market-dump the whole position
+      // immediately. So a lagging node could make the bot panic-sell a fresh
+      // entry at whatever the curve would pay. Environmental reverts are
+      // reported as UNKNOWN, which the caller leaves alone.
+      if (/AccountNotFound|could not find account|Attempt to debit an account but found no record|InsufficientFundsForRent|BlockhashNotFound|InvalidAccountData/i.test(detail)) {
+        log?.(`sell simulation could not be evaluated (environmental, not the token): ${detail}`);
+        return null;
+      }
+
+      log?.(`sell simulation FAILED: ${detail}`);
       return false;
     }
     return true;
