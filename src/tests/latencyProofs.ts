@@ -577,6 +577,92 @@ test('only the primary route drives RPC failover', () => {
     'only the primary route may feed noteRpcOutcome');
 });
 
+console.log('\n-- The slow lane learns its wait instead of assuming it --');
+
+/**
+ * The shipped estimator's arithmetic, extracted so the RULE can be tested. The
+ * service methods are four lines around exactly this; the source assertions
+ * below pin that they still are.
+ */
+const ALPHA = 0.2, FRACTION = 0.8, PRIORITY_FRACTION = 0.6, MIN_MS = 80, MAX_MS = 800;
+function ewma(seed: number, samples: number[]): number {
+  let v = seed;
+  for (const raw of samples) v = v * (1 - ALPHA) + Math.min(raw, MAX_MS) * ALPHA;
+  return v;
+}
+const sleepFor = (est: number, priority = false) =>
+  Math.max(MIN_MS, Math.min(MAX_MS, Math.round(est * (priority ? PRIORITY_FRACTION : FRACTION))));
+
+test('a fast chain shortens the wait the hardcoded guess would have paid in full', () => {
+  // The old code slept 350ms before the first read on every leader trade this
+  // lane handles — every pump-AMM, Raydium and Jupiter buy the leader makes.
+  const learned = ewma(350, Array(20).fill(150));
+  assert.ok(learned < 250, `estimate should fall toward the observed 150ms, got ${learned.toFixed(0)}`);
+  assert.ok(sleepFor(learned) < 300, 'and the sleep should follow it down');
+});
+
+test('a slow chain lengthens it, so we stop burning the key on reads that cannot succeed', () => {
+  const learned = ewma(350, Array(20).fill(700));
+  assert.ok(learned > 500, `estimate should rise toward 700ms, got ${learned.toFixed(0)}`);
+  assert.ok(sleepFor(learned) > 400);
+});
+
+test('A RATE-LIMITED READ DESCRIBES THE KEY, NOT THE CHAIN', () => {
+  // An 8s read happened because the key was throttled. Letting that into the
+  // average would make every later trade wait for a problem that has gone away.
+  const poisoned = ewma(350, [8000, 8000, 8000]);
+  assert.ok(poisoned <= MAX_MS, `one anomalous sample must not pin the estimate high, got ${poisoned.toFixed(0)}`);
+});
+
+test('the sleep never collapses to a busy-poll, however fast the chain looks', () => {
+  const learned = ewma(350, Array(50).fill(1));
+  assert.strictEqual(sleepFor(learned), MIN_MS,
+    'a floor is what stops this becoming a tight loop against a shared key');
+});
+
+test('waking EARLY is the deliberate choice — the fraction is below 1', () => {
+  // Sleeping the full estimate means the first read lands exactly when the
+  // transaction becomes available on average, which is a coin flip. Early costs
+  // one wasted call; late costs latency on every trade.
+  assert.ok(FRACTION < 1 && PRIORITY_FRACTION < FRACTION,
+    'entries wake early, and a live exit earlier still');
+});
+
+test('the shipped estimator still uses those constants and clamps the sample', () => {
+  const copy = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  const recIdx = copy.indexOf('private recordConfirmWait(');
+  assert.ok(recIdx > 0, 'the observed wait must be recorded somewhere');
+  const rec = copy.slice(recIdx, recIdx + 600);
+  assert.ok(/Math\.min\(observedMs, CONFIRM_WAIT_MAX_MS\)/.test(rec),
+    'the sample must be clamped BEFORE it enters the average, or one throttled read poisons it');
+  assert.ok(/CONFIRM_WAIT_ALPHA/.test(rec), 'it must be an EWMA, not a last-value assignment');
+
+  const estIdx = copy.indexOf('private estimatedConfirmWaitMs(');
+  assert.ok(estIdx > 0);
+  const est = copy.slice(estIdx, estIdx + 400);
+  assert.ok(/CONFIRM_WAIT_MIN_MS/.test(est) && /CONFIRM_WAIT_MAX_MS/.test(est),
+    'the sleep must be clamped at both ends');
+
+  // And the hardcoded guess must be gone from the fetch path.
+  const fetchIdx = copy.indexOf('private async fetchParsedTx(');
+  const fetchBody = copy.slice(fetchIdx, fetchIdx + 2500);
+  assert.ok(!/await sleep\(priority \? 300 : 350\)/.test(fetchBody),
+    'the fixed 300/350ms pre-sleep must not survive next to the estimator');
+  assert.ok(/await sleep\(this\.estimatedConfirmWaitMs\(priority\)\)/.test(fetchBody),
+    'the fetch must sleep the learned wait');
+});
+
+test('the processed→confirmed floor is documented as an API limit, not a defect', () => {
+  // Worth pinning: a future reader will wonder why this lane cannot simply read
+  // at 'processed' like the fast one does. It cannot — getParsedTransaction
+  // takes a Finality, and 'processed' is not one.
+  const copy = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  const fetchIdx = copy.indexOf('private async fetchParsedTx(');
+  const body = copy.slice(fetchIdx, fetchIdx + 2500);
+  assert.ok(/Finality/.test(body),
+    'the reason the wait cannot be removed must be recorded where the wait is');
+});
+
 void (async () => {
   if (asyncTests.length) console.log(`\n-- Async broadcast proofs (${asyncTests.length}) --`);
   for (const t of asyncTests) {

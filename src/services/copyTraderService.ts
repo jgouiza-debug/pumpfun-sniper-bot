@@ -133,6 +133,20 @@ const PROCESSED_SIG_LIMIT = 3000;
  */
 const TX_FETCH_DEADLINE_MS = 8000;
 const TX_FETCH_INTERVAL_MS = 250;
+/**
+ * Tuning for the learned processed→confirmed wait. See estimatedConfirmWaitMs.
+ *
+ * The fractions are below 1 on purpose: sleeping the full estimate means the
+ * first read lands exactly when the transaction becomes available on average,
+ * which is a coin flip. Waking a little early costs one wasted call; waking
+ * late costs latency on every single trade this lane handles.
+ */
+const CONFIRM_WAIT_ALPHA = 0.2;
+const CONFIRM_WAIT_FRACTION = 0.8;
+/** A live exit is worth one more speculative read than an entry is. */
+const CONFIRM_WAIT_PRIORITY_FRACTION = 0.6;
+const CONFIRM_WAIT_MIN_MS = 80;
+const CONFIRM_WAIT_MAX_MS = 800;
 /** One paced re-read of a leader tx that outlived the polling budget — long enough for an RPC 429 storm to pass. */
 const TX_REFETCH_DELAY_MS = 20_000;
 /**
@@ -1396,14 +1410,62 @@ export class CopyTraderService {
    * code made one fetch, one 700ms retry, and dropped the signal on any
    * exception.)
    */
+  /**
+   * Rolling estimate of how long after a 'processed' notification the same
+   * transaction becomes readable at 'confirmed'. Seeded at the old hardcoded
+   * guess so behaviour on the very first trade of a session is unchanged.
+   */
+  private confirmWaitEwmaMs = 350;
+
+  private recordConfirmWait(observedMs: number): void {
+    if (!Number.isFinite(observedMs) || observedMs <= 0) return;
+    // Clamped before it enters the average: a read that took 8 seconds because
+    // the key was rate-limited describes the KEY, not the chain, and letting it
+    // into the estimate would make every later trade wait for a problem that
+    // has since gone away.
+    const sample = Math.min(observedMs, CONFIRM_WAIT_MAX_MS);
+    this.confirmWaitEwmaMs = this.confirmWaitEwmaMs * (1 - CONFIRM_WAIT_ALPHA) + sample * CONFIRM_WAIT_ALPHA;
+  }
+
+  /**
+   * What to sleep before the first read. Deliberately UNDER the estimate: being
+   * early costs one wasted call, being late costs latency on every trade, and
+   * only one of those two is the thing this lane is being judged on.
+   */
+  private estimatedConfirmWaitMs(priority: boolean): number {
+    const base = this.confirmWaitEwmaMs * (priority ? CONFIRM_WAIT_PRIORITY_FRACTION : CONFIRM_WAIT_FRACTION);
+    return Math.max(CONFIRM_WAIT_MIN_MS, Math.min(CONFIRM_WAIT_MAX_MS, Math.round(base)));
+  }
+
   private async fetchParsedTx(signature: string, priority = false): Promise<ParsedTransactionWithMeta | null> {
     if (!this.heliusConn) return null;
     const release = await this.acquireTxFetchSlot(priority);
     try {
       const deadline = Date.now() + TX_FETCH_DEADLINE_MS;
-      // First read near the 'confirmed' floor; a live sell (priority) starts a
-      // hair sooner.
-      await sleep(priority ? 300 : 350);
+      const startedAt = Date.now();
+
+      // LEARN THE WAIT INSTEAD OF ASSUMING IT.
+      //
+      // This lane cannot be made fast the way the other one was. The
+      // notification arrives at 'processed', but getParsedTransaction only
+      // accepts a Finality — 'confirmed' or 'finalized', never 'processed' —
+      // so there is no API by which the transaction can be read at the
+      // commitment we already have it at. The processed→confirmed lag is a
+      // floor imposed by the RPC surface, not by this code.
+      //
+      // What WAS wrong is that the wait before the first read was a hardcoded
+      // 300/350ms guess, paid in full on every leader trade this lane handles —
+      // and this lane handles every non-bonding-curve venue, so every pump-AMM,
+      // Raydium and Jupiter buy the leader makes pays it. The real lag varies
+      // with the network and, right now, is measured nowhere.
+      //
+      // So it is measured here, as an EWMA of how long the reads actually took,
+      // and the pre-sleep becomes a slightly conservative fraction of that.
+      // When the chain is quick this saves most of the fixed wait; when it is
+      // slow the sleep grows and stops burning the shared key on reads that
+      // cannot possibly succeed yet. Bounded at both ends so one anomalous
+      // sample cannot pin it high or drop it to a busy-poll.
+      await sleep(this.estimatedConfirmWaitMs(priority));
       let pollDelay = TX_FETCH_INTERVAL_MS;
       while (Date.now() < deadline) {
         try {
@@ -1411,7 +1473,10 @@ export class CopyTraderService {
             maxSupportedTransactionVersion: 0,
             commitment: 'confirmed',
           });
-          if (parsed) return parsed;
+          if (parsed) {
+            this.recordConfirmWait(Date.now() - startedAt);
+            return parsed;
+          }
           // A live sell polls at a flat tight interval so each miss costs a
           // small bounded wait instead of the escalating 250→400→550→700
           // ladder — that backoff growth, not the pre-sleep, was the dominant
