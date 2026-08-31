@@ -72,7 +72,14 @@ export interface CurveMoment {
   ageSeconds?: number;
   /** Curve position at `atMs`, on the repo's canonical scale. */
   curveProgressPct?: number;
-  /** Curve transactions that landed strictly before `atMs`. Capped, see `rankCapped`. */
+  /**
+   * Curve transactions that landed before `atMs`. An UPPER BOUND, and named
+   * for what it counts rather than for what a reader might want it to mean:
+   * the bonding curve's signature list holds sells and the create transaction
+   * as well as buys, and separating them costs one transaction read per
+   * predecessor. Failed transactions are excluded; same-second trades are
+   * included (see the note at the filter).
+   */
   curveTxRank?: number;
   /** True when the rank hit the page cap and is therefore a floor, not a count. */
   rankCapped: boolean;
@@ -123,6 +130,13 @@ export interface ReadMomentOptions {
   readWindow?: boolean;
   /** Signature pages to walk. Each is one RPC call and up to 1000 signatures. */
   maxPages?: number;
+  /**
+   * The transaction this moment IS, when the caller has one.
+   *
+   * Excluded from the rank so a buyer is not counted as being ahead of
+   * themselves. Omit when the moment is not a particular trade.
+   */
+  excludeSignature?: string;
 }
 
 /**
@@ -169,7 +183,7 @@ export async function readCurveMoment(
   for (let page = 0; page < maxPages; page++) {
     if (deps.isBusy?.()) { out.stoppedEarly = 'trading path busy'; break; }
     if (!spend(1)) { out.stoppedEarly = 'read budget exhausted'; break; }
-    let batch: Array<{ signature: string; blockTime?: number | null }>;
+    let batch: Array<{ signature: string; blockTime?: number | null; err?: unknown }>;
     try {
       batch = await conn.getSignaturesForAddress(curve, { limit: SIG_PAGE_LIMIT, before });
       out.reads++;
@@ -178,6 +192,11 @@ export async function readCurveMoment(
       break;
     }
     for (const b of batch) {
+      // A FAILED TRANSACTION IS NOT A TRADE. It moved no SOL and touched no
+      // reserves, but it is still in the signature list — so counting it puts
+      // every loser of a snipe race into the queue ahead of the winner, and a
+      // hot launch's rank becomes a measure of contention rather than demand.
+      if (b.err) continue;
       if (typeof b.blockTime === 'number' && b.blockTime > 0) {
         sigs.push({ signature: b.signature, blockTime: b.blockTime });
       }
@@ -198,7 +217,25 @@ export async function readCurveMoment(
   }
 
   const atSec = Math.floor(atMs / 1000);
-  const before_ = sigs.filter(s => s.blockTime < atSec);
+  // BLOCK TIME HAS ONE-SECOND GRANULARITY, and a hot launch puts dozens of
+  // buys inside one second. A strict `<` therefore drops every same-second
+  // predecessor — understating the rank most severely exactly where the rank
+  // carries the most information, and making an ordinary buyer on a contested
+  // launch look like they were at the front.
+  //
+  // `<=` counts the moment's own second as ahead of us. That over-counts by
+  // however many trades landed in the same second AFTER the one being
+  // described, which is the safe direction: the rank is documented as an upper
+  // bound, and a buyer wrongly placed further back is not mistaken for an
+  // insider. Exact intra-slot ordering needs getBlock and is not worth an RPC
+  // call per predecessor here.
+  //
+  // The moment's OWN transaction is excluded by signature rather than by
+  // subtracting one, because whether it is in this list at all depends on the
+  // caller: a backfilled entry is one of the mint's trades, a sampled control
+  // is an instant at which nobody in particular bought. Blanket-subtracting
+  // would have been right for the first and wrong for the second.
+  const before_ = sigs.filter(s => s.blockTime <= atSec && s.signature !== opts.excludeSignature);
   out.curveTxRank = before_.length;
   if (out.rankCapped) {
     // The rank is a floor. Reported anyway — "at least 3000 trades ahead of

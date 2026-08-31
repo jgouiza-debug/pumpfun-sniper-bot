@@ -34,6 +34,7 @@ import { PROFILE_MIN_RULES, PROFILE_MIN_SCORE } from './services/playbookRouter'
 import {
   getLastScoutReport, loadScoutReport, runScoutOnce, startScoutSchedule,
   MAX_IDLE_HOURS, MAX_COPYABLE_BUY_SOL, MIN_HOLD_SECONDS, MIN_CLOSED_TRADES,
+  MAX_FILL_DRAG_PCT, STALE_BAG_HOURS,
 } from './services/traderScout';
 import { backfillFromWallets } from './services/entryBackfill';
 import { smartMoneyDetector } from './services/smartMoneySignal';
@@ -493,6 +494,8 @@ app.get('/api/scout', (req, res) => {
       maxCopyableBuySol: MAX_COPYABLE_BUY_SOL,
       minHoldSeconds: MIN_HOLD_SECONDS,
       minClosedTrades: MIN_CLOSED_TRADES,
+      maxFillDragPct: MAX_FILL_DRAG_PCT,
+      staleBagHours: STALE_BAG_HOURS,
     },
     keysSet: {
       solanaTracker: Boolean(sniperEngine.getConfig().solanaTrackerApiKey),

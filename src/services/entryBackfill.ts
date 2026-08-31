@@ -173,6 +173,7 @@ export async function backfillFromWallets(
       const moment = await readCurveMoment(buy.ev.mint, atMs, curveDeps, {
         vSolAtMoment: vSol,
         readWindow,
+        excludeSignature: buy.signature,
       });
       if (!moment) { reject('curve unreadable'); continue; }
       result.reads += moment.reads;

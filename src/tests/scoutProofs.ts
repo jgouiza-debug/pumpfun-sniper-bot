@@ -31,6 +31,8 @@ import {
   verifyTrader, scoreOf, runScout,
   MAX_IDLE_HOURS, MIN_CLOSED_TRADES, MAX_TOP_MINT_SHARE, MAX_COPYABLE_BUY_SOL,
   MIN_SERIOUS_BUY_SOL, MIN_HOLD_SECONDS, MAX_FRONT_OF_QUEUE_SHARE, PRIOR_TRIALS,
+  MAX_FILL_DRAG_PCT, OUR_TYPICAL_ENTRY_SOL, STALE_BAG_HOURS, MAX_STALE_SHARE,
+  QUEUE_SAMPLE_MINTS, wilsonLower,
   type TraderStats,
 } from '../services/traderScout';
 import {
@@ -119,7 +121,7 @@ class FakeConn {
  * scores positions where the wallet sold everything it bought, because an open
  * bag has no outcome yet.
  */
-interface TradeSpec { mint: string; sol: number; mult: number; holdS: number; endedSAgo: number; }
+interface TradeSpec { mint: string; sol: number; mult: number; holdS: number; endedSAgo: number; vSol?: number; unsold?: boolean; depth?: number; }
 
 function fixture(trades: TradeSpec[], opts: { curveDepth?: number } = {}) {
   const sigs = new Map<string, Array<{ signature: string; blockTime: number }>>();
@@ -134,10 +136,14 @@ function fixture(trades: TradeSpec[], opts: { curveDepth?: number } = {}) {
     const sSig = `sell${i}`;
     walletSigs.push({ signature: sSig, blockTime: sellAt });
     walletSigs.push({ signature: bSig, blockTime: buyAt });
-    txs.set(bSig, { logs: logsFor([{ mint: t.mint, user: TRADER, isBuy: true, sol: t.sol, tokens: TOKENS, ts: buyAt }]) });
-    txs.set(sSig, { logs: logsFor([{ mint: t.mint, user: TRADER, isBuy: false, sol: t.sol * t.mult, tokens: TOKENS, ts: sellAt }]) });
+    txs.set(bSig, { logs: logsFor([{ mint: t.mint, user: TRADER, isBuy: true, sol: t.sol, tokens: TOKENS, ts: buyAt, vSol: t.vSol }]) });
+    // An unsold bag: the buy is there, the sell never happened. This is what a
+    // rug looks like in a wallet's history — and what the scout used to drop.
+    if (!t.unsold) {
+      txs.set(sSig, { logs: logsFor([{ mint: t.mint, user: TRADER, isBuy: false, sol: t.sol * t.mult, tokens: TOKENS, ts: sellAt, vSol: t.vSol }]) });
+    }
     // The mint's own curve history, for the queue-position sample.
-    const depth = opts.curveDepth ?? 50;
+    const depth = t.depth ?? opts.curveDepth ?? 50;
     const curve = PublicKey.findProgramAddressSync(
       [Buffer.from('bonding-curve'), new PublicKey(t.mint).toBuffer()],
       new PublicKey(PUMP_PROGRAM_ID),
@@ -264,6 +270,141 @@ atest('a normal trader is NOT flagged as an insider', async () => {
   assert.ok(!s.disqualifiers.some(d => /launching/.test(d)));
 });
 
+console.log('\n-- Survivorship: the rugs they never sold --');
+
+atest('A WALLET FULL OF UNSOLD BAGS IS NOT A WINNER', async () => {
+  // The defect this closes, and the most dangerous one in the file. Scoring
+  // only CLOSED positions sounds cautious and is the opposite: not selling is
+  // exactly what a trader does when the token went to zero, so every rug
+  // quietly leaves the sample and the small wins stay. This wallet has twelve
+  // tidy closed wins and twenty bags it has been holding for two days.
+  const closed = goodTrades();
+  const bags: TradeSpec[] = Array.from({ length: 20 }, (_, i) => ({
+    mint: pk(`bag${i}`), sol: 1.5, mult: 0, holdS: 0,
+    endedSAgo: (STALE_BAG_HOURS + 36) * 3600 + i * 60,
+    unsold: true,
+  }));
+  const s = await verify([...closed, ...bags], { queue: false });
+  assert.strictEqual(s.closedTrades, 12, 'the closed wins are still counted');
+  assert.ok(s.stalePositions >= 20, `only ${s.stalePositions} bags were noticed`);
+  assert.ok(s.staleShare > MAX_STALE_SHARE, `stale share ${s.staleShare}`);
+  assert.ok(s.disqualifiers.some(d => /never sold/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('a bag bought an hour ago is a position, not a bag', async () => {
+  // The negative case: a trader who is holding something they bought this
+  // morning is just a trader who is holding something.
+  const fresh: TradeSpec[] = Array.from({ length: 6 }, (_, i) => ({
+    mint: pk(`fresh${i}`), sol: 1.5, mult: 0, holdS: 0, endedSAgo: 1800 + i * 60, unsold: true,
+  }));
+  const s = await verify([...goodTrades(), ...fresh], { queue: false });
+  assert.strictEqual(s.stalePositions, 0, 'an hour-old position has not had time to be evidence');
+  assert.ok(!s.disqualifiers.some(d => /never sold/.test(d)), s.disqualifiers.join(' | '));
+});
+
+console.log('\n-- Fill drag: what copying them would actually cost us --');
+
+atest('A SMALL WALLET BUYING A FRESH CURVE IS UNCOPYABLE — a SOL cap misses this', async () => {
+  // 3 SOL entries look modest and pass any flat size limit. Into a 31 SOL
+  // curve they are not: (3 + 0.5) / 31 = 11.3% worse average fill for us,
+  // before the trade has an opinion.
+  const early = goodTrades().map(t => ({ ...t, sol: 3, vSol: 31 }));
+  const s = await verify(early, { queue: false });
+  assert.ok(s.medianBuySol < MAX_COPYABLE_BUY_SOL, 'the flat SOL cap does not fire here — that is the point');
+  assert.ok((s.expectedFillDragPct ?? 0) > MAX_FILL_DRAG_PCT, `drag was ${s.expectedFillDragPct}%`);
+  assert.ok(s.disqualifiers.some(d => /worse fills/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('the same size deep in a curve is fine', async () => {
+  // And the negative case, which is what makes the drag a measurement rather
+  // than a second size limit: identical 3 SOL entries at 200 vSol drag 1.75%.
+  const deep = goodTrades().map(t => ({ ...t, sol: 3, vSol: 200 }));
+  const s = await verify(deep, { queue: false });
+  assert.ok((s.expectedFillDragPct ?? 99) < MAX_FILL_DRAG_PCT, `drag was ${s.expectedFillDragPct}%`);
+  assert.ok(!s.disqualifiers.some(d => /worse fills/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('the drag matches the curve identity, not a fudge factor', async () => {
+  const s = await verify(goodTrades().map(t => ({ ...t, sol: 2, vSol: 50 })), { queue: false });
+  assert.strictEqual(s.medianEntryVSol, 50);
+  assert.strictEqual(s.expectedFillDragPct, ((2 + OUR_TYPICAL_ENTRY_SOL) / 50) * 100);
+});
+
+console.log('\n-- One call is not a record --');
+
+atest('LEAVE ONE OUT: remove their best token and see what is left', async () => {
+  // Cleaner than the concentration ratio and it costs nothing. The ratio
+  // divides by the sum of WINNERS, so it cannot see a wallet that is
+  // net-negative once its single good call is removed.
+  const trades: TradeSpec[] = [
+    { mint: pk('luckyOne'), sol: 2, mult: 20, holdS: 600, endedSAgo: 1200 },
+    ...Array.from({ length: 11 }, (_, i) => ({
+      mint: pk(`dud${i}`), sol: 2, mult: 0.6, holdS: 600, endedSAgo: 1300 + i * 60,
+    })),
+  ];
+  const s = await verify(trades, { queue: false });
+  assert.ok(s.realizedSol > 0, 'overall they are up, which is what a leaderboard sees');
+  assert.ok(s.realizedExBestSol < 0, `ex-best was ${s.realizedExBestSol}`);
+  assert.ok(s.disqualifiers.some(d => /the record is one call/.test(d)), s.disqualifiers.join(' | '));
+});
+
+console.log('\n-- Active means trading, not last seen --');
+
+atest('ONE TRADE FIVE HOURS AGO IS NOT "ACTIVE"', async () => {
+  // It passes any last-seen-within-six-hours test while describing a wallet
+  // that has stopped.
+  const winding: TradeSpec[] = [
+    ...Array.from({ length: 11 }, (_, i) => ({
+      mint: pk(`old${i}`), sol: 1.5, mult: 1.6, holdS: 600, endedSAgo: 20 * 3600 + i * 60,
+    })),
+    { mint: pk('lastOne'), sol: 1.5, mult: 1.6, holdS: 600, endedSAgo: 5 * 3600 },
+  ];
+  const s = await verify(winding, { queue: false });
+  assert.ok(s.idleHours < MAX_IDLE_HOURS, 'the last-seen test passes it — that is the trap');
+  assert.ok(s.disqualifiers.some(d => /winding down/.test(d)), s.disqualifiers.join(' | '));
+});
+
+console.log('\n-- Accusing someone of being an insider needs evidence --');
+
+test('THREE OF FIVE IS NOT PROOF, ELEVEN OF TWELVE IS', () => {
+  // At n=5 the binomial spread around a 0.6 threshold is wide enough that the
+  // gate fires on coin flips. A Wilson lower bound asks how lopsided a small
+  // sample has to be before it can accuse anyone.
+  assert.ok(wilsonLower(3, 5) < MAX_FRONT_OF_QUEUE_SHARE,
+    `3-of-5 (${wilsonLower(3, 5)}) must not accuse a normal trader`);
+  assert.ok(wilsonLower(11, 12) > MAX_FRONT_OF_QUEUE_SHARE,
+    `11-of-12 (${wilsonLower(11, 12)}) must accuse`);
+  assert.strictEqual(wilsonLower(0, 0), 0, 'no sample accuses nobody');
+  assert.ok(wilsonLower(5, 5) < 1, 'even a perfect small sample is not certainty');
+});
+
+atest('THE BOUND IS APPLIED ON THE REAL PATH, NOT JUST AVAILABLE', async () => {
+  // A wallet first-in-queue on 8 of 12 sampled mints. The raw share is 67% and
+  // would accuse; the Wilson lower bound is 39% and does not. This is the
+  // failure mode the bound exists for — an ordinary trader with a good week
+  // being labelled an insider — and it is only closed if the bound is actually
+  // used at the call site, which asserting on wilsonLower() alone does not
+  // prove. (Found by mutating the call site back to the raw share and watching
+  // every test stay green.)
+  const trades: TradeSpec[] = Array.from({ length: 12 }, (_, i) => ({
+    mint: pk(`mix${i}`), sol: 1.5, mult: i < 8 ? 1.6 : 0.5, holdS: 600,
+    endedSAgo: 1200 + i * 60,
+    depth: i < 8 ? 0 : 50,
+  }));
+  const s = await verify(trades);
+  assert.ok(s.frontOfQueueShare !== undefined, 'the sample must have run');
+  assert.ok(8 / 12 > MAX_FRONT_OF_QUEUE_SHARE, 'fixture check: the RAW share would accuse');
+  assert.ok(s.frontOfQueueShare! < MAX_FRONT_OF_QUEUE_SHARE,
+    `reported ${s.frontOfQueueShare} — a raw share, not a bound`);
+  assert.ok(!s.disqualifiers.some(d => /launching/.test(d)),
+    'a good week is not evidence of being an insider');
+});
+
+test('the queue sample is large enough for the threshold to mean anything', () => {
+  assert.ok(QUEUE_SAMPLE_MINTS >= 12,
+    `${QUEUE_SAMPLE_MINTS} mints is too few to distinguish a launcher from a lucky week`);
+});
+
 console.log('\n-- Evidence, not enthusiasm --');
 
 atest('three winning trades is not a track record', async () => {
@@ -314,6 +455,8 @@ test('ABSOLUTE PROFIT, NEVER PERCENTAGE RETURN', () => {
   const base = {
     wallet: 'x', sources: [], closedTrades: 20, wins: 12, winRate: 0.5, medianHoldSeconds: 600,
     distinctMints: 20, topMintProfitShare: 0.2, lastTradeAt: 0, idleHours: 1, openPositions: 0,
+    stalePositions: 0, staleShare: 0, medianEntryVSol: 60, realizedExBestSol: 10,
+    tradesLast2h: 2, tradesLast6h: 6,
     disqualifiers: [], score: 0, reads: 0,
   };
   //
@@ -335,7 +478,9 @@ test('fresher beats staler, all else equal', () => {
   const base: TraderStats = {
     wallet: 'x', sources: [], realizedSol: 20, closedTrades: 20, wins: 12, winRate: 0.5,
     medianHoldSeconds: 600, medianBuySol: 2, distinctMints: 20, topMintProfitShare: 0.2,
-    lastTradeAt: 0, idleHours: 0.5, openPositions: 0, disqualifiers: [], score: 0, reads: 0,
+    lastTradeAt: 0, idleHours: 0.5, openPositions: 0, stalePositions: 0, staleShare: 0,
+    medianEntryVSol: 60, realizedExBestSol: 10, tradesLast2h: 2, tradesLast6h: 6,
+    disqualifiers: [], score: 0, reads: 0,
   };
   assert.ok(scoreOf(base) > scoreOf({ ...base, idleHours: 5 }));
 });
@@ -344,7 +489,9 @@ test('a concentrated wallet scores below a spread one', () => {
   const base: TraderStats = {
     wallet: 'x', sources: [], realizedSol: 20, closedTrades: 20, wins: 12, winRate: 0.5,
     medianHoldSeconds: 600, medianBuySol: 2, distinctMints: 20, topMintProfitShare: 0.1,
-    lastTradeAt: 0, idleHours: 1, openPositions: 0, disqualifiers: [], score: 0, reads: 0,
+    lastTradeAt: 0, idleHours: 1, openPositions: 0, stalePositions: 0, staleShare: 0,
+    medianEntryVSol: 60, realizedExBestSol: 10, tradesLast2h: 2, tradesLast6h: 6,
+    disqualifiers: [], score: 0, reads: 0,
   };
   assert.ok(scoreOf(base) > scoreOf({ ...base, topMintProfitShare: 0.55 }));
 });
@@ -353,7 +500,9 @@ test('a disqualified wallet scores zero, whatever its numbers', () => {
   const s: TraderStats = {
     wallet: 'x', sources: [], realizedSol: 900, closedTrades: 50, wins: 45, winRate: 0.9,
     medianHoldSeconds: 600, medianBuySol: 2, distinctMints: 50, topMintProfitShare: 0.1,
-    lastTradeAt: 0, idleHours: 0.1, openPositions: 0, disqualifiers: ['stale'], score: 0, reads: 0,
+    lastTradeAt: 0, idleHours: 0.1, openPositions: 0, stalePositions: 0, staleShare: 0,
+    medianEntryVSol: 60, realizedExBestSol: 10, tradesLast2h: 2, tradesLast6h: 6,
+    disqualifiers: ['stale'], score: 0, reads: 0,
   };
   // scoreOf itself is pure; the guarantee is that verifyTrader never calls it
   // for a disqualified wallet.

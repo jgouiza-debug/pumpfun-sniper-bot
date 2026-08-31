@@ -263,6 +263,13 @@ interface ScoutTrader {
   idleHours: number;
   frontOfQueueShare?: number;
   openPositions: number;
+  stalePositions: number;
+  staleShare: number;
+  medianEntryVSol: number;
+  expectedFillDragPct?: number;
+  realizedExBestSol: number;
+  tradesLast2h: number;
+  tradesLast6h: number;
   disqualifiers: string[];
   score: number;
 }
@@ -277,7 +284,7 @@ interface ScoutPayload {
     notes: string[];
     sourceOutcomes: Array<{ name: string; ok: boolean; detail?: string; seenKeys?: string[] }>;
   } | null;
-  bars: { maxIdleHours: number; maxCopyableBuySol: number; minHoldSeconds: number; minClosedTrades: number };
+  bars: { maxIdleHours: number; maxCopyableBuySol: number; minHoldSeconds: number; minClosedTrades: number; maxFillDragPct: number; staleBagHours: number };
   keysSet: { solanaTracker: boolean; birdeye: boolean };
 }
 
@@ -362,7 +369,17 @@ function TraderScoutPanel() {
                 {' '}{Math.round(rep.best.winRate * 100)}% win rate ·
                 {' '}typical entry {rep.best.medianBuySol} SOL ·
                 {' '}typical hold {hold(rep.best.medianHoldSeconds)} ·
-                {' '}last traded {Math.round(rep.best.idleHours * 10) / 10}h ago
+                {' '}{rep.best.tradesLast6h} trades in 6h
+              </div>
+              <div style={{ fontSize: '9px', color: '#8a8a8a', lineHeight: 1.6, marginTop: 3 }}>
+                Copying it should cost about{' '}
+                <strong>{rep.best.expectedFillDragPct?.toFixed(1) ?? '?'}%</strong> in worse fills
+                (their {rep.best.medianBuySol} SOL entries land in a {rep.best.medianEntryVSol} SOL curve, and ours lands after).
+                {' '}Take away their best token and they are still at{' '}
+                <strong style={{ color: rep.best.realizedExBestSol > 0 ? '#00e676' : '#ff5252' }}>
+                  {rep.best.realizedExBestSol > 0 ? '+' : ''}{rep.best.realizedExBestSol} SOL
+                </strong>.
+                {rep.best.stalePositions > 0 && <> {rep.best.stalePositions} bag(s) held over {sc!.bars.staleBagHours}h are unresolved and were not scored either way.</>}
               </div>
               <button
                 onClick={() => post('/api/scout/follow', { address: rep.best!.wallet }, 'Follow')}
@@ -451,9 +468,12 @@ function TraderScoutPanel() {
           <div style={{ fontSize: '9px', color: '#8a8a8a', lineHeight: 1.5 }}>
             {rep.notes.map((n, i) => <div key={i}>· {n}</div>)}
             <div>
-              · Bars: active inside {sc!.bars.maxIdleHours}h, {sc!.bars.minClosedTrades}+ closed trades,
-              {' '}entry under {sc!.bars.maxCopyableBuySol} SOL (bigger moves the curve before we land),
-              {' '}hold over {sc!.bars.minHoldSeconds}s (shorter than we can follow).
+              · Bars: trading now (not just seen inside {sc!.bars.maxIdleHours}h),
+              {' '}{sc!.bars.minClosedTrades}+ closed trades,
+              {' '}under {sc!.bars.maxFillDragPct}% expected fill drag from copying them,
+              {' '}hold over {sc!.bars.minHoldSeconds}s (shorter than we can follow),
+              {' '}still profitable with their best token removed,
+              {' '}and under half their positions unresolved bags.
             </div>
             <div style={{ marginTop: 3 }}>
               Sources: {rep.sourceOutcomes.map(o => `${o.name} ${o.ok ? '✓' : `✗ (${o.detail ?? 'failed'})`}`).join(' · ')}

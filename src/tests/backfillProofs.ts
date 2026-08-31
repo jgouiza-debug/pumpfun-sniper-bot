@@ -200,6 +200,55 @@ atest('the rank counts only what landed before the moment', async () => {
   assert.strictEqual(m!.curveTxRank, 3, 'trades after the moment are not ahead of you');
 });
 
+atest('A FAILED TRANSACTION IS NOT SOMEBODY AHEAD OF YOU', async () => {
+  // Failed transactions stay in the signature list. On a contested launch most
+  // of them are snipers who LOST the race — they moved no SOL and touched no
+  // reserves — so counting them makes the rank a measure of contention rather
+  // than of demand, and puts every ordinary buyer behind a crowd that never
+  // actually bought.
+  const sigs = new Map([[curveOf(MINT_A), [
+    { signature: 'ok2', blockTime: T - 5 },
+    { signature: 'lost1', blockTime: T - 6, err: { InstructionError: [0, 'x'] } },
+    { signature: 'lost2', blockTime: T - 7, err: { InstructionError: [0, 'x'] } },
+    { signature: 'ok1', blockTime: T - 40 },
+    { signature: 'birth', blockTime: T - 900 },
+  ]]]);
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())));
+  assert.strictEqual(m!.curveTxRank, 3, 'two failed races were counted as buyers');
+  assert.strictEqual(m!.ageSeconds, 900, 'and a failed tx must not be mistaken for the birth either');
+});
+
+atest('SAME-SECOND PREDECESSORS COUNT — block time is only second-granular', async () => {
+  // A hot launch puts dozens of buys inside one second. A strict `<` drops
+  // every one of them, understating the rank most severely exactly where the
+  // rank carries the most information — and making an ordinary buyer on a
+  // contested launch look like they were at the front, which is the input to
+  // the insider check.
+  const sigs = new Map([[curveOf(MINT_A), [
+    { signature: 'same3', blockTime: T },
+    { signature: 'same2', blockTime: T },
+    { signature: 'same1', blockTime: T },
+    { signature: 'mine', blockTime: T },
+    { signature: 'birth', blockTime: T - 600 },
+  ]]]);
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), {
+    excludeSignature: 'mine',
+  });
+  assert.strictEqual(m!.curveTxRank, 4, 'three same-second trades plus the birth are all ahead');
+});
+
+atest('and a buyer is never counted as ahead of themselves', async () => {
+  const sigs = new Map([[curveOf(MINT_A), [
+    { signature: 'mine', blockTime: T },
+    { signature: 'birth', blockTime: T - 600 },
+  ]]]);
+  const withOut = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), { excludeSignature: 'mine' });
+  assert.strictEqual(withOut!.curveTxRank, 1, 'only the birth is ahead of them');
+  // And a caller with no particular transaction still gets a defensible count.
+  const plain = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())));
+  assert.strictEqual(plain!.curveTxRank, 2, 'a control moment is not any of the trades, so nothing is excluded');
+});
+
 atest('curve position is on the canonical scale, not a local formula', async () => {
   const sigs = new Map([[curveOf(MINT_A), [{ signature: 's1', blockTime: T - 60 }]]]);
   const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), { vSolAtMoment: 30 + 85 / 2 });

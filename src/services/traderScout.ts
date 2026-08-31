@@ -79,6 +79,26 @@ export interface TraderStats {
   frontOfQueueShare?: number;
   /** Positions still open. Their outcome is unknown, so they are not counted either way. */
   openPositions: number;
+  /**
+   * Open positions bought long enough ago that not selling is itself the
+   * answer. See STALE_BAG_HOURS — this is the survivorship-bias guard.
+   */
+  stalePositions: number;
+  /** Stale bags as a share of everything with an outcome, 0-1. */
+  staleShare: number;
+  /** Median virtual SOL reserves at their entries. Where on the curve they buy. */
+  medianEntryVSol: number;
+  /**
+   * How much worse OUR average fill would be, copying them, in percent.
+   * Derived from the curve, not guessed. The real too-big-to-copy test.
+   */
+  expectedFillDragPct?: number;
+  /** Realized SOL with their single best mint removed. Negative = one lucky call. */
+  realizedExBestSol: number;
+  /** Trades in the last 2 hours, from the signature list we already walked. */
+  tradesLast2h: number;
+  /** Trades in the last 6 hours. */
+  tradesLast6h: number;
 
   /** Every check this wallet failed. Empty means copyable. */
   disqualifiers: string[];
@@ -130,13 +150,57 @@ export const PRIOR_TRIALS = 8;
  */
 export const MAX_TOP_MINT_SHARE = 0.6;
 /**
- * The biggest median entry worth following, SOL.
+ * A coarse backstop on entry size, SOL. The real test is the drag below.
  *
- * A 15 SOL buy into a bonding curve holding 40 SOL of real liquidity moves the
- * price by a third before a follower's transaction is even built. Beyond this
- * we are not copying their entry, we are providing their exit liquidity.
+ * Kept because a wallet whose curve position we could not read still needs an
+ * answer, and because a 40 SOL entry is uncopyable at any point on any curve.
  */
 export const MAX_COPYABLE_BUY_SOL = 15;
+/**
+ * THE ACTUAL TOO-BIG-TO-COPY TEST: how much worse our fill would be.
+ *
+ * On a constant-product bonding curve, a follower entering right behind a
+ * leader pays an average fill worse by
+ *
+ *     drag = (leaderSol + ourSol) / virtualSolReserves
+ *
+ * because the leader's own buy has already moved the reserves and ours moves
+ * them again. This is exact, it is derivable from numbers we already have, and
+ * it replaces a guess about SOL amounts with a measurement about outcomes.
+ *
+ * It also captures what a flat SOL cap cannot: WHERE on the curve they buy. A
+ * 10 SOL entry at 200 vSol drags 5%. A 3 SOL entry into a fresh 30 vSol curve
+ * drags 12% — the smaller trader is the one we cannot follow.
+ *
+ * 10% is the budget. Memecoin edges do not survive giving away a tenth of the
+ * entry before the trade has an opinion.
+ */
+export const MAX_FILL_DRAG_PCT = 10;
+/** Our own typical entry, SOL — the `ourSol` term in the drag identity. */
+export const OUR_TYPICAL_ENTRY_SOL = 0.5;
+/**
+ * How long an unsold bag stays "open" before it counts as evidence.
+ *
+ * THE SURVIVORSHIP-BIAS GUARD, and the most important number in this file.
+ * Scoring only closed positions and skipping the rest sounds cautious and is
+ * the opposite: NOT SELLING IS EXACTLY WHAT A LOSING MEMECOIN TRADER DOES. A
+ * wallet that bought thirty rugs and is still holding all of them, alongside
+ * twelve small closed wins, reads as a 12-trade winner with a great record.
+ *
+ * Twelve hours because a pump.fun position is a hours-long trade; a bag held
+ * overnight was not a plan.
+ */
+export const STALE_BAG_HOURS = 12;
+/**
+ * The most of a wallet's history that may be bags with no outcome.
+ *
+ * Above this we are not saying they lost — we cannot know that — we are saying
+ * too little of what they did has resolved for the rest to mean anything.
+ */
+export const MAX_STALE_SHARE = 0.5;
+/** Trades required in the last 6h / 2h before a wallet counts as actively trading. */
+export const MIN_TRADES_6H = 3;
+export const MIN_TRADES_2H = 1;
 /** And a floor: a wallet risking 0.02 SOL a go is testing, not trading. */
 export const MIN_SERIOUS_BUY_SOL = 0.1;
 /**
@@ -163,8 +227,16 @@ export const FRONT_OF_QUEUE_RANK = 6;
 export const MAX_PAGES_PER_TRADER = 3;
 /** Transactions read per candidate. The expensive call. */
 export const MAX_TX_READS_PER_TRADER = 150;
-/** Mints sampled per candidate for the insider check. */
-export const QUEUE_SAMPLE_MINTS = 5;
+/**
+ * Mints sampled per candidate for the insider check.
+ *
+ * Twelve, not five. At n=5 the binomial spread around a 0.6 threshold is wide
+ * enough that the gate fires on coin flips — a normal trader who happened to
+ * be early three times out of five is indistinguishable from a launcher. The
+ * share is also taken as a Wilson lower bound below, so a small sample has to
+ * be lopsided before it accuses anyone.
+ */
+export const QUEUE_SAMPLE_MINTS = 12;
 /** Candidates verified in one run. */
 export const MAX_CANDIDATES_VERIFIED = 25;
 /** Total RPC reads one scout run may spend. */
@@ -310,6 +382,12 @@ export async function verifyTrader(
     lastTradeAt: 0,
     idleHours: Infinity,
     openPositions: 0,
+    stalePositions: 0,
+    staleShare: 0,
+    medianEntryVSol: 0,
+    realizedExBestSol: 0,
+    tradesLast2h: 0,
+    tradesLast6h: 0,
     disqualifiers: [],
     score: 0,
     reads: 0,
@@ -400,22 +478,54 @@ export async function verifyTrader(
   // walk looks like a pure sell; those show tokensIn === 0 and are excluded.
   const holds: number[] = [];
   const allBuys: number[] = [];
-  const profitByMint: number[] = [];
-  let totalProfit = 0;
+  const entryVSols: number[] = [];
+  const pnlByMint: number[] = [];
+  const nowSec = Math.floor(now() / 1000);
 
   for (const p of positions.values()) {
     for (const b of p.buys) allBuys.push(b);
+    if (typeof p.firstBuyVSol === 'number' && p.firstBuyVSol > 0) entryVSols.push(p.firstBuyVSol);
     const closed = p.tokensIn > 0n && p.tokensOut >= p.tokensIn;
-    if (!closed) { stats.openPositions++; continue; }
+    if (!closed) {
+      stats.openPositions++;
+      // A BAG THIS OLD IS EVIDENCE, EVEN THOUGH IT IS NOT A LOSS.
+      //
+      // Skipping every unsold position and scoring only the closed ones is the
+      // survivorship bias that makes a losing wallet look like a winner: not
+      // selling is precisely what a trader does when the token went to zero,
+      // so the rugs quietly leave the sample and the small wins stay.
+      //
+      // We still refuse to call it a loss — we cannot know that, and a genuine
+      // long-term holder exists. What we do instead is count how much of the
+      // wallet's history has no outcome, and refuse to rank a wallet whose
+      // record is mostly unresolved.
+      if (p.tokensIn > 0n && p.firstBuyAt < Number.MAX_SAFE_INTEGER
+          && nowSec - p.firstBuyAt > STALE_BAG_HOURS * 3600) {
+        stats.stalePositions++;
+      }
+      continue;
+    }
     const pnl = p.sellSol - p.buySol;
     stats.closedTrades++;
     stats.realizedSol += pnl;
-    if (pnl > 0) {
-      stats.wins++;
-      totalProfit += pnl;
-      profitByMint.push(pnl);
-    }
+    // Every closed mint's PnL, winners AND losers. The old version collected
+    // only winners, so the concentration ratio below divided by the sum of
+    // wins and could not see a wallet that was net-negative overall.
+    pnlByMint.push(pnl);
+    if (pnl > 0) stats.wins++;
     if (p.lastSellAt > p.firstBuyAt) holds.push(p.lastSellAt - p.firstBuyAt);
+  }
+
+  // Activity as a RATE, not a last-seen stamp. One trade five hours ago passes
+  // any "active within six hours" test while describing a wallet that has
+  // stopped. Both counts come free from the signature list already walked.
+  for (const p of positions.values()) {
+    for (const at of [p.firstBuyAt, p.lastSellAt]) {
+      if (!at || at <= 0 || at === Number.MAX_SAFE_INTEGER) continue;
+      const ago = nowSec - at;
+      if (ago <= 6 * 3600) stats.tradesLast6h++;
+      if (ago <= 2 * 3600) stats.tradesLast2h++;
+    }
   }
 
   stats.distinctMints = positions.size;
@@ -425,9 +535,27 @@ export async function verifyTrader(
     : 0;
   stats.medianHoldSeconds = median(holds);
   stats.medianBuySol = round4(median(allBuys));
-  stats.topMintProfitShare = totalProfit > 0
-    ? round4(Math.max(...profitByMint, 0) / totalProfit)
-    : 0;
+  stats.medianEntryVSol = round4(median(entryVSols));
+  const resolved = stats.closedTrades + stats.stalePositions;
+  stats.staleShare = resolved > 0 ? round4(stats.stalePositions / resolved) : 0;
+
+  const bestMintPnl = pnlByMint.length ? Math.max(...pnlByMint) : 0;
+  const totalProfit = pnlByMint.filter(v => v > 0).reduce((a, b) => a + b, 0);
+  stats.topMintProfitShare = totalProfit > 0 ? round4(Math.max(bestMintPnl, 0) / totalProfit) : 0;
+  // THE LEAVE-ONE-OUT TEST. Cleaner than the ratio and it costs nothing: take
+  // away their single best token and see whether anything is left. A ratio
+  // computed over winners alone cannot notice a wallet that is net-negative
+  // once its one good call is removed.
+  stats.realizedExBestSol = round4(stats.realizedSol - bestMintPnl);
+
+  // The fill drag we would actually eat, from the curve identity. Needs their
+  // curve position at entry, which comes free with the decoded TradeEvent —
+  // absent only when no entry in the window was readable, and then the coarse
+  // SOL cap below is the only test that can run.
+  if (stats.medianEntryVSol > 0 && stats.medianBuySol > 0) {
+    stats.expectedFillDragPct = round4(
+      ((stats.medianBuySol + OUR_TYPICAL_ENTRY_SOL) / stats.medianEntryVSol) * 100);
+  }
   stats.idleHours = stats.lastTradeAt > 0
     ? round4((now() - stats.lastTradeAt) / 3_600_000)
     : Infinity;
@@ -452,7 +580,7 @@ export async function verifyTrader(
         now: deps.now,
         sleep: deps.sleep,
         spend,
-      }, { vSolAtMoment: p.firstBuyVSol, maxPages: 2 });
+      }, { vSolAtMoment: p.firstBuyVSol, maxPages: 2, excludeSignature: p.firstBuySig });
       if (!m) continue;
       stats.reads += m.reads;
       // A capped rank is a floor, and a floor above the threshold still proves
@@ -461,13 +589,26 @@ export async function verifyTrader(
       sampled++;
       if (m.curveTxRank <= FRONT_OF_QUEUE_RANK) front++;
     }
-    if (sampled > 0) stats.frontOfQueueShare = round4(front / sampled);
+    // A WILSON LOWER BOUND, not the raw share. Three-of-five looks like 60% and
+    // is consistent with an ordinary trader having a lucky week; the bound asks
+    // how lopsided a small sample has to be before it can accuse anyone.
+    if (sampled > 0) stats.frontOfQueueShare = round4(wilsonLower(front, sampled));
   }
 
   // ---- the bars ----------------------------------------------------------
   const d = stats.disqualifiers;
   if (stats.idleHours > MAX_IDLE_HOURS) {
     d.push(`not trading — last pump.fun trade ${fmtHours(stats.idleHours)} ago, needs one inside ${MAX_IDLE_HOURS}h`);
+  } else if (stats.tradesLast6h < MIN_TRADES_6H || stats.tradesLast2h < MIN_TRADES_2H) {
+    // "Last seen inside six hours" passes a wallet whose single trade was five
+    // hours ago and which has since stopped — which is not what "trading right
+    // now" means to anyone who asked for it.
+    d.push(`winding down — ${stats.tradesLast6h} trade(s) in 6h and ${stats.tradesLast2h} in 2h;`
+      + ` needs ${MIN_TRADES_6H} and ${MIN_TRADES_2H}`);
+  }
+  if (stats.staleShare > MAX_STALE_SHARE) {
+    d.push(`${Math.round(stats.staleShare * 100)}% of its positions are bags held over ${STALE_BAG_HOURS}h and never sold`
+      + ' — too little of this record has resolved to judge the rest');
   }
   if (stats.closedTrades < MIN_CLOSED_TRADES) {
     d.push(`only ${stats.closedTrades} closed position(s) visible; ${MIN_CLOSED_TRADES} needed before a win rate means anything`);
@@ -478,8 +619,16 @@ export async function verifyTrader(
   if (stats.topMintProfitShare > MAX_TOP_MINT_SHARE) {
     d.push(`${Math.round(stats.topMintProfitShare * 100)}% of profit came from one token — one correct call, not a method`);
   }
+  if (stats.closedTrades > 0 && stats.realizedExBestSol <= 0 && stats.realizedSol > 0) {
+    d.push(`take away their best token and they are at ${stats.realizedExBestSol} SOL — the record is one call`);
+  }
+  if (stats.expectedFillDragPct !== undefined && stats.expectedFillDragPct > MAX_FILL_DRAG_PCT) {
+    d.push(`copying it would cost ~${stats.expectedFillDragPct.toFixed(1)}% worse fills`
+      + ` (entries of ${stats.medianBuySol} SOL into a ${stats.medianEntryVSol} SOL curve)`
+      + ` — over the ${MAX_FILL_DRAG_PCT}% budget before the trade has an opinion`);
+  }
   if (stats.medianBuySol > MAX_COPYABLE_BUY_SOL) {
-    d.push(`median entry ${stats.medianBuySol} SOL is too large to follow — their own buy moves the curve before ours lands`);
+    d.push(`median entry ${stats.medianBuySol} SOL is too large to follow at any point on any curve`);
   }
   if (stats.medianBuySol > 0 && stats.medianBuySol < MIN_SERIOUS_BUY_SOL) {
     d.push(`median entry ${stats.medianBuySol} SOL — testing, not trading`);
@@ -518,6 +667,23 @@ export function scoreOf(s: TraderStats): number {
   // 14 SOL trader are both harder to follow than a 2 SOL one.
   const size = clamp01(1 - Math.abs(Math.log(Math.max(s.medianBuySol, 0.01) / 2)) / Math.log(20));
   return round4(clamp01(0.4 * profit + 0.2 * rate + 0.2 * fresh + 0.1 * spread + 0.1 * size));
+}
+
+/**
+ * Wilson score interval, lower bound at ~95%.
+ *
+ * The honest way to read "k of n" when n is small: it answers "what share can
+ * we be confident is at least this high", so an accusation needs either a big
+ * sample or a very lopsided one.
+ */
+export function wilsonLower(k: number, n: number, z = 1.96): number {
+  if (n <= 0) return 0;
+  const p = k / n;
+  const z2 = z * z;
+  const denom = 1 + z2 / n;
+  const centre = p + z2 / (2 * n);
+  const margin = z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n);
+  return clamp01((centre - margin) / denom);
 }
 
 function median(xs: number[]): number {
