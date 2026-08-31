@@ -108,6 +108,16 @@ const POSITION_SYNC_INTERVAL_MS = 90_000;
  * acting on it would delete real positions seconds after opening them.
  */
 const POSITION_SYNC_MIN_AGE_MS = 60_000;
+/**
+ * Concurrent fast-lane verifications allowed at once.
+ *
+ * Each is an unawaited poll loop, and an unawaited loop PER EVENT is exactly
+ * how a diagnostic becomes the 429 storm it exists to diagnose: a 2400 tx/min
+ * leader would have started ~800 of them, polling several hundred times a
+ * second between them. It is anchored to real copy BUYS (bounded by the spend
+ * governor) rather than to notifications, and capped here as well.
+ */
+const MAX_FAST_VERIFY_IN_FLIGHT = 4;
 
 /** Host of a URL, for log lines. Never throws on a malformed value. */
 function hostOf(url: string): string {
@@ -1143,9 +1153,6 @@ export class CopyTraderService {
     // the transaction is readable, the leader's real post-trade balances
     // replace whatever was inferred here.
     this.scheduleReconcile(ev.address, ev.signature);
-    // And check, AFTER the fact, that the leader's transaction actually
-    // survived. See verifyFastSignal.
-    this.verifyFastSignal(wallet, ev.signature, signals);
     void (async () => {
       for (const sig of signals) {
         // The tally above is already updated (the leader's balance is real
@@ -1195,51 +1202,63 @@ export class CopyTraderService {
    * A signature seen at 'processed' that still has NO status after this window
    * did not land — a real one confirms in a second or two.
    */
-  private verifyFastSignal(wallet: TrackedWalletInternal, signature: string, signals: LeaderSignal[]): void {
+  private fastVerifyInFlight = 0;
+
+  private verifyFastSignal(wallet: TrackedWalletInternal, sig: LeaderSignal): void {
     const conn = this.heliusConn;
-    if (!conn || !signals.length) return;
+    const signature = sig.signature;
+    if (!conn || !signature) return;
+
+    // HARD BOUND. Called once per real copy BUY, which the governor already
+    // limits — but a ceiling here as well, because an unawaited poll loop per
+    // event is exactly the shape that turns a diagnostic into the 429 storm it
+    // was meant to diagnose. Dropping a verification is a lost warning; running
+    // hundreds of them is a broken bot.
+    if (this.fastVerifyInFlight >= MAX_FAST_VERIFY_IN_FLIGHT) return;
+    this.fastVerifyInFlight++;
+
     const started = Date.now();
     const WINDOW_MS = 20_000;
 
     const poll = async (): Promise<void> => {
-      while (Date.now() - started < WINDOW_MS) {
-        try {
-          const res = await conn.getSignatureStatuses([signature], { searchTransactionHistory: true });
-          const v = res?.value?.[0];
-          if (v) {
-            if (v.err) {
-              this.warnFastSignalLost(wallet, signals, signature,
-                `it FAILED on-chain (${JSON.stringify(v.err)})`);
-              return;
+      try {
+        while (Date.now() - started < WINDOW_MS) {
+          try {
+            const res = await conn.getSignatureStatuses([signature], { searchTransactionHistory: true });
+            const v = res?.value?.[0];
+            if (v) {
+              if (v.err) {
+                this.warnFastSignalLost(wallet, sig, signature, `it FAILED on-chain (${JSON.stringify(v.err)})`);
+                return;
+              }
+              if (v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized') return; // healthy
             }
-            if (v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized') return; // healthy
-          }
-        } catch { /* transient — keep polling inside the window */ }
-        await sleep(1500);
+          } catch { /* transient — keep polling inside the window */ }
+          await sleep(2500);
+        }
+        this.warnFastSignalLost(wallet, sig, signature,
+          `it never reached a confirmed status within ${WINDOW_MS / 1000}s — it was most likely dropped`);
+      } finally {
+        this.fastVerifyInFlight--;
       }
-      this.warnFastSignalLost(wallet, signals, signature,
-        `it never reached a confirmed status within ${WINDOW_MS / 1000}s — it was most likely dropped`);
     };
     void poll();
   }
 
   private warnFastSignalLost(
     wallet: TrackedWalletInternal,
-    signals: LeaderSignal[],
+    sig: LeaderSignal,
     signature: string,
     why: string
   ): void {
-    const copiedBuys = signals.filter(s => s.side === 'buy');
-    for (const sig of copiedBuys) {
-      const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
-      this.pushFeed(wallet, sig, 'failed',
-        `⚠️ The leader transaction this copy was based on did not survive — ${why}. `
-        + (held
-          ? `We are holding $${this.symbolFor(sig)} on a trade the leader may never have made. Review it. `
-          : 'Nothing was opened for it. ')
-        + `https://solscan.io/tx/${signature}`);
-    }
-    if (copiedBuys.length) this.emitChange();
+    const held = this.positions.find(p => p.mint === sig.mint && p.status !== 'CLOSED');
+    this.pushFeed(wallet, sig, 'failed',
+      `⚠️ The leader transaction this copy was based on did not survive — ${why}. `
+      + (held
+        ? `We are holding $${this.symbolFor(sig)} on a trade the leader may never have made. Review it. `
+        : 'Nothing is open for it. ')
+      + `https://solscan.io/tx/${signature}`);
+    this.emitChange();
   }
 
   /**
@@ -2243,6 +2262,13 @@ export class CopyTraderService {
         this.pushFeed(wallet, sig, 'copied',
           `REAL BUY ${copySol} SOL of $${symbol}${existingNow ? ' (added to position)' : ''}${clampNote} @ ${fmtPrice(entryPriceSol)} SOL/token`,
           copySol, result.txid);
+
+        // Only NOW, and only for a fast-lane signal: check that the leader
+        // transaction we acted on actually survived. Anchored here rather than
+        // at the notification because we just spent real money on it — and
+        // because the notification rate is the leader's, which can be hundreds
+        // per minute, while this rate is bounded by the governor.
+        if (sig.fast && sig.signature) this.verifyFastSignal(wallet, sig);
       } else {
         // Paper: fill at the leader's realized price plus a slippage haircut —
         // we would have landed AFTER them, never at a better price.
