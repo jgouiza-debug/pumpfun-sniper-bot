@@ -62,6 +62,13 @@ echo.
 
 REM No --use-system-ca here: it only exists on Node 22.15+, and on anything
 REM older node exits immediately with "bad option" instead of starting the bot.
+REM Run with the PRODUCT flag set. Without it, featureFlags falls back to
+REM DEFAULTS -- the "legacy behaviour" table in which the kill switch, the
+REM honeypot check, the dev-sell stop, the economics gate, playbook routing
+REM and honest paper accounting are ALL OFF. That table was never meant for a
+REM real trading session; PACKAGED_DEFAULTS is "the flags the project actually
+REM operates with", and this launcher is a real trading session.
+set "SNIPER_PACKAGED=1"
 node "dist\server.js"
 
 echo.

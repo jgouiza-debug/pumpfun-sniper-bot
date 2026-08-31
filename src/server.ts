@@ -103,8 +103,22 @@ app.get('/api/session-token', (req, res) => {
   // build takes the target token explicitly instead of reading it here.
   // Packaged = the pkg exe ((process as any).pkg) OR the packaged Electron app
   // (SNIPER_PACKAGED, set by electron/main.js when app.isPackaged).
-  if (Boolean((process as any).pkg) || process.env.SNIPER_PACKAGED === '1') {
-    res.status(404).json({ error: 'session-token is not served by the packaged app; the UI is served with its token embedded.' });
+  // OPT-IN, and off everywhere by default.
+  //
+  // This used to be disabled only for PACKAGED builds, on the reasoning that
+  // nothing legitimate fetches it there. But the project's own documented
+  // launcher (`run bot real.cmd`) runs `node dist/server.js`, which is not a
+  // packaged build — so on the supported path the endpoint was live, and it is
+  // an unauthenticated GET that hands out the bearer token authorizing every
+  // trading endpoint. Any other local server, notebook, or Electron app on the
+  // machine (or a page one of them serves that pulled a compromised
+  // dependency) could take it and then arm real mode, widen slippage and place
+  // orders.
+  //
+  // It exists solely for the vite dev server on another port, so it is now
+  // gated on an explicit opt-in that only a developer sets.
+  if (process.env.SNIPER_DEV_TOKEN_ENDPOINT !== '1') {
+    res.status(404).json({ error: 'session-token is disabled. The UI is served with its token embedded; set SNIPER_DEV_TOKEN_ENDPOINT=1 only for the vite dev server.' });
     return;
   }
   res.json({ token: apiToken() });

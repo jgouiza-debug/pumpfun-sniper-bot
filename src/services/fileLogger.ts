@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { installPath } from './installPaths';
 
 /**
  * Durable log beside the exe (same base-dir rule as loadEnv/keyStore: the
@@ -18,8 +19,20 @@ import * as path from 'path';
  * flushed synchronously at process exit. Rotation at 5 MB; a rotation blocked
  * by a file lock is retried on every flush rather than silently abandoned.
  */
-const isPackaged = Boolean((process as any).pkg);
-const LOG_FILE = path.join(isPackaged ? path.dirname(process.execPath) : process.cwd(), 'bot.log');
+// Resolved through the SHARED helper, which honours SNIPER_DATA_DIR — the
+// per-user app-data path electron/main.js sets. This file re-derived the rule
+// and missed that branch, so under the installed desktop app (not `process.pkg`)
+// it fell through to process.cwd(): C:\Windows\System32 from a Start-menu
+// shortcut, or the read-only Program Files install directory. Every append
+// then failed, and every failure is swallowed by design here — so the ONLY
+// durable forensic artifact this bot produces did not exist for exactly the
+// users who run the installer, while positions and copy state (which do use
+// installPath) landed correctly in AppData.
+//
+// That is why an incident report can arrive with no way to tell a phantom
+// position from a real one: the log line that records which flags were live,
+// and every ⚠️/❌ the engine emitted, had nowhere to go.
+const LOG_FILE = installPath('bot.log');
 const MAX_BYTES = 5 * 1024 * 1024;
 const FLUSH_INTERVAL_MS = 250;
 
