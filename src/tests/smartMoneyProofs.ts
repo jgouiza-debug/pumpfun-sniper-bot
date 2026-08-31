@@ -42,6 +42,9 @@ function test(name: string, fn: () => void | Promise<void>): void {
   }
 }
 
+/** Read once, near the top: a `const` arrow used above its declaration is a TDZ error, not a miss. */
+const engineSrc = () => readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+
 const W = 'WalletAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const T0 = 1_700_000_000_000;
 
@@ -563,6 +566,49 @@ test('ONE WALLET CANNOT BE ITS OWN QUORUM', () => {
   }
 });
 
+test('A BUNDLED FLEET IS ONE OPINION, NOT A QUORUM', () => {
+  // The attack the review named: "distinct wallet address" is not
+  // independence. A bundler buys from up to sixteen wallets in ONE
+  // transaction, and an operator running a fleet does the same thing on
+  // purpose. Counting those as several observers agreeing is a confluence
+  // detector agreeing with itself — and independence is the entire reason this
+  // is preferred over mirroring one wallet faster.
+  const d = new SmartMoneyDetector(promotedLedger(4));
+  const SAME_TX = 'BundledSignature1111111111111111111111111111';
+  for (let i = 0; i < 4; i++) {
+    const sig = d.observe({ wallet: `P${i}`, mint: MINT, solIn: 1, at: T0 + i, signature: SAME_TX });
+    assert.strictEqual(sig, null, `wallet ${i} from the same transaction must not build a quorum`);
+  }
+});
+
+test('the same wallets in DIFFERENT transactions are a real quorum', () => {
+  const d = new SmartMoneyDetector(promotedLedger(2));
+  assert.strictEqual(d.observe({ wallet: 'P0', mint: MINT, solIn: 1, at: T0, signature: 'txA' }), null);
+  const sig = d.observe({ wallet: 'P1', mint: MINT, solIn: 1, at: T0 + 1000, signature: 'txB' });
+  assert.ok(sig, 'two wallets acting separately is what the detector is for');
+  assert.strictEqual(sig!.wallets.length, 2);
+});
+
+test('a mixed batch counts each transaction once', () => {
+  // Three wallets, two of them bundled together: two opinions, not three.
+  const d = new SmartMoneyDetector(promotedLedger(3));
+  d.setConfig({ minWallets: 3 });
+  d.observe({ wallet: 'P0', mint: MINT, solIn: 1, at: T0, signature: 'bundle' });
+  d.observe({ wallet: 'P1', mint: MINT, solIn: 1, at: T0 + 1, signature: 'bundle' });
+  assert.strictEqual(
+    d.observe({ wallet: 'P2', mint: MINT, solIn: 1, at: T0 + 2, signature: 'solo' }), null,
+    'the bundle contributes one vote, so three are not yet present');
+});
+
+test('the engine supplies the signature, or the independence test is inert', () => {
+  const src = engineSrc();
+  const idx = src.indexOf('smartMoneyDetector.observe({');
+  assert.ok(idx > 0, 'the feed must call the detector');
+  const body = src.slice(idx, idx + 700);
+  assert.ok(/signature: ev\.signature/.test(body),
+    'without a signature every bundled buy reads as an independent one');
+});
+
 test('an UNPROMOTED wallet contributes nothing, however much it buys', () => {
   const l = promotedLedger(1);
   l.recordBuy('Stranger', MINT, 50, T0);   // exists in the ledger, not promoted
@@ -693,7 +739,6 @@ test('the pending view shows what is accumulating without firing anything', () =
 
 console.log('\n-- The entry path: no shortcut, no second door --');
 
-const engineSrc = () => readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
 
 test('THE SMART-MONEY LANE DOES NOT FABRICATE A PASSING GATE RESULT', () => {
   // fireLaunchSnipe, a few lines away in the same file, constructs a

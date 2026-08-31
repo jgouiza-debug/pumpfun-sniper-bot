@@ -36,6 +36,16 @@ export interface SmartMoneyBuy {
   /** The leader's slot, when the feed carried one. */
   slot?: number;
   /**
+   * The transaction this buy came from.
+   *
+   * The independence test. "Distinct wallet address" is not independence — a
+   * bundler buys from sixteen wallets in ONE transaction, which is one actor
+   * expressing one opinion, and counting it as sixteen is a confluence
+   * detector agreeing with itself. Two votes from the same signature are one
+   * vote.
+   */
+  signature?: string;
+  /**
    * The bonding curve's virtual SOL reserves at the moment of this buy.
    *
    * Comes free with the decoded TradeEvent — no RPC — and it is what tells the
@@ -163,9 +173,28 @@ export class SmartMoneyDetector {
     const stillPromoted = inWindow.filter(b => this.ledger.get(b.wallet)?.state === 'promoted');
     if (stillPromoted.length < this.config.minWallets) return null;
 
+    // ONE TRANSACTION IS ONE OPINION. Wallets that bought in the same
+    // transaction were bundled by whoever built it — a fleet operator, or a
+    // launch bundler moving sixteen wallets at once. They are not independent
+    // observers agreeing; they are one actor, and the whole argument for
+    // preferring confluence over mirroring rests on the observers being
+    // independent. Buys with no signature are treated as distinct, because the
+    // fast lane always supplies one and a missing one is not evidence of
+    // bundling.
+    const bySignature = new Map<string, SmartMoneyBuy>();
+    const independent: SmartMoneyBuy[] = [];
+    for (const b of stillPromoted) {
+      if (!b.signature) { independent.push(b); continue; }
+      const seen = bySignature.get(b.signature);
+      if (seen) continue;                       // same transaction — already counted once
+      bySignature.set(b.signature, b);
+      independent.push(b);
+    }
+    if (independent.length < this.config.minWallets) return null;
+
     this.firedAt.set(buy.mint, now);
 
-    const convictions = stillPromoted
+    const convictions = independent
       .map(b => this.ledger.score(b.wallet)?.conviction)
       .filter((c): c is number => typeof c === 'number');
     const meanConviction = convictions.length
@@ -173,21 +202,21 @@ export class SmartMoneyDetector {
       : 0.5;
     // Agreement beyond the minimum counts for something, but with sharply
     // diminishing weight: four wallets is better than two, not twice as good.
-    const excess = stillPromoted.length - this.config.minWallets;
+    const excess = independent.length - this.config.minWallets;
     const agreementBonus = 1 - Math.pow(0.6, excess);       // 0, 0.4, 0.64, …
     const strength = clamp01(meanConviction * (0.75 + 0.25 * agreementBonus));
 
-    const slots = stillPromoted.map(b => b.slot).filter((s): s is number => typeof s === 'number' && s > 0);
+    const slots = independent.map(b => b.slot).filter((s): s is number => typeof s === 'number' && s > 0);
     // The most recent contributor's reading of the curve.
-    const freshest = [...stillPromoted].sort((a, b) => b.at - a.at)
+    const freshest = [...independent].sort((a, b) => b.at - a.at)
       .find(b => typeof b.vSolInBondingCurve === 'number');
 
     return {
       mint: buy.mint,
-      wallets: stillPromoted.map(b => b.wallet),
-      totalSolIn: round4(stillPromoted.reduce((s, b) => s + b.solIn, 0)),
-      firstAt: Math.min(...stillPromoted.map(b => b.at)),
-      lastAt: Math.max(...stillPromoted.map(b => b.at)),
+      wallets: independent.map(b => b.wallet),
+      totalSolIn: round4(independent.reduce((s, b) => s + b.solIn, 0)),
+      firstAt: Math.min(...independent.map(b => b.at)),
+      lastAt: Math.max(...independent.map(b => b.at)),
       strength,
       ...(slots.length ? { leaderSlot: Math.max(...slots) } : {}),
       ...(freshest ? { vSolInBondingCurve: freshest.vSolInBondingCurve } : {}),

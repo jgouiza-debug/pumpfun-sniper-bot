@@ -3918,6 +3918,9 @@ export class SniperEngine {
               solIn,
               at: Date.now(),
               slot: ev.slot || undefined,
+              // The independence key: two roster wallets in ONE transaction
+              // were bundled by one actor, and count once.
+              signature: ev.signature,
               // Free with the decode. Without it the router cannot place the
               // token on the curve and refuses every candidate.
               vSolInBondingCurve: Number(t.virtualSolReserves) / 1e9,
