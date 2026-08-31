@@ -37,10 +37,24 @@
 
 :root {
   /* --- ground ---------------------------------------------------------- */
-  --bg:          #0a0c10;   /* the desk */
-  --bg-panel:    #10131a;   /* a card sitting on it */
-  --bg-raised:   #161a23;   /* a header or hovered row inside a card */
-  --bg-input:    #070910;   /* a hole in the surface — inputs, the console */
+  --bg:          #08090d;   /* the desk */
+  --bg-panel:    #0e1117;   /* a card sitting on it */
+  --bg-raised:   #151922;   /* a header or hovered row inside a card */
+  --bg-input:    #05070b;   /* a hole in the surface — inputs, the console */
+
+  /* Layer light. A panel is lit from above by a single hairline highlight and
+     falls off downward — the whole of the "depth" here, and the reason the
+     surfaces read as stacked rather than as flat rectangles of slightly
+     different grey. Kept to a 2-3% lightness shift: any more and a dark UI
+     starts looking like plastic. */
+  --panel-sheen: linear-gradient(180deg, rgba(255,255,255,0.028) 0%, rgba(255,255,255,0) 42%);
+  --edge-light:  rgba(255,255,255,0.055);
+
+  /* Glow. Used ONLY on values that are live and on the one number that leads.
+     A screen where everything glows is a screen where nothing does. */
+  --glow-ok:   0 0 14px rgba(63, 185, 80, 0.30);
+  --glow-bad:  0 0 14px rgba(248, 81, 73, 0.30);
+  --glow-info: 0 0 14px rgba(88, 166, 255, 0.28);
 
   /* --- structure ------------------------------------------------------- */
   --line:        #222835;   /* the default hairline */
@@ -108,7 +122,20 @@ html, body {
   width: 100vw !important;
   max-height: 100vh !important;
   overflow: hidden !important;      /* the layout is a fixed viewport, by design */
-  background: var(--bg);
+  /* A scanline at 2.5% over a corner-lit ground. At this alpha it is not a
+     visible pattern, it is a texture — the desk stops being a flat #08090d
+     rectangle and the panels sitting on it gain something to sit on. Anything
+     stronger fights the type, which is the one thing that must not happen. */
+  background:
+    repeating-linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.025) 0px,
+      rgba(255, 255, 255, 0.025) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    radial-gradient(1200px 620px at 12% -8%, rgba(88, 166, 255, 0.055), transparent 62%),
+    var(--bg);
   color: var(--fg);
   font-family: var(--mono);
   font-size: var(--fs-sm);
@@ -197,6 +224,26 @@ a:hover { text-decoration: underline; }
   content: '$ ';
   color: var(--ok);
   font-weight: 400;
+  text-shadow: var(--glow-ok);
+}
+/* A block cursor after the title. The one piece of motion on the chrome, and
+   it earns its place: it is the difference between a screenshot of a terminal
+   and a terminal that is running. */
+.brand-title::after {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 12px;
+  margin-left: 7px;
+  vertical-align: -1px;
+  background: var(--ok);
+  box-shadow: var(--glow-ok);
+  animation: caret 1.15s steps(1) infinite;
+}
+@keyframes caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-title::after { animation: none; opacity: 0.65; }
 }
 
 .brand-subtitle {
@@ -234,11 +281,18 @@ a:hover { text-decoration: underline; }
 .btn-terminal {
   padding: 5px 11px;
   background: var(--ok-bg);
+  background-image: var(--panel-sheen);
   color: var(--ok);
   border: 1px solid var(--ok);
   font-weight: 600;
+  text-shadow: 0 0 10px rgba(63, 185, 80, 0.35);
 }
-.btn-terminal:hover { background: var(--ok); color: var(--bg); }
+.btn-terminal:hover {
+  background: var(--ok);
+  color: var(--bg);
+  text-shadow: none;
+  box-shadow: var(--glow-ok);
+}
 
 .btn-terminal-outline {
   padding: 5px 11px;
@@ -264,6 +318,7 @@ a:hover { text-decoration: underline; }
   color: var(--info);
   border-color: var(--info);
   font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--info);
 }
 
 .btn-ghost {
@@ -303,11 +358,29 @@ button:disabled:hover { background: inherit; color: inherit; }
 .stat-card {
   padding: var(--sp-2) var(--sp-3);
   background: var(--bg-panel);
+  background-image: var(--panel-sheen);
   display: flex;
   flex-direction: column;
   gap: 2px;
   justify-content: center;
-  min-height: 58px;
+  min-height: 62px;
+  position: relative;
+  transition: background-color 0.15s ease;
+}
+.stat-card:hover { background-color: var(--bg-raised); }
+
+/* A rail down the left edge of every card. Off by default — it lights up only
+   where a value is live — so the strip reads as a row of instruments with a
+   couple of them powered, rather than as five equally loud boxes. */
+.stat-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--line-bright);
+  opacity: 0.5;
 }
 
 /* Nine cards in five columns leaves a tenth slot empty, and with the gap
@@ -317,12 +390,16 @@ button:disabled:hover { background: inherit; color: inherit; }
    different card counts and neither should have to know about the other. */
 .stat-card:nth-last-child(1):nth-child(9) { grid-column: span 2; }
 
-/* The anchor is the number you look at first, and it earns that with a rule
-   under it rather than with a different typeface. */
+/* The anchor is the number you look at first, and it earns that with light
+   rather than with a different typeface. */
 .stat-card.hero-anchor {
   background: var(--bg-raised);
-  box-shadow: inset 0 -2px 0 var(--info);
+  background-image:
+    linear-gradient(180deg, rgba(88, 166, 255, 0.07) 0%, rgba(88, 166, 255, 0) 55%),
+    var(--panel-sheen);
+  box-shadow: inset 0 -2px 0 var(--info), inset 0 1px 0 var(--edge-light);
 }
+.stat-card.hero-anchor::before { background: var(--info); opacity: 1; box-shadow: var(--glow-info); }
 
 .stat-label {
   font-size: var(--fs-xs);
@@ -350,8 +427,11 @@ button:disabled:hover { background: inherit; color: inherit; }
   letter-spacing: -0.02em;
 }
 
-.delta-positive { color: var(--ok); }
-.delta-negative { color: var(--bad); }
+.delta-positive { color: var(--ok); text-shadow: var(--glow-ok); }
+.delta-negative { color: var(--bad); text-shadow: var(--glow-bad); }
+
+/* The strip itself is lit from the top edge like the cards on it. */
+.stats-grid { box-shadow: inset 0 1px 0 var(--edge-light); }
 
 /* ===========================================================================
    LAYOUT
@@ -384,11 +464,14 @@ button:disabled:hover { background: inherit; color: inherit; }
   margin-bottom: var(--sp-2);
   flex-shrink: 0;
 }
+/* The rule fades out rather than stopping dead. It is the cheapest possible
+   way to make a divider look drawn rather than defaulted, and it stops a
+   column of six section headers reading as six identical grey lines. */
 .section-header::after {
   content: '';
   flex: 1;
   height: 1px;
-  background: var(--line);
+  background: linear-gradient(90deg, var(--line-bright) 0%, var(--line) 38%, transparent 100%);
 }
 /* Keep the count on the far right of the rule rather than beside the title. */
 .section-header > .section-count { order: 3; }
@@ -409,9 +492,18 @@ button:disabled:hover { background: inherit; color: inherit; }
   color: var(--fg-dim);
   white-space: nowrap;
 }
+/* A lit block rather than a glyph: it sits on the baseline properly at any
+   size, where a box-drawing character depends on whichever font the platform
+   substitutes for it. */
 .section-title::before {
-  content: '▚ ';
-  color: var(--line-focus);
+  content: '';
+  display: inline-block;
+  width: 3px;
+  height: 10px;
+  margin-right: 7px;
+  vertical-align: -1px;
+  background: var(--info);
+  box-shadow: 0 0 8px rgba(88, 166, 255, 0.45);
 }
 
 .section-count {
@@ -427,6 +519,8 @@ button:disabled:hover { background: inherit; color: inherit; }
 .matrix-container {
   border: 1px solid var(--line);
   background: var(--bg-panel);
+  background-image: var(--panel-sheen);
+  box-shadow: inset 0 1px 0 var(--edge-light);
   overflow: auto;
   flex-shrink: 0;
 }
@@ -437,17 +531,37 @@ button:disabled:hover { background: inherit; color: inherit; }
   overflow-y: auto !important;
 }
 
+/* An empty table now has a lot of room — removing the filter matrix freed the
+   left column — so the placeholder FILLS the bay instead of floating in it.
+   A one-line message centred in a tall empty box reads as content that failed
+   to load; the same message inside a dashed region the size of the panel reads
+   as a bay that is deliberately empty, which is what it is. */
+.matrix-container.flex-matrix:has(> .empty-state) {
+  display: flex;
+  padding: var(--sp-2);
+}
+.matrix-container.flex-matrix > .empty-state {
+  flex: 1;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+}
+
 .matrix-table { width: 100%; border-collapse: collapse; text-align: left; }
 
 .matrix-table th {
   font-size: var(--fs-xs);
-  font-weight: 500;
-  letter-spacing: 0.08em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-dim);
   padding: var(--sp-2) var(--sp-3);
   border-bottom: 1px solid var(--line-bright);
   background: var(--bg-raised);
+  background-image: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0));
   position: sticky;
   top: 0;
   z-index: 10;
@@ -455,13 +569,22 @@ button:disabled:hover { background: inherit; color: inherit; }
 }
 
 .matrix-table td {
-  padding: 5px var(--sp-3);
+  padding: 6px var(--sp-3);
   border-bottom: 1px solid var(--line);
   font-size: var(--fs-sm);
   color: var(--fg-dim);
 }
 
+/* Zebra at 1.6%. Below the threshold where you notice stripes, above the one
+   where your eye loses its place tracking a wide row of numbers — which is the
+   entire job. */
+.matrix-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.016); }
+
+/* Hover lights a rail down the row rather than washing it, so the row you are
+   reading is marked without the numbers in it changing contrast. */
+.matrix-table tbody tr { transition: background-color 0.1s ease; }
 .matrix-table tbody tr:hover td { background: var(--bg-raised); }
+.matrix-table tbody tr:hover td:first-child { box-shadow: inset 2px 0 0 var(--info); }
 .matrix-table tr:last-child td { border-bottom: none; }
 
 .num-col { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
@@ -495,6 +618,10 @@ button:disabled:hover { background: inherit; color: inherit; }
 
 .console-container {
   background: var(--bg-input);
+  /* Inset rather than raised: the log is a well cut into the desk, which is
+     the opposite treatment to the panels and is what makes it read as a
+     different KIND of surface instead of another card. */
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5);
   border: 1px solid var(--line);
   padding: var(--sp-2) 0;
   flex: 1;
@@ -514,9 +641,12 @@ button:disabled:hover { background: inherit; color: inherit; }
 }
 .log-line:hover { background: var(--bg-panel); }
 
-.log-time { color: var(--fg-faint); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.log-time { color: var(--fg-faint); flex-shrink: 0; font-variant-numeric: tabular-nums; opacity: 0.85; }
+/* Every line is prefixed, so the feed scans as a transcript rather than as
+   wrapped prose. */
+.log-line::before { content: '›'; color: var(--line-focus); flex-shrink: 0; }
 
-.log-level-snipe { color: var(--ok); font-weight: 500; }
+.log-level-snipe { color: var(--ok); font-weight: 500; text-shadow: 0 0 10px rgba(63, 185, 80, 0.25); }
 .log-level-sell  { color: var(--warn); font-weight: 500; }
 .log-level-error { color: var(--bad); font-weight: 500; }
 .log-level-warn  { color: var(--warn); }
@@ -578,6 +708,8 @@ button:disabled:hover { background: inherit; color: inherit; }
 
 .modal-card {
   background: var(--bg-panel);
+  background-image: var(--panel-sheen);
+  box-shadow: inset 0 1px 0 var(--edge-light), 0 24px 64px rgba(0, 0, 0, 0.6);
   border: 1px solid var(--line-bright);
   padding: var(--sp-4);
   max-width: 640px;
@@ -596,7 +728,18 @@ button:disabled:hover { background: inherit; color: inherit; }
   padding-bottom: var(--sp-2);
   border-bottom: 1px solid var(--line);
 }
-.modal-title::before { content: '▚ '; color: var(--line-focus); }
+/* The same lit rail as a section title, so a modal reads as part of the same
+   instrument rather than as a dialog the OS put there. */
+.modal-title::before {
+  content: '';
+  display: inline-block;
+  width: 3px;
+  height: 11px;
+  margin-right: 8px;
+  vertical-align: -1px;
+  background: var(--info);
+  box-shadow: 0 0 8px rgba(88, 166, 255, 0.45);
+}
 
 /* ===========================================================================
    PANELS
@@ -609,6 +752,8 @@ button:disabled:hover { background: inherit; color: inherit; }
 .panel {
   border: 1px solid var(--line);
   background: var(--bg-panel);
+  background-image: var(--panel-sheen);
+  box-shadow: inset 0 1px 0 var(--edge-light);
   padding: var(--sp-3);
 }
 .panel-learn { border-color: rgba(163, 113, 247, 0.3); background: var(--learn-bg); }
@@ -624,14 +769,17 @@ button:disabled:hover { background: inherit; color: inherit; }
   margin-bottom: var(--sp-2);
 }
 
+/* An empty panel should look deliberately empty, not broken. The dashed inset
+   says "nothing here yet" in a way a bare sentence on a flat card does not. */
 .empty-state {
   padding: var(--sp-4);
+  margin: var(--sp-3);
   text-align: center;
-  background: var(--bg-panel);
-  border: 1px solid var(--line);
+  background: transparent;
+  border: 1px dashed var(--line-bright);
   color: var(--fg-faint);
   font-size: var(--fs-sm);
-  line-height: 1.6;
+  line-height: 1.65;
 }
 
 /* ===========================================================================
@@ -648,4 +796,83 @@ button:disabled:hover { background: inherit; color: inherit; }
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .console-container { height: 280px; flex: none; }
   .header { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+}
+
+/* ===========================================================================
+   STATUS BAR
+   ---------------------------------------------------------------------------
+   The tmux/vim convention, and it is a convention because it works: the handful
+   of facts you check constantly — mode, port, chain health, wallet, uptime —
+   live in one fixed strip instead of being hunted for among the panels.
+
+   It also closes the layout. A dense screen that simply stops at the bottom
+   edge reads as cut off; a bar reads as the bottom of an instrument.
+   =========================================================================== */
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
+  margin-top: var(--sp-2);
+  border: 1px solid var(--line);
+  background: var(--bg-raised);
+  background-image: var(--panel-sheen);
+  box-shadow: inset 0 1px 0 var(--edge-light);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.06em;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.status-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px var(--sp-3);
+  border-right: 1px solid var(--line);
+  color: var(--fg-dim);
+  min-width: 0;
+}
+.status-seg:last-child { border-right: none; }
+
+/* The leftmost segment is the mode, and it is inverted — the one solid block
+   of colour in the chrome, so "am I on paper or live money" is answered from
+   across the room. That question is worth a colour on its own. */
+.status-seg.mode {
+  background: var(--info);
+  color: var(--bg);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.status-seg.mode.live { background: var(--bad); }
+
+.status-key { color: var(--fg-faint); text-transform: uppercase; }
+.status-val { color: var(--fg); font-variant-numeric: tabular-nums; }
+.status-val.ok   { color: var(--ok); }
+.status-val.bad  { color: var(--bad); }
+.status-val.warn { color: var(--warn); }
+
+/* Pushes everything after it to the right edge. */
+.status-spacer { flex: 1; border-right: none; padding: 0; }
+
+/* A live dot that actually breathes, so a stalled feed is visible as a
+   stalled feed rather than as a green dot that happens to be a green dot. */
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50% !important;
+  background: var(--ok);
+  box-shadow: var(--glow-ok);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+.status-dot.bad { background: var(--bad); box-shadow: var(--glow-bad); animation: none; }
+@keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot { animation: none; }
+}
+
+@media (max-width: 1100px) {
+  .status-bar { flex-wrap: wrap; }
 }

@@ -1316,6 +1316,38 @@ export function App() {
           <div style={{ minWidth: '380px' }} />
         </header>
         <CopyTradingPage apiBase={API_BASE} />
+
+        {/* The same bar as the sniper view, carrying only the facts this view
+            actually owns. The copy engine's own counters live in its stat
+            strip; duplicating them here would be a second source of truth for
+            a number that is already on screen. */}
+        <div className="status-bar">
+          <div className={`status-seg mode${botStatus?.tradingMode === 'real' ? ' live' : ''}`}>
+            {botStatus?.tradingMode === 'real' ? '● LIVE MONEY' : '◇ PAPER'}
+          </div>
+          <div className="status-seg">
+            <span className="status-key">port</span>
+            <span className="status-val">{selectedPort}</span>
+          </div>
+          <div className="status-seg">
+            <span className="status-key">rpc</span>
+            <span className={`status-val ${wallet?.rpcHealthy !== false ? 'ok' : 'bad'}`}>
+              {wallet?.rpcHealthy !== false ? 'OK' : 'DOWN'}
+            </span>
+            {rpcEndpointLabel && <span className="status-key">{rpcEndpointLabel}</span>}
+          </div>
+          <div className="status-seg">
+            <span className="status-key">wallet</span>
+            <span className={`status-val ${wallet?.linked ? 'ok' : 'warn'}`}>
+              {wallet?.linked ? `${wallet.solBalance} SOL` : 'NOT LINKED'}
+            </span>
+          </div>
+          <div className="status-seg status-spacer" />
+          <div className="status-seg">
+            <span className="status-key">view</span>
+            <span className="status-val">COPY TRADING</span>
+          </div>
+        </div>
       </div>
     );
   }
@@ -1404,42 +1436,11 @@ export function App() {
         </div>
 
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-          <div
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '6px 12px',
-              borderRadius: '4px',
-              border: `1px solid ${wallet?.rpcHealthy !== false ? 'var(--ok-bg)' : 'var(--bad-bg)'}`,
-              background: wallet?.rpcHealthy !== false ? 'var(--ok-bg)' : 'var(--bad-bg)',
-              color: wallet?.rpcHealthy !== false ? 'var(--ok)' : 'var(--bad)',
-              fontSize: '12px',
-              fontWeight: 700,
-              fontFamily: 'var(--font-mono)'
-            }}
-            title={[
-              wallet?.rpcHealthy !== false ? 'RPC connection active' : 'RPC connection offline',
-              rpcEndpointLabel ? `Endpoint: ${rpcEndpointLabel}` : null,
-              rpcInfo?.keyOverridden
-                ? 'SOLANA_RPC_URL is set, so your Helius key is NOT being used.'
-                : null,
-              rpcInfo?.credentialRejected ? 'The provider rejected the API key itself.' : null,
-            ].filter(Boolean).join('\n')}
-          >
-            <span style={{
-              width: '7px',
-              height: '7px',
-              borderRadius: '50%',
-              background: wallet?.rpcHealthy !== false ? 'var(--ok)' : 'var(--bad)',
-              boxShadow: wallet?.rpcHealthy !== false ? '0 0 6px var(--ok)' : '0 0 6px var(--bad)'
-            }} />
-            RPC {wallet?.rpcHealthy !== false ? 'OK' : 'DOWN'}
-            {rpcEndpointLabel && (
-              <span style={{ opacity: 0.7, fontWeight: 400 }}>· {rpcInfo!.endpointHost}</span>
-            )}
-          </div>
-
+          {/* The RPC pill used to live here. It is in the status bar now, which
+              is where a persistent condition belongs — and carrying it in both
+              places is what pushed this header onto three ragged rows whenever
+              the chain was unreachable, i.e. exactly when it most needed to be
+              readable. */}
           {/* The exact state that produced "valid key, RPC still down". */}
           {rpcInfo?.keyOverridden && (
             <div
@@ -1706,66 +1707,8 @@ export function App() {
 
       {/* Main Single-Screen Split Grid (Zero Forced Page Scrolling) */}
       <div className="main-viewport-grid">
-        {/* Left Column: Leniency Matrix + Positions Matrix */}
+        {/* Left column: what to copy, what is open, what closed. */}
         <div className="viewport-column">
-          {/* Filter profile — locked to STRICT (server coerces any other value) */}
-          <div className="section-header">
-            <div className="section-title">Filter Profile Specification</div>
-            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-              <span
-                className="btn-terminal-outline"
-                style={{
-                  padding: '2px 8px',
-                  fontSize: '11px',
-                  background: 'var(--ink-primary)',
-                  color: 'var(--bg-dark)',
-                  cursor: 'default',
-                }}
-              >
-                STRICT — LOCKED
-              </span>
-            </div>
-          </div>
-
-          <div className="matrix-container">
-            <table className="matrix-table">
-              <thead>
-                <tr>
-                  <th>Filter Parameter</th>
-                  <th className="num-col" style={{ color: 'var(--accent-olive)' }}>Strict (Active)</th>
-                  <th className="num-col">Normal</th>
-                  <th className="num-col">Lenient</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>Minimum Score to Trade</td>
-                  <td className="num-col">62</td>
-                  <td className="num-col">50</td>
-                  <td className="num-col" style={{ color: 'var(--accent-olive)', fontWeight: 600 }}>30</td>
-                </tr>
-                <tr>
-                  <td>Minimum Liquidity (USD)</td>
-                  <td className="num-col">$8,000</td>
-                  <td className="num-col">$3,500</td>
-                  <td className="num-col" style={{ color: 'var(--accent-olive)', fontWeight: 600 }}>$1,500</td>
-                </tr>
-                <tr>
-                  <td>Top 10 Holder Cap / Single Holder</td>
-                  <td className="num-col">30% / 12%</td>
-                  <td className="num-col">45% / 20%</td>
-                  <td className="num-col">65% / 40%</td>
-                </tr>
-                <tr>
-                  <td>Bundled Supply / Dev Cap</td>
-                  <td className="num-col">25% / 8%</td>
-                  <td className="num-col">35% / 12%</td>
-                  <td className="num-col">55% / 25%</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
           <TraderScoutPanel />
           <SmartMoneyPanel />
 
@@ -1962,6 +1905,72 @@ export function App() {
             )}
             <div ref={terminalEndRef} />
           </div>
+        </div>
+      </div>
+
+      {/* STATUS BAR — the facts you check constantly, in one fixed strip.
+          Everything here is already on screen somewhere; the point is that it
+          is on screen ALWAYS, and in the same place, so none of it has to be
+          hunted for among the panels. */}
+      <div className="status-bar">
+        <div className={`status-seg mode${botStatus?.tradingMode === 'real' ? ' live' : ''}`}>
+          {botStatus?.tradingMode === 'real' ? '● LIVE MONEY' : '◇ PAPER'}
+        </div>
+        <div className="status-seg">
+          <span className={`status-dot${isBotActive ? '' : ' bad'}`} />
+          <span className="status-val">{isBotActive ? 'ARMED' : 'IDLE'}</span>
+        </div>
+        <div className="status-seg">
+          <span className="status-key">port</span>
+          <span className="status-val">{selectedPort}</span>
+        </div>
+        <div
+          className="status-seg"
+          title={[
+            wallet?.rpcHealthy !== false ? 'RPC connection active' : 'RPC connection offline',
+            rpcEndpointLabel ? `Endpoint: ${rpcEndpointLabel}` : null,
+            rpcInfo?.keyOverridden
+              ? 'SOLANA_RPC_URL is set in the .env beside the app and takes precedence, so your Helius key is NOT being used. Remove it for the key to take effect.'
+              : null,
+            rpcInfo?.credentialRejected ? (rpcInfo.lastError || 'The provider rejected the API key itself.') : null,
+          ].filter(Boolean).join('\n')}
+        >
+          <span className="status-key">rpc</span>
+          <span className={`status-val ${wallet?.rpcHealthy !== false ? 'ok' : 'bad'}`}>
+            {wallet?.rpcHealthy !== false ? 'OK' : 'DOWN'}
+          </span>
+          {rpcEndpointLabel && <span className="status-key">{rpcEndpointLabel}</span>}
+          {/* Two conditions that look identical from the outside — "RPC is
+              down" — but have opposite fixes. They were badges in the header;
+              they are flags here, and the segment's tooltip carries the whole
+              explanation rather than a truncated one. */}
+          {rpcInfo?.credentialRejected && <span className="status-val bad">KEY REJECTED</span>}
+          {rpcInfo?.keyOverridden && <span className="status-val warn">KEY UNUSED · URL OVERRIDE</span>}
+        </div>
+        <div className="status-seg">
+          <span className="status-key">wallet</span>
+          <span className={`status-val ${wallet?.linked ? 'ok' : 'warn'}`}>
+            {wallet?.linked ? `${wallet.solBalance} SOL` : 'NOT LINKED'}
+          </span>
+        </div>
+        <div className="status-seg">
+          <span className="status-key">open</span>
+          <span className="status-val">{activePositions.length}/{botStatus?.config?.maxActivePositions ?? '—'}</span>
+        </div>
+
+        <div className="status-seg status-spacer" />
+
+        <div className="status-seg">
+          <span className="status-key">uptime</span>
+          <span className="status-val">
+            {runElapsedSec === null
+              ? '--:--:--'
+              : new Date(runElapsedSec * 1000).toISOString().substring(11, 19)}
+          </span>
+        </div>
+        <div className="status-seg">
+          <span className="status-key">log</span>
+          <span className="status-val">{logs.length}</span>
         </div>
       </div>
 
