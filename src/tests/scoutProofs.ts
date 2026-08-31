@@ -1,0 +1,484 @@
+/**
+ * TRADER SCOUT PROOFS — is the wallet it recommends actually copyable?
+ *
+ *   npx ts-node src/tests/scoutProofs.ts
+ *
+ * The operator asked for the most profitable memecoin trader active right now,
+ * a list of three, and the best one named. Every list that claims to answer
+ * that is gameable, and several of the wallets at the top of them will empty
+ * your account if you follow them. So the scout treats a leaderboard as a
+ * source of ADDRESSES and nothing else, and these tests are mostly about the
+ * five ways a wallet can look excellent and be useless:
+ *
+ *   - it stopped trading yesterday
+ *   - 97% of its profit is one token it called correctly once
+ *   - its median entry is 40 SOL, so its own buy moves the curve and the
+ *     follower fills into the move — the bigger the trader, the worse this is,
+ *     and it is exactly what a profit-ranked leaderboard selects for
+ *   - it holds for four seconds, which is faster than we can land a buy
+ *   - it is first in the queue on every token, which means it is launching them
+ *
+ * Plus the one that is not about wallets at all: a vendor renaming a field, so
+ * every source silently returns nobody and the panel reads as "no good traders
+ * today" forever.
+ */
+import assert from 'assert';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { PublicKey } from '@solana/web3.js';
+import { createHash } from 'crypto';
+import {
+  verifyTrader, scoreOf, runScout,
+  MAX_IDLE_HOURS, MIN_CLOSED_TRADES, MAX_TOP_MINT_SHARE, MAX_COPYABLE_BUY_SOL,
+  MIN_SERIOUS_BUY_SOL, MIN_HOLD_SECONDS, MAX_FRONT_OF_QUEUE_SHARE, PRIOR_TRIALS,
+  type TraderStats,
+} from '../services/traderScout';
+import {
+  gatherCandidates, fetchSolanaTrackerTop, fetchSolanaTrackerKols, fetchBirdeyeGainers,
+  looksLikeWallet,
+} from '../services/traderSources';
+import { PUMP_PROGRAM_ID } from '../services/pumpEventDecoder';
+
+let passed = 0;
+let failed = 0;
+const queue: Array<() => Promise<void>> = [];
+
+function test(name: string, fn: () => void): void {
+  try { fn(); passed++; console.log(`  ok    ${name}`); }
+  catch (err: any) { failed++; console.error(`  FAIL  ${name}\n        ${err.message}`); }
+}
+function atest(name: string, fn: () => Promise<void>): void {
+  queue.push(async () => {
+    try { await fn(); passed++; console.log(`  ok    ${name}`); }
+    catch (err: any) { failed++; console.error(`  FAIL  ${name}\n        ${err.message}`); }
+  });
+}
+
+// ---- real TradeEvent bytes, so the real decoder does the work -------------
+const DISC = createHash('sha256').update('event:TradeEvent').digest().subarray(0, 8);
+function pk(seed: string): string {
+  const b = Buffer.alloc(32);
+  Buffer.from(seed).copy(b);
+  return new PublicKey(b).toBase58();
+}
+interface EvSpec { mint: string; user: string; isBuy: boolean; sol: number; tokens: number; ts: number; vSol?: number; }
+function encodeTradeEvent(e: EvSpec): string {
+  const b = Buffer.alloc(129);
+  let o = 0;
+  DISC.copy(b, o); o += 8;
+  new PublicKey(e.mint).toBuffer().copy(b, o); o += 32;
+  b.writeBigUInt64LE(BigInt(Math.round(e.sol * 1e9)), o); o += 8;
+  b.writeBigUInt64LE(BigInt(Math.round(e.tokens)), o); o += 8;
+  b.writeUInt8(e.isBuy ? 1 : 0, o); o += 1;
+  new PublicKey(e.user).toBuffer().copy(b, o); o += 32;
+  b.writeBigInt64LE(BigInt(e.ts), o); o += 8;
+  b.writeBigUInt64LE(BigInt(Math.round((e.vSol ?? 60) * 1e9)), o); o += 8;
+  b.writeBigUInt64LE(BigInt(1_000_000_000), o); o += 8;
+  b.writeBigUInt64LE(0n, o); o += 8;
+  b.writeBigUInt64LE(0n, o);
+  return b.toString('base64');
+}
+function logsFor(evs: EvSpec[]): string[] {
+  return [
+    `Program ${PUMP_PROGRAM_ID} invoke [1]`,
+    ...evs.map(e => `Program data: ${encodeTradeEvent(e)}`),
+    `Program ${PUMP_PROGRAM_ID} success`,
+  ];
+}
+
+const NOW_S = 1_800_000_000;
+const NOW_MS = NOW_S * 1000;
+const TRADER = pk('theTrader');
+
+interface FakeTx { logs: string[]; err?: unknown; }
+class FakeConn {
+  constructor(
+    private sigs: Map<string, Array<{ signature: string; blockTime: number; err?: unknown }>>,
+    private txs: Map<string, FakeTx>,
+  ) {}
+  async getSignaturesForAddress(addr: PublicKey, o: { limit: number; before?: string }) {
+    const all = this.sigs.get(addr.toBase58()) ?? [];
+    let start = 0;
+    if (o.before) {
+      const i = all.findIndex(s => s.signature === o.before);
+      start = i >= 0 ? i + 1 : all.length;
+    }
+    return all.slice(start, start + o.limit);
+  }
+  async getTransaction(sig: string) {
+    const t = this.txs.get(sig);
+    if (!t) return null;
+    return { meta: { err: t.err ?? null, logMessages: t.logs } };
+  }
+}
+
+/**
+ * One closed round trip: buy `sol` in, sell `sol * mult` out, held `holdS`.
+ *
+ * Token amounts match exactly so the position reads as CLOSED — the scout only
+ * scores positions where the wallet sold everything it bought, because an open
+ * bag has no outcome yet.
+ */
+interface TradeSpec { mint: string; sol: number; mult: number; holdS: number; endedSAgo: number; }
+
+function fixture(trades: TradeSpec[], opts: { curveDepth?: number } = {}) {
+  const sigs = new Map<string, Array<{ signature: string; blockTime: number }>>();
+  const txs = new Map<string, FakeTx>();
+  const walletSigs: Array<{ signature: string; blockTime: number }> = [];
+  const TOKENS = 1_000_000;
+
+  trades.forEach((t, i) => {
+    const sellAt = NOW_S - t.endedSAgo;
+    const buyAt = sellAt - t.holdS;
+    const bSig = `buy${i}`;
+    const sSig = `sell${i}`;
+    walletSigs.push({ signature: sSig, blockTime: sellAt });
+    walletSigs.push({ signature: bSig, blockTime: buyAt });
+    txs.set(bSig, { logs: logsFor([{ mint: t.mint, user: TRADER, isBuy: true, sol: t.sol, tokens: TOKENS, ts: buyAt }]) });
+    txs.set(sSig, { logs: logsFor([{ mint: t.mint, user: TRADER, isBuy: false, sol: t.sol * t.mult, tokens: TOKENS, ts: sellAt }]) });
+    // The mint's own curve history, for the queue-position sample.
+    const depth = opts.curveDepth ?? 50;
+    const curve = PublicKey.findProgramAddressSync(
+      [Buffer.from('bonding-curve'), new PublicKey(t.mint).toBuffer()],
+      new PublicKey(PUMP_PROGRAM_ID),
+    )[0].toBase58();
+    sigs.set(curve, [
+      ...Array.from({ length: depth }, (_, k) => ({ signature: `${t.mint}c${k}`, blockTime: buyAt - 1 - k })),
+      { signature: `${t.mint}birth`, blockTime: buyAt - depth - 100 },
+    ]);
+  });
+  // Newest first, as the RPC returns them.
+  walletSigs.sort((a, b) => b.blockTime - a.blockTime);
+  sigs.set(TRADER, walletSigs);
+  return { sigs, txs };
+}
+
+const deps = (conn: FakeConn) => ({
+  getConnection: () => conn as any,
+  fetch: (async () => { throw new Error('no network in this test'); }) as any,
+  now: () => NOW_MS,
+  sleep: async () => {},
+});
+const alwaysSpend = () => true;
+
+/** A wallet that should pass every bar: steady, spread, recent, copyable size. */
+function goodTrades(): TradeSpec[] {
+  return Array.from({ length: 12 }, (_, i) => ({
+    mint: pk(`good${i}`),
+    sol: 1.5,
+    mult: i < 8 ? 1.6 : 0.5,          // 8 wins, 4 losses — spread across mints
+    holdS: 600,
+    endedSAgo: 1200 + i * 60,
+  }));
+}
+
+async function verify(trades: TradeSpec[], opts: { curveDepth?: number; queue?: boolean } = {}): Promise<TraderStats> {
+  const f = fixture(trades, { curveDepth: opts.curveDepth });
+  const s = await verifyTrader({ wallet: TRADER, sources: ['test'] }, deps(new FakeConn(f.sigs, f.txs)),
+    alwaysSpend, { checkQueuePosition: opts.queue !== false });
+  assert.ok(s, 'the wallet should have been readable');
+  return s!;
+}
+
+console.log('\n-- A wallet that is genuinely worth copying --');
+
+atest('a steady, spread, recent, right-sized wallet passes', async () => {
+  const s = await verify(goodTrades());
+  assert.deepStrictEqual(s.disqualifiers, [], `unexpectedly rejected: ${s.disqualifiers.join(' | ')}`);
+  assert.strictEqual(s.closedTrades, 12);
+  assert.strictEqual(s.wins, 8);
+  assert.ok(s.realizedSol > 0, `realized ${s.realizedSol}`);
+  assert.ok(s.score > 0, 'a passing wallet must be scored');
+});
+
+atest('an open position is neither a win nor a loss', async () => {
+  // A wallet holding ten bags is not a wallet that lost ten times. Counting
+  // unsold positions as losses would reject every trader who holds, which is
+  // most of the good ones.
+  const f = fixture(goodTrades());
+  // Add a buy with no matching sell.
+  const openMint = pk('stillOpen');
+  f.txs.set('openBuy', { logs: logsFor([{ mint: openMint, user: TRADER, isBuy: true, sol: 2, tokens: 5_000, ts: NOW_S - 400 }]) });
+  f.sigs.get(TRADER)!.unshift({ signature: 'openBuy', blockTime: NOW_S - 400 });
+  const s = await verifyTrader({ wallet: TRADER, sources: ['t'] }, deps(new FakeConn(f.sigs, f.txs)), alwaysSpend, { checkQueuePosition: false });
+  assert.strictEqual(s!.closedTrades, 12, 'the open bag must not be scored');
+  assert.strictEqual(s!.openPositions, 1, 'but it must be reported');
+});
+
+console.log('\n-- The five ways a profitable-looking wallet is useless --');
+
+atest('1. NOT TRADING ANY MORE', async () => {
+  const stale = goodTrades().map(t => ({ ...t, endedSAgo: t.endedSAgo + (MAX_IDLE_HOURS + 2) * 3600 }));
+  const s = await verify(stale);
+  assert.ok(s.disqualifiers.some(d => /not trading/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('2. ONE LUCKY TOKEN', async () => {
+  // 400 SOL of profit, 390 of it from a single mint. The leaderboard sees a
+  // star; what we would be copying is the other eleven trades.
+  const trades = goodTrades().map((t, i) => (i === 0 ? { ...t, sol: 50, mult: 9 } : { ...t, mult: 1.02 }));
+  const s = await verify(trades);
+  assert.ok(s.topMintProfitShare > MAX_TOP_MINT_SHARE, `share was ${s.topMintProfitShare}`);
+  assert.ok(s.disqualifiers.some(d => /one token/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('3. TOO BIG TO COPY — the one a profit ranking selects FOR', async () => {
+  // This is the important one. Sorting any leaderboard by profit puts the
+  // largest wallets on top, and the largest wallets are exactly the ones whose
+  // own entry moves the curve before a follower's transaction is even built.
+  const whale = goodTrades().map(t => ({ ...t, sol: MAX_COPYABLE_BUY_SOL + 25 }));
+  const s = await verify(whale);
+  assert.ok(s.realizedSol > 0, 'and it is genuinely profitable, which is the point');
+  assert.ok(s.disqualifiers.some(d => /too large to follow/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('3b. and a wallet too small to be deciding anything', async () => {
+  const dust = goodTrades().map(t => ({ ...t, sol: MIN_SERIOUS_BUY_SOL / 2 }));
+  const s = await verify(dust);
+  assert.ok(s.disqualifiers.some(d => /testing, not trading/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('4. FASTER THAN WE CAN LAND', async () => {
+  // We land one to two slots behind the leader — 350-700ms — from a
+  // residential connection. A four-second hold is an arbitrage we would be
+  // buying the exit of.
+  const fast = goodTrades().map(t => ({ ...t, holdS: 4 }));
+  const s = await verify(fast);
+  assert.ok(s.medianHoldSeconds < MIN_HOLD_SECONDS);
+  assert.ok(s.disqualifiers.some(d => /shorter than we can copy/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('5. THE INSIDER — first in the queue on everything', async () => {
+  // curveDepth 0 means every one of their buys is the first transaction on the
+  // token. Nobody finds tokens that fast; they are launching them, or being
+  // told.
+  const s = await verify(goodTrades(), { curveDepth: 0 });
+  assert.ok((s.frontOfQueueShare ?? 0) > MAX_FRONT_OF_QUEUE_SHARE, `share was ${s.frontOfQueueShare}`);
+  assert.ok(s.disqualifiers.some(d => /being told, or is launching/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('a normal trader is NOT flagged as an insider', async () => {
+  // The check has to have a negative case or it is just a rejection machine.
+  const s = await verify(goodTrades(), { curveDepth: 50 });
+  assert.ok((s.frontOfQueueShare ?? 1) === 0, `share was ${s.frontOfQueueShare}`);
+  assert.ok(!s.disqualifiers.some(d => /launching/.test(d)));
+});
+
+console.log('\n-- Evidence, not enthusiasm --');
+
+atest('three winning trades is not a track record', async () => {
+  const thin = goodTrades().slice(0, 3).map(t => ({ ...t, mult: 3 }));
+  const s = await verify(thin);
+  assert.ok(s.disqualifiers.some(d => /closed position/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('THE WIN RATE IS LAPLACE-CORRECTED, so a perfect small sample does not win', async () => {
+  const perfect8 = Array.from({ length: 8 }, (_, i) => ({
+    mint: pk(`p${i}`), sol: 1, mult: 1.5, holdS: 300, endedSAgo: 600 + i * 30,
+  }));
+  const s = await verify(perfect8);
+  assert.strictEqual(s.wins, 8);
+  assert.strictEqual(s.closedTrades, 8);
+  assert.ok(s.winRate < 0.6, `8-for-8 reported as ${s.winRate}; an uncorrected rate would be 1.0`);
+  assert.strictEqual(s.winRate, 8 / (8 + PRIOR_TRIALS));
+});
+
+atest('a losing wallet is rejected however busy it is', async () => {
+  const losers = goodTrades().map(t => ({ ...t, mult: 0.6 }));
+  const s = await verify(losers);
+  assert.ok(s.realizedSol < 0);
+  assert.ok(s.disqualifiers.some(d => /realized/.test(d)), s.disqualifiers.join(' | '));
+});
+
+atest('THE BUYER IS THE PROGRAM\'S `user`, NOT THE SIGNER', async () => {
+  // A bundler's fee payer signs for wallets that are not it. Attributing by
+  // signer would credit one address with sixteen strangers' trades.
+  const other = pk('someoneElse');
+  const sigs = new Map<string, Array<{ signature: string; blockTime: number }>>();
+  const txs = new Map<string, FakeTx>();
+  sigs.set(TRADER, [{ signature: 'bundle', blockTime: NOW_S - 100 }]);
+  txs.set('bundle', {
+    logs: logsFor([{ mint: pk('m1'), user: other, isBuy: true, sol: 5, tokens: 100, ts: NOW_S - 100 }]),
+  });
+  const s = await verifyTrader({ wallet: TRADER, sources: ['t'] }, deps(new FakeConn(sigs, txs)), alwaysSpend, { checkQueuePosition: false });
+  assert.ok(s!.disqualifiers.some(d => /no pump\.fun trades/.test(d)),
+    'another wallet in the same transaction is not this wallet trading');
+});
+
+console.log('\n-- Ranking --');
+
+test('ABSOLUTE PROFIT, NEVER PERCENTAGE RETURN', () => {
+  // The single most common way a copy-trading tool ends up following someone
+  // useless: a wallet that turned 0.3 SOL into 3 tops any ratio-sorted board,
+  // and there is no size at which copying it matters.
+  const base = {
+    wallet: 'x', sources: [], closedTrades: 20, wins: 12, winRate: 0.5, medianHoldSeconds: 600,
+    distinctMints: 20, topMintProfitShare: 0.2, lastTradeAt: 0, idleHours: 1, openPositions: 0,
+    disqualifiers: [], score: 0, reads: 0,
+  };
+  //
+  // The fixture has to make the two orderings DISAGREE, or it proves nothing.
+  // An earlier version had the big wallet winning on both ratio and absolute,
+  // so swapping the scorer to a ratio left every assertion green — found by
+  // mutating scoreOf and watching this test pass.
+  //   tiny: 5 SOL profit on 0.2 SOL entries  -> 25x, tiny absolute
+  //   real: 60 SOL profit on 6 SOL entries   -> 10x, large absolute
+  const tiny: TraderStats = { ...base, realizedSol: 5, medianBuySol: 0.2 };
+  const real: TraderStats = { ...base, realizedSol: 60, medianBuySol: 6 };
+  assert.ok(tiny.realizedSol / tiny.medianBuySol > real.realizedSol / real.medianBuySol,
+    'fixture check: the small wallet must have the BETTER percentage return');
+  assert.ok(scoreOf(real) > scoreOf(tiny),
+    `a 25x micro-account outranked a 60 SOL trader (${scoreOf(tiny)} vs ${scoreOf(real)})`);
+});
+
+test('fresher beats staler, all else equal', () => {
+  const base: TraderStats = {
+    wallet: 'x', sources: [], realizedSol: 20, closedTrades: 20, wins: 12, winRate: 0.5,
+    medianHoldSeconds: 600, medianBuySol: 2, distinctMints: 20, topMintProfitShare: 0.2,
+    lastTradeAt: 0, idleHours: 0.5, openPositions: 0, disqualifiers: [], score: 0, reads: 0,
+  };
+  assert.ok(scoreOf(base) > scoreOf({ ...base, idleHours: 5 }));
+});
+
+test('a concentrated wallet scores below a spread one', () => {
+  const base: TraderStats = {
+    wallet: 'x', sources: [], realizedSol: 20, closedTrades: 20, wins: 12, winRate: 0.5,
+    medianHoldSeconds: 600, medianBuySol: 2, distinctMints: 20, topMintProfitShare: 0.1,
+    lastTradeAt: 0, idleHours: 1, openPositions: 0, disqualifiers: [], score: 0, reads: 0,
+  };
+  assert.ok(scoreOf(base) > scoreOf({ ...base, topMintProfitShare: 0.55 }));
+});
+
+test('a disqualified wallet scores zero, whatever its numbers', () => {
+  const s: TraderStats = {
+    wallet: 'x', sources: [], realizedSol: 900, closedTrades: 50, wins: 45, winRate: 0.9,
+    medianHoldSeconds: 600, medianBuySol: 2, distinctMints: 50, topMintProfitShare: 0.1,
+    lastTradeAt: 0, idleHours: 0.1, openPositions: 0, disqualifiers: ['stale'], score: 0, reads: 0,
+  };
+  // scoreOf itself is pure; the guarantee is that verifyTrader never calls it
+  // for a disqualified wallet.
+  const src = readFileSync(join(__dirname, '..', 'services', 'traderScout.ts'), 'utf8');
+  assert.ok(/stats\.score = d\.length === 0 \? scoreOf\(stats\) : 0;/.test(src),
+    'a disqualified wallet must never carry a rank');
+  assert.strictEqual(s.score, 0);
+});
+
+console.log('\n-- The sources are leads, not facts --');
+
+function fakeFetch(payload: any, status = 200): typeof fetch {
+  return (async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => payload,
+  })) as any;
+}
+
+atest('Solana Tracker rows are read by their REAL field names', async () => {
+  // `wallet`, not `address`; `realized`, not `realized_profit`. Guessing yields
+  // undefined silently, which is why the parse failure below reports the keys
+  // it actually saw.
+  const w = pk('stWallet');
+  const o = await fetchSolanaTrackerTop('k', {
+    fetch: fakeFetch({ traders: [{ wallet: w, period: { realized: 42 }, winRate: 0.6, counts: { trades: 30 } }] }),
+  });
+  assert.strictEqual(o.ok, true, o.detail);
+  assert.strictEqual(o.candidates[0].wallet, w);
+  assert.strictEqual(o.candidates[0].claimedRealizedSol, 42);
+});
+
+atest('A VENDOR RENAME IS REPORTED, NOT SILENTLY ZERO', async () => {
+  // The failure that would take longest to notice: the panel reads "no good
+  // traders today", forever, and nothing is wrong with the bot.
+  const o = await fetchSolanaTrackerTop('k', {
+    fetch: fakeFetch({ traders: [{ walletAddress: pk('renamed'), pnl: 42 }] }),
+  });
+  assert.strictEqual(o.ok, false);
+  assert.ok(o.seenKeys?.includes('walletAddress'),
+    'the keys actually returned must be surfaced so the rename is diagnosable');
+});
+
+atest('an HTTP failure is reported per source, and does not stop the others', async () => {
+  const good = pk('birdWallet');
+  let call = 0;
+  const f: typeof fetch = (async () => {
+    call++;
+    if (call <= 2) return { ok: false, status: 429, json: async () => ({}) } as any;
+    return { ok: true, status: 200, json: async () => ({ data: { items: [{ address: good, trade_count: 40 }] } }) } as any;
+  }) as any;
+  const { candidates, outcomes } = await gatherCandidates({ solanaTracker: 'a', birdeye: 'b' }, { fetch: f });
+  assert.strictEqual(outcomes.filter(o => !o.ok).length, 2, 'both Solana Tracker calls failed');
+  assert.ok(outcomes.some(o => o.ok && o.name === 'birdeye/gainers'), 'and Birdeye still ran');
+  assert.strictEqual(candidates.length, 1);
+});
+
+atest('a missing key is a stated reason, not an empty result', async () => {
+  const { outcomes } = await gatherCandidates({}, { fetch: fakeFetch({}) });
+  assert.ok(outcomes.every(o => !o.ok));
+  assert.ok(outcomes.some(o => /no Solana Tracker key/.test(o.detail ?? '')),
+    'an operator must be able to tell "not configured" from "found nobody"');
+});
+
+atest('the same wallet from two boards is one candidate with two sources', async () => {
+  const w = pk('bothBoards');
+  const f: typeof fetch = (async (url: string) => {
+    if (String(url).includes('kols')) {
+      return { ok: true, status: 200, json: async () => ({ traders: [{ wallet: w, name: 'somebody' }] }) } as any;
+    }
+    if (String(url).includes('leaderboard/top')) {
+      return { ok: true, status: 200, json: async () => ({ traders: [{ wallet: w, period: { realized: 10 } }] }) } as any;
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as any;
+  }) as any;
+  const { candidates } = await gatherCandidates({ solanaTracker: 'k' }, { fetch: f });
+  assert.strictEqual(candidates.length, 1);
+  assert.strictEqual(candidates[0].sources.length, 2);
+  assert.strictEqual(candidates[0].label, 'somebody');
+});
+
+test('a garbage address is never queued for an RPC walk', () => {
+  assert.ok(!looksLikeWallet('N/A'));
+  assert.ok(!looksLikeWallet(''));
+  assert.ok(!looksLikeWallet('0x1234567890abcdef1234567890abcdef12345678'));   // an EVM address
+  assert.ok(looksLikeWallet(pk('real')));
+});
+
+atest('NOTHING IS RECOMMENDED WHEN NO SOURCE ANSWERS', async () => {
+  const r = await runScout({}, {
+    getConnection: () => null,
+    fetch: fakeFetch({}),
+    now: () => NOW_MS,
+    sleep: async () => {},
+  });
+  assert.strictEqual(r.best, null);
+  assert.deepStrictEqual(r.top, []);
+  assert.ok(r.notes.some(n => /nothing is being recommended/.test(n)));
+});
+
+console.log('\n-- Provenance --');
+
+test('the report states that the ranking used none of the vendors\' numbers', () => {
+  // The operator has to be able to tell where a recommendation came from. A
+  // number with no stated provenance has to be taken on faith, which is the
+  // thing this whole design is avoiding.
+  const src = readFileSync(join(__dirname, '..', 'services', 'traderScout.ts'), 'utf8');
+  assert.ok(/none of their numbers were used to rank anything/.test(src));
+  assert.ok(/LOWER BOUND/.test(src), 'and that curve-only PnL understates a trader who holds through graduation');
+});
+
+test('following a wallet is a person\'s decision, not the scout\'s', () => {
+  const src = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+  const idx = src.indexOf("app.post('/api/scout/follow'");
+  assert.ok(idx > 0, 'there must be an explicit follow endpoint');
+  const body = src.slice(idx, idx + 1200);
+  assert.ok(/requireApiToken/.test(body), 'and it must be token-gated');
+  assert.ok(/disqualifiers\.length > 0/.test(body), 'and refuse a wallet the scout rejected');
+  // Nothing may add a copy target on its own.
+  assert.ok(!/copyTrader\.addWallet/.test(readFileSync(join(__dirname, '..', 'services', 'traderScout.ts'), 'utf8')),
+    'the scout itself must never add a copy target');
+});
+
+(async () => {
+  for (const fn of queue) await fn();
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed > 0 ? 1 : 0);
+})();

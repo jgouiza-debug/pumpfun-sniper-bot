@@ -2756,6 +2756,8 @@ console.log('\n-- No decorative settings: every BotConfig field must drive behav
   const OUTBOUND_ONLY = new Set([
     'heliusApiKeySet', 'heliusApiKeyHint', 'heliusApiKeySource',
     'pumpPortalApiKeySet', 'pumpPortalApiKeyHint',
+    'solanaTrackerApiKeySet', 'solanaTrackerApiKeyHint',
+    'birdeyeApiKeySet', 'birdeyeApiKeyHint',
   ]);
 
   // The mirror image: write-only commands, acted on at the moment the config

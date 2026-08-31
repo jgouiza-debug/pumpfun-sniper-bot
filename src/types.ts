@@ -378,11 +378,27 @@ export interface BotConfig {
    * never be baked into a shared build.
    */
   pumpPortalApiKey?: string;
+  /**
+   * Solana Tracker, free tier. The only free source that ranks Solana wallets
+   * by realized profit over a plain keyed GET — GMGN and Kolscan are behind
+   * Cloudflare's TLS fingerprinting and cannot be read from a server at all.
+   *
+   * READ-ONLY, and it buys nothing. Without it the scout falls back to the
+   * wallets the bot discovered on chain by itself, which works but is slower to
+   * find someone new.
+   */
+  solanaTrackerApiKey?: string;
+  /** Birdeye, free tier. A second opinion for the scout's candidate list. */
+  birdeyeApiKey?: string;
   // --- Status-only mirrors. Never sent by the UI; set by getStatus() so the
   // dashboard can show whether a key exists without the key itself being
   // broadcast on every poll. ---
   heliusApiKeySet?: boolean;
   heliusApiKeyHint?: string;
+  solanaTrackerApiKeySet?: boolean;
+  solanaTrackerApiKeyHint?: string;
+  birdeyeApiKeySet?: boolean;
+  birdeyeApiKeyHint?: string;
   /**
    * Where the live key came from: 'stored' is the one saved from Settings
    * (.api-keys.json), 'env' is HELIUS_API_KEY / .env, 'none' means the bot is

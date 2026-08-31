@@ -237,6 +237,237 @@ function SmartMoneyPanel() {
 }
 
 /**
+ * WHO TO COPY RIGHT NOW.
+ *
+ * The answer to "find me the most profitable trader trading memecoins at this
+ * moment". Three of them, best first, with the evidence — and, just as
+ * important, the wallets that were checked and rejected, because "this one
+ * looked great and here is why it is uncopyable" is the part that stops an
+ * operator pasting a leaderboard address in by hand.
+ *
+ * Nothing here is automatic. The scout ranks; a person presses Follow. Adding a
+ * copy target is the decision that starts spending money on a stranger, and six
+ * hours of pump.fun history is not enough evidence to make it unattended.
+ */
+interface ScoutTrader {
+  wallet: string;
+  label?: string;
+  sources: string[];
+  claimedRealizedSol?: number;
+  realizedSol: number;
+  closedTrades: number;
+  winRate: number;
+  medianHoldSeconds: number;
+  medianBuySol: number;
+  topMintProfitShare: number;
+  idleHours: number;
+  frontOfQueueShare?: number;
+  openPositions: number;
+  disqualifiers: string[];
+  score: number;
+}
+interface ScoutPayload {
+  report: {
+    ranAt: number;
+    best: ScoutTrader | null;
+    top: ScoutTrader[];
+    rejected: ScoutTrader[];
+    considered: number;
+    reads: number;
+    notes: string[];
+    sourceOutcomes: Array<{ name: string; ok: boolean; detail?: string; seenKeys?: string[] }>;
+  } | null;
+  bars: { maxIdleHours: number; maxCopyableBuySol: number; minHoldSeconds: number; minClosedTrades: number };
+  keysSet: { solanaTracker: boolean; birdeye: boolean };
+}
+
+function TraderScoutPanel() {
+  const [sc, setSc] = useState<ScoutPayload | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const pull = async () => {
+    try {
+      const r = await apiFetch('/api/scout');
+      if (r.ok) setSc(await r.json());
+    } catch { /* the RPC pill already says the backend is unreachable */ }
+  };
+  useEffect(() => {
+    pull();
+    const iv = setInterval(pull, 60_000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const post = async (path: string, body: any, label: string) => {
+    setBusy(label); setMsg(null);
+    try {
+      const r = await apiFetch(path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const j = await r.json().catch(() => ({}));
+      setMsg(r.ok ? `${label} done.` : `${label} failed: ${j?.error ?? r.status}`);
+      await pull();
+    } catch (e: any) {
+      setMsg(`${label} failed: ${e?.message ?? e}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const rep = sc?.report ?? null;
+  const short = (w: string) => `${w.slice(0, 4)}…${w.slice(-4)}`;
+  const hold = (s: number) => (s >= 3600 ? `${Math.round(s / 360) / 10}h` : s >= 60 ? `${Math.round(s / 60)}m` : `${Math.round(s)}s`);
+
+  return (
+    <div style={{ marginTop: '12px', padding: '10px', background: 'rgba(0,229,255,0.05)', border: '1px solid rgba(0,229,255,0.25)', borderRadius: '4px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+        <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#18ffff' }}>
+          🔎 Who to copy — found, then checked against the chain
+        </div>
+        <button
+          onClick={() => post('/api/scout/run', {}, 'Scout run')}
+          disabled={busy !== null}
+          style={{ fontSize: '9px', padding: '2px 8px', cursor: busy ? 'wait' : 'pointer', background: 'transparent', border: '1px solid rgba(0,229,255,0.4)', color: '#18ffff', borderRadius: 3 }}
+        >
+          {busy === 'Scout run' ? 'scanning…' : 'scan now'}
+        </button>
+      </div>
+
+      {!sc?.keysSet.solanaTracker && (
+        <div style={{ fontSize: '10px', color: '#ffab40', lineHeight: 1.6, marginBottom: '8px' }}>
+          No Solana Tracker key set. That is the only free source that ranks Solana wallets by
+          realized profit over a plain API call — the boards people usually quote (GMGN, Kolscan)
+          sit behind Cloudflare and cannot be read from a server at all. Without it the scout still
+          runs, but only over wallets this bot discovered on chain by itself, which takes longer to
+          surface someone new. Paste a free key in Settings.
+        </div>
+      )}
+
+      {!rep ? (
+        <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6 }}>
+          No scan yet. The first one runs a few minutes after startup, then hourly.
+        </div>
+      ) : (
+        <>
+          {rep.best ? (
+            <div style={{ padding: '8px', background: 'rgba(0,230,118,0.07)', border: '1px solid rgba(0,230,118,0.3)', borderRadius: 3, marginBottom: '8px' }}>
+              <div style={{ fontSize: '10px', color: '#00e676', fontWeight: 700, marginBottom: 4 }}>
+                BEST RIGHT NOW — {rep.best.label ? `${rep.best.label} · ` : ''}
+                <a href={`https://solscan.io/account/${rep.best.wallet}`} target="_blank" rel="noreferrer" style={{ color: '#00e676', fontFamily: 'monospace' }}>
+                  {short(rep.best.wallet)}
+                </a>
+              </div>
+              <div style={{ fontSize: '10px', color: '#ccc', lineHeight: 1.6 }}>
+                +{rep.best.realizedSol} SOL realized over {rep.best.closedTrades} closed trades ·
+                {' '}{Math.round(rep.best.winRate * 100)}% win rate ·
+                {' '}typical entry {rep.best.medianBuySol} SOL ·
+                {' '}typical hold {hold(rep.best.medianHoldSeconds)} ·
+                {' '}last traded {Math.round(rep.best.idleHours * 10) / 10}h ago
+              </div>
+              <button
+                onClick={() => post('/api/scout/follow', { address: rep.best!.wallet }, 'Follow')}
+                disabled={busy !== null}
+                style={{ marginTop: 6, fontSize: '9px', padding: '3px 10px', cursor: 'pointer', background: 'rgba(0,230,118,0.15)', border: '1px solid rgba(0,230,118,0.5)', color: '#00e676', borderRadius: 3 }}
+              >
+                {busy === 'Follow' ? 'adding…' : 'copy this wallet'}
+              </button>
+              <button
+                onClick={() => post('/api/scout/backfill', {}, 'Backfill')}
+                disabled={busy !== null}
+                title="Rebuild the entry profile from these wallets' own trade history, instead of waiting weeks to watch 40 live entries"
+                style={{ marginTop: 6, marginLeft: 6, fontSize: '9px', padding: '3px 10px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(124,77,255,0.5)', color: '#b388ff', borderRadius: 3 }}
+              >
+                {busy === 'Backfill' ? 'learning…' : 'learn their strategy from history'}
+              </button>
+            </div>
+          ) : (
+            <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6, marginBottom: '8px' }}>
+              {rep.considered} wallet(s) checked, none copyable. That is a normal result, not a
+              fault — most profitable-looking wallets fail one of the bars below.
+            </div>
+          )}
+
+          {rep.top.length > 1 && (
+            <div style={{ overflowX: 'auto', marginBottom: '8px' }}>
+              <table style={{ width: '100%', fontSize: '10px', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ color: '#8a8a8a', textAlign: 'left' }}>
+                    <th style={{ padding: '3px 6px' }}>#</th>
+                    <th style={{ padding: '3px 6px' }}>Wallet</th>
+                    <th style={{ padding: '3px 6px' }}>Realized</th>
+                    <th style={{ padding: '3px 6px' }}>Win</th>
+                    <th style={{ padding: '3px 6px' }}>Entry</th>
+                    <th style={{ padding: '3px 6px' }}>Hold</th>
+                    <th style={{ padding: '3px 6px' }}>Idle</th>
+                    <th style={{ padding: '3px 6px' }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rep.top.map((t, i) => (
+                    <tr key={t.wallet} style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                      <td style={{ padding: '3px 6px' }}>{i + 1}</td>
+                      <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>
+                        <a href={`https://solscan.io/account/${t.wallet}`} target="_blank" rel="noreferrer" style={{ color: '#18ffff' }}>{short(t.wallet)}</a>
+                        {t.label && <span style={{ color: '#8a8a8a' }}> {t.label}</span>}
+                      </td>
+                      <td style={{ padding: '3px 6px', color: '#00e676' }}>+{t.realizedSol}</td>
+                      <td style={{ padding: '3px 6px' }}>{Math.round(t.winRate * 100)}%</td>
+                      <td style={{ padding: '3px 6px' }}>{t.medianBuySol}</td>
+                      <td style={{ padding: '3px 6px' }}>{hold(t.medianHoldSeconds)}</td>
+                      <td style={{ padding: '3px 6px' }}>{Math.round(t.idleHours * 10) / 10}h</td>
+                      <td style={{ padding: '3px 6px' }}>
+                        <button
+                          onClick={() => post('/api/scout/follow', { address: t.wallet }, 'Follow')}
+                          disabled={busy !== null}
+                          style={{ fontSize: '9px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(0,229,255,0.4)', color: '#18ffff', borderRadius: 3 }}
+                        >follow</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {rep.rejected.length > 0 && (
+            <details style={{ fontSize: '10px', color: '#8a8a8a', marginBottom: '6px' }}>
+              <summary style={{ cursor: 'pointer' }}>
+                {rep.rejected.length} checked and rejected — why
+              </summary>
+              <div style={{ marginTop: 4, lineHeight: 1.6 }}>
+                {rep.rejected.slice(0, 10).map(t => (
+                  <div key={t.wallet} style={{ marginBottom: 3 }}>
+                    <span style={{ fontFamily: 'monospace', color: '#aaa' }}>{short(t.wallet)}</span>
+                    {t.claimedRealizedSol !== undefined && (
+                      <span style={{ color: '#666' }}> (board claimed {Math.round(t.claimedRealizedSol)})</span>
+                    )}
+                    {' — '}{t.disqualifiers[0]}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+
+          <div style={{ fontSize: '9px', color: '#8a8a8a', lineHeight: 1.5 }}>
+            {rep.notes.map((n, i) => <div key={i}>· {n}</div>)}
+            <div>
+              · Bars: active inside {sc!.bars.maxIdleHours}h, {sc!.bars.minClosedTrades}+ closed trades,
+              {' '}entry under {sc!.bars.maxCopyableBuySol} SOL (bigger moves the curve before we land),
+              {' '}hold over {sc!.bars.minHoldSeconds}s (shorter than we can follow).
+            </div>
+            <div style={{ marginTop: 3 }}>
+              Sources: {rep.sourceOutcomes.map(o => `${o.name} ${o.ok ? '✓' : `✗ (${o.detail ?? 'failed'})`}`).join(' · ')}
+            </div>
+          </div>
+        </>
+      )}
+
+      {msg && <div style={{ fontSize: '10px', color: msg.includes('failed') ? '#ff5252' : '#00e676', marginTop: 6 }}>{msg}</div>}
+    </div>
+  );
+}
+
+/**
  * WHAT THE BOT LEARNED THEY LOOK FOR.
  *
  * The roster above answers "who". This answers "what for" — and it is the part
@@ -482,6 +713,8 @@ export function App() {
     // blank field therefore keeps the stored key rather than clearing it.
     heliusApiKey: '',
     pumpPortalApiKey: '',
+    solanaTrackerApiKey: '',
+    birdeyeApiKey: '',
   });
 
   // Photon wallet linking state. The key only ever lives in this input until
@@ -1506,6 +1739,7 @@ export function App() {
             </table>
           </div>
 
+          <TraderScoutPanel />
           <SmartMoneyPanel />
 
           {/* Positions Matrix Table */}
@@ -1947,6 +2181,55 @@ export function App() {
                   Play 2 (mid-curve entry) can never trigger, the creator-dump exit can never fire, and copy
                   trading mirrors nothing. Get one at pumpportal.fun and fund it with your own SOL — it is never
                   shared between users.
+                </div>
+              </div>
+
+              {/* Scout credentials. READ-ONLY and free — neither of these can
+                  place an order, and neither is required to trade. They only
+                  supply candidate wallet ADDRESSES; every number the scout
+                  ranks on is re-measured from chain data by this bot. */}
+              <div className="form-group" style={{ marginTop: '10px' }}>
+                <label className="form-label">
+                  Solana Tracker Key{' '}
+                  {botStatus?.config?.solanaTrackerApiKeySet
+                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.solanaTrackerApiKeyHint}</span>
+                    : <span style={{ color: '#ffab00' }}>— not set (the scout falls back to on-chain discovery)</span>}
+                </label>
+                <input
+                  type="password"
+                  className="form-input"
+                  placeholder={botStatus?.config?.solanaTrackerApiKeySet ? 'Leave blank to keep the stored key' : 'Paste your free Solana Tracker key (optional)'}
+                  value={configForm.solanaTrackerApiKey || ''}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, solanaTrackerApiKey: e.target.value })}
+                />
+                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
+                  Free tier at solanatracker.io. Feeds the <strong>Who to copy</strong> scout with candidate
+                  wallets — both the profit leaderboard and the named-KOL board. It is the only free source
+                  that ranks Solana wallets by realized profit over a plain API call: GMGN and Kolscan are
+                  behind Cloudflare's TLS fingerprinting and cannot be read from a server at all.
+                  <strong> Read-only</strong> — it cannot trade, and the scout ignores its PnL numbers,
+                  re-deriving every figure from the chain before ranking anything.
+                </div>
+              </div>
+
+              <div className="form-group" style={{ marginTop: '10px' }}>
+                <label className="form-label">
+                  Birdeye Key{' '}
+                  {botStatus?.config?.birdeyeApiKeySet
+                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.birdeyeApiKeyHint}</span>
+                    : <span style={{ color: 'var(--ink-muted)' }}>— not set (optional)</span>}
+                </label>
+                <input
+                  type="password"
+                  className="form-input"
+                  placeholder={botStatus?.config?.birdeyeApiKeySet ? 'Leave blank to keep the stored key' : 'Paste your free Birdeye key (optional)'}
+                  value={configForm.birdeyeApiKey || ''}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, birdeyeApiKey: e.target.value })}
+                />
+                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
+                  Free tier at birdeye.so. A second opinion for the scout's candidate list — a wallet two
+                  independent boards both name is worth checking first. Purely additive: the scout works
+                  without it.
                 </div>
               </div>
 

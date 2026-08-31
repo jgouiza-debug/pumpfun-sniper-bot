@@ -56,7 +56,7 @@ import {
   probeHeliusKey, markHeliusKeyRejected,
   resolveRpcEndpoint, normalizeHeliusKey, noteRpcOutcome, isCredentialError,
 } from './rpcHealth';
-import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } from './keyStore';
+import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField, STORABLE_KEY_FIELDS, KEY_ENV_NAMES } from './keyStore';
 
 /**
  * Minimum real SOL that must sit in a bonding curve before we will buy into it.
@@ -478,6 +478,8 @@ export class SniperEngine {
     // with the holder's own SOL, so a baked-in key would be spending one
     // person's balance for everybody who runs the exe.
     pumpPortalApiKey: resolveKey('pumpPortalApiKey', process.env.PUMPPORTAL_API_KEY).value,
+    solanaTrackerApiKey: resolveKey('solanaTrackerApiKey', process.env.SOLANA_TRACKER_API_KEY).value,
+    birdeyeApiKey: resolveKey('birdeyeApiKey', process.env.BIRDEYE_API_KEY).value,
   };
 
   private marketRegime: MarketRegime = 'RISK_ON';
@@ -1461,7 +1463,7 @@ export class SniperEngine {
    * so a raw key in this payload is a real exfiltration route.
    */
   public getPublicConfig(): BotConfig {
-    const { privateKey, heliusApiKey, pumpPortalApiKey, ...safeConfig } = this.config;
+    const { privateKey, heliusApiKey, pumpPortalApiKey, solanaTrackerApiKey, birdeyeApiKey, ...safeConfig } = this.config;
     const hint = (k?: string) => (k && k.length >= 4 ? `••••${k.slice(-4)}` : '');
     return {
       ...safeConfig,
@@ -1473,6 +1475,12 @@ export class SniperEngine {
       heliusApiKeySource: this.heliusKeySource,
       pumpPortalApiKeySet: Boolean(pumpPortalApiKey),
       pumpPortalApiKeyHint: hint(pumpPortalApiKey),
+      solanaTrackerApiKey: '',
+      birdeyeApiKey: '',
+      solanaTrackerApiKeySet: Boolean(solanaTrackerApiKey),
+      solanaTrackerApiKeyHint: hint(solanaTrackerApiKey),
+      birdeyeApiKeySet: Boolean(birdeyeApiKey),
+      birdeyeApiKeyHint: hint(birdeyeApiKey),
     } as BotConfig;
   }
 
@@ -1627,19 +1635,22 @@ export class SniperEngine {
       : [];
     delete (newConfig as any).forgetStoredKeys;
 
-    for (const keyField of ['heliusApiKey', 'pumpPortalApiKey'] as const) {
+    for (const keyField of ['heliusApiKey', 'pumpPortalApiKey', 'solanaTrackerApiKey', 'birdeyeApiKey'] as const) {
       if (typeof newConfig[keyField] === 'string' && newConfig[keyField]!.trim() === '') {
         delete newConfig[keyField];
       }
     }
 
     for (const keyField of forget) {
-      if (keyField !== 'heliusApiKey' && keyField !== 'pumpPortalApiKey') continue;
+      if (!STORABLE_KEY_FIELDS.includes(keyField as StorableKeyField)) continue;
       clearStoredKey(keyField);
       delete newConfig[keyField];
       // Fall back to whatever the environment still offers, so forgetting a
       // stored key reveals the .env value instead of leaving nothing.
-      const envName = keyField === 'heliusApiKey' ? 'HELIUS_API_KEY' : 'PUMPPORTAL_API_KEY';
+      // From the shared map. The old ternary answered PUMPPORTAL_API_KEY for
+      // every field that was not Helius, so forgetting any third credential
+      // would have restored PumpPortal's environment value into it.
+      const envName = KEY_ENV_NAMES[keyField];
       this.config[keyField] = (process.env[envName] || '').trim();
       if (keyField === 'heliusApiKey') {
         this.heliusKeySource = this.config.heliusApiKey ? 'env' : 'none';
@@ -1674,7 +1685,7 @@ export class SniperEngine {
     // Persist a newly supplied key so the UI path survives a restart. Before
     // this, a key typed in Settings lived only in memory: it worked until the
     // process ended and then silently vanished, which read as "the RPC broke".
-    for (const keyField of ['heliusApiKey', 'pumpPortalApiKey'] as const) {
+    for (const keyField of ['heliusApiKey', 'pumpPortalApiKey', 'solanaTrackerApiKey', 'birdeyeApiKey'] as const) {
       const supplied = newConfig[keyField];
       if (typeof supplied === 'string' && supplied.trim()) {
         const savedToDisk = storeKey(keyField, supplied);
@@ -3778,6 +3789,35 @@ export class SniperEngine {
     }
   }
 
+  /**
+   * True while anything on the trading path would be slowed by another RPC call.
+   *
+   * Extracted so every off-hot-path job shares ONE definition. It was inline in
+   * the harvester's deps, so the trader scout — a second job on the same Helius
+   * key — would have arrived with its own approximation of "busy", and the two
+   * would have drifted the moment either engine grew a new in-flight state.
+   */
+  public tradingPathBusy(): boolean {
+    return this.entriesInFlight.size > 0
+      || this.activePositions.some(p => p.exitInFlight)
+      || this.inFlightBuyCount > 0
+      || this.copyBusyProvider();
+  }
+
+  /**
+   * Connection and yield check for research jobs that live outside this class.
+   *
+   * The connection stays private — handing it out would let a caller run
+   * anything on the trading key. This hands out the two things a bounded,
+   * yielding research walk needs and nothing else.
+   */
+  public researchDeps(): { getConnection: () => Connection | null; isBusy: () => boolean } {
+    return {
+      getConnection: () => this.solanaConnection,
+      isBusy: () => this.tradingPathBusy(),
+    };
+  }
+
   private startResearch(): void {
     if (!featureFlags.get('smartMoneySniper')) return;
     if (!this.harvester) {
@@ -3791,11 +3831,7 @@ export class SniperEngine {
         // walk would happily burn the shared key's budget in the middle of a
         // copy buy, which is exactly the shape of the incident that got local
         // transaction building demoted from the default.
-        isBusy: () =>
-          this.entriesInFlight.size > 0
-          || this.activePositions.some(p => p.exitInFlight)
-          || this.inFlightBuyCount > 0
-          || this.copyBusyProvider(),
+        isBusy: () => this.tradingPathBusy(),
         log: (level, msg) => this.log(level, msg),
       });
     }

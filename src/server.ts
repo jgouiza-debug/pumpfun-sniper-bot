@@ -31,6 +31,11 @@ import { flushGovernorState, loadGovernorState, setGovernorWalletProvider } from
 import { flushWalletLedger, loadWalletLedger, walletLedger, WalletLedger } from './services/walletLedger';
 import { entryProfile, flushEntryProfile, loadEntryProfile, MIN_ENTERED_SAMPLES, MIN_SEPARATION, MIN_SKIPPED_SAMPLES } from './services/entryProfile';
 import { PROFILE_MIN_RULES, PROFILE_MIN_SCORE } from './services/playbookRouter';
+import {
+  getLastScoutReport, loadScoutReport, runScoutOnce, startScoutSchedule,
+  MAX_IDLE_HOURS, MAX_COPYABLE_BUY_SOL, MIN_HOLD_SECONDS, MIN_CLOSED_TRADES,
+} from './services/traderScout';
+import { backfillFromWallets } from './services/entryBackfill';
 import { smartMoneyDetector } from './services/smartMoneySignal';
 // Reinstate a spend-governor halt from a previous session BEFORE anything can
 // trade. A restart is the natural response to a runaway, and it must not be the
@@ -54,6 +59,17 @@ loadGovernorState();
 // proven wallets actually took and 200 they passed on. At a handful of smart
 // entries a day that is weeks of observation, so dropping it on every restart
 // would mean the profile never becomes usable at all.
+// The scout's last answer, so a restart does not present an empty panel while
+// the first scheduled run is still an hour away.
+{
+  const r = loadScoutReport();
+  if (r) {
+    const age = Math.round((Date.now() - r.ranAt) / 60_000);
+    console.log(r.best
+      ? `🔎 Trader scout: last run ${age}m ago — best copyable wallet ${r.best.wallet.slice(0, 4)}…${r.best.wallet.slice(-4)} (${r.best.realizedSol} SOL realized).`
+      : `🔎 Trader scout: last run ${age}m ago found nobody copyable out of ${r.considered} candidate(s).`);
+  }
+}
 {
   const restored = loadEntryProfile();
   if (restored > 0) {
@@ -437,6 +453,109 @@ app.get('/api/entry-profile', (req, res) => {
     })),
     sentences: entryProfile.describe(),
   });
+});
+
+/**
+ * One dependency bundle for every scout entry point.
+ *
+ * The keys are read at CALL time, not captured: an operator who pastes a
+ * Solana Tracker key into Settings expects the next run to use it, not the
+ * next restart.
+ */
+function scoutDeps() {
+  const cfg = sniperEngine.getConfig();
+  return {
+    ...sniperEngine.researchDeps(),
+    fetch: globalThis.fetch,
+    log: (level: 'info' | 'warn', msg: string) => console.log(msg),
+    getKeys: () => ({
+      solanaTracker: (cfg.solanaTrackerApiKey || process.env.SOLANA_TRACKER_API_KEY || '').trim() || undefined,
+      birdeye: (cfg.birdeyeApiKey || process.env.BIRDEYE_API_KEY || '').trim() || undefined,
+    }),
+  };
+}
+
+// ---------------- TRADER SCOUT ----------------
+//
+// "Find the most profitable trader active right now and tell me who to copy."
+// The lists that claim to answer that are gameable and sometimes simply wrong,
+// so they supply ADDRESSES ONLY — every number reported here is re-measured
+// from chain data by this bot. That distinction is surfaced in the payload
+// rather than left in a comment, because a recommendation whose provenance the
+// operator cannot see is a recommendation they have to take on faith.
+
+app.get('/api/scout', (req, res) => {
+  const r = getLastScoutReport();
+  res.json({
+    report: r,
+    bars: {
+      maxIdleHours: MAX_IDLE_HOURS,
+      maxCopyableBuySol: MAX_COPYABLE_BUY_SOL,
+      minHoldSeconds: MIN_HOLD_SECONDS,
+      minClosedTrades: MIN_CLOSED_TRADES,
+    },
+    keysSet: {
+      solanaTracker: Boolean(sniperEngine.getConfig().solanaTrackerApiKey),
+      birdeye: Boolean(sniperEngine.getConfig().birdeyeApiKey),
+    },
+  });
+});
+
+/**
+ * Run the scout now.
+ *
+ * Token-gated even though it only reads: it spends the same RPC budget the
+ * trading path uses, so an open tab must not be able to start one.
+ */
+app.post('/api/scout/run', requireApiToken, async (req, res) => {
+  const report = await runScoutOnce(scoutDeps());
+  res.json({ ok: true, report });
+});
+
+/**
+ * Follow one of the scouted wallets.
+ *
+ * DELIBERATELY NOT AUTOMATIC. The scout can be confident and still be wrong —
+ * it measures six hours of pump.fun history, not a career — and adding a copy
+ * target is the decision that starts spending money on a stranger. The bot
+ * finds and ranks; a person chooses.
+ */
+app.post('/api/scout/follow', requireApiToken, (req, res) => {
+  const address = String(req.body?.address || '').trim();
+  if (!address) return res.status(400).json({ ok: false, error: 'address is required' });
+  const r = getLastScoutReport();
+  const known = r && [...r.top, ...r.rejected].find(t => t.wallet === address);
+  if (!known) {
+    return res.status(400).json({ ok: false, error: 'that address is not in the latest scout report — re-run the scout first' });
+  }
+  if (known.disqualifiers.length > 0) {
+    return res.status(400).json({ ok: false, error: `the scout disqualified that wallet: ${known.disqualifiers[0]}` });
+  }
+  const added = copyTrader.addWallet(address, known.label || `scout ${new Date(r!.ranAt).toISOString().slice(0, 10)}`);
+  if (!added.ok) return res.status(400).json({ ok: false, error: added.error });
+  res.json({ ok: true });
+});
+
+/**
+ * Rebuild the entry profile from the scouted wallets' own chain history.
+ *
+ * This is what removes the weeks-long wait before the sniper can screen on a
+ * learned profile: the trades already happened, so the evidence is recoverable
+ * in minutes instead of accumulated in fortnights.
+ */
+app.post('/api/scout/backfill', requireApiToken, async (req, res) => {
+  const r = getLastScoutReport();
+  const fromBody: string[] = Array.isArray(req.body?.wallets) ? req.body.wallets.map(String) : [];
+  const wallets = fromBody.length ? fromBody : (r?.top ?? []).map(t => t.wallet);
+  if (!wallets.length) {
+    return res.status(400).json({ ok: false, error: 'no verified wallets to learn from — run the scout first' });
+  }
+  const result = await backfillFromWallets(wallets, {
+    ...sniperEngine.researchDeps(),
+    log: (lvl: 'info' | 'warn', msg: string) => console.log(msg),
+  }, {});
+  flushEntryProfile();
+  res.json({ ok: true, result, profile: entryProfile.profile() });
 });
 
 app.get('/api/governor', (req, res) => {
@@ -1235,6 +1354,11 @@ function startListening(retriesLeft = 5): void {
     console.log(`🖥️  UI Server listening at ${url}`);
     console.log(`🔑 Enter your Photon Wallet & Helius API key in UI Settings`);
     console.log(`========================================================\n`);
+
+    // Started only once the server is up, so the first run never competes with
+    // position restore. It yields to the trading path on every read and holds
+    // its own RPC budget, so the worst case is a scout run that gives up.
+    startScoutSchedule(scoutDeps());
 
     launchAppWindow(url, server);
   });

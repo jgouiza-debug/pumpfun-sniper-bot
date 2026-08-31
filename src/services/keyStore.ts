@@ -33,14 +33,37 @@ import { encryptSecret, decryptSecret } from './secureStore';
 
 const STORE_FILE = '.api-keys.json';
 
-export type StorableKeyField = 'heliusApiKey' | 'pumpPortalApiKey';
+export type StorableKeyField = 'heliusApiKey' | 'pumpPortalApiKey' | 'solanaTrackerApiKey' | 'birdeyeApiKey';
 
 export interface StoredKeys {
   heliusApiKey?: string;
   pumpPortalApiKey?: string;
+  /** Read-only leaderboard credentials for the trader scout. Free tiers. */
+  solanaTrackerApiKey?: string;
+  birdeyeApiKey?: string;
 }
 
-const FIELDS: StorableKeyField[] = ['heliusApiKey', 'pumpPortalApiKey'];
+const FIELDS: StorableKeyField[] = [
+  'heliusApiKey', 'pumpPortalApiKey', 'solanaTrackerApiKey', 'birdeyeApiKey',
+];
+
+/**
+ * The same list, exported.
+ *
+ * Callers used to gate on a hardcoded pair — `field !== 'heliusApiKey' &&
+ * field !== 'pumpPortalApiKey'` — which silently ignores any field added here,
+ * so a new credential would be storable but never forgettable. One list, one
+ * place.
+ */
+export const STORABLE_KEY_FIELDS: readonly StorableKeyField[] = FIELDS;
+
+/** The environment variable each credential falls back to. */
+export const KEY_ENV_NAMES: Record<StorableKeyField, string> = {
+  heliusApiKey: 'HELIUS_API_KEY',
+  pumpPortalApiKey: 'PUMPPORTAL_API_KEY',
+  solanaTrackerApiKey: 'SOLANA_TRACKER_API_KEY',
+  birdeyeApiKey: 'BIRDEYE_API_KEY',
+};
 
 export function keyStorePath(): string {
   // installBaseDir centralizes the rule: the Electron data dir, else next to the

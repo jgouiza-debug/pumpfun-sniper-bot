@@ -947,13 +947,24 @@ test('the research queue is bounded, and a winner displaces a dud rather than be
 });
 
 test('research yields to anything the trading path is doing', () => {
+  // The predicate now lives in ONE method rather than inline in the harvester's
+  // deps, because a second research job (the trader scout) runs on the same
+  // Helius key and would otherwise have arrived with its own approximation of
+  // "busy". The test follows it there, and additionally pins that every
+  // research job actually uses the shared one.
   const src = engineSrc();
-  const idx = src.indexOf('private startResearch()');
-  assert.ok(idx > 0);
-  const body = src.slice(idx, src.indexOf('\n  private stopResearch', idx));
-  assert.ok(/isBusy: \(\) =>/.test(body), 'the harvester must be given a busy predicate');
+  const idx = src.indexOf('public tradingPathBusy()');
+  assert.ok(idx > 0, 'the shared busy predicate must exist');
+  const body = src.slice(idx, src.indexOf('\n  }', idx));
   assert.ok(/entriesInFlight\.size > 0/.test(body), 'an entry in flight must stop research');
   assert.ok(/exitInFlight/.test(body), 'and so must a position being exited');
+
+  const research = src.slice(src.indexOf('private startResearch()'), src.indexOf('\n  private stopResearch'));
+  assert.ok(/isBusy: \(\) => this\.tradingPathBusy\(\)/.test(research),
+    'the harvester must use the shared predicate, not a copy of it');
+  const deps = src.slice(src.indexOf('public researchDeps()'), src.indexOf('private startResearch()'));
+  assert.ok(/isBusy: \(\) => this\.tradingPathBusy\(\)/.test(deps),
+    'and so must every research job wired from outside this class');
 });
 
 test('every research entry point is gated on the flag', () => {
@@ -1173,9 +1184,9 @@ test('research yields to the COPY trader too, not just the sniper', () => {
   // meant a research walk could burn the shared budget in the middle of a copy
   // buy — the shape of the incident that got local tx building demoted.
   const src = engineSrc();
-  const idx = src.indexOf('isBusy: () =>');
+  const idx = src.indexOf('public tradingPathBusy()');
   assert.ok(idx > 0);
-  const body = src.slice(idx, idx + 400);
+  const body = src.slice(idx, src.indexOf('\n  }', idx));
   assert.ok(/this\.copyBusyProvider\(\)/.test(body), 'the copy trader must be consulted');
   assert.ok(/inFlightBuyCount > 0/.test(body), 'and any in-flight buy from either engine');
   const server = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
