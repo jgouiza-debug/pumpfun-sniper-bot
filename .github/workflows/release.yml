@@ -73,8 +73,21 @@ jobs:
           echo "Stamping buildCommit ${{ github.sha }}"
           npm pkg set buildCommit=${{ github.sha }}
 
+      # THE FULL SUITE, not just run.ts.
+      #
+      # This step used to be `npm test`, which runs src/tests/run.ts alone — so
+      # the incident proofs, both copy drills, the guardrail proofs and the
+      # auto-update proofs never ran at release. The binary that shipped was
+      # gated on a subset that, by construction, excluded every test written
+      # about the paths that lose money.
       - name: Run Tests
-        run: npm test
+        run: npm run test:all
+
+      # A type error is a shipped bug in a codebase this size; the build script
+      # runs tsc, but only after vite, so a failure here is caught earlier and
+      # more clearly.
+      - name: Typecheck
+        run: npx tsc --noEmit
 
       # build:pkg-mac*, NOT build:mac. Since v2.0.0 the plain build:mac name
       # belongs to the Electron/electron-builder .dmg build (see desktop.yml);

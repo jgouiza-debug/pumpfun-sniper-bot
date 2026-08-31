@@ -18,6 +18,8 @@
  *                          times into one token the bot could spend.
  */
 import assert from 'assert';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { classifyFlow, TRADE_MIN_SOL_BUY, VENUE_TRADE_MIN_SOL_BUY } from '../services/leaderTxClassifier';
 import { TradeGovernor, DEFAULT_GOVERNOR_LIMITS } from '../services/tradeGovernor';
 import { settleTransaction, didLand, provablyDidNothing } from '../services/txSettlement';
@@ -280,16 +282,75 @@ test('fixed: NEW entries keep the self-correcting free-slot divisor (no slice de
 
 console.log('\n-- S3b: nothing bounded how much the bot could spend --');
 
-test('OLD BUG: the copy path reached the signer BELOW every breaker', () => {
-  // Not an assertion about code that exists any more — it is the shape of the
-  // hole, recorded so the ceiling is never moved back up into a caller.
-  // guardrails.ts' limiters were evaluated in exactly one place, sniperEngine's
-  // own entry gate; the copy trader called executeExternalTrade, which drops
-  // straight into executeRealMainnetTrade. noteTradeFailure even excluded copy
-  // failures from the breaker explicitly ("the copy trader runs its own bounded
-  // retries instead") — and the copy trader had none. The governor is therefore
-  // enforced INSIDE executeRealMainnetTrade, which has no second door.
-  assert.ok(true);
+test('the ceiling is enforced INSIDE executeRealMainnetTrade, before anything is sent', () => {
+  // This test used to be `assert.ok(true)` with a paragraph of explanation —
+  // a tautology guarding the single most important wiring in the change, which
+  // is exactly the kind of test that lets a regression ship green.
+  //
+  // The hole it describes: guardrails.ts' limiters were evaluated in exactly
+  // one place, sniperEngine's own entry gate. The copy trader called
+  // executeExternalTrade, which drops straight into executeRealMainnetTrade —
+  // below every one of them. noteTradeFailure even excluded copy failures from
+  // the breaker explicitly ("the copy trader runs its own bounded retries
+  // instead"), and the copy trader had none. So the ceiling has to live at the
+  // chokepoint, and this asserts that it does.
+  const engineSrc = readFileSync(join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const fnStart = engineSrc.indexOf('private async executeRealMainnetTrade');
+  assert.ok(fnStart > 0, 'executeRealMainnetTrade must exist');
+  const fnSrc = engineSrc.slice(fnStart, engineSrc.indexOf('\n  private async confirmTransaction', fnStart));
+  assert.ok(fnSrc.length > 1000, 'the slice must actually cover the function');
+
+  // Anchored on the actual CALL, not the bare word: the comments in this area
+  // name sendRawTransaction while explaining why the ceiling sits here, and a
+  // test that matches prose instead of code proves nothing.
+  const SEND_CALL = 'this.solanaConnection.sendRawTransaction(';
+  const reserveAt = fnSrc.indexOf('tradeGovernor.tryReserveBuy(');
+  const sendAt = fnSrc.indexOf(SEND_CALL);
+  assert.ok(reserveAt > 0, 'the governor must be consulted inside executeRealMainnetTrade, not in a caller');
+  assert.ok(sendAt > 0, 'the send must be in this function');
+  assert.ok(reserveAt < sendAt, 'the ceiling must be checked BEFORE the transaction is sent');
+
+  // checkBuy alone is check-then-act; only tryReserveBuy claims atomically.
+  assert.ok(!/tradeGovernor\.checkBuy\(/.test(fnSrc),
+    'the engine must reserve atomically, never check-then-act');
+
+  // Both engines reach the chain through this one function, and there is no
+  // other sendRawTransaction anywhere in the engine.
+  const sends = engineSrc.split(SEND_CALL).length - 1;
+  assert.strictEqual(sends, 1, 'a second send path would be a second door around the ceiling');
+
+  // Outcomes must be reported, or the failure breaker never trips.
+  assert.ok(/tradeGovernor\.recordBuyOutcome\(false/.test(fnSrc), 'failures must be reported');
+  assert.ok(/tradeGovernor\.recordBuyOutcome\(true/.test(fnSrc), 'successes must clear the streak');
+});
+
+test('the pre-sign guard is called with the CEILINGS, not with its permissive defaults', () => {
+  // assertOutboundTradeTx's ceilings are OPTIONAL (`opts = {}`), which is a
+  // sharp edge: the drain tests in run.ts call it without them, so the suite
+  // exercises a strictly weaker guard than the one that ships. This pins the
+  // PRODUCTION call site instead — if a refactor drops the options, the guard
+  // silently reverts to its backstops and this fails.
+  const engineSrc = readFileSync(join(__dirname, '../services/sniperEngine.ts'), 'utf8');
+  const at = engineSrc.indexOf('assertOutboundTradeTx(');
+  assert.ok(at > 0, 'the guard must be called before signing');
+  const call = engineSrc.slice(at, at + 600);
+  assert.ok(/maxLamportsOut/.test(call),
+    'the guard must be told what this trade was sized for, or the naming bypass has no total to be measured against');
+  assert.ok(/maxPriorityFeeLamports/.test(call),
+    'the guard must be given a priority-fee ceiling, or ComputeBudget is unbounded');
+
+  // And the guard must be consulted BEFORE the signature.
+  const signAt = engineSrc.indexOf('tx.sign([keypair])');
+  assert.ok(signAt > at, 'the intent check must run before the key touches the transaction');
+
+  // Exactly one signing site: a second would be a second door.
+  assert.strictEqual(engineSrc.split('tx.sign([keypair])').length - 1, 1);
+});
+
+test('the copy trader has no way to reach the chain except through that function', () => {
+  const copySrc = readFileSync(join(__dirname, '../services/copyTraderService.ts'), 'utf8');
+  assert.ok(!/sendRawTransaction|\.sign\(\[/.test(copySrc),
+    'the copy trader must never sign or send on its own — it goes through the engine, and the ceiling is there');
 });
 
 const req = (over: Partial<Parameters<TradeGovernor['checkBuy']>[0]> = {}) => ({
