@@ -23,7 +23,7 @@
     "test:filters": "ts-node src/tests/filterProofs.ts",
     "test:guardrails": "ts-node src/tests/guardrailProofs.ts",
     "test:copy": "ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyRealBuyDrill.ts && ts-node src/tests/copyGasSim.ts",
-    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/incidentProofs.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyRealBuyDrill.ts && ts-node src/tests/copyGasSim.ts && ts-node src/tests/autoUpdateProofs.ts && ts-node src/tests/latencyProofs.ts",
+    "test:all": "ts-node src/tests/run.ts && ts-node src/tests/incidentProofs.ts && ts-node src/tests/filterProofs.ts && ts-node src/tests/guardrailProofs.ts && ts-node src/tests/copySellDrill.ts && ts-node src/tests/copyRealBuyDrill.ts && ts-node src/tests/copyGasSim.ts && ts-node src/tests/autoUpdateProofs.ts && ts-node src/tests/latencyProofs.ts && ts-node src/tests/smartMoneyProofs.ts",
     "test:autoupdate": "ts-node src/tests/autoUpdateProofs.ts",
     "test:incident": "ts-node src/tests/incidentProofs.ts"
   },
