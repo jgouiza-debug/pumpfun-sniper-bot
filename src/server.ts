@@ -681,6 +681,10 @@ app.post('/api/updater/apply', async (req, res) => {
 // trader's in-flight buy reservations when sizing, so the two never overdraft
 // the wallet together (copy-correctness-5). Wired here to avoid an import cycle.
 sniperEngine.setCopyInFlightReservedProvider(() => copyTrader.getInFlightBuyReservedSol());
+// Adopt any positions left open by a previous run, verified against the chain
+// first. Deferred rather than awaited at construction: it reads token balances,
+// and the engine must be constructible without a working RPC.
+setTimeout(() => { void sniperEngine.adoptRestoredPositions(); }, 3000).unref();
 // Shared-mint refusal, in BOTH directions: a percentage sell moves the wallet's
 // whole balance of a mint, so neither engine may open one the other holds.
 sniperEngine.setCopyHeldMintsProvider(() => copyTrader.getHeldMints());

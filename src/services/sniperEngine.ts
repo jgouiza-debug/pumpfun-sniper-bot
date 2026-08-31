@@ -509,8 +509,19 @@ export class SniperEngine {
       for (const p of restored.positions) {
         console.warn(`   • $${p.tokenSymbol} ${p.mint} — ${p.tokensHeld.toLocaleString()} tokens, cost $${p.investedUsd.toFixed(2)}, opened ${new Date(p.entryTime).toISOString()}`);
       }
-      console.warn('   These are NOT being managed by this process. Check the wallet and use LIQUIDATE if they are still held.');
       console.warn(`${'='.repeat(78)}\n`);
+      // ADOPT THEM. This block used to end with "These are NOT being managed by
+      // this process. Check the wallet and use LIQUIDATE if they are still
+      // held." — printed to a console that, in the packaged desktop app, nobody
+      // ever sees. So every restart, every crash and every auto-update
+      // permanently orphaned whatever was open: real bags, in the wallet, with
+      // no position tracking them, no exit rules running and no line in the UI.
+      // The store existed, the file was written correctly, and the data was
+      // read back and thrown away.
+      //
+      // Adoption is verified against the chain first (see below), so a position
+      // that was sold while the process was down is not resurrected.
+      this.pendingRestore = restored.positions;
     }
 
     this.rugCheckService = new RugCheckService({
@@ -754,6 +765,82 @@ export class SniperEngine {
    * would let the pair commit twice what either was allowed.
    */
   private inFlightBuyCount = 0;
+
+  /**
+   * Positions read from the crash-recovery store at construction, waiting to be
+   * verified against the chain and adopted. Adoption is async (it reads token
+   * balances) and the constructor is not, so it is handed over here.
+   */
+  private pendingRestore: PersistedPosition[] = [];
+
+  /**
+   * Verify each stored position against the wallet and adopt the ones that are
+   * really still held, so their exit rules run again.
+   *
+   * Rules, in the same spirit as everywhere else in this file:
+   *  - an UNREADABLE balance is not a zero. Those are adopted with their stored
+   *    quantity and reconciled later; abandoning a bag we merely could not read
+   *    is the failure this whole change is about.
+   *  - a balance of zero (or dust) means it was sold while we were down —
+   *    dropped, with a line saying so.
+   *  - a balance that differs from the record is corrected to the CHAIN's
+   *    figure before adoption, because that is what the next exit will sell.
+   */
+  public async adoptRestoredPositions(): Promise<void> {
+    const pending = this.pendingRestore;
+    this.pendingRestore = [];
+    if (!pending.length) return;
+
+    let adopted = 0;
+    let gone = 0;
+    for (const p of pending) {
+      if (this.activePositions.some(a => a.mint === p.mint)) continue;
+      const held = await this.readOwnedTokenAmount(p.mint);
+      if (held !== null && held <= Math.max(0, (p.tokensHeld || 0) * 0.05)) {
+        gone++;
+        this.log('info', `↩️ Restored position $${p.tokenSymbol} is no longer in the wallet — it was closed while the bot was down. Not re-opened.`, p.mint);
+        continue;
+      }
+      const tokensHeld = held !== null && held > 0 ? held : p.tokensHeld;
+      const buyPriceUsd = tokensHeld > 0 && p.investedUsd > 0 ? p.investedUsd / tokensHeld : p.buyPriceUsd;
+      this.activePositions.push({
+        id: p.id,
+        mint: p.mint,
+        tokenName: p.tokenName ?? p.tokenSymbol,
+        tokenSymbol: p.tokenSymbol,
+        playbook: (p.playbook as PlaybookType) ?? 'PLAY_2',
+        venue: p.venue,
+        buyPriceUsd,
+        currentPriceUsd: buyPriceUsd,
+        highestPriceUsd: buyPriceUsd,
+        tokensHeld,
+        investedSol: p.investedSol,
+        investedUsd: p.investedUsd,
+        buyTxid: p.entryTxid,
+        // The cost basis came from a previous process's record, not from a
+        // transaction read in this one. It is not a verified fill.
+        fillVerified: false,
+        entryTime: p.entryTime,
+        pnlPct: 0,
+        pnlUsd: 0,
+        pnlSol: 0,
+        status: 'OPEN',
+        principalRecovered: false,
+        moonbagRiding: false,
+        score: 0,
+        priceTicks: [{ timestamp: Date.now(), priceUsd: buyPriceUsd }],
+        realizedPnlUsd: p.realizedPnlUsd ?? 0,
+        legCount: p.legCount,
+      } as InternalPosition);
+      adopted++;
+      this.log('warn', `♻️ Re-adopted $${p.tokenSymbol} from the previous run — ${Math.round(tokensHeld).toLocaleString()} tokens${held !== null && Math.abs(held - p.tokensHeld) > p.tokensHeld * 0.05 ? ' (quantity corrected from the chain)' : ''}. Its exit rules are running again.`, p.mint);
+    }
+    if (adopted || gone) {
+      this.persistPositions();
+      this.emitChange();
+      this.log('info', `♻️ Position recovery: ${adopted} re-adopted, ${gone} already closed.`);
+    }
+  }
 
   /** Mints the copy trader holds — see withEntrySlot. Wired in server.ts. */
   private copyHeldMintsProvider: () => Set<string> = () => new Set();
