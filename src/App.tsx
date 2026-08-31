@@ -1,5 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BotConfig, BotInstanceInfo, BotStatusResponse, FilterResult, LeniencyMode, Position, TradeHistoryRecord } from './types';
+
+/**
+ * Strip pictographic emoji from text the SERVER produced.
+ *
+ * The engine's log lines are peppered with them, and an emoji is the one thing
+ * on screen that renders in full colour whatever the scheme says — which makes
+ * it the loudest element in a monochrome console and defeats the point of
+ * having a scheme at all.
+ *
+ * Done at render, deliberately, rather than by editing the log strings: those
+ * strings are asserted on by the test suite and read by anyone tailing
+ * bot.log, where the glyphs are a harmless scanning aid. This changes what the
+ * TERMINAL shows, which is the only place the look matters.
+ *
+ * The ranges are pictographs and dingbats only. Box-drawing, arrows and the
+ * mathematical marks a console legitimately prints are untouched.
+ */
+const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{1F1E6}-\u{1F1FF}]/gu;
+export function stripEmoji(text: string): string {
+  return text.replace(EMOJI, '').replace(/\s{2,}/g, ' ').trim();
+}
+
 import { previewWalletAddress } from './services/clientWallet';
 import { apiFetch } from './apiClient';
 import { CopyTradingPage } from './CopyTradingPage';
@@ -44,8 +66,7 @@ function ExitFillBadge({ trade }: { trade: TradeHistoryRecord }) {
           className="status-badge"
           style={{ color: 'var(--warn)', borderColor: 'var(--warn)' }}
           title={`Only ${pct.toFixed(1)}% of the position was sold. The rest was still held after this order.`}
-        >
-          PARTIAL FILL
+        > PARTIAL FILL
         </span>
       )}
     </div>
@@ -55,8 +76,7 @@ function ExitFillBadge({ trade }: { trade: TradeHistoryRecord }) {
 function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean }) {
   if (!isOnChainTxid(txid)) {
     return (
-      <span className="status-badge" title="Paper fill — this trade was simulated and never sent to the chain">
-        SIMULATED
+      <span className="status-badge" title="Paper fill — this trade was simulated and never sent to the chain"> SIMULATED
       </span>
     );
   }
@@ -155,10 +175,9 @@ function SmartMoneyPanel() {
   const pct = (v: number | null) => (v === null ? '—' : `${Math.round(v * 100)}%`);
 
   return (
-    <div style={{ marginTop: '12px', padding: '10px', background: 'var(--learn-bg)', border: '1px solid var(--learn-bg)', borderRadius: '4px' }}>
+    <div style={{ marginTop: '12px', padding: '10px', background: 'transparent', border: '1px solid var(--line)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--learn)' }}>
-          🧠 Smart Money — wallets the bot proved, not a pasted list
+        <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--learn)' }}> Smart Money — wallets the bot proved, not a pasted list
         </div>
         <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>
           {sm.roster.length} promoted / {sm.walletsSeen} seen · research queue {sm.research.queued} · reads left {sm.research.readBudgetRemaining}
@@ -166,8 +185,7 @@ function SmartMoneyPanel() {
       </div>
 
       {sm.roster.length === 0 ? (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
-          No wallet has earned promotion yet. This is expected on a new install and is not a fault:
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}> No wallet has earned promotion yet. This is expected on a new install and is not a fault:
           the roster is built from chain history the bot gathers itself, so it needs days of
           graduations and duds before anyone clears the bar. Until then this lane produces nothing.
           {sm.research.dudCandidates > 0 && <> Currently tracking {sm.research.dudCandidates} token(s) to see how they turn out.</>}
@@ -194,7 +212,7 @@ function SmartMoneyPanel() {
                     <a href={`https://solscan.io/account/${w.address}`} target="_blank" rel="noreferrer" style={{ color: 'var(--learn)' }}>
                       {w.address.slice(0, 4)}…{w.address.slice(-4)}
                     </a>
-                    {w.pinned === 'always' && <span title="pinned on by you" style={{ marginLeft: 4 }}>📌</span>}
+                    {w.pinned === 'always' && <span title="pinned on by you" style={{ marginLeft: 4 }}>*</span>}
                   </td>
                   <td style={{ padding: '3px 6px' }}>{pct(w.conviction)}</td>
                   <td style={{ padding: '3px 6px' }}>{pct(w.winRate)}</td>
@@ -220,15 +238,13 @@ function SmartMoneyPanel() {
         </div>
       )}
 
-      <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '8px', lineHeight: 1.5 }}>
-        An entry needs <strong>{sm.confluence.minWallets}</strong> of these wallets to buy the same token
+      <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '8px', lineHeight: 1.5 }}> An entry needs <strong>{sm.confluence.minWallets}</strong> of these wallets to buy the same token
         within <strong>{sm.confluence.windowMs / 1000}s</strong>, each risking at least {sm.confluence.minBuySol} SOL.
         {sm.pendingSignals.length > 0 && (
           <> Currently watching {sm.pendingSignals.length} token(s) part-way to a quorum
             (best: {sm.pendingSignals[0].wallets}/{sm.pendingSignals[0].needed}).</>
         )}
-        <br />
-        Every entry from this lane still passes the same rug, honeypot and spend-governor checks as any other.
+        <br /> Every entry from this lane still passes the same rug, honeypot and spend-governor checks as any other.
       </div>
 
       <EntryProfileSection />
@@ -326,23 +342,21 @@ function TraderScoutPanel() {
   const hold = (s: number) => (s >= 3600 ? `${Math.round(s / 360) / 10}h` : s >= 60 ? `${Math.round(s / 60)}m` : `${Math.round(s)}s`);
 
   return (
-    <div style={{ marginTop: '12px', padding: '10px', background: 'var(--info-bg)', border: '1px solid var(--info-bg)', borderRadius: '4px' }}>
+    <div style={{ marginTop: '12px', padding: '10px', background: 'transparent', border: '1px solid var(--line)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--info)' }}>
-          🔎 Who to copy — found, then checked against the chain
+        <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--info)' }}> Who to copy — found, then checked against the chain
         </div>
         <button
           onClick={() => post('/api/scout/run', {}, 'Scout run')}
           disabled={busy !== null}
-          style={{ fontSize: '11px', padding: '2px 8px', cursor: busy ? 'wait' : 'pointer', background: 'transparent', border: '1px solid var(--info-bg)', color: 'var(--info)', borderRadius: 3 }}
+          style={{ fontSize: '11px', padding: '2px 8px', cursor: busy ? 'wait' : 'pointer', background: 'transparent', border: '1px solid var(--line-focus)', color: 'var(--info)' }}
         >
           {busy === 'Scout run' ? 'scanning…' : 'scan now'}
         </button>
       </div>
 
       {!sc?.keysSet.solanaTracker && (
-        <div style={{ fontSize: '11px', color: 'var(--warn)', lineHeight: 1.6, marginBottom: '8px' }}>
-          No Solana Tracker key set. That is the only free source that ranks Solana wallets by
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginBottom: '8px' }}>No Solana Tracker key set. That is the only free source that ranks Solana wallets by
           realized profit over a plain API call — the boards people usually quote (GMGN, Kolscan)
           sit behind Cloudflare and cannot be read from a server at all. Without it the scout still
           runs, but only over wallets this bot discovered on chain by itself, which takes longer to
@@ -351,15 +365,13 @@ function TraderScoutPanel() {
       )}
 
       {!rep ? (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
-          No scan yet. The first one runs a few minutes after startup, then hourly.
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}> No scan yet. The first one runs a few minutes after startup, then hourly.
         </div>
       ) : (
         <>
           {rep.best ? (
             <div style={{ padding: '8px', background: 'var(--ok-bg)', border: '1px solid var(--ok-bg)', borderRadius: 3, marginBottom: '8px' }}>
-              <div style={{ fontSize: '11px', color: 'var(--ok)', fontWeight: 700, marginBottom: 4 }}>
-                BEST RIGHT NOW — {rep.best.label ? `${rep.best.label} · ` : ''}
+              <div style={{ fontSize: '11px', color: 'var(--ok)', fontWeight: 700, marginBottom: 4 }}> BEST RIGHT NOW — {rep.best.label ? `${rep.best.label} · ` : ''}
                 <a href={`https://solscan.io/account/${rep.best.wallet}`} target="_blank" rel="noreferrer" style={{ color: 'var(--ok)', fontFamily: 'monospace' }}>
                   {short(rep.best.wallet)}
                 </a>
@@ -371,8 +383,7 @@ function TraderScoutPanel() {
                 {' '}typical hold {hold(rep.best.medianHoldSeconds)} ·
                 {' '}{rep.best.tradesLast6h} trades in 6h
               </div>
-              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginTop: 3 }}>
-                Copying it should cost about{' '}
+              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginTop: 3 }}> Copying it should cost about{' '}
                 <strong>{rep.best.expectedFillDragPct?.toFixed(1) ?? '?'}%</strong> in worse fills
                 (their {rep.best.medianBuySol} SOL entries land in a {rep.best.medianEntryVSol} SOL curve, and ours lands after).
                 {' '}Take away their best token and they are still at{' '}
@@ -392,7 +403,7 @@ function TraderScoutPanel() {
                 onClick={() => post('/api/scout/backfill', {}, 'Backfill')}
                 disabled={busy !== null}
                 title="Rebuild the entry profile from these wallets' own trade history, instead of waiting weeks to watch 40 live entries"
-                style={{ marginTop: 6, marginLeft: 6, fontSize: '11px', padding: '3px 10px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--learn-bg)', color: 'var(--learn)', borderRadius: 3 }}
+                style={{ marginTop: 6, marginLeft: 6, fontSize: '11px', padding: '3px 10px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--line-focus)', color: 'var(--fg-dim)' }}
               >
                 {busy === 'Backfill' ? 'learning…' : 'learn their strategy from history'}
               </button>
@@ -436,7 +447,7 @@ function TraderScoutPanel() {
                         <button
                           onClick={() => post('/api/scout/follow', { address: t.wallet }, 'Follow')}
                           disabled={busy !== null}
-                          style={{ fontSize: '11px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--info-bg)', color: 'var(--info)', borderRadius: 3 }}
+                          style={{ fontSize: '11px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--line-focus)', color: 'var(--info)' }}
                         >follow</button>
                       </td>
                     </tr>
@@ -475,8 +486,7 @@ function TraderScoutPanel() {
               {' '}still profitable with their best token removed,
               {' '}and under half their positions unresolved bags.
             </div>
-            <div style={{ marginTop: 3 }}>
-              Sources: {rep.sourceOutcomes.map(o => `${o.name} ${o.ok ? '✓' : `✗ (${o.detail ?? 'failed'})`}`).join(' · ')}
+            <div style={{ marginTop: 3 }}> Sources: {rep.sourceOutcomes.map(o => `${o.name} ${o.ok ? '✓' : `✗ (${o.detail ?? 'failed'})`}`).join(' · ')}
             </div>
           </div>
         </>
@@ -555,16 +565,13 @@ function EntryProfileSection() {
   };
 
   return (
-    <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid var(--learn-bg)' }}>
-      <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--learn)', marginBottom: '6px' }}>
-        🔬 What they look for — learned, then applied to every launch
+    <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid var(--line)' }}>
+      <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--learn)', marginBottom: '6px' }}> What they look for — learned, then applied to every launch
       </div>
 
       {!ep.usable ? (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
-          Not driving entries yet: {ep.notReady}.
-          <br />
-          Evidence so far: <strong>{ep.enteredSamples}</strong>/{ep.needEntered} tokens they bought,
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}> Not driving entries yet: {ep.notReady}.
+          <br /> Evidence so far: <strong>{ep.enteredSamples}</strong>/{ep.needEntered} tokens they bought,
           {' '}<strong>{ep.skippedSamples}</strong>/{ep.needSkipped} they passed on. Both sides are needed —
           the tokens they skipped are what make the comparison say anything.
         </div>
@@ -596,8 +603,7 @@ function EntryProfileSection() {
               </tbody>
             </table>
           </div>
-          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}>
-            Built from {ep.enteredSamples} of their entries against {ep.skippedSamples} launches they passed on.
+          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}> Built from {ep.enteredSamples} of their entries against {ep.skippedSamples} launches they passed on.
             A fresh token is bought on this profile alone when it matches at least{' '}
             <strong>{Math.round(ep.minScore * 100)}%</strong> of these rules by weight, on{' '}
             <strong>{ep.minRules}</strong> or more of them — no wallet has to buy first.
@@ -1287,14 +1293,12 @@ export function App() {
       <button
         className={`btn-instance ${activePage === 'sniper' ? 'active' : ''}`}
         onClick={() => setActivePage('sniper')}
-      >
-        🎯 SNIPER TERMINAL
+      > SNIPER TERMINAL
       </button>
       <button
         className={`btn-instance ${activePage === 'copy' ? 'active' : ''}`}
         onClick={() => setActivePage('copy')}
-      >
-        👥 COPY TRADING
+      > COPY TRADING
       </button>
     </div>
   );
@@ -1363,9 +1367,8 @@ export function App() {
           is told to git pull instead of being offered a swap it cannot do. */}
       {updateInfo?.hasUpdate && (
         <div style={{ background: 'var(--ok)', color: 'var(--fg)', padding: '10px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', fontSize: '15px', fontWeight: 600, borderBottom: '1px solid var(--ok)' }}>
-          <span style={{ minWidth: 0 }}>
-            🚀 UPDATE AVAILABLE: {updateInfo.latestVersion} (you have {updateInfo.currentVersion})
-            {updateError && <span style={{ display: 'block', fontWeight: 400, fontSize: '12px', color: 'var(--bad)' }}>⚠️ {updateError}</span>}
+          <span style={{ minWidth: 0 }}> UPDATE AVAILABLE: {updateInfo.latestVersion} (you have {updateInfo.currentVersion})
+            {updateError && <span style={{ display: 'block', fontWeight: 400, fontSize: '12px', color: 'var(--bad)' }}>{updateError}</span>}
             {applyingUpdate && updateProgress && (
               <span style={{ display: 'block', fontWeight: 400, fontSize: '12px' }}>
                 {updateProgress.message}
@@ -1381,7 +1384,7 @@ export function App() {
                 disabled={applyingUpdate}
                 style={{ background: 'var(--fg)', color: 'var(--ok)', padding: '6px 14px', border: 'none', borderRadius: '4px', fontWeight: 700, cursor: applyingUpdate ? 'wait' : 'pointer', opacity: applyingUpdate ? 0.7 : 1 }}
               >
-                {applyingUpdate ? '⏳ UPDATING…' : '⬇ UPDATE NOW'}
+                {applyingUpdate ? 'UPDATING…' : '⬇ UPDATE NOW'}
               </button>
             ) : updateInfo.installKind === 'electron' ? (
               // The desktop app is a DIRECTORY of files: swapping one exe would
@@ -1397,8 +1400,7 @@ export function App() {
             ) : (
               <span style={{ fontSize: '12px', fontWeight: 400 }}>Dev checkout — run <code>git pull</code></span>
             )}
-            <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer" style={{ background: 'var(--line)', color: 'var(--fg)', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}>
-              NOTES
+            <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer" style={{ background: 'var(--line)', color: 'var(--fg)', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}> NOTES
             </a>
           </div>
         </div>
@@ -1414,8 +1416,7 @@ export function App() {
 
         {/* Multi-Instance Switcher Bar */}
         <div className="instance-bar">
-          <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--ink-secondary)', fontWeight: 700, marginRight: '4px' }}>
-            BOT INSTANCES:
+          <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--ink-secondary)', fontWeight: 700, marginRight: '4px' }}> BOT INSTANCES:
           </span>
           {instances.map(inst => (
             <button
@@ -1428,7 +1429,7 @@ export function App() {
           ))}
           <button
             className="btn-instance"
-            style={{ borderColor: 'var(--accent-bronze)', color: 'var(--accent-bronze)' }}
+
             onClick={() => setShowInstanceModal(true)}
           >
             + NEW INSTANCE
@@ -1441,46 +1442,11 @@ export function App() {
               places is what pushed this header onto three ragged rows whenever
               the chain was unreachable, i.e. exactly when it most needed to be
               readable. */}
-          {/* The exact state that produced "valid key, RPC still down". */}
-          {rpcInfo?.keyOverridden && (
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                padding: '6px 12px',
-                borderRadius: '4px',
-                border: '1px solid var(--warn-bg)',
-                background: 'var(--warn-bg)',
-                color: 'var(--warn)',
-                fontSize: '12px',
-                fontWeight: 700,
-                fontFamily: 'var(--font-mono)'
-              }}
-              title={`SOLANA_RPC_URL in the .env beside the app points at ${rpcInfo.endpointHost} and takes precedence over the Helius key. Remove it for the key to take effect.`}
-            >
-              ⚠ HELIUS KEY UNUSED — SOLANA_RPC_URL OVERRIDE
-            </div>
-          )}
-
-          {rpcInfo?.credentialRejected && (
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                padding: '6px 12px',
-                borderRadius: '4px',
-                border: '1px solid var(--bad-bg)',
-                background: 'var(--bad-bg)',
-                color: 'var(--bad)',
-                fontSize: '12px',
-                fontWeight: 700,
-                fontFamily: 'var(--font-mono)'
-              }}
-              title={rpcInfo.lastError || 'The RPC provider rejected the API key.'}
-            >
-              ⚠ RPC KEY REJECTED
-            </div>
-          )}
+          {/* The two RPC fault badges were here. Both are flags on the status
+              bar's rpc segment now, with the full explanation in its tooltip.
+              Carrying them here as well meant the header grew a row exactly
+              when the chain was unreachable — and put two red blocks on a
+              screen whose whole point is that colour is rationed. */}
 
           <button
             className="btn-terminal-outline"
@@ -1492,16 +1458,13 @@ export function App() {
               background: featureFlags.allInSizing ? 'var(--ok-bg)' : 'transparent',
             }}
             title="When active, every trade spends 100% of your available Photon wallet SOL balance"
-          >
-            ⚡ ALL-IN MODE: {featureFlags.allInSizing ? 'ON' : 'OFF'}
+          > ALL-IN MODE: {featureFlags.allInSizing ? 'ON' : 'OFF'}
           </button>
 
-          <button className="btn-terminal-outline" onClick={() => setShowConfigModal(true)}>
-            SETTINGS &amp; FLAGS
+          <button className="btn-terminal-outline" onClick={() => setShowConfigModal(true)}> SETTINGS &amp; FLAGS
           </button>
 
-          <button className="btn-terminal-outline" onClick={handleClearHistory} style={{ borderColor: 'var(--ink-secondary)' }}>
-            🗑️ CLEAR RECEIPTS
+          <button className="btn-terminal-outline" onClick={handleClearHistory} style={{ borderColor: 'var(--ink-secondary)' }}> CLEAR RECEIPTS
           </button>
 
           <button 
@@ -1514,7 +1477,7 @@ export function App() {
               fontWeight: 700
             }}
           >
-            {isBotActive ? '⏹ CEASE / STOP BOT' : '▶ START BOT'}
+            {isBotActive ? '■ CEASE / STOP BOT' : '▶ START BOT'}
           </button>
 
           <button 
@@ -1526,8 +1489,7 @@ export function App() {
               color: 'var(--fg)',
               fontWeight: 700
             }}
-          >
-            💀 KILL DEV SERVER
+          > KILL DEV SERVER
           </button>
         </div>
       </header>
@@ -1549,15 +1511,13 @@ export function App() {
           <div className="stat-value-mono">
             ${botStatus?.bankrollUsd.toFixed(2) || '100.00'}
           </div>
-          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
-            PORT {selectedPort} EQUALITY
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}> PORT {selectedPort} EQUALITY
           </div>
         </div>
 
         {/* Hero Anchor Card — Cumulative Performance in Large Italic Fraunces */}
         <div className="stat-card hero-anchor">
-          <div className="stat-label" style={{ color: 'var(--ink-primary)', fontWeight: 700 }}>
-            Cumulative Performance
+          <div className="stat-label" style={{ color: 'var(--ink-primary)', fontWeight: 700 }}> Cumulative Performance
           </div>
           <div className={`hero-fraunces-number ${stats.totalNetPnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
             {stats.totalNetPnlUsd >= 0 ? '+' : ''}${stats.totalNetPnlUsd.toFixed(2)}
@@ -1582,8 +1542,7 @@ export function App() {
           <div className="stat-value-mono">
             {activePositions.length} / {botStatus?.config.maxActivePositions ?? '—'}
           </div>
-          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}>
-            CONCURRENT LIMIT
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}> CONCURRENT LIMIT
           </div>
         </div>
 
@@ -1627,8 +1586,7 @@ export function App() {
 
         {/* Wallet state — the difference between paper and real money */}
         <div className="stat-card" style={{ border: wallet?.linked ? '1px solid var(--ok-bg)' : undefined }}>
-          <div className="stat-label">
-            Photon Wallet
+          <div className="stat-label"> Photon Wallet
             <span style={{ float: 'right', fontSize: '11px', color: streamLive ? 'var(--ok)' : 'var(--warn)' }}>
               {streamLive ? '● LIVE' : '○ POLLING'}
             </span>
@@ -1648,7 +1606,7 @@ export function App() {
         <div className="stat-card" style={{ border: featureFlags.allInSizing ? '1px solid var(--ok-bg)' : undefined }}>
           <div className="stat-label">
             {featureFlags.allInSizing
-              ? '⚡ ALL-IN WALLET BUDGET'
+              ? 'ALL-IN WALLET BUDGET'
               : botStatus?.config?.walletSplitSizing
                 ? `Slot Size (1 of ${botStatus?.config?.maxActivePositions ?? 3})`
                 : 'Next Entry Size'}
@@ -1668,26 +1626,23 @@ export function App() {
           {/* The whole point of splitting: name what one dead slot actually
               costs, in the currency the owner thinks in. */}
           {sizing && botStatus?.config?.walletSplitSizing && sizing.nextBuySol > 0 && (
-            <div style={{ fontSize: '11px', marginTop: '3px', fontFamily: 'var(--font-mono)', color: 'var(--ink-muted)' }}>
-              MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (sizing.slots || botStatus?.config?.maxActivePositions || 3))}% OF RUN)
+            <div style={{ fontSize: '11px', marginTop: '3px', fontFamily: 'var(--font-mono)', color: 'var(--ink-muted)' }}> MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (sizing.slots || botStatus?.config?.maxActivePositions || 3))}% OF RUN)
             </div>
           )}
           {/* blockedReason now only means the balance physically cannot fund
               an order. Bad economics no longer block — every amount trades —
               so they get an advisory line, not a stop sign. */}
           {sizing && sizing.blockedReason && (
-            <div style={{ fontSize: '11px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--bad)', border: '1px solid var(--bad)', background: 'var(--bad-bg)' }}>
-              ⛔ NO TRADES POSSIBLE — {sizing.blockedReason}
+            <div style={{ fontSize: '11px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--bad)', border: '1px solid var(--bad)', background: 'var(--bad-bg)' }}> NO TRADES POSSIBLE — {sizing.blockedReason}
             </div>
           )}
           {sizing && !sizing.blockedReason && sizing.economicsOk === false && (
-            <div style={{ fontSize: '11px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--warn)', border: '1px solid var(--warn)', background: 'var(--warn-bg)' }}>
-              ⚠️ ROUND-TRIP COST {sizing.breakevenPct}% — EVERY ENTRY STARTS THAT FAR UNDERWATER. TRADING ANYWAY.
+            <div style={{ fontSize: '11px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--warn)', border: '1px solid var(--warn)', background: 'var(--warn-bg)' }}> ROUND-TRIP COST {sizing.breakevenPct}% — EVERY ENTRY STARTS THAT FAR UNDERWATER. TRADING ANYWAY.
             </div>
           )}
           {sizing && sizing.slotsReducedForEconomics && (
             <div style={{ fontSize: '11px', marginTop: '4px', fontFamily: 'var(--font-mono)', color: 'var(--warn)' }}>
-              ⚠️ {sizing.requestedSlots} SLOTS REQUESTED → {sizing.slots} FUNDABLE. ONE DEAD POSITION NOW COSTS {Math.round(100 / (sizing.slots || 1))}% OF THE RUN.
+              {sizing.requestedSlots} SLOTS REQUESTED → {sizing.slots} FUNDABLE. ONE DEAD POSITION NOW COSTS {Math.round(100 / (sizing.slots || 1))}% OF THE RUN.
             </div>
           )}
           {/* Fee drag is the number that decides whether small stakes can work
@@ -1698,8 +1653,7 @@ export function App() {
               marginTop: '3px',
               fontFamily: 'var(--font-mono)',
               color: sizing.breakevenPct > 10 ? 'var(--bad)' : sizing.breakevenPct > 6 ? 'var(--warn)' : 'var(--ok)',
-            }}>
-              NEEDS +{sizing.breakevenPct}% TO BREAK EVEN
+            }}> NEEDS +{sizing.breakevenPct}% TO BREAK EVEN
             </div>
           )}
         </div>
@@ -1726,8 +1680,7 @@ export function App() {
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
                     <div>No active positions on Bot Instance Port {selectedPort}.</div>
-                    <button className="btn-terminal" onClick={toggleBotPower}>
-                      START BOT
+                    <button className="btn-terminal" onClick={toggleBotPower}> START BOT
                     </button>
                   </div>
                 )}
@@ -1787,8 +1740,7 @@ export function App() {
                               rel="noopener noreferrer"
                               className="btn-terminal-outline"
                               style={{ padding: '2px 6px', fontSize: '11px' }}
-                            >
-                              SOLSCAN
+                            > SOLSCAN
                             </a>
                           )}
                           <a
@@ -1797,11 +1749,9 @@ export function App() {
                             rel="noopener noreferrer"
                             className="btn-terminal-outline"
                             style={{ padding: '2px 6px', fontSize: '11px' }}
-                          >
-                            PHOTON
+                          > PHOTON
                           </a>
-                          <button className="btn-cell-action" onClick={() => forceSellPosition(pos.id)}>
-                            LIQUIDATE
+                          <button className="btn-cell-action" onClick={() => forceSellPosition(pos.id)}> LIQUIDATE
                           </button>
                         </div>
                       </td>
@@ -1827,15 +1777,13 @@ export function App() {
                 className="btn-terminal-outline" 
                 onClick={handleClearHistory}
                 style={{ fontSize: '11px', padding: '2px 8px', color: 'var(--bad)', borderColor: 'var(--bad)' }}
-              >
-                🗑️ CLEAR RECEIPTS
+              > CLEAR RECEIPTS
               </button>
             )}
           </div>
           <div className="matrix-container flex-matrix">
             {tradeHistory.length === 0 ? (
-              <div className="empty-state">
-                No closed trades yet. Real fills appear here with an ON-CHAIN ✓ link to their Solscan
+              <div className="empty-state"> No closed trades yet. Real fills appear here with an ON-CHAIN ✓ link to their Solscan
                 transaction; paper fills are labeled SIMULATED.
               </div>
             ) : (
@@ -1890,15 +1838,14 @@ export function App() {
 
           <div className="console-container">
             {visibleLogs.length === 0 ? (
-              <div style={{ color: 'var(--ink-muted)' }}>
-                Console cleared. Screening activity appears here as it happens.
+              <div style={{ color: 'var(--ink-muted)' }}> Console cleared. Screening activity appears here as it happens.
               </div>
             ) : (
               visibleLogs.map(log => (
                 <div key={log.id} className="log-line">
                   <span className="log-time">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
                   <span className={`log-level-${log.level}`}>
-                    {log.message}
+                    {stripEmoji(log.message)}
                   </span>
                 </div>
               ))
@@ -2008,15 +1955,13 @@ export function App() {
                   className="btn-terminal-outline"
                   style={{ flex: 1 }}
                   onClick={() => setShowInstanceModal(false)}
-                >
-                  DISCARD
+                > DISCARD
                 </button>
                 <button
                   type="submit"
                   className="btn-terminal"
                   style={{ flex: 1 }}
-                >
-                  SPAWN INSTANCE
+                > SPAWN INSTANCE
                 </button>
               </div>
             </form>
@@ -2055,7 +2000,7 @@ export function App() {
                   <label className="form-label">Filter Profile</label>
                   <input
                     className="form-input"
-                    value="STRICT (High Safety, Score ≥ 62)"
+                    value="STRICT — SCORE >= 62"
                     disabled
                     readOnly
                   />
@@ -2074,8 +2019,7 @@ export function App() {
                     <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                       ⬇ Software Update
                     </div>
-                    <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '3px', fontFamily: 'var(--font-mono)' }}>
-                      Installed: <strong>v{updateInfo?.currentVersion ?? '—'}</strong>
+                    <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '3px', fontFamily: 'var(--font-mono)' }}> Installed: <strong>v{updateInfo?.currentVersion ?? '—'}</strong>
                       {updateInfo?.latestVersion && updateInfo.latestVersion !== updateInfo.currentVersion && (
                         <> · Available: <strong>{updateInfo.latestVersion}</strong></>
                       )}
@@ -2106,7 +2050,7 @@ export function App() {
                 </div>
 
                 <div style={{ fontSize: '10px', marginTop: '6px', lineHeight: 1.55, color: 'var(--ink-muted)' }}>
-                  {updateError && <div style={{ color: 'var(--bad)' }}>⚠️ {updateError}</div>}
+                  {updateError && <div style={{ color: 'var(--bad)' }}>{updateError}</div>}
 
                   {applyingUpdate && updateProgress && (
                     <div style={{ color: 'var(--ok)' }}>
@@ -2116,8 +2060,7 @@ export function App() {
                   )}
 
                   {!applyingUpdate && updateInfo?.hasUpdate && (
-                    <div style={{ color: 'var(--ok)' }}>
-                      A newer release is published.
+                    <div style={{ color: 'var(--ok)' }}> A newer release is published.
                       {!updateInfo.canSelfUpdate && (updateInfo.installKind === 'electron'
                         ? ' This is the installed desktop app — download the new installer from the release page and run it. Your settings and positions are kept (they live in the app-data folder, not next to the app).'
                         : ' This is a dev checkout — run git pull instead of installing.')}
@@ -2142,8 +2085,7 @@ export function App() {
                   )}
 
                   {updateInfo && !updateInfo.canSelfUpdate && !updateInfo.hasUpdate && (
-                    <div style={{ marginTop: '2px' }}>
-                      Running from source, so in-place install is unavailable — only the packaged .exe can replace itself.
+                    <div style={{ marginTop: '2px' }}> Running from source, so in-place install is unavailable — only the packaged .exe can replace itself.
                     </div>
                   )}
                 </div>
@@ -2154,8 +2096,7 @@ export function App() {
                   a key is stored, so saving with it empty keeps the existing
                   one instead of wiping it. */}
               <div className="form-group" style={{ marginTop: '10px' }}>
-                <label className="form-label">
-                  Helius RPC Key{' '}
+                <label className="form-label"> Helius RPC Key{' '}
                   {botStatus?.config?.heliusApiKeySet
                     ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.heliusApiKeyHint}</span>
                     : <span style={{ color: 'var(--bad)' }}>— NOT SET (the bot cannot reach the chain)</span>}
@@ -2167,8 +2108,7 @@ export function App() {
                   value={configForm.heliusApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, heliusApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px' }}>
-                  Free tier at helius.dev. Used for every RPC call, position pricing and transaction submission.
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px' }}> Free tier at helius.dev. Used for every RPC call, position pricing and transaction submission.
                   There is no built-in key — each user supplies their own.
                   {' '}Keys entered here are saved to <code>.api-keys.json</code> beside the app and reused on the next start.
                 </div>
@@ -2183,22 +2123,19 @@ export function App() {
                     </span>
                     {botStatus.config.heliusApiKeySource === 'stored' && (
                       <button type="button" className="btn-ghost" style={{ fontSize: '10px', padding: '1px 5px' }}
-                        onClick={() => void handleForgetKey('heliusApiKey')}>
-                        Forget saved key
+                        onClick={() => void handleForgetKey('heliusApiKey')}> Forget saved key
                       </button>
                     )}
                   </div>
                 )}
                 {!botStatus?.config?.heliusApiKeySet && (
-                  <div style={{ fontSize: '10px', marginTop: '3px', color: 'var(--warn)' }}>
-                    Running on the public RPC endpoint — heavily rate limited. Positions can still be priced and sold, but snipes will lose races.
+                  <div style={{ fontSize: '10px', marginTop: '3px', color: 'var(--warn)' }}> Running on the public RPC endpoint — heavily rate limited. Positions can still be priced and sold, but snipes will lose races.
                   </div>
                 )}
               </div>
 
               <div className="form-group" style={{ marginTop: '10px' }}>
-                <label className="form-label">
-                  PumpPortal Data Key{' '}
+                <label className="form-label"> PumpPortal Data Key{' '}
                   {botStatus?.config?.pumpPortalApiKeySet
                     ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.pumpPortalApiKeyHint}</span>
                     : <span style={{ color: 'var(--warn)' }}>— not set (free tier)</span>}
@@ -2225,8 +2162,7 @@ export function App() {
                   supply candidate wallet ADDRESSES; every number the scout
                   ranks on is re-measured from chain data by this bot. */}
               <div className="form-group" style={{ marginTop: '10px' }}>
-                <label className="form-label">
-                  Solana Tracker Key{' '}
+                <label className="form-label"> Solana Tracker Key{' '}
                   {botStatus?.config?.solanaTrackerApiKeySet
                     ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.solanaTrackerApiKeyHint}</span>
                     : <span style={{ color: 'var(--warn)' }}>— not set (the scout falls back to on-chain discovery)</span>}
@@ -2238,8 +2174,7 @@ export function App() {
                   value={configForm.solanaTrackerApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, solanaTrackerApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
-                  Free tier at solanatracker.io. Feeds the <strong>Who to copy</strong> scout with candidate
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}> Free tier at solanatracker.io. Feeds the <strong>Who to copy</strong> scout with candidate
                   wallets — both the profit leaderboard and the named-KOL board. It is the only free source
                   that ranks Solana wallets by realized profit over a plain API call: GMGN and Kolscan are
                   behind Cloudflare's TLS fingerprinting and cannot be read from a server at all.
@@ -2249,8 +2184,7 @@ export function App() {
               </div>
 
               <div className="form-group" style={{ marginTop: '10px' }}>
-                <label className="form-label">
-                  Birdeye Key{' '}
+                <label className="form-label"> Birdeye Key{' '}
                   {botStatus?.config?.birdeyeApiKeySet
                     ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.birdeyeApiKeyHint}</span>
                     : <span style={{ color: 'var(--ink-muted)' }}>— not set (optional)</span>}
@@ -2262,8 +2196,7 @@ export function App() {
                   value={configForm.birdeyeApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, birdeyeApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
-                  Free tier at birdeye.so. A second opinion for the scout's candidate list — a wallet two
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}> Free tier at birdeye.so. A second opinion for the scout's candidate list — a wallet two
                   independent boards both name is worth checking first. Purely additive: the scout works
                   without it.
                 </div>
@@ -2271,8 +2204,7 @@ export function App() {
 
               {/* Photon Wallet Link — real on-chain execution */}
               <div className="form-group" style={{ border: '1px solid var(--line)', padding: 12, marginTop: '6px' }}>
-                <label className="form-label">
-                  Photon Wallet {wallet?.linked ? '— LINKED' : '— not linked'}
+                <label className="form-label"> Photon Wallet {wallet?.linked ? '— LINKED' : '— not linked'}
                 </label>
 
                 {wallet?.linked ? (
@@ -2284,17 +2216,14 @@ export function App() {
                       <span><strong>{wallet.solBalance}</strong> SOL</span>
                       <span style={{ color: 'var(--fg-dim)' }}>${wallet.usdBalance}</span>
                       <span style={{ color: 'var(--ok)' }}>{wallet.deployableSol} deployable</span>
-                      <span style={{ color: wallet.rpcHealthy ? 'var(--ok)' : 'var(--bad)' }}>
-                        RPC {wallet.rpcHealthy ? 'OK' : 'DOWN'}
+                      <span style={{ color: wallet.rpcHealthy ? 'var(--ok)' : 'var(--bad)' }}> RPC {wallet.rpcHealthy ? 'OK' : 'DOWN'}
                       </span>
                     </div>
 
                     <div style={{ display: 'flex', gap: 8 }}>
-                      <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={refreshWallet}>
-                        REFRESH BALANCE
+                      <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={refreshWallet}> REFRESH BALANCE
                       </button>
-                      <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={unlinkWallet}>
-                        UNLINK
+                      <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={unlinkWallet}> UNLINK
                       </button>
                     </div>
                   </div>
@@ -2312,11 +2241,9 @@ export function App() {
                         type="checkbox"
                         checked={walletPersist}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setWalletPersist(e.target.checked)}
-                      />
-                      Save to .photon-wallet.json so it reloads on restart
+                      /> Save to .photon-wallet.json so it reloads on restart
                     </label>
-                    <button type="button" className="btn-terminal" onClick={linkWallet} disabled={!walletKeyInput.trim()}>
-                      LINK WALLET
+                    <button type="button" className="btn-terminal" onClick={linkWallet} disabled={!walletKeyInput.trim()}> LINK WALLET
                     </button>
                   </div>
                 )}
@@ -2324,8 +2251,7 @@ export function App() {
 
               {/* Strategy Parameters Grid */}
               <div style={{ marginTop: '10px' }}>
-                <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
-                  Strategy Parameters
+                <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}> Strategy Parameters
                 </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
@@ -2357,8 +2283,7 @@ export function App() {
                     wins or loses. It was previously pinned (floor == ceiling)
                     with no way to change it outside a config file. */}
                 <div style={{ marginTop: '10px', padding: '10px', background: 'var(--warn-bg)', border: '1px solid var(--warn-bg)', borderRadius: '4px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--warn)', marginBottom: '6px' }}>
-                    ⚡ Priority Fee — what you pay to land
+                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--warn)', marginBottom: '6px' }}> Priority Fee — what you pay to land
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                     <div className="form-group">
@@ -2382,12 +2307,10 @@ export function App() {
                       />
                     </div>
                   </div>
-                  <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}>
-                    Paid on <strong>every</strong> transaction, win or lose. The floor is what you always pay;
+                  <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}> Paid on <strong>every</strong> transaction, win or lose. The floor is what you always pay;
                     with dynamic fees on, a congested slot can bid up to the ceiling.
                     A fee too low simply does not land — and a send that does not land still burns its base fee.
-                    <br />
-                    Whatever you set here, a single fee is never more than <strong>5% of the position</strong>,
+                    <br /> Whatever you set here, a single fee is never more than <strong>5% of the position</strong>,
                     so on a {(configForm.buyAmountSol ?? 0.6).toFixed(3)} SOL position the most one trade can pay is{' '}
                     <strong>{Math.min(configForm.maxPriorityFeeSol ?? 0.01, (configForm.buyAmountSol ?? 0.6) * 0.05).toFixed(4)} SOL</strong>
                     {' '}(~{((Math.min(configForm.maxPriorityFeeSol ?? 0.01, (configForm.buyAmountSol ?? 0.6) * 0.05) * 2 / (configForm.buyAmountSol || 1)) * 100).toFixed(1)}% of the position for a round trip).
@@ -2397,8 +2320,7 @@ export function App() {
                 {/* Take-profit Automation Controls (positive P&L only). The
                     loss side lives in its own Exit Policy block below. */}
                 <div style={{ marginTop: '10px', padding: '10px', background: 'var(--ok-bg)', border: '1px solid var(--ok-bg)', borderRadius: '4px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ok)', marginBottom: '6px' }}>
-                    💰 Take-Profit Automation (Positive P&L Only)
+                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ok)', marginBottom: '6px' }}> Take-Profit Automation (Positive P&L Only)
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                     <div className="form-group">
@@ -2448,11 +2370,9 @@ export function App() {
                     switch, not a hardcoded rule. All off = the bot never sells
                     on its own; dangers are still detected and logged. */}
                 <div style={{ marginTop: '10px', padding: '10px', background: 'var(--warn-bg)', border: '1px solid var(--warn-bg)', borderRadius: '4px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--warn)', marginBottom: '4px' }}>
-                    🛡️ Exit Policy — which automatic sells may fire
+                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--warn)', marginBottom: '4px' }}> Exit Policy — which automatic sells may fire
                   </div>
-                  <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '8px', lineHeight: 1.5 }}>
-                    Turn every switch off and the bot never sells on its own — dangers are still detected and
+                  <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '8px', lineHeight: 1.5 }}> Turn every switch off and the bot never sells on its own — dangers are still detected and
                     logged, and LIQUIDATE stays the only exit. Take-profit rungs above are unaffected.
                   </div>
 
@@ -2548,9 +2468,8 @@ export function App() {
                     slots at START, so one dead trade costs 1/N of the run. */}
                 <div style={{ marginTop: '8px', padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
                   <div>
-                    <div style={{ fontSize: '10px', fontWeight: 700 }}>💰 Split Wallet Across Slots</div>
-                    <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>
-                      At START, divide the deployable balance into {configForm.maxActivePositions ?? 3} equal
+                    <div style={{ fontSize: '10px', fontWeight: 700 }}>Split Wallet Across Slots</div>
+                    <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}> At START, divide the deployable balance into {configForm.maxActivePositions ?? 3} equal
                       slots and stake one per trade. Fixed for the run, so a position going to zero costs
                       1/{configForm.maxActivePositions ?? 3} and never shrinks the others. Overrides Position Size.
                     </div>
@@ -2562,14 +2481,12 @@ export function App() {
                   />
                 </div>
 
-                {/* Launch snipe (Play 1): enabled by the 🚀 Launch Snipe flag
+                {/* Launch snipe (Play 1): enabled by the Launch Snipe flag
                     below; these tune WHEN it pulls the trigger. */}
                 <div style={{ marginTop: '10px' }}>
-                  <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
-                    🚀 Launch Snipe (Play 1)
+                  <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}> Launch Snipe (Play 1)
                   </div>
-                  <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '6px' }}>
-                    Buys fresh launches in their first candle, next to the other snipers, skipping the
+                  <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '6px' }}> Buys fresh launches in their first candle, next to the other snipers, skipping the
                     slow screening entirely. Inflow 0 = buy the instant the create event arrives; otherwise
                     wait until that much SOL from other buyers hits the curve inside the window.
                   </div>
@@ -2622,13 +2539,12 @@ export function App() {
 
               {/* Feature Flags Matrix */}
               <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid var(--border-hairline)' }}>
-                <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
-                  Engine Feature Flags &amp; Guards
+                <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}> Engine Feature Flags &amp; Guards
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🚀 Launch Snipe</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Launch Snipe</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Play 1: first-candle entry, screens skipped</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.launchSnipe} onChange={e => handleToggleFlag('launchSnipe', e.target.checked)} />
@@ -2636,7 +2552,7 @@ export function App() {
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🛑 Dev Sell Stop</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Dev Sell Stop</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Exit on creator / cluster sells</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.devSellStop} onChange={e => handleToggleFlag('devSellStop', e.target.checked)} />
@@ -2644,7 +2560,7 @@ export function App() {
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🧪 Honest Paper</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Honest Paper</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Real curve fills &amp; fee drag</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.honestPaper} onChange={e => handleToggleFlag('honestPaper', e.target.checked)} />
@@ -2652,7 +2568,7 @@ export function App() {
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🎯 Playbook Router</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Playbook Router</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Measured curve routing</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.playbookRouting} onChange={e => handleToggleFlag('playbookRouting', e.target.checked)} />
@@ -2660,7 +2576,7 @@ export function App() {
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>⚡ Kill Switch</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Kill Switch</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Auto-pause on hourly loss</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.killSwitch} onChange={e => handleToggleFlag('killSwitch', e.target.checked)} />
@@ -2668,7 +2584,7 @@ export function App() {
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>⛽ Dynamic Priority Fee</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Dynamic Priority Fee</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>P75 network fee scaling</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.dynamicPriorityFee} onChange={e => handleToggleFlag('dynamicPriorityFee', e.target.checked)} />
@@ -2676,7 +2592,7 @@ export function App() {
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🔒 Honeypot Audit</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>Honeypot Audit</div>
                       <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Freeze &amp; transfer hook check</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.honeypotChecks} onChange={e => handleToggleFlag('honeypotChecks', e.target.checked)} />
@@ -2690,15 +2606,13 @@ export function App() {
                   className="btn-terminal-outline"
                   style={{ flex: 1 }}
                   onClick={() => setShowConfigModal(false)}
-                >
-                  DISCARD
+                > DISCARD
                 </button>
                 <button
                   type="submit"
                   className="btn-terminal"
                   style={{ flex: 1 }}
-                >
-                  APPLY PARAMETERS
+                > APPLY PARAMETERS
                 </button>
               </div>
             </form>

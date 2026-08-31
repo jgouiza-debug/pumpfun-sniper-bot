@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { CopyFeedEvent, CopyPosition, CopyStatusResponse, CopyTradeRecord, CopyTraderConfig, TrackedWalletPublic } from './types';
+import { stripEmoji } from './App';
 import { apiFetch } from './apiClient';
 
 const LOG_WIPE_INTERVAL_MS = 5_000;
@@ -25,8 +26,7 @@ const fmtAgo = (ts: number | null): string => {
 function ExecBadge({ txid, fillVerified }: { txid?: string; fillVerified?: boolean }) {
   if (!isOnChainTxid(txid)) {
     return (
-      <span className="status-badge" title="Paper fill — simulated at the leader's observed price, never sent to the chain">
-        SIMULATED
+      <span className="status-badge" title="Paper fill — simulated at the leader's observed price, never sent to the chain"> SIMULATED
       </span>
     );
   }
@@ -343,8 +343,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
       {/* Stat strip — mirrors the sniper page's 5-card anatomy */}
       <section className="stats-grid">
         <div className="stat-card" style={{ border: enabled ? '1px solid var(--ok-bg)' : undefined }}>
-          <div className="stat-label">
-            Copy Engine
+          <div className="stat-label"> Copy Engine
             <span style={{ float: 'right', fontSize: '11px', color: streamLive ? 'var(--ok)' : 'var(--warn)' }}>
               {streamLive ? '● LIVE' : '○ POLLING'}
             </span>
@@ -372,8 +371,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
         {/* Hero anchor — realized copy P&L */}
         <div className="stat-card hero-anchor">
-          <div className="stat-label" style={{ color: 'var(--ink-primary)', fontWeight: 700 }}>
-            Copy P&amp;L Realized
+          <div className="stat-label" style={{ color: 'var(--ink-primary)', fontWeight: 700 }}> Copy P&amp;L Realized
           </div>
           <div className={`hero-fraunces-number ${(stats?.realizedPnlUsd ?? 0) >= 0 ? 'delta-positive' : 'delta-negative'}`}>
             {(stats?.realizedPnlUsd ?? 0) >= 0 ? '+' : ''}${(stats?.realizedPnlUsd ?? 0).toFixed(2)}
@@ -439,14 +437,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           </form>
           {addError && (
             <div style={{ fontSize: '11px', color: 'var(--bad)', fontFamily: 'var(--font-mono)', marginBottom: '6px', flexShrink: 0 }}>
-              ⛔ {addError}
+              {addError}
             </div>
           )}
 
           <div className="matrix-container" style={{ maxHeight: '32%', overflowY: 'auto' }}>
             {wallets.length === 0 ? (
-              <div className="empty-state">
-                No leader wallets yet. Paste any wallet address above — every buy and sell it makes,
+              <div className="empty-state"> No leader wallets yet. Paste any wallet address above — every buy and sell it makes,
                 on any venue, is mirrored while the copy engine runs.
               </div>
             ) : (
@@ -490,8 +487,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                             rel="noopener noreferrer"
                             className="btn-terminal-outline"
                             style={{ padding: '2px 6px', fontSize: '11px', textDecoration: 'none' }}
-                          >
-                            SOLSCAN
+                          > SOLSCAN
                           </a>
                           <button
                             className="btn-terminal-outline"
@@ -500,8 +496,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                           >
                             {w.enabled ? 'PAUSE' : 'RESUME'}
                           </button>
-                          <button className="btn-cell-action" onClick={() => removeWallet(w.address)}>
-                            UNTRACK
+                          <button className="btn-cell-action" onClick={() => removeWallet(w.address)}> UNTRACK
                           </button>
                         </div>
                       </td>
@@ -582,11 +577,9 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                             rel="noopener noreferrer"
                             className="btn-terminal-outline"
                             style={{ padding: '2px 6px', fontSize: '11px', textDecoration: 'none' }}
-                          >
-                            PHOTON
+                          > PHOTON
                           </a>
-                          <button className="btn-cell-action" onClick={() => forceSell(pos.id)}>
-                            LIQUIDATE
+                          <button className="btn-cell-action" onClick={() => forceSell(pos.id)}> LIQUIDATE
                           </button>
                           <button
                             className="btn-terminal-outline"
@@ -617,15 +610,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 className="btn-terminal-outline"
                 onClick={clearHistory}
                 style={{ fontSize: '11px', padding: '2px 8px', color: 'var(--bad)', borderColor: 'var(--bad)' }}
-              >
-                🗑️ CLEAR
+              > CLEAR
               </button>
             )}
           </div>
           <div className="matrix-container flex-matrix">
             {history.length === 0 ? (
-              <div className="empty-state">
-                No copy trades recorded yet. Every mirrored buy and sell lands here with its execution proof.
+              <div className="empty-state"> No copy trades recorded yet. Every mirrored buy and sell lands here with its execution proof.
               </div>
             ) : (
               <table className="matrix-table">
@@ -681,18 +672,17 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
           <div className="console-container">
             {visibleFeed.length === 0 ? (
-              <div style={{ color: 'var(--ink-muted)' }}>
-                Every leader buy/sell appears here with the copy verdict: COPIED, SKIPPED (with the reason), or FAILED.
+              <div style={{ color: 'var(--ink-muted)' }}> Every leader buy/sell appears here with the copy verdict: COPIED, SKIPPED (with the reason), or FAILED.
               </div>
             ) : (
               [...visibleFeed].reverse().map(ev => (
                 <div key={ev.id} className="log-line">
                   <span className="log-time">[{new Date(ev.timestamp).toLocaleTimeString()}]</span>
                   <span className={feedColor(ev)}>
-                    {ev.action === 'copied' ? '✅' : ev.action === 'failed' ? '❌' : ev.action === 'pending' ? '⏳' : '⏭️'}
+                    {ev.action === 'copied' ? '' : ev.action === 'failed' ? '' : ev.action === 'pending' ? '' : '»'}
                     {ev.via ? ` [${ev.via === 'helius' ? 'CHAIN' : ev.via === 'manual' ? 'MANUAL' : 'PUMP'}]` : ''}{' '}
                     {ev.leaderNickname} {ev.side.toUpperCase()} ${ev.tokenSymbol}
-                    {ev.leaderSolAmount > 0 ? ` (${ev.leaderSolAmount} SOL)` : ''} — {ev.detail}
+                    {ev.leaderSolAmount > 0 ? ` (${ev.leaderSolAmount} SOL)` : ''} — {stripEmoji(ev.detail)}
                   </span>
                 </div>
               ))
@@ -752,8 +742,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     value={configForm.fixedBuySol ?? 0.02}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, fixedBuySol: Number(e.target.value) })}
                   />
-                  <div className="form-help">
-                    How much SOL to spend each time you copy one of the leader's buys.
+                  <div className="form-help"> How much SOL to spend each time you copy one of the leader's buys.
                     {engineWallet?.deployableSol ? (
                       <> Your wallet holds {engineWallet.deployableSol.toFixed(3)} SOL — about{' '}
                         <strong>{Math.max(0, Math.floor(engineWallet.deployableSol / Math.max(0.001, configForm.fixedBuySol ?? 0.02)))} buys</strong> worth.</>
@@ -770,15 +759,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     value={configForm.proportionalPct ?? 10}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, proportionalPct: Number(e.target.value) })}
                   />
-                  <div className="form-help">
-                    They buy 1 SOL, you buy {((configForm.proportionalPct ?? 10) / 100).toFixed(2)} SOL — capped by the maximum below.
+                  <div className="form-help"> They buy 1 SOL, you buy {((configForm.proportionalPct ?? 10) / 100).toFixed(2)} SOL — capped by the maximum below.
                   </div>
                 </div>
               )}
 
               <div className="form-group">
-                <label className="form-label">
-                  Max positions at once
+                <label className="form-label"> Max positions at once
                   {(configForm.buySizeMode || 'split') === 'split' ? ' — also the wallet divisor' : ''}
                 </label>
                 <input
@@ -786,8 +773,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                   value={configForm.maxOpenPositions ?? 5}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, maxOpenPositions: Number(e.target.value) })}
                 />
-                <div className="form-help">
-                  Once this many copies are open, new leader buys wait until one closes.
+                <div className="form-help"> Once this many copies are open, new leader buys wait until one closes.
                   {(configForm.buySizeMode || 'split') === 'split' && (
                     <>
                       {' '}<strong>This number also decides the size of every buy:</strong> the wallet is cut this
@@ -811,8 +797,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     type="checkbox"
                     checked={configForm.copySells === true}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, copySells: e.target.checked })}
-                  />
-                  Sell when the leader sells
+                  /> Sell when the leader sells
                 </label>
                 {configForm.copySells === true && (
                   <div className="form-group" style={{ marginTop: 6, marginBottom: 0 }}>
@@ -918,8 +903,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: 'var(--fg)' }}>
                       <input type="checkbox"
                         checked={configForm.blockRepeatBuys !== true}
-                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, blockRepeatBuys: !e.target.checked })} />
-                      Add to a position when the leader buys the same coin again
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, blockRepeatBuys: !e.target.checked })} /> Add to a position when the leader buys the same coin again
                     </label>
                     <div className="form-help">On = follow the leader's adds (DCA). Off = one buy per coin, ignore their re-buys.</div>
                   </div>
@@ -929,8 +913,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                       <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: 'var(--fg)' }}>
                         <input type="checkbox"
                           checked={configForm.mirrorLeaderTokenMoves !== false}
-                          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, mirrorLeaderTokenMoves: e.target.checked })} />
-                        Count the leader moving a coin out as a sell
+                          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, mirrorLeaderTokenMoves: e.target.checked })} /> Count the leader moving a coin out as a sell
                       </label>
                     </div>
                   )}
@@ -939,16 +922,14 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
               {settingsError && (
                 <div style={{ fontSize: '11px', marginTop: '8px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--bad)', border: '1px solid var(--bad)', background: 'var(--bad-bg)' }}>
-                  ⛔ {settingsError}
+                  {settingsError}
                 </div>
               )}
 
               <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
-                <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={() => { setShowSettings(false); setSettingsError(''); }}>
-                  DISCARD
+                <button type="button" className="btn-terminal-outline" style={{ flex: 1 }} onClick={() => { setShowSettings(false); setSettingsError(''); }}> DISCARD
                 </button>
-                <button type="submit" className="btn-terminal" style={{ flex: 1 }}>
-                  APPLY PARAMETERS
+                <button type="submit" className="btn-terminal" style={{ flex: 1 }}> APPLY PARAMETERS
                 </button>
               </div>
             </form>
@@ -992,7 +973,7 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, 
           title="Click to dismiss"
           onClick={onDismissError}
         >
-          ⛔ {error}
+          {error}
         </div>
       )}
       <span
@@ -1002,13 +983,11 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, 
           : { color: 'var(--accent-olive)', borderColor: 'var(--accent-olive)' }}
         title={mode === 'real' ? 'Copies execute with real SOL from the linked Photon wallet' : 'Copies are simulated — no SOL moves'}
       >
-        {mode === 'real' ? '⚠ REAL MONEY' : 'PAPER'}
+        {mode === 'real' ? 'REAL MONEY' : 'PAPER'}
       </span>
-      <button className="btn-terminal-outline" onClick={onTestAlert} title="Play the buy-alert sound to test it">
-        🔊 TEST SOUND
+      <button className="btn-terminal-outline" onClick={onTestAlert} title="Play the buy-alert sound to test it"> TEST SOUND
       </button>
-      <button className="btn-terminal-outline" onClick={onSettings}>
-        COPY SETTINGS
+      <button className="btn-terminal-outline" onClick={onSettings}> COPY SETTINGS
       </button>
       <button
         className="btn-terminal"
@@ -1020,7 +999,7 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, 
           fontWeight: 700,
         }}
       >
-        {enabled ? '⏹ STOP COPY ENGINE' : '▶ START COPY ENGINE'}
+        {enabled ? '■ STOP COPY ENGINE' : '▶ START COPY ENGINE'}
       </button>
     </div>
   );

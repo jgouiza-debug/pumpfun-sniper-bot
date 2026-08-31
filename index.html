@@ -5,15 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PUMPPORTAL TERMINAL — ALGORITHMIC POSITION SYSTEM</title>
     <meta name="color-scheme" content="dark">
-    <!-- ONE TYPEFACE. Fraunces (a serif, used in italic for hero numbers) and
-         Switzer (a sans, for labels) are gone: a trading terminal needs its
-         digits to align in columns, and three families in one dense screen
-         read as three different tools sharing a window. Dropping them also
-         removes a second font host from the critical path. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  </head>
+    <!-- NO WEBFONT. The face is Cascadia Mono — Windows Terminal's own default
+         — falling back to Consolas, both of which are already on the machine.
+         Fetching a font to imitate a local one was slower, needed the network,
+         and produced an approximation of the thing rather than the thing. -->
+</head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>

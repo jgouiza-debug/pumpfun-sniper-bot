@@ -1,93 +1,100 @@
 /* ===========================================================================
-   TERMINAL — the design system for the whole app.
+   WINDOWS TERMINAL — Campbell.
    ---------------------------------------------------------------------------
-   WHY THIS EXISTS. The UI had three typefaces (a serif used in italic for hero
-   numbers, a sans for labels, a mono for values), a body size of 8-9.5px, and
-   twenty-seven hardcoded hex colours doing the work of about six semantic
-   roles. Panels added at different times each brought their own accent — a
-   cyan scout beside an olive stat strip beside a violet roster — so the screen
-   read as several tools sharing a window rather than one instrument.
+   This is not "a dark theme with terminal vibes". It is the actual default
+   scheme that ships with Windows Terminal, values unchanged, on the font that
+   ships with it. If you put this window beside a real console the greys and
+   the greens match, because they are the same numbers.
 
-   THE RULES, in the order they matter:
+   WHAT THAT COSTS, deliberately. The gradients, sheens, glows and scanlines
+   from the previous pass are gone. A console is FLAT — one background colour,
+   sixteen foreground colours, nothing lit from anywhere — and every one of
+   those effects was working against that. Structure is carried by hairlines
+   and spacing alone.
 
-   1. ONE TYPEFACE. IBM Plex Mono, everywhere. This is a trading terminal: the
-      numbers must align in columns, and a proportional font makes a table of
-      prices unreadable no matter how it is spaced. It also means a label and
-      the value under it share a grid, which is most of what makes a dense
-      screen feel engineered rather than crowded.
+   COLOUR IS RATIONED. Campbell gives sixteen colours and a console spends most
+   of its life using two of them: #CCCCCC on #0C0C0C. Colour here means a
+   state that costs or makes money, or a fault. Panels have no tint, headings
+   have no accent, and nothing glows. If everything is coloured, the one line
+   that matters cannot be found.
 
-   2. COLOUR IS A STATEMENT, NOT DECORATION. Five accents, each with exactly
-      one meaning: green is money made, red is money lost or a hard stop, amber
-      is attention-needed, blue is a fact or a link, violet is something the
-      bot LEARNED rather than was told. If a thing has no state, it is grey.
-      A screen where everything is coloured is a screen where colour says
-      nothing.
+   NO EMOJI. They are the one thing on screen that renders in full colour no
+   matter what the scheme says, which makes them the loudest element in a
+   monochrome interface — and they are pictures where a console uses words.
+   Stripped from the markup, and from log text at render (see stripEmoji in
+   App.tsx) so the server's own strings need not change.
 
-   3. READABLE FIRST. 8px type is not a design decision, it is a defect. The
-      base is 11px and labels are 10px, which is genuinely small but legible on
-      a laptop panel; nothing goes below that. Density is bought with spacing
-      and hairlines, never with type size.
-
-   4. THE ACCENTS ARE PICKED FOR DARK BACKGROUNDS. These are GitHub's dark
-      palette values. They are not chosen for taste — they are chosen because
-      they hold their hue and contrast on a near-black ground, which most
-      "terminal green" and "terminal red" do not: saturated primaries vibrate
-      against dark backgrounds and go muddy when dimmed.
+   THE TOKEN NAMES ARE UNCHANGED from the previous scheme. Several hundred
+   inline styles across App.tsx and CopyTradingPage.tsx reference them, so
+   retuning the VALUES moves the whole app at once and a missed call site
+   inherits the new palette rather than a dangling variable.
    =========================================================================== */
 
 :root {
+  /* --- Campbell, verbatim ------------------------------------------------
+     background #0C0C0C   foreground #CCCCCC
+     black   #0C0C0C  red     #C50F1F  green   #13A10E  yellow  #C19C00
+     blue    #0037DA  magenta #881798  cyan    #3A96DD  white   #CCCCCC
+     br.black#767676  br.red  #E74856  br.green#16C60C  br.yell #F9F1A5
+     br.blue #3B78FF  br.mag  #B4009E  br.cyan #61D6D6  br.white#F2F2F2   */
+
   /* --- ground ---------------------------------------------------------- */
-  --bg:          #08090d;   /* the desk */
-  --bg-panel:    #0e1117;   /* a card sitting on it */
-  --bg-raised:   #151922;   /* a header or hovered row inside a card */
-  --bg-input:    #05070b;   /* a hole in the surface — inputs, the console */
+  --bg:          #0C0C0C;   /* Campbell background. One colour, everywhere. */
+  --bg-panel:    #0C0C0C;   /* A console has no cards. Structure is a border. */
+  --bg-raised:   #1A1A1A;   /* Only for a header row or a hovered line. */
+  --bg-input:    #0C0C0C;
 
-  /* Layer light. A panel is lit from above by a single hairline highlight and
-     falls off downward — the whole of the "depth" here, and the reason the
-     surfaces read as stacked rather than as flat rectangles of slightly
-     different grey. Kept to a 2-3% lightness shift: any more and a dark UI
-     starts looking like plastic. */
-  --panel-sheen: linear-gradient(180deg, rgba(255,255,255,0.028) 0%, rgba(255,255,255,0) 42%);
-  --edge-light:  rgba(255,255,255,0.055);
+  /* --- structure -------------------------------------------------------- */
+  --line:        #2B2B2B;   /* the default hairline — visible, not loud */
+  --line-bright: #3F3F3F;
+  --line-focus:  #767676;   /* bright black: the dimmest thing WT will print */
 
-  /* Glow. Used ONLY on values that are live and on the one number that leads.
-     A screen where everything glows is a screen where nothing does. */
-  --glow-ok:   0 0 14px rgba(63, 185, 80, 0.30);
-  --glow-bad:  0 0 14px rgba(248, 81, 73, 0.30);
-  --glow-info: 0 0 14px rgba(88, 166, 255, 0.28);
+  /* --- text, three tiers from the scheme --------------------------------- */
+  --fg:          #CCCCCC;   /* white — the default foreground */
+  --fg-dim:      #9A9A9A;
+  --fg-faint:    #767676;   /* bright black */
+  --fg-bright:   #F2F2F2;   /* bright white — the one number that leads */
 
-  /* --- structure ------------------------------------------------------- */
-  --line:        #222835;   /* the default hairline */
-  --line-bright: #333c4e;   /* a border that is doing work */
-  --line-focus:  #4b566b;
+  /* --- the five meanings, as ANSI ---------------------------------------- */
+  --ok:          #16C60C;   /* bright green */
+  --bad:         #E74856;   /* bright red */
+  --warn:        #C19C00;   /* yellow — bright yellow (#F9F1A5) is a highlight,
+                               not a warning, and reads as cream on black */
+  --info:        #61D6D6;   /* bright cyan — the console colour for a fact */
+  --learn:       #B4009E;   /* bright magenta */
 
-  /* --- text ------------------------------------------------------------ */
-  --fg:          #d6dbe4;   /* values, primary reading */
-  --fg-dim:      #8b95a7;   /* labels, secondary */
-  --fg-faint:    #59637a;   /* timestamps, units, disabled */
+  /* Tints, at the lowest alpha that still reads as a region. A console does
+     not tint anything; these exist only so a warning block is findable, and
+     they are half the strength they were. */
+  --ok-bg:       rgba(22, 198, 12, 0.07);
+  --bad-bg:      rgba(231, 72, 86, 0.08);
+  --warn-bg:     rgba(193, 156, 0, 0.07);
+  --info-bg:     rgba(97, 214, 214, 0.07);
+  --learn-bg:    rgba(180, 0, 158, 0.09);
 
-  /* --- the five meanings ----------------------------------------------- */
-  --ok:          #3fb950;   /* realised gain, healthy, passed */
-  --bad:         #f85149;   /* loss, refused, stopped */
-  --warn:        #d29922;   /* needs attention, degraded, not configured */
-  --info:        #58a6ff;   /* a fact, a link, a measurement */
-  --learn:       #a371f7;   /* something the bot worked out for itself */
+  /* No sheen, no edge light, no glow. Kept as no-ops because call sites
+     elsewhere still name them, and a dangling var() silently drops the whole
+     declaration it appears in. */
+  --panel-sheen: none;
+  --edge-light:  transparent;
+  --glow-ok:     none;
+  --glow-bad:    none;
+  --glow-info:   none;
 
-  /* Tinted grounds. Always 10-14% — enough to read as a region, never enough
-     to compete with the text sitting on it. */
-  --ok-bg:       rgba(63, 185, 80, 0.10);
-  --bad-bg:      rgba(248, 81, 73, 0.10);
-  --warn-bg:     rgba(210, 153, 34, 0.10);
-  --info-bg:     rgba(88, 166, 255, 0.10);
-  --learn-bg:    rgba(163, 113, 247, 0.10);
-
-  /* --- type ------------------------------------------------------------ */
-  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-  --fs-xs: 10px;    /* labels, badges, help */
-  --fs-sm: 11px;    /* body, table cells — the default */
-  --fs-md: 12px;    /* emphasis inside body */
-  --fs-lg: 15px;    /* stat values */
-  --fs-xl: 21px;    /* the one number you look at first */
+  /* --- type ---------------------------------------------------------------
+     Cascadia Mono is Windows Terminal's default face and ships with Windows
+     Terminal, Windows 11 and VS Code; Consolas is on every Windows install
+     going back years. Both are LOCAL, so the app no longer fetches a webfont
+     at all — which is faster, works offline, and is the actual typeface the
+     look is named after rather than an approximation of it. */
+  --mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'Lucida Console',
+          ui-monospace, Menlo, 'DejaVu Sans Mono', monospace;
+  --fs-xs: 11px;
+  --fs-sm: 12px;    /* Cascadia runs smaller than Plex at the same px, so the
+                       scale moves up one step to hold the same reading size */
+  --fs-md: 13px;
+  --fs-lg: 16px;
+  --fs-xl: 22px;
 
   /* --- rhythm ---------------------------------------------------------- */
   --sp-1: 3px;
@@ -95,10 +102,7 @@
   --sp-3: 9px;
   --sp-4: 13px;
 
-  /* Legacy aliases. The TSX carries hundreds of inline styles referencing the
-     old names; mapping them here means the whole app moves to this palette
-     without touching every one of them, and a missed call site inherits the
-     new system instead of a dangling variable. */
+  /* Legacy aliases — see the note at the top of the file. */
   --bg-dark: var(--bg);
   --bg-surface: var(--bg-panel);
   --bg-subtle: var(--bg-raised);
@@ -122,20 +126,7 @@ html, body {
   width: 100vw !important;
   max-height: 100vh !important;
   overflow: hidden !important;      /* the layout is a fixed viewport, by design */
-  /* A scanline at 2.5% over a corner-lit ground. At this alpha it is not a
-     visible pattern, it is a texture — the desk stops being a flat #08090d
-     rectangle and the panels sitting on it gain something to sit on. Anything
-     stronger fights the type, which is the one thing that must not happen. */
-  background:
-    repeating-linear-gradient(
-      180deg,
-      rgba(255, 255, 255, 0.025) 0px,
-      rgba(255, 255, 255, 0.025) 1px,
-      transparent 1px,
-      transparent 3px
-    ),
-    radial-gradient(1200px 620px at 12% -8%, rgba(88, 166, 255, 0.055), transparent 62%),
-    var(--bg);
+  background: var(--bg);
   color: var(--fg);
   font-family: var(--mono);
   font-size: var(--fs-sm);
@@ -221,10 +212,9 @@ a:hover { text-decoration: underline; }
   white-space: nowrap;
 }
 .brand-title::before {
-  content: '$ ';
-  color: var(--ok);
+  content: '> ';
+  color: var(--fg-faint);
   font-weight: 400;
-  text-shadow: var(--glow-ok);
 }
 /* A block cursor after the title. The one piece of motion on the chrome, and
    it earns its place: it is the difference between a screenshot of a terminal
@@ -237,7 +227,6 @@ a:hover { text-decoration: underline; }
   margin-left: 7px;
   vertical-align: -1px;
   background: var(--ok);
-  box-shadow: var(--glow-ok);
   animation: caret 1.15s steps(1) infinite;
 }
 @keyframes caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
@@ -281,17 +270,13 @@ a:hover { text-decoration: underline; }
 .btn-terminal {
   padding: 5px 11px;
   background: var(--ok-bg);
-  background-image: var(--panel-sheen);
   color: var(--ok);
   border: 1px solid var(--ok);
   font-weight: 600;
-  text-shadow: 0 0 10px rgba(63, 185, 80, 0.35);
 }
 .btn-terminal:hover {
   background: var(--ok);
   color: var(--bg);
-  text-shadow: none;
-  box-shadow: var(--glow-ok);
 }
 
 .btn-terminal-outline {
@@ -313,12 +298,13 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--line);
 }
 .btn-instance:hover { color: var(--fg); border-color: var(--line-bright); }
+/* Inverted, which is how a console marks a selection — foreground and
+   background swap. Cheaper to read than a tint and needs no colour. */
 .btn-instance.active {
-  background: var(--info-bg);
-  color: var(--info);
-  border-color: var(--info);
+  background: var(--fg);
+  color: var(--bg);
+  border-color: var(--fg);
   font-weight: 600;
-  box-shadow: inset 0 -2px 0 var(--info);
 }
 
 .btn-ghost {
@@ -358,7 +344,6 @@ button:disabled:hover { background: inherit; color: inherit; }
 .stat-card {
   padding: var(--sp-2) var(--sp-3);
   background: var(--bg-panel);
-  background-image: var(--panel-sheen);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -394,12 +379,9 @@ button:disabled:hover { background: inherit; color: inherit; }
    rather than with a different typeface. */
 .stat-card.hero-anchor {
   background: var(--bg-raised);
-  background-image:
-    linear-gradient(180deg, rgba(88, 166, 255, 0.07) 0%, rgba(88, 166, 255, 0) 55%),
-    var(--panel-sheen);
-  box-shadow: inset 0 -2px 0 var(--info), inset 0 1px 0 var(--edge-light);
+  box-shadow: inset 0 -2px 0 var(--info);
 }
-.stat-card.hero-anchor::before { background: var(--info); opacity: 1; box-shadow: var(--glow-info); }
+.stat-card.hero-anchor::before { background: var(--info); opacity: 1; }
 
 .stat-label {
   font-size: var(--fs-xs);
@@ -427,11 +409,8 @@ button:disabled:hover { background: inherit; color: inherit; }
   letter-spacing: -0.02em;
 }
 
-.delta-positive { color: var(--ok); text-shadow: var(--glow-ok); }
-.delta-negative { color: var(--bad); text-shadow: var(--glow-bad); }
-
-/* The strip itself is lit from the top edge like the cards on it. */
-.stats-grid { box-shadow: inset 0 1px 0 var(--edge-light); }
+.delta-positive { color: var(--ok); }
+.delta-negative { color: var(--bad); }
 
 /* ===========================================================================
    LAYOUT
@@ -471,7 +450,7 @@ button:disabled:hover { background: inherit; color: inherit; }
   content: '';
   flex: 1;
   height: 1px;
-  background: linear-gradient(90deg, var(--line-bright) 0%, var(--line) 38%, transparent 100%);
+  background: var(--line);
 }
 /* Keep the count on the far right of the rule rather than beside the title. */
 .section-header > .section-count { order: 3; }
@@ -502,8 +481,7 @@ button:disabled:hover { background: inherit; color: inherit; }
   height: 10px;
   margin-right: 7px;
   vertical-align: -1px;
-  background: var(--info);
-  box-shadow: 0 0 8px rgba(88, 166, 255, 0.45);
+  background: var(--line-focus);
 }
 
 .section-count {
@@ -519,8 +497,6 @@ button:disabled:hover { background: inherit; color: inherit; }
 .matrix-container {
   border: 1px solid var(--line);
   background: var(--bg-panel);
-  background-image: var(--panel-sheen);
-  box-shadow: inset 0 1px 0 var(--edge-light);
   overflow: auto;
   flex-shrink: 0;
 }
@@ -561,7 +537,6 @@ button:disabled:hover { background: inherit; color: inherit; }
   padding: var(--sp-2) var(--sp-3);
   border-bottom: 1px solid var(--line-bright);
   background: var(--bg-raised);
-  background-image: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0));
   position: sticky;
   top: 0;
   z-index: 10;
@@ -575,10 +550,8 @@ button:disabled:hover { background: inherit; color: inherit; }
   color: var(--fg-dim);
 }
 
-/* Zebra at 1.6%. Below the threshold where you notice stripes, above the one
-   where your eye loses its place tracking a wide row of numbers — which is the
-   entire job. */
-.matrix-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.016); }
+/* No zebra. A console prints rows, it does not stripe them — and with the
+   hover rail below there is already a way to keep your place. */
 
 /* Hover lights a rail down the row rather than washing it, so the row you are
    reading is marked without the numbers in it changing contrast. */
@@ -618,10 +591,6 @@ button:disabled:hover { background: inherit; color: inherit; }
 
 .console-container {
   background: var(--bg-input);
-  /* Inset rather than raised: the log is a well cut into the desk, which is
-     the opposite treatment to the panels and is what makes it read as a
-     different KIND of surface instead of another card. */
-  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5);
   border: 1px solid var(--line);
   padding: var(--sp-2) 0;
   flex: 1;
@@ -646,7 +615,7 @@ button:disabled:hover { background: inherit; color: inherit; }
    wrapped prose. */
 .log-line::before { content: '›'; color: var(--line-focus); flex-shrink: 0; }
 
-.log-level-snipe { color: var(--ok); font-weight: 500; text-shadow: 0 0 10px rgba(63, 185, 80, 0.25); }
+.log-level-snipe { color: var(--ok); font-weight: 500; }
 .log-level-sell  { color: var(--warn); font-weight: 500; }
 .log-level-error { color: var(--bad); font-weight: 500; }
 .log-level-warn  { color: var(--warn); }
@@ -708,11 +677,10 @@ button:disabled:hover { background: inherit; color: inherit; }
 
 .modal-card {
   background: var(--bg-panel);
-  background-image: var(--panel-sheen);
-  box-shadow: inset 0 1px 0 var(--edge-light), 0 24px 64px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 18px 52px rgba(0, 0, 0, 0.72);
   border: 1px solid var(--line-bright);
   padding: var(--sp-4);
-  max-width: 640px;
+  max-width: 720px;
   width: 100%;
   max-height: 88vh;
   overflow-y: auto;
@@ -737,8 +705,7 @@ button:disabled:hover { background: inherit; color: inherit; }
   height: 11px;
   margin-right: 8px;
   vertical-align: -1px;
-  background: var(--info);
-  box-shadow: 0 0 8px rgba(88, 166, 255, 0.45);
+  background: var(--line-focus);
 }
 
 /* ===========================================================================
@@ -752,8 +719,6 @@ button:disabled:hover { background: inherit; color: inherit; }
 .panel {
   border: 1px solid var(--line);
   background: var(--bg-panel);
-  background-image: var(--panel-sheen);
-  box-shadow: inset 0 1px 0 var(--edge-light);
   padding: var(--sp-3);
 }
 .panel-learn { border-color: rgba(163, 113, 247, 0.3); background: var(--learn-bg); }
@@ -817,8 +782,6 @@ button:disabled:hover { background: inherit; color: inherit; }
   margin-top: var(--sp-2);
   border: 1px solid var(--line);
   background: var(--bg-raised);
-  background-image: var(--panel-sheen);
-  box-shadow: inset 0 1px 0 var(--edge-light);
   font-size: var(--fs-xs);
   letter-spacing: 0.06em;
   overflow: hidden;
@@ -836,16 +799,18 @@ button:disabled:hover { background: inherit; color: inherit; }
 }
 .status-seg:last-child { border-right: none; }
 
-/* The leftmost segment is the mode, and it is inverted — the one solid block
-   of colour in the chrome, so "am I on paper or live money" is answered from
-   across the room. That question is worth a colour on its own. */
+/* The leftmost segment is the mode, inverted the way a console marks its own
+   status line. PAPER is the safe state, so it is plain foreground-on-black
+   reversed and carries no colour at all; LIVE MONEY is the single red block on
+   the screen. Colouring both would make the distinction a hue you have to
+   remember instead of a thing you notice. */
 .status-seg.mode {
-  background: var(--info);
+  background: var(--fg);
   color: var(--bg);
   font-weight: 600;
   text-transform: uppercase;
 }
-.status-seg.mode.live { background: var(--bad); }
+.status-seg.mode.live { background: var(--bad); color: var(--bg); }
 
 .status-key { color: var(--fg-faint); text-transform: uppercase; }
 .status-val { color: var(--fg); font-variant-numeric: tabular-nums; }
@@ -863,10 +828,9 @@ button:disabled:hover { background: inherit; color: inherit; }
   height: 6px;
   border-radius: 50% !important;
   background: var(--ok);
-  box-shadow: var(--glow-ok);
   animation: breathe 2.4s ease-in-out infinite;
 }
-.status-dot.bad { background: var(--bad); box-shadow: var(--glow-bad); animation: none; }
+.status-dot.bad { background: var(--bad); animation: none; }
 @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 @media (prefers-reduced-motion: reduce) {
