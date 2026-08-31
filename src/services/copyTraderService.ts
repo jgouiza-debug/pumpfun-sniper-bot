@@ -1083,7 +1083,26 @@ export class CopyTraderService {
       const tracked = this.leaderBalances.get(key);
       let remainingTokens: number | undefined;
       if (e.isBuy) {
-        tallyUpdates.push([key, (tracked ?? 0) + tokens]);
+        // ONLY when we already have a real tally for this leader+mint.
+        //
+        // `(tracked ?? 0) + tokens` treated a first sighting as "they now hold
+        // exactly what they just bought", which is only true if they held none
+        // before. A leader who already owned 900k of the mint — bought before
+        // the bot was armed, or through a venue the pump-log fast lane cannot
+        // decode — buys 100k more and the tally reads 100k instead of 1,000,000.
+        //
+        // Mirror mode then sizes the next partial sell off that number: the
+        // leader disposes of 100k (11% of their bag) and
+        // `remainingTokens = 100k - 100k = 0` makes leaderSellFraction return
+        // 1.0, so we exit 100% of OUR position on an 11% leader trim.
+        //
+        // Leaving it undefined is the honest state and already has a safe path:
+        // the mirror branch below bails to the analysis lane, which sizes from
+        // the chain's real balances, and scheduleReconcile fills the tally in
+        // from the chain shortly after. The coalescing in 7c5f25e made the
+        // fabricated value more likely to persist, but the fabrication is the
+        // defect.
+        if (tracked !== undefined) tallyUpdates.push([key, tracked + tokens]);
       } else if (this.config.sellMode === 'full') {
         // Full mode sells 100% of OUR bag on any leader sell, so it never needs
         // the leader's post-trade balance — forcing the slow confirmed-fetch

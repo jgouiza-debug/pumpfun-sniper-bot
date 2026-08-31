@@ -722,24 +722,65 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 </select>
               </div>
 
+              {/* SIZING — the panel now states which mode is ACTUALLY active.
+                  Before this, the "SOL per copy trade" box showed fixedBuySol
+                  and only switched the mode to 'fixed' when the input was
+                  EDITED. On the shipped default (buySizeMode 'split') the
+                  number displayed here was inert: the operator read "0.05 SOL
+                  per trade ... about 20 buys worth", concluded their downside
+                  per trade was 0.05, and the engine sized every buy from a
+                  completely different rule. Telling someone their risk is a
+                  number the engine ignores is how a UI loses trust. */}
               <div className="form-group">
-                <label className="form-label">SOL per copy trade</label>
-                <input
-                  type="number" step="0.005" min="0" className="form-input"
-                  value={configForm.fixedBuySol ?? 0.02}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, buySizeMode: 'fixed', fixedBuySol: Number(e.target.value) })}
-                />
-                <div className="form-help">
-                  How much SOL to spend each time you copy one of the leader's buys.
-                  {engineWallet?.deployableSol ? (
-                    <> Your wallet holds {engineWallet.deployableSol.toFixed(3)} SOL — about{' '}
-                      <strong>{Math.max(0, Math.floor(engineWallet.deployableSol / Math.max(0.001, configForm.fixedBuySol ?? 0.02)))} buys</strong> worth.</>
-                  ) : null}
-                </div>
+                <label className="form-label">How each copy is sized</label>
+                <select
+                  className="form-select"
+                  value={configForm.buySizeMode || 'split'}
+                  onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setConfigForm({ ...configForm, buySizeMode: e.target.value as 'split' | 'fixed' | 'proportional' })}
+                >
+                  <option value="split">Split my wallet — each copy gets one slice</option>
+                  <option value="fixed">Fixed amount — the same SOL every time</option>
+                  <option value="proportional">Match the leader — a percentage of what they spent</option>
+                </select>
               </div>
 
+              {(configForm.buySizeMode || 'split') === 'fixed' && (
+                <div className="form-group">
+                  <label className="form-label">SOL per copy trade</label>
+                  <input
+                    type="number" step="0.005" min="0" className="form-input"
+                    value={configForm.fixedBuySol ?? 0.02}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, fixedBuySol: Number(e.target.value) })}
+                  />
+                  <div className="form-help">
+                    How much SOL to spend each time you copy one of the leader's buys.
+                    {engineWallet?.deployableSol ? (
+                      <> Your wallet holds {engineWallet.deployableSol.toFixed(3)} SOL — about{' '}
+                        <strong>{Math.max(0, Math.floor(engineWallet.deployableSol / Math.max(0.001, configForm.fixedBuySol ?? 0.02)))} buys</strong> worth.</>
+                    ) : null}
+                  </div>
+                </div>
+              )}
+
+              {(configForm.buySizeMode || 'split') === 'proportional' && (
+                <div className="form-group">
+                  <label className="form-label">Percentage of the leader's buy</label>
+                  <input
+                    type="number" step="1" min="1" max="100" className="form-input"
+                    value={configForm.proportionalPct ?? 10}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, proportionalPct: Number(e.target.value) })}
+                  />
+                  <div className="form-help">
+                    They buy 1 SOL, you buy {((configForm.proportionalPct ?? 10) / 100).toFixed(2)} SOL — capped by the maximum below.
+                  </div>
+                </div>
+              )}
+
               <div className="form-group">
-                <label className="form-label">Max positions at once</label>
+                <label className="form-label">
+                  Max positions at once
+                  {(configForm.buySizeMode || 'split') === 'split' ? ' — also the wallet divisor' : ''}
+                </label>
                 <input
                   type="number" min="1" className="form-input"
                   value={configForm.maxOpenPositions ?? 5}
@@ -747,6 +788,19 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 />
                 <div className="form-help">
                   Once this many copies are open, new leader buys wait until one closes.
+                  {(configForm.buySizeMode || 'split') === 'split' && (
+                    <>
+                      {' '}<strong>This number also decides the size of every buy:</strong> the wallet is cut this
+                      many ways. Lowering it does NOT trade less — it makes each trade BIGGER. Setting it to 1
+                      stakes the whole wallet on a single copy.
+                      {engineWallet?.deployableSol ? (
+                        <> At {engineWallet.deployableSol.toFixed(3)} SOL deployable that is roughly{' '}
+                          <strong>
+                            {(engineWallet.deployableSol / Math.max(1, configForm.maxOpenPositions ?? 5)).toFixed(4)} SOL
+                          </strong>{' '}per copy.</>
+                      ) : null}
+                    </>
+                  )}
                 </div>
               </div>
 
