@@ -147,6 +147,14 @@ const TX_REFETCH_DELAY_MS = 20_000;
  * refusing one would strand the bag.
  */
 const MAX_BUY_SIGNAL_AGE_MS = 15_000;
+/**
+ * How long UI change notifications are collected before one push goes out.
+ *
+ * Sits just below the server's own SSE_MIN_GAP_MS (25ms) so this never becomes
+ * the binding constraint on how fresh the dashboard is — it exists to keep the
+ * full-status rebuild off the notification handler's stack, not to slow the UI.
+ */
+const COPY_EMIT_COALESCE_MS = 25;
 /** How long a signature-less PumpPortal copy blocks the delayed Helius re-read of the same mint+side. */
 const UNSIGNED_COPY_DEDUP_MS = 90_000;
 
@@ -3431,7 +3439,44 @@ export class CopyTraderService {
     }
   }
 
+  /**
+   * Tell the UI something changed — NEVER on the caller's own stack.
+   *
+   * WHY THIS IS DEFERRED. This used to call every listener synchronously, and
+   * one of the call sites is the Helius log notification handler
+   * (`onLog`), which runs it on every notification that repriced an open
+   * position — BEFORE `handleFastLog` decides whether to buy. Each listener is
+   * an SSE push that rebuilds the entire copy status (config, every wallet, up
+   * to 60 history rows and 80 feed rows, every open position) and serializes it
+   * to JSON, per connected client. That is real work, on the one code path
+   * whose entire purpose is to be fast, done for the benefit of a dashboard
+   * nobody is watching at 3am.
+   *
+   * A 25ms coalesce also collapses the burst case: a leader transaction with
+   * several legs, or several leaders trading in the same instant, produced one
+   * full serialization each. The UI cannot show more than one of those anyway.
+   *
+   * The timer is unref'd — telemetry for a browser tab must never be the reason
+   * the process stays alive.
+   */
+  private emitTimer: NodeJS.Timeout | null = null;
+
   private emitChange(): void {
+    if (this.emitTimer) return;
+    this.emitTimer = setTimeout(() => {
+      this.emitTimer = null;
+      this.flushChange();
+    }, COPY_EMIT_COALESCE_MS);
+    this.emitTimer.unref?.();
+  }
+
+  /**
+   * Push immediately. For the paths where a caller genuinely needs the UI to
+   * have the new state before it returns — shutdown, and the tests, which
+   * cannot await a timer they do not own.
+   */
+  private flushChange(): void {
+    if (this.emitTimer) { clearTimeout(this.emitTimer); this.emitTimer = null; }
     for (const listener of this.changeListeners) {
       try { listener(); } catch { /* dead SSE socket */ }
     }

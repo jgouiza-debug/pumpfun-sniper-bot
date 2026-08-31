@@ -304,5 +304,40 @@ test('every settlement marks the balance stale, whatever the outcome', () => {
     'no outcome branch may sit between the verdict and the stamp, or some outcomes would not mark it');
 });
 
+console.log('\n-- The dashboard is not allowed to sit on the trading path --');
+
+test('emitChange defers — it never calls listeners on the caller\'s stack', () => {
+  // The call site that matters is the Helius log notification handler, which
+  // ran this on every notification that repriced an open position, BEFORE
+  // handleFastLog decided whether to buy. Each listener rebuilds the whole copy
+  // status (config, every wallet, 60 history rows, 80 feed rows, every open
+  // position) and serializes it to JSON, per connected client — real work, on
+  // the one path whose entire purpose is to be fast.
+  const copy = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  const idx = copy.indexOf('private emitChange(): void {');
+  assert.ok(idx > 0, 'emitChange must exist');
+  const body = copy.slice(idx, copy.indexOf('\n  }', idx));
+  assert.ok(/setTimeout\(/.test(body),
+    'emitChange must schedule, not iterate — a synchronous loop here is a full status '
+    + 'serialization per client in front of the buy decision');
+  assert.ok(!/for \(const listener of this\.changeListeners\)/.test(body),
+    'the listener loop must live in the deferred flush, not in emitChange itself');
+  assert.ok(/unref/.test(body),
+    'a timer for a browser tab must never keep a trading process alive');
+});
+
+test('the coalesce window stays under the server\'s own SSE gap', () => {
+  // This exists to keep work off the notification handler, not to make the UI
+  // staler. If it ever exceeded the server's SSE_MIN_GAP_MS it would become the
+  // binding constraint on dashboard freshness, which is not its job.
+  const copy = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  const server = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+  const copyMs = Number(/COPY_EMIT_COALESCE_MS = (\d+)/.exec(copy)?.[1]);
+  const serverMs = Number(/SSE_MIN_GAP_MS = (\d+)/.exec(server)?.[1]);
+  assert.ok(Number.isFinite(copyMs) && Number.isFinite(serverMs), 'both windows must be declared as constants');
+  assert.ok(copyMs <= serverMs,
+    `the copy coalesce (${copyMs}ms) must not exceed the server's SSE gap (${serverMs}ms)`);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
