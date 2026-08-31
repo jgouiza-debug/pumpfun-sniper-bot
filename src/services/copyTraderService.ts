@@ -2149,9 +2149,23 @@ export class CopyTraderService {
         // TRIMS the order (never refuses a fundable one — owner posture);
         // only a literal zero after the reserve is skipped, and it says why.
         let clampNote = '';
-        // Balance-only forced read, bounded so a hung RPC socket cannot pin
-        // this mint's queue while a leader flip-sell waits behind the buy.
-        await Promise.race([sniperEngine.refreshWalletBalance(), sleep(1500)]);
+        // Balance read, but ONLY when one is owed — i.e. when a trade has
+        // settled since the last read and the cached number therefore stopped
+        // matching the chain. In the steady state the settlement's own
+        // background refresh has already landed and this costs nothing;
+        // previously it was an unconditional RPC round trip (40-200ms, bounded
+        // at 1500ms) sitting on the hot path of every single real copy buy,
+        // inside the per-mint queue, with the leader's fill getting further
+        // away the whole time. Still bounded, for the same reason as before: a
+        // hung socket must not pin this mint's queue while a flip-sell waits.
+        const balanceRead = await sniperEngine.refreshWalletBalanceIfOwed(1500);
+        if (balanceRead === 'timed-out') {
+          // Not fatal — the governor refuses a buy sized against a balance
+          // older than its own maxBalanceAgeMs, so a genuinely stale number is
+          // caught below rather than traded on. Worth saying out loud, though:
+          // it means the RPC is struggling.
+          console.warn(`[CopyTrader] Balance read for ${mint.slice(0, 8)}… did not return within 1500ms; sizing against the cached value.`);
+        }
         const openAfterThisBuy = this.openPositionsForCurrentMode().length + (existingNow ? 0 : 1);
         // Per open position, sized from the fee this session will actually pay.
         const exitGasPerPosition = copyExitGasReserveSol(sniperEngine.getSizingPriorityFeeSol());

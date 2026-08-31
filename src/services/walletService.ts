@@ -386,6 +386,16 @@ export class WalletService {
     return this.keypair ? this.keypair.publicKey.toBase58() : null;
   }
 
+  /**
+   * When the balance was last actually read from the chain, epoch ms; 0 if
+   * never. Exposed so a caller can tell whether a forced read is owed rather
+   * than performing one unconditionally on a latency-sensitive path — see
+   * sniperEngine.refreshWalletBalanceIfOwed.
+   */
+  public balanceReadAt(): number {
+    return this.lastCheckedAt;
+  }
+
   public getSolBalance(): number {
     return this.solBalance;
   }

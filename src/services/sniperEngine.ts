@@ -755,6 +755,47 @@ export class SniperEngine {
   }
 
   /**
+   * When a trade of ours last SETTLED, and therefore when the cached wallet
+   * balance last became wrong. Both engines pass through
+   * executeRealMainnetTrade, so this covers the sniper's own orders too.
+   */
+  private lastTradeSettledAt = 0;
+
+  /**
+   * Force a balance read ONLY if one is actually owed. Returns without any RPC
+   * when the cache already reflects every trade that has settled.
+   *
+   * WHY THIS IS NOT JUST `refreshBalance(true)`. The forced read exists for a
+   * real incident: on 2026-08-23 two leader buys 4s apart were both sized from
+   * the same 8s-cached snapshot, the second overdrafted the gas float, and the
+   * wallet was left too poor to fund its own exit. So the read cannot simply be
+   * deleted for speed — but it also does not need to happen every time. It is
+   * owed exactly when a trade has settled since the last read, because that is
+   * when the number on file stopped matching the chain. SOL committed by orders
+   * that have NOT settled is already accounted for separately, by the caller's
+   * in-flight reservation and by the governor's own worst-case charge.
+   *
+   * In the steady state this costs nothing: every settlement already kicks off
+   * a background `syncLiveWalletBalance()`, so by the time the next signal
+   * arrives the cache is usually current and this returns 'cached' without
+   * touching the network. The forced read remains for the case that actually
+   * bit — a second buy arriving before that background refresh has landed.
+   *
+   * Bounded either way, so a hung RPC socket cannot pin a mint's trade queue
+   * while a leader's flip-sell waits behind the buy.
+   */
+  public async refreshWalletBalanceIfOwed(budgetMs = 1500): Promise<'cached' | 'refreshed' | 'timed-out'> {
+    const lastRead = this.wallet.balanceReadAt();
+    if (lastRead > 0 && lastRead >= this.lastTradeSettledAt) return 'cached';
+    let done = false;
+    await Promise.race([
+      this.refreshWalletBalance().then(() => { done = true; }),
+      new Promise(res => setTimeout(res, budgetMs)),
+    ]);
+    return done ? 'refreshed' : 'timed-out';
+  }
+
+  /**
    * Worst-case per-trade priority fee for SIZING. With dynamicPriorityFee on,
    * execution can pay up to maxPriorityFeeSol — budgeting the static value
    * lets each buy eat the difference out of the gas float (the engine's own
@@ -2445,6 +2486,13 @@ export class SniperEngine {
         // The verdict is in: nothing may keep pushing this transaction.
         stopRebroadcast?.();
         stopRebroadcast = null;
+        // THE CACHED BALANCE IS NOW WRONG. Every outcome here has spent
+        // something — a landed trade moved SOL, and a reverted or slippage-
+        // rejected one still burned its fee. Marking the moment is what lets
+        // the next buy skip a forced balance read when nothing has settled
+        // since the last one, without reopening the 2026-08-23 double-spend.
+        // See refreshWalletBalanceIfOwed.
+        this.lastTradeSettledAt = Date.now();
         if (confirmed === 'slippage_failed' || (confirmed === 'failed' && action === 'sell')) {
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain due to Slippage (6004). Inspect: https://solscan.io/tx/${txid}`, mint);
 

@@ -227,5 +227,82 @@ test('the fast lane stamps observedAt, or the staleness guard cannot fire on it'
     'a fast signal must carry the leader\'s slot, or the fill cannot be scored against it');
 });
 
+console.log('\n-- The forced balance read happens only when it is owed --');
+
+/**
+ * A stand-in for the two facts refreshWalletBalanceIfOwed decides on, so the
+ * RULE can be tested without a wallet, a keypair or a socket. The shipped
+ * method is four lines around exactly this comparison; the assertions below
+ * pin the comparison, and the source check that follows pins that the shipped
+ * code still makes it.
+ */
+function owed(lastBalanceReadAt: number, lastTradeSettledAt: number): boolean {
+  return !(lastBalanceReadAt > 0 && lastBalanceReadAt >= lastTradeSettledAt);
+}
+
+test('nothing has settled since the last read → no RPC on the hot path', () => {
+  // The steady state, and the whole point: a copy buy arriving when the book is
+  // quiet used to pay an unconditional 40-200ms round trip inside the per-mint
+  // queue, with the leader's fill getting further away the whole time.
+  assert.strictEqual(owed(10_000, 9_000), false);
+  assert.strictEqual(owed(10_000, 10_000), false, 'a read at the same instant already reflects it');
+});
+
+test('THE 2026-08-23 DOUBLE-SPEND: a trade settled after the last read → force it', () => {
+  // Two leader buys 4s apart were both sized from the same 8s-cached snapshot.
+  // The second overdrafted the gas float and the wallet was left too poor to
+  // fund its own exit — the "bot did not sell" session. The forced read is what
+  // fixed that, so making it conditional must not make THIS case skip it.
+  assert.strictEqual(owed(10_000, 10_001), true, 'a settlement after the read owes a fresh one');
+  assert.strictEqual(owed(10_000, 14_000), true);
+});
+
+test('a wallet that has never been read is always owed a read', () => {
+  // lastCheckedAt is 0 before the first successful balance call and is reset to
+  // 0 when the wallet is re-linked. Treating "never read" as "up to date" would
+  // size the first buy after a re-link against a balance of zero.
+  assert.strictEqual(owed(0, 0), true);
+  assert.strictEqual(owed(0, 5_000), true);
+});
+
+test('the shipped method still decides on exactly those two facts', () => {
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('public async refreshWalletBalanceIfOwed(');
+  assert.ok(idx > 0, 'the conditional refresh must exist');
+  const body = engine.slice(idx, idx + 800);
+  assert.ok(/this\.wallet\.balanceReadAt\(\)/.test(body), 'it must read when the balance was last fetched');
+  assert.ok(/lastRead >= this\.lastTradeSettledAt/.test(body),
+    'and compare it against the last settlement — that comparison IS the safety property');
+  assert.ok(/return 'cached'/.test(body), 'and skip the RPC when nothing is owed');
+  // Bounded, for the same reason the unconditional read was: a hung socket must
+  // not pin the mint's trade queue while a flip-sell waits behind the buy.
+  assert.ok(/budgetMs/.test(body), 'the forced read must stay bounded');
+});
+
+test('every settlement marks the balance stale, whatever the outcome', () => {
+  // A landed trade moved SOL; a reverted or slippage-rejected one still burned
+  // its fee. Stamping only on success would let a wallet drained by a run of
+  // failed buys keep reporting its pre-trade balance.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const lines = engine.split('\n');
+  // UNCONDITIONAL. Asserted on the whole line, not on a substring: `if (cond)
+  // this.lastTradeSettledAt = ...` contains the same text and would satisfy a
+  // substring check while marking the balance stale on only some outcomes.
+  const stampLines = lines
+    .map((l, i) => ({ i, t: l.trim() }))
+    .filter(x => x.t.includes('lastTradeSettledAt = Date.now()'));
+  assert.strictEqual(stampLines.length, 1, 'exactly one place may mark the balance stale');
+  assert.strictEqual(stampLines[0].t, 'this.lastTradeSettledAt = Date.now();',
+    'the stamp must be an unconditional statement — a guard in front of it means some settlement '
+    + 'outcomes leave the cached balance looking fresh when the fee has already been burned');
+
+  const confirmIdx = lines.findIndex(l => l.includes('const confirmed = await this.confirmTransaction('));
+  assert.ok(confirmIdx >= 0 && stampLines[0].i > confirmIdx,
+    'the stamp must come after the verdict, so it covers every outcome rather than only the happy path');
+  const between = lines.slice(confirmIdx, stampLines[0].i).join('\n');
+  assert.ok(!/if \(confirmed ===/.test(between),
+    'no outcome branch may sit between the verdict and the stamp, or some outcomes would not mark it');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
