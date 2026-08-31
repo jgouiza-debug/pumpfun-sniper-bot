@@ -35,6 +35,15 @@ export interface SmartMoneyBuy {
   at: number;
   /** The leader's slot, when the feed carried one. */
   slot?: number;
+  /**
+   * The bonding curve's virtual SOL reserves at the moment of this buy.
+   *
+   * Comes free with the decoded TradeEvent — no RPC — and it is what tells the
+   * playbook router WHERE ON THE CURVE the token is. Without it the router
+   * cannot classify the phase and refuses the candidate outright, which is how
+   * the first version of this lane could never buy anything.
+   */
+  vSolInBondingCurve?: number;
 }
 
 export interface SmartMoneySignal {
@@ -53,6 +62,8 @@ export interface SmartMoneySignal {
   strength: number;
   /** The best slot we know of, so the entry can be scored against the leaders. */
   leaderSlot?: number;
+  /** Curve position at the freshest contributing buy. Measured, never assumed. */
+  vSolInBondingCurve?: number;
 }
 
 export interface ConfluenceConfig {
@@ -131,6 +142,9 @@ export class SmartMoneyDetector {
       // Keep the larger stake and the earliest time; still just one vote.
       already.solIn = Math.max(already.solIn, buy.solIn);
       if (buy.slot && !already.slot) already.slot = buy.slot;
+      // The curve moves, so the FRESHEST reading wins — an old one would price
+      // the candidate against a position the token has already left.
+      if (buy.vSolInBondingCurve !== undefined) already.vSolInBondingCurve = buy.vSolInBondingCurve;
     } else {
       list.push(buy);
     }
@@ -164,6 +178,9 @@ export class SmartMoneyDetector {
     const strength = clamp01(meanConviction * (0.75 + 0.25 * agreementBonus));
 
     const slots = stillPromoted.map(b => b.slot).filter((s): s is number => typeof s === 'number' && s > 0);
+    // The most recent contributor's reading of the curve.
+    const freshest = [...stillPromoted].sort((a, b) => b.at - a.at)
+      .find(b => typeof b.vSolInBondingCurve === 'number');
 
     return {
       mint: buy.mint,
@@ -173,6 +190,7 @@ export class SmartMoneyDetector {
       lastAt: Math.max(...stillPromoted.map(b => b.at)),
       strength,
       ...(slots.length ? { leaderSlot: Math.max(...slots) } : {}),
+      ...(freshest ? { vSolInBondingCurve: freshest.vSolInBondingCurve } : {}),
     };
   }
 

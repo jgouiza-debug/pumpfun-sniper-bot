@@ -59,6 +59,25 @@ export interface PhaseInput {
   pairAgeSeconds?: number;
 }
 
+/**
+ * Does this candidate carry a smart-money quorum strong enough to stand in for
+ * the anonymous demand evidence?
+ *
+ * Two wallets is the detector's own floor and is re-asserted here so the
+ * router cannot be handed a "quorum" of one by a future caller. The strength
+ * floor keeps a barely-passing signal from carrying a full unit.
+ */
+export const SMART_MONEY_MIN_WALLETS = 2;
+export const SMART_MONEY_MIN_STRENGTH = 0.5;
+
+function qualifyingSmartMoney(input: RouteInput, _config: PlaybookConfig): boolean {
+  const sm = input.smartMoney;
+  if (!sm) return false;
+  if (!Number.isFinite(sm.wallets) || sm.wallets < SMART_MONEY_MIN_WALLETS) return false;
+  if (!Number.isFinite(sm.strength) || sm.strength < SMART_MONEY_MIN_STRENGTH) return false;
+  return true;
+}
+
 export function classifyPhase(
   input: PhaseInput,
   /** MIGRATION->POST_MIGRATION boundary. Risk tiers widen it (strict 90s, normal 180s). */
@@ -122,6 +141,42 @@ export interface RouteInput extends PhaseInput {
   isBoosted?: boolean;
   /** Live SOL price, used to convert the SOL-denominated liquidity floors. */
   solPriceUsd?: number;
+  /**
+   * Several INDEPENDENTLY-PROVEN wallets bought this mint inside a short
+   * window. Present only for the smart-money lane.
+   *
+   * WHY THIS EXISTS AND WHAT IT IS ALLOWED TO REPLACE.
+   *
+   * `score` grades a token's own characteristics — distribution, deployer
+   * holdings, volume, socials — and its demand component is built from
+   * anonymous proxies (unique-buyer counts, curve velocity, buy pressure)
+   * because trader identity is structurally unavailable on the free tier. Play
+   * 2 then requires the FULL-unit score, and this repo's own measurement is
+   * that "the maximum score observed across 3,635 real candidates is 66"
+   * against a strict threshold of 71. A candidate graded on that scale
+   * therefore cannot pass, whoever is buying it.
+   *
+   * A confluence of proven wallets is not a better reading of those proxies —
+   * it is the thing the proxies were approximating, measured directly. Grading
+   * it on the anonymous scale is a category error, and the practical effect is
+   * a lane that can never fire.
+   *
+   * So this substitutes for the DEMAND evidence and for the score tier, and
+   * for nothing else. Every other refusal in every branch still applies: the
+   * phase rules (block-0 and early-curve are still refused outright), the
+   * market-cap ceilings, and above all the liquidity floors including the
+   * asserted-liquidity refusal. Nor does it touch the safety verdicts —
+   * honeypot, rug flags and the mcap:liquidity ratio are evaluated before the
+   * router is called and force the candidate unsafe regardless of what this
+   * says. "Someone good bought it" is evidence about demand, not about whether
+   * the token can be sold.
+   */
+  smartMoney?: {
+    /** Distinct promoted wallets in the quorum. */
+    wallets: number;
+    /** 0-1, from the ledger's measured conviction in those wallets. */
+    strength: number;
+  };
 }
 
 export interface RouteDecision {
@@ -248,17 +303,22 @@ export function routePlay(input: RouteInput, config: PlaybookConfig = PLAYBOOK_D
       // play2MinBuyPressurePct (55) were declared, documented, surfaced — and
       // silently ignored. Every Play 2 tuning experiment on the NORMAL tier was
       // therefore a no-op against the STRICT numbers.
-      const buyers2 = input.uniqueBuyers5m ?? 0;
-      if (buyers2 > 1) {
-        if (buyers2 < config.play2MinUniqueBuyers5m) reasons.push(`Unique 5m buyers ${buyers2} < ${config.play2MinUniqueBuyers5m}`);
-      } else if ((input.progressVelocity5m ?? 0) < config.play2MinVelocity5m) {
-        reasons.push(`No buyer attribution and curve velocity ${(input.progressVelocity5m ?? 0).toFixed(1)}%/5m < ${config.play2MinVelocity5m}%`);
+      // A proven-wallet quorum IS the demand signal these proxies approximate,
+      // so it stands in for them — and only for them. See RouteInput.smartMoney.
+      const smart = qualifyingSmartMoney(input, config);
+      if (!smart) {
+        const buyers2 = input.uniqueBuyers5m ?? 0;
+        if (buyers2 > 1) {
+          if (buyers2 < config.play2MinUniqueBuyers5m) reasons.push(`Unique 5m buyers ${buyers2} < ${config.play2MinUniqueBuyers5m}`);
+        } else if ((input.progressVelocity5m ?? 0) < config.play2MinVelocity5m) {
+          reasons.push(`No buyer attribution and curve velocity ${(input.progressVelocity5m ?? 0).toFixed(1)}%/5m < ${config.play2MinVelocity5m}%`);
+        }
+        if ((input.buyPressurePct ?? 0) < config.play2MinBuyPressurePct) {
+          reasons.push(`Buy pressure ${(input.buyPressurePct ?? 0).toFixed(0)}% < ${config.play2MinBuyPressurePct}%`);
+        }
       }
-      if ((input.buyPressurePct ?? 0) < config.play2MinBuyPressurePct) {
-        reasons.push(`Buy pressure ${(input.buyPressurePct ?? 0).toFixed(0)}% < ${config.play2MinBuyPressurePct}%`);
-      }
-      const ok2 = reasons.length === 0 && scoreTier === 1;
-      if (scoreTier !== 1 && reasons.length === 0) reasons.push(`Play 2 requires score >= ${config.minScoreFullUnit}`);
+      const ok2 = reasons.length === 0 && (smart || scoreTier === 1);
+      if (!smart && scoreTier !== 1 && reasons.length === 0) reasons.push(`Play 2 requires score >= ${config.minScoreFullUnit}`);
       return { ...base, play: 'PLAY_2', eligible: ok2, sizeMultiplier: ok2 ? 1 : 0, reasons };
     }
 

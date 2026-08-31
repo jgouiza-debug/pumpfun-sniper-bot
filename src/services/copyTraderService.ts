@@ -1879,6 +1879,18 @@ export class CopyTraderService {
    * it (copy-correctness-5). The copy side already subtracts the sniper's
    * in-flight; this makes the accounting symmetric.
    */
+  /**
+   * True while this engine is doing something that must not be slowed down.
+   *
+   * Consumed by the sniper's research harvester, which shares the Helius key.
+   * An in-flight buy, an exit mid-settlement, or anything queued per-mint all
+   * count: the research walk can wait, an order cannot.
+   */
+  public isBusyTrading(): boolean {
+    if (this.inFlightBuySol.size > 0) return true;
+    return this.positions.some(p => p.status !== 'CLOSED' && p.exitInFlight);
+  }
+
   public getInFlightBuyReservedSol(): number {
     let sum = 0;
     for (const sol of this.inFlightBuySol.values()) sum += sol;

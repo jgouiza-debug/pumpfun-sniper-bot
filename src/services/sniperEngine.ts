@@ -28,7 +28,7 @@ import { latencyTimeline } from './latencyTimeline';
 import { slotDelta, SlotDeltaTracker } from './slotDelta';
 import { broadcast, buildRoutes } from './txBroadcaster';
 import { walletLedger, WalletLedger, flushWalletLedger, loadWalletLedger } from './walletLedger';
-import { WalletHarvester } from './walletHarvester';
+import { WalletHarvester, bondingCurveFor } from './walletHarvester';
 import { smartMoneyDetector, type SmartMoneySignal } from './smartMoneySignal';
 import { WalletLogWatcher } from './walletLogWatcher';
 import { tradeEventsFromLogs } from './pumpEventDecoder';
@@ -205,6 +205,8 @@ const RPC_PRIMARY_RETRY_MS = 120_000;
  * not reported yet at that instant. Logging then would print "no other route
  * answered" every single time and make the fan-out look useless.
  */
+/** Mints whose age floor is remembered. A token only gets older, so this never expires. */
+const MINT_AGE_CACHE_MAX = 2_000;
 const ROUTE_REPORT_DELAY_MS = 2_000;
 const SMART_MONEY_ROSTER_SYNC_MS = 120_000;
 /** How often one queued research job is attempted. Slow by design. */
@@ -215,6 +217,15 @@ const RESEARCH_QUEUE_MAX = 100;
 /** Fresh creates sampled as possible duds: roughly one in this many. */
 const DUD_SAMPLE_ONE_IN = 12;
 const DUD_CANDIDATES_MAX = 300;
+/**
+ * Every Nth research job takes a DUD first, whatever winners are waiting.
+ *
+ * 3, so roughly a third of the read budget goes to the losing half of the
+ * evidence. Without a reservation the duds are never read at all and every
+ * wallet the ledger knows has a 100% early-hit rate — which makes the rate
+ * useless as a filter and promotes whoever buys the most launches.
+ */
+const DUD_RESEARCH_EVERY_N = 3;
 /**
  * How long a sampled create is given to graduate before it is judged a dud.
  * A token minutes old has not had time to fail yet, and calling it early would
@@ -3646,6 +3657,13 @@ export class SniperEngine {
   private harvester: WalletHarvester | null = null;
   /** Mints sampled as possible duds, with when they were created. */
   private dudCandidates = new Map<string, number>();
+  private researchTick = 0;
+
+  /** True while the copy trader is doing something research must not slow down. */
+  private copyBusyProvider: () => boolean = () => false;
+  public setCopyBusyProvider(fn: () => boolean): void {
+    this.copyBusyProvider = fn;
+  }
 
   private enqueueResearch(mint: string, wasWinner: boolean, delayMs = 0): void {
     if (!featureFlags.get('smartMoneySniper')) return;
@@ -3701,7 +3719,16 @@ export class SniperEngine {
         // THE YIELD. Research must never be the reason an order is slow. Any
         // entry in flight, or any position being managed through an exit, and
         // the walk stops where it is and resumes on a later tick.
-        isBusy: () => this.entriesInFlight.size > 0 || this.activePositions.some(p => p.exitInFlight),
+        // YIELDS TO BOTH ENGINES. This checked only the sniper's own entries,
+        // on the same Helius connection the copy trader uses — so a research
+        // walk would happily burn the shared key's budget in the middle of a
+        // copy buy, which is exactly the shape of the incident that got local
+        // transaction building demoted from the default.
+        isBusy: () =>
+          this.entriesInFlight.size > 0
+          || this.activePositions.some(p => p.exitInFlight)
+          || this.inFlightBuyCount > 0
+          || this.copyBusyProvider(),
         log: (level, msg) => this.log(level, msg),
       });
     }
@@ -3721,7 +3748,19 @@ export class SniperEngine {
     const now = Date.now();
     // Winners first: the scarce sample, and the one whose wallets are worth
     // subscribing to soonest.
-    const idx = this.researchQueue.findIndex(r => r.wasWinner && r.readyAt <= now);
+    // WINNERS FIRST, BUT NOT ALWAYS. Unconditional winner priority starved the
+    // dud queue completely: graduations arrive steadily, so a winner was almost
+    // always ready, and the read budget was spent entirely on them. The
+    // early-hit RATE then has no denominator — every credited wallet shows
+    // 100%, which is exactly the signal the ratio exists to disprove. Every
+    // DUD_RESEARCH_EVERY_N-th drain takes a dud first so the losing half of the
+    // evidence actually gets collected.
+    this.researchTick++;
+    const preferDud = this.researchTick % DUD_RESEARCH_EVERY_N === 0;
+    const firstOf = (wantWinner: boolean) =>
+      this.researchQueue.findIndex(r => r.wasWinner === wantWinner && r.readyAt <= now);
+    const primary = firstOf(!preferDud);
+    const idx = primary >= 0 ? primary : firstOf(preferDud);
     const pick = idx >= 0 ? idx : this.researchQueue.findIndex(r => r.readyAt <= now);
     if (pick < 0) return;
     const [job] = this.researchQueue.splice(pick, 1);
@@ -3798,15 +3837,38 @@ export class SniperEngine {
         commitment: 'processed',
         onLog: (ev) => {
           if (ev.err) return;                       // a failed tx moved nothing
-          // Zero RPC: the buy is fully described by the log lines already in
+          // THE FLAG IS CHECKED HERE, not only where the watcher is started.
+          // Turning it off at runtime (POST /api/flags) used to stop nothing:
+          // the socket stayed open, the detector kept accumulating and the
+          // entry injection kept firing, while /api/smart-money reported
+          // `enabled: false`. A switch that does not switch anything off is
+          // worse than no switch.
+          if (!featureFlags.get('smartMoneySniper')) return;
+          // Zero RPC: the trade is fully described by the log lines already in
           // hand. Same decoder the copy trader's fast lane runs.
           for (const t of tradeEventsFromLogs(ev.logs)) {
-            if (!t.isBuy || t.user !== ev.address) continue;
+            if (t.user !== ev.address) continue;
+            // SELLS ARE RECORDED TOO, and until now they were not — so
+            // recordSell had no caller, the entire closed-trade half of the
+            // promotion ladder was dead code, and every loss-based demotion
+            // was unreachable. A wallet could be promoted and never
+            // un-promoted by its own results.
+            if (!t.isBuy) {
+              walletLedger.recordSell(t.user, t.mint, Number(t.solLamports) / 1e9);
+              continue;
+            }
             const solIn = Number(t.solLamports) / 1e9;
             walletLedger.recordBuy(t.user, t.mint, solIn);
-            const sig = smartMoneyDetector.observe(
-              { wallet: t.user, mint: t.mint, solIn, at: Date.now(), slot: ev.slot || undefined },
-            );
+            const sig = smartMoneyDetector.observe({
+              wallet: t.user,
+              mint: t.mint,
+              solIn,
+              at: Date.now(),
+              slot: ev.slot || undefined,
+              // Free with the decode. Without it the router cannot place the
+              // token on the curve and refuses every candidate.
+              vSolInBondingCurve: Number(t.virtualSolReserves) / 1e9,
+            });
             if (sig) void this.onSmartMoneySignal(sig);
           }
         },
@@ -3882,6 +3944,10 @@ export class SniperEngine {
    * "someone good bought it" is not evidence the sell path works.
    */
   private async onSmartMoneySignal(sig: SmartMoneySignal): Promise<void> {
+    // Re-checked at the moment of action: a signal can be in flight when the
+    // operator switches the lane off, and the whole point of the switch is that
+    // nothing further is bought.
+    if (!featureFlags.get('smartMoneySniper')) return;
     if (!this.config.isBotActive) return;
     if (this.activePositions.some(p => p.mint === sig.mint)) return;
     if (this.entriesInFlight.has(sig.mint)) return;
@@ -3891,17 +3957,43 @@ export class SniperEngine {
       + `${Math.round((sig.lastAt - sig.firstAt) / 1000)}s (${sig.totalSolIn} SOL between them, `
       + `strength ${(sig.strength * 100).toFixed(0)}%). Screening it.`, sig.mint);
 
+    // THE ROUTER NEEDS TRUTHFUL INPUTS, AND IT HAS TO GET THEM FROM SOMEWHERE.
+    //
+    // The first version of this lane injected `{mint, txType:'create'}` and
+    // nothing else. computeAgeSeconds(undefined) returns 0, so classifyPhase
+    // put every signal in BLOCK_0 ("inside the insider exit window, never
+    // enter") and refused it — on the packaged flag set the lane could not buy
+    // anything, ever, while logging that it was screening. Verified by running
+    // the shipped routePlay with exactly those inputs.
+    //
+    // The fix is not to bypass the gate. It is to tell the gate the truth:
+    // where the token is on its curve (free, from the decoded events) and how
+    // old it is (one bounded RPC call, below).
+    const ageSeconds = await this.establishMintAgeSeconds(sig.mint);
+    if (ageSeconds === null) {
+      // WE DO NOT KNOW, SO WE DO NOT TRADE. Passing 0 would recreate the bug
+      // above; passing a guess would let a token inside the insider window
+      // through a gate written to keep it out.
+      this.log('warn', `🧠 Skipping ${sig.mint.slice(0, 8)}… — could not establish how old the token is, `
+        + `and the entry gate's block-0 rule cannot be evaluated without it.`, sig.mint);
+      return;
+    }
+
     this.pendingSmartMoney.set(sig.mint, sig);
     try {
-      // The same synthetic-create injection handleWatchedTrade uses. The curve
-      // fields are left undefined deliberately: processIncomingToken fetches
-      // real DexScreener and RugCheck data for a token this age, and inventing
-      // curve numbers here would give the gate a fabricated liquidity figure to
-      // decide on — the exact defect the audit found in the migration path.
+      // Everything here is MEASURED. `vSolInBondingCurve` came off the trade
+      // events the wallets themselves produced; `timestamp` is derived from a
+      // real block time. Liquidity and holder data are still left to
+      // processIncomingToken, which fetches them — inventing those is the
+      // defect the audit found in the migration path.
       await this.processIncomingToken({
         mint: sig.mint,
         txType: 'create',
         symbol: undefined,
+        timestamp: Date.now() - ageSeconds * 1000,
+        ...(sig.vSolInBondingCurve !== undefined
+          ? { vSolInBondingCurve: sig.vSolInBondingCurve }
+          : {}),
         __smartMoney: {
           wallets: sig.wallets.length,
           strength: sig.strength,
@@ -3910,6 +4002,44 @@ export class SniperEngine {
       }, Date.now());
     } finally {
       this.pendingSmartMoney.delete(sig.mint);
+    }
+  }
+
+  /**
+   * A LOWER BOUND on how many seconds old a mint is, or null if we cannot say.
+   *
+   * The entry gate's block-0 rule asks "is this token at least 2 minutes old",
+   * and a lower bound answers that question rigorously — if the bound clears
+   * the threshold, the real age certainly does. That is why this returns the
+   * OLDEST signature it can see rather than trying to find the true creation:
+   * walking back to a busy token's first transaction costs many calls, while
+   * one page of 1000 gives an answer good enough for the question being asked.
+   *
+   * Cheap by construction: one `getSignaturesForAddress` per signal, and the
+   * detector's cooldown means at most one signal per mint per ten minutes. The
+   * answer is cached, because a token only gets older.
+   */
+  private mintAgeFloorAt = new Map<string, { oldestSeenMs: number; at: number }>();
+
+  private async establishMintAgeSeconds(mint: string): Promise<number | null> {
+    const cached = this.mintAgeFloorAt.get(mint);
+    if (cached) return Math.floor((Date.now() - cached.oldestSeenMs) / 1000);
+
+    const curve = bondingCurveFor(mint);
+    if (!curve) return null;
+    try {
+      const page = await this.solanaConnection.getSignaturesForAddress(curve, { limit: 1000 });
+      const times = page.map(p => p.blockTime).filter((t): t is number => typeof t === 'number' && t > 0);
+      if (!times.length) return null;
+      const oldestSeenMs = Math.min(...times) * 1000;
+      if (this.mintAgeFloorAt.size > MINT_AGE_CACHE_MAX) {
+        const oldestKey = this.mintAgeFloorAt.keys().next().value;
+        if (oldestKey) this.mintAgeFloorAt.delete(oldestKey);
+      }
+      this.mintAgeFloorAt.set(mint, { oldestSeenMs, at: Date.now() });
+      return Math.floor((Date.now() - oldestSeenMs) / 1000);
+    } catch {
+      return null;   // unreadable is unknown, and unknown does not trade
     }
   }
 
@@ -4380,6 +4510,7 @@ export class SniperEngine {
       // vSol >= 70 (~47% up the curve) as a migration.
       const ageSeconds = launchData.ageSeconds ?? 0;
       const migratedAt = this.migrationSeenAt.get(filterResult.mint);
+      const smartForRouter = this.pendingSmartMoney.get(filterResult.mint);
       const decision: RouteDecision = routePlay({
         isMigrationEvent: isMigration,
         secondsSinceMigration: migratedAt ? (Date.now() - migratedAt) / 1000 : undefined,
@@ -4398,6 +4529,11 @@ export class SniperEngine {
         buys5m: launchData.buys5m,
         isBoosted: launchData.isBoosted,
         solPriceUsd: this.config.solPriceUsd,
+        // Read from the in-flight signal for this mint, not from the payload:
+        // the payload crosses a `JSON`-shaped boundary and a caller could
+        // fabricate `__smartMoney` on it. pendingSmartMoney is written only by
+        // onSmartMoneySignal, from a quorum the detector actually formed.
+        ...(smartForRouter ? { smartMoney: { wallets: smartForRouter.wallets.length, strength: smartForRouter.strength } } : {}),
       }, this.activePlaybook());
 
       latencyTimeline.annotate(filterResult.mint, {

@@ -831,6 +831,11 @@ app.post('/api/updater/apply', async (req, res) => {
 // trader's in-flight buy reservations when sizing, so the two never overdraft
 // the wallet together (copy-correctness-5). Wired here to avoid an import cycle.
 sniperEngine.setCopyInFlightReservedProvider(() => copyTrader.getInFlightBuyReservedSol());
+// The research harvester shares the Helius key with the copy trader, so it has
+// to yield to BOTH engines — not just to the sniper's own entries. Wired here
+// because the engine cannot import the copy service without a cycle, the same
+// reason the reserved-SOL provider above lives here.
+sniperEngine.setCopyBusyProvider(() => copyTrader.isBusyTrading());
 // Adopt any positions left open by a previous run, verified against the chain
 // first. Deferred rather than awaited at construction: it reads token balances,
 // and the engine must be constructible without a working RPC.

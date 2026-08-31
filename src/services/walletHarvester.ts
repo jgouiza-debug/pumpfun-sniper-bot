@@ -152,16 +152,35 @@ export class WalletHarvester {
       // say so rather than crediting whoever we happened to reach.
       let all: Array<{ signature: string; blockTime: number | null }> = [];
       let before: string | undefined;
+      /**
+       * Did the walk actually REACH the token's first transactions?
+       *
+       * This is the difference between "the earliest buyers" and "the oldest
+       * addresses in the last four thousand trades", and getting it wrong is
+       * not a cosmetic inaccuracy — it is the whole attack. On a token someone
+       * else graduated, an attacker who sprays dust buys during the busy period
+       * lands in the last 4000 signatures; if the walk stops at MAX_PAGES and
+       * credits whoever it reached, those dust buys become "early buyer" credits
+       * on a winner. Four such tokens produce a fleet of perfect-record wallets
+       * for well under a SOL, and the roster is capped, so they displace the
+       * honest ones.
+       *
+       * Only a page that came back SHORT proves we saw the beginning.
+       */
+      let reachedBeginning = false;
       for (let page = 0; page < MAX_PAGES; page++) {
         if (this.deps.isBusy()) { stoppedEarly = 'trading path busy'; break; }
         if (!this.spend()) { stoppedEarly = 'hourly read budget spent'; break; }
         reads++;
         const batch = await conn.getSignaturesForAddress(curve, { limit: 1000, ...(before ? { before } : {}) });
-        if (!batch.length) break;
+        if (!batch.length) { reachedBeginning = true; break; }
         all = all.concat(batch.map(s => ({ signature: s.signature, blockTime: s.blockTime ?? null })));
         before = batch[batch.length - 1].signature;
-        if (batch.length < 1000) break;          // reached the beginning
+        if (batch.length < 1000) { reachedBeginning = true; break; }
         await this.sleep(READ_SPACING_MS);
+      }
+      if (!reachedBeginning && !stoppedEarly) {
+        stoppedEarly = `more than ${MAX_PAGES * 1000} curve transactions — never reached the token's first buyers`;
       }
       if (!all.length) {
         // A COMPLETED walk that found nothing is done with — the curve has no
@@ -213,16 +232,34 @@ export class WalletHarvester {
         await this.sleep(READ_SPACING_MS);
       }
 
-      for (const b of buyers) walletLedger.recordEarlyCall(b, mint, wasWinner, this.now());
+      // CREDIT NOTHING UNLESS THESE ARE GENUINELY THE FIRST BUYERS. A partial
+      // walk found the oldest addresses it could reach, which on a busy token
+      // is a mid-life snapshot — crediting those as early calls is how a dust
+      // sprayer earns a perfect record. The observed buys above are still
+      // recorded (they are true: those wallets did buy this mint); only the
+      // EARLY CALL, which is the thing promotion is decided on, is withheld.
+      if (reachedBeginning) {
+        for (const b of buyers) walletLedger.recordEarlyCall(b, mint, wasWinner, this.now());
+      } else {
+        this.deps.log?.('warn',
+          `[Harvester] ${mint.slice(0, 8)}… has more than ${MAX_PAGES * 1000} curve transactions — `
+          + `credited NO early calls, because the wallets reached are not the token's first buyers.`);
+      }
       // Same rule as the empty case: only a walk that ran to its own end is
       // finished. One stopped by the budget or by live trading is retryable.
       if (!stoppedEarly) this.done.add(mint);
 
       this.deps.log?.('info',
-        `[Harvester] ${mint.slice(0, 8)}… (${wasWinner ? 'WINNER' : 'dud'}): credited ${buyers.length} early buyers `
-        + `from ${reads} reads${stoppedEarly ? ` — stopped early: ${stoppedEarly}` : ''}.`);
+        `[Harvester] ${mint.slice(0, 8)}… (${wasWinner ? 'WINNER' : 'dud'}): credited `
+        + `${reachedBeginning ? buyers.length : 0} early buyers from ${reads} reads`
+        + `${stoppedEarly ? ` — stopped early: ${stoppedEarly}` : ''}.`);
 
-      return { mint, earlyBuyers: buyers, reads, ...(stoppedEarly ? { stoppedEarly } : {}) };
+      return {
+        mint,
+        earlyBuyers: reachedBeginning ? buyers : [],
+        reads,
+        ...(stoppedEarly ? { stoppedEarly } : {}),
+      };
     } catch (err: any) {
       this.deps.log?.('warn', `[Harvester] ${mint.slice(0, 8)}… failed: ${err?.message ?? err}`);
       return null;

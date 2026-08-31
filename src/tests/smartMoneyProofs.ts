@@ -20,6 +20,8 @@ import { join } from 'path';
 import { WalletLedger, DEFAULT_PROMOTION_THRESHOLDS } from '../services/walletLedger';
 import { WalletHarvester, HARVESTER_LIMITS, bondingCurveFor } from '../services/walletHarvester';
 import { SmartMoneyDetector, DEFAULT_CONFLUENCE } from '../services/smartMoneySignal';
+import { pessimisticRate } from '../services/walletLedger';
+import { routePlay, playbookConfigFor } from '../services/playbookRouter';
 
 let passed = 0;
 let failed = 0;
@@ -285,17 +287,34 @@ test('a promoted wallet is never evicted by the size cap', () => {
 
 console.log('\n-- Persistence round-trips, and a corrupt file starts from nothing --');
 
-test('a saved ledger restores its evidence and its states', () => {
+test('a saved ledger restores its EVIDENCE exactly, and re-derives the state from it', () => {
+  // Evidence is data and comes back as written. State is a CONCLUSION and is
+  // recomputed, because this file is plain JSON in the install directory next
+  // to the wallet key — see the hostile-file proof below.
   const l = new WalletLedger();
   withRecord(l, 'ProvenA', 12, 9);
   l.reevaluate(T0 + 10_000);
+  assert.strictEqual(l.get('ProvenA')!.state, 'promoted');
   const blob = JSON.parse(JSON.stringify(l.serialize()));
 
   const l2 = new WalletLedger();
   assert.strictEqual(l2.restore(blob), 1);
-  assert.strictEqual(l2.get('ProvenA')!.state, 'promoted');
-  assert.strictEqual(l2.get('ProvenA')!.closedTrades, 12);
+  assert.strictEqual(l2.get('ProvenA')!.closedTrades, 12, 'the evidence is restored verbatim');
   assert.strictEqual(l2.score('ProvenA')!.winRate, 0.75);
+  // The fixture's activity is far in the past, so the staleness rule demotes it
+  // on the re-derivation — which is the right answer for a wallet that has not
+  // traded in days, and is only visible because the state is recomputed.
+  assert.strictEqual(l2.get('ProvenA')!.state, 'demoted');
+  assert.ok(/no activity/.test(l2.get('ProvenA')!.stateReason));
+
+  // Re-derived as promoted again once the same evidence is current.
+  const l3 = new WalletLedger();
+  l3.restore(blob);
+  const w = l3.get('ProvenA')!;
+  w.lastSeenAt = Date.now();
+  l3.reevaluate();
+  assert.strictEqual(l3.get('ProvenA')!.state, 'promoted',
+    'the same evidence, current, still earns promotion');
 });
 
 test('a corrupt or hostile ledger file yields no wallets, not a crash', () => {
@@ -306,13 +325,36 @@ test('a corrupt or hostile ledger file yields no wallets, not a crash', () => {
   assert.strictEqual(l.size(), 0);
 });
 
-test('a restored record with a bogus state falls back to candidate', () => {
-  // The file is on disk beside the wallet key. A hand-edited "promoted" is the
-  // one field worth being paranoid about, but any unknown value must degrade
-  // to the least-trusted state rather than being kept.
+test('A HOSTILE LEDGER FILE CANNOT PROMOTE A WALLET', () => {
+  // This file is plain JSON in the install directory. Trusting `state` from it
+  // would mean anything able to write there — a hand edit, a script, malware —
+  // puts an arbitrary wallet straight into the followable set, defeating the
+  // entire "earned from chain evidence, never pasted in" property that is the
+  // reason this subsystem exists rather than a config list.
   const l = new WalletLedger();
-  l.restore({ wallets: [{ address: 'X', state: 'super-promoted', closedTrades: 999 }] });
-  assert.strictEqual(l.get('X')!.state, 'candidate');
+  l.restore({ wallets: [
+    { address: 'Attacker1', state: 'promoted', closedTrades: 0, wins: 0 },
+    { address: 'Attacker2', state: 'promoted', pinned: 'always', closedTrades: 0 },
+    { address: 'Bogus', state: 'super-promoted', closedTrades: 999 },
+  ] });
+  assert.deepStrictEqual(l.promotedAddresses(), [],
+    'no wallet may arrive promoted from disk, however the file says so');
+  assert.strictEqual(l.get('Attacker2')!.pinned, undefined,
+    "pinned:'always' forces promotion with no evidence — the one pin an attacker wants, and it is not honoured");
+});
+
+test("a pin of 'never' IS honoured from disk — it is the safe direction", () => {
+  // Asymmetric on purpose: refusing to follow a wallet can only cost missed
+  // signals, while forcing one to be followed spends money.
+  const l = new WalletLedger();
+  withRecord(l, 'ProvenA', 12, 9);
+  l.reevaluate();
+  const blob = JSON.parse(JSON.stringify(l.serialize()));
+  blob.wallets[0].pinned = 'never';
+  const l2 = new WalletLedger();
+  l2.restore(blob);
+  assert.strictEqual(l2.get('ProvenA')!.pinned, 'never');
+  assert.deepStrictEqual(l2.promotedAddresses(), []);
 });
 
 console.log('\n-- The harvester is bounded, and yields to live trading --');
@@ -674,17 +716,37 @@ test('THE SMART-MONEY LANE DOES NOT FABRICATE A PASSING GATE RESULT', () => {
     'and it must not call commitEntry directly, which would skip the gate entirely');
 });
 
-test('it invents no curve numbers for the gate to decide on', () => {
-  // handleWatchedTrade legitimately passes real curve state it has been
-  // tracking. This lane has none, and the audit already found what happens when
-  // a gate decides against an asserted rather than measured liquidity figure.
+test('everything the lane hands the gate is MEASURED, never a literal', () => {
+  // The first version passed no curve state and no age at all, which made
+  // computeAgeSeconds return 0 and the router refuse every signal as BLOCK_0 —
+  // the lane could not buy anything, ever. The fix is not to invent numbers
+  // (the audit already found what an asserted liquidity figure does to a gate)
+  // but to pass real ones: the curve reserves come off the trade events the
+  // wallets themselves produced, and the age from a real block time.
   const src = engineSrc();
   const start = src.indexOf('private async onSmartMoneySignal(');
-  const body = src.slice(start, src.indexOf('\n  private ', start + 10));
-  for (const field of ['vSolInBondingCurve', 'vTokensInBondingCurve', 'marketCapSol', 'bondingProgress']) {
-    assert.ok(!new RegExp(`${field}\\s*:`).test(body),
-      `${field} must not be fabricated here — processIncomingToken fetches real data for a token this age`);
+  const body = src.slice(start, src.indexOf('\n  /**', start + 10));
+  assert.ok(/vSolInBondingCurve: sig\.vSolInBondingCurve/.test(body),
+    'the curve position must come from the signal, which read it off the chain');
+  assert.ok(/timestamp: Date\.now\(\) - ageSeconds \* 1000/.test(body),
+    'the age must be derived from a measured block time');
+  // Still no fabricated liquidity or holder data — those remain
+  // processIncomingToken's job, which fetches them.
+  for (const field of ['liquidityUsd', 'marketCapSol', 'volume5mUsd', 'uniqueBuyers5m']) {
+    assert.ok(!new RegExp(`${field}\\s*:`).test(body), `${field} must not be fabricated here`);
   }
+});
+
+test('AN UNKNOWABLE AGE DOES NOT TRADE', () => {
+  // Passing 0 would recreate the BLOCK_0 bug; passing a guess would let a token
+  // inside the insider window through a gate written to keep it out.
+  const src = engineSrc();
+  const start = src.indexOf('private async onSmartMoneySignal(');
+  const body = src.slice(start, src.indexOf('\n  /**', start + 10));
+  assert.ok(/if \(ageSeconds === null\)/.test(body), 'an unknown age must be handled explicitly');
+  const branch = body.slice(body.indexOf('if (ageSeconds === null)'));
+  assert.ok(branch.indexOf('return;') < branch.indexOf('processIncomingToken'),
+    'and must return before any screening happens');
 });
 
 test('conviction sizing can only shrink a slot, never grow one', () => {
@@ -813,12 +875,20 @@ test('A REFUSED HARVEST IS RE-QUEUED, NOT DROPPED', () => {
     'and the job must go back on the queue with a delay');
 });
 
-test('winners are drained before duds', () => {
+test('winners are preferred, but DUDS GET A GUARANTEED SHARE', () => {
+  // Unconditional winner priority starved the dud queue completely:
+  // graduations arrive steadily, so a winner was almost always ready and the
+  // whole read budget went to them. The early-hit RATE then has no denominator
+  // — every credited wallet shows 100%, which is exactly the signal the ratio
+  // exists to disprove, and promotion degenerates to "was early to 4 winners".
   const src = engineSrc();
   const idx = src.indexOf('private async drainResearchQueue(');
   const body = src.slice(idx, src.indexOf('\n  /** Research state', idx));
-  assert.ok(/findIndex\(r => r\.wasWinner && r\.readyAt <= now\)/.test(body),
-    'a graduated token is the scarce, high-value sample and must be read first');
+  assert.ok(/DUD_RESEARCH_EVERY_N/.test(body), 'the drain must reserve turns for duds');
+  assert.ok(/preferDud/.test(body), 'and act on that reservation');
+  const everyN = Number(/DUD_RESEARCH_EVERY_N = (\d+)/.exec(src)?.[1]);
+  assert.ok(Number.isFinite(everyN) && everyN >= 2 && everyN <= 5,
+    `duds must get a meaningful share of the budget, got 1 in ${everyN}`);
 });
 
 test('the research queue is bounded, and a winner displaces a dud rather than being dropped', () => {
@@ -915,6 +985,157 @@ test('the operator can drop a wallet from the panel', () => {
   const body = app.slice(idx, app.indexOf('function DiagnosticsPanel()', idx));
   assert.ok(/api\/smart-money\/pin/.test(body), 'the panel must be able to overrule the ladder');
   assert.ok(/'never'/.test(body), 'specifically to stop following a wallet');
+});
+
+console.log('\n-- The lane can actually fire, and is still refused where it should be --');
+
+test('OLD BUG: with no age and no curve state the router refuses everything', () => {
+  // Reproduced against the shipped router. This is what the lane sent in its
+  // first version: computeAgeSeconds(undefined) is 0, so classifyPhase returned
+  // BLOCK_0 ("inside the insider exit window — never enter") for every signal,
+  // on a token that was in fact hours old. The lane logged that it was
+  // screening and could not buy anything, ever.
+  const cfg = playbookConfigFor('strict');
+  const asShipped: any = { ageSeconds: 0, isMigrationEvent: false, score: 100, marketCapUsd: 40000,
+    liquidityUsd: 200000, volume5mUsd: 50000, solPriceUsd: 200 };
+  const r = routePlay(asShipped, cfg);
+  assert.strictEqual(r.phase, 'BLOCK_0');
+  assert.strictEqual(r.eligible, false);
+});
+
+test('fixed: a real quorum on a mid-curve token is eligible', () => {
+  const cfg = playbookConfigFor('strict');
+  const base: any = { ageSeconds: 3600, isMigrationEvent: false, vSolInBondingCurve: 70, hasDexPair: false,
+    score: 60, marketCapUsd: 40000, liquidityUsd: 20000, volume5mUsd: 8000,
+    uniqueBuyers5m: 0, buyPressurePct: 0, solPriceUsd: 200 };
+  assert.strictEqual(routePlay(base, cfg).eligible, false, 'the anonymous proxies alone refuse it');
+  assert.strictEqual(routePlay({ ...base, smartMoney: { wallets: 2, strength: 0.62 } }, cfg).eligible, true,
+    'a proven-wallet quorum is the demand evidence those proxies approximate');
+});
+
+test('the quorum substitutes for DEMAND EVIDENCE ONLY — never for a phase rule', () => {
+  // This is the line between "different evidence" and "a second door". The
+  // block-0 window and the early-curve rug-density rule are about the TOKEN,
+  // not about who is buying it, and no amount of conviction may pass them.
+  const cfg = playbookConfigFor('strict');
+  const strong = { wallets: 5, strength: 1 };
+  const base: any = { isMigrationEvent: false, hasDexPair: false, score: 100, marketCapUsd: 40000,
+    liquidityUsd: 200000, volume5mUsd: 50000, solPriceUsd: 200 };
+  const blockZero = routePlay({ ...base, ageSeconds: 10, vSolInBondingCurve: 70, smartMoney: strong }, cfg);
+  assert.strictEqual(blockZero.phase, 'BLOCK_0');
+  assert.strictEqual(blockZero.eligible, false, 'the insider window is not negotiable');
+  const early = routePlay({ ...base, ageSeconds: 3600, vSolInBondingCurve: 33, smartMoney: strong }, cfg);
+  assert.strictEqual(early.phase, 'EARLY_CURVE');
+  assert.strictEqual(early.eligible, false, '~70% of these die on day one, whoever bought');
+});
+
+test('a quorum of ONE, or a weak one, does not qualify', () => {
+  const cfg = playbookConfigFor('strict');
+  const base: any = { ageSeconds: 3600, isMigrationEvent: false, vSolInBondingCurve: 70, hasDexPair: false,
+    score: 60, marketCapUsd: 40000, liquidityUsd: 20000, volume5mUsd: 8000, solPriceUsd: 200 };
+  assert.strictEqual(routePlay({ ...base, smartMoney: { wallets: 1, strength: 1 } }, cfg).eligible, false,
+    'one wallet is not a confluence, whatever the router is told');
+  assert.strictEqual(routePlay({ ...base, smartMoney: { wallets: 4, strength: 0.3 } }, cfg).eligible, false,
+    'a barely-passing signal does not carry a full unit');
+});
+
+test('the router reads the quorum from engine state, not from the payload', () => {
+  // The payload crosses a JSON-shaped boundary and originates in a websocket
+  // frame. A caller that could set `__smartMoney` on it would be setting the
+  // one field that substitutes for the score gate.
+  const src = engineSrc();
+  const idx = src.indexOf('const smartForRouter =');
+  assert.ok(idx > 0, 'the router input must be resolved from engine state');
+  const body = src.slice(idx, idx + 200);
+  assert.ok(/this\.pendingSmartMoney\.get\(/.test(body),
+    'it must come from pendingSmartMoney, which only onSmartMoneySignal writes');
+});
+
+console.log('\n-- Evidence cannot be manufactured cheaply --');
+
+test('A PARTIAL WALK CREDITS NOBODY', () => {
+  // The attack the review found: on a token someone else graduated, an attacker
+  // sprays dust buys during the busy period. Those land inside the last 4000
+  // signatures, so a walk that stops at its page cap and credits "the oldest
+  // addresses it reached" turns them into early-buyer credits on a winner. Four
+  // such tokens produce a fleet of perfect-record wallets for well under a SOL,
+  // and the roster is capped, so they displace the honest ones.
+  const src = readFileSync(join(__dirname, '..', 'services', 'walletHarvester.ts'), 'utf8');
+  assert.ok(/let reachedBeginning = false;/.test(src),
+    'the walk must know whether it actually reached the first transactions');
+  assert.ok(/if \(reachedBeginning\) \{\s*\n\s*for \(const b of buyers\) walletLedger\.recordEarlyCall/.test(src),
+    'early calls may only be credited when the beginning was genuinely reached');
+  assert.ok(/never reached the token's first buyers/.test(src),
+    'and a truncated walk must say so rather than reporting partial coverage as complete');
+});
+
+test('perfection stops being free: a 4-for-4 record cannot outrank a long honest one', () => {
+  // Conviction blended raw rates shrunk toward 0.5, so four early calls with
+  // four winners scored 0.70 while an honest wallet with thirty calls at a
+  // realistic 60% scored 0.60 — the manufactured record outranked the real one
+  // and, because the promoted set is capped and ranked by conviction, took its
+  // slot.
+  assert.ok(pessimisticRate(4, 4) < pessimisticRate(18, 30),
+    `4-for-4 (${pessimisticRate(4, 4).toFixed(3)}) must rank below 30 calls at 60% (${pessimisticRate(18, 30).toFixed(3)})`);
+  assert.ok(pessimisticRate(8, 8) < pessimisticRate(60, 100),
+    'and a longer honest record must beat a shorter perfect one');
+  assert.ok(pessimisticRate(1, 1) < 0.5, 'a single lucky call is worth less than no opinion');
+  assert.strictEqual(pessimisticRate(0, 0), 0, 'no evidence is not a rate');
+
+  const l = new WalletLedger();
+  for (let i = 0; i < 4; i++) l.recordEarlyCall('Attacker', `W${i}`, true, T0);
+  for (let i = 0; i < 18; i++) l.recordEarlyCall('Honest', `H${i}`, true, T0);
+  for (let i = 0; i < 12; i++) l.recordEarlyCall('Honest', `L${i}`, false, T0);
+  assert.ok(l.score('Honest')!.conviction! > l.score('Attacker')!.conviction!,
+    'and the ranking the cap uses must agree');
+});
+
+test('SELLS ARE RECORDED, or the closed-trade ladder is dead code', () => {
+  // recordSell had no caller: the entire trade-based promotion route and every
+  // loss-based demotion were unreachable, so a promoted wallet could never be
+  // un-promoted by its own results.
+  const src = engineSrc();
+  const idx = src.indexOf('for (const t of tradeEventsFromLogs(ev.logs))');
+  assert.ok(idx > 0, 'the watch feed must decode trades');
+  const body = src.slice(idx, idx + 1600);
+  // Asserted on the BRANCH, not on the call: `if (false) { recordSell(...) }`
+  // contains the same text and would satisfy a substring check while recording
+  // nothing — which is how the mutation run caught the first version of this
+  // test passing over a dead sell path.
+  assert.ok(/if \(!t\.isBuy\) \{\s*\n(\s*\/\/[^\n]*\n)*\s*walletLedger\.recordSell\(/.test(body),
+    'a sell must reach the ledger, from a branch that is actually taken');
+  assert.ok(/walletLedger\.recordBuy\(/.test(body), 'and so must a buy');
+  assert.ok(!/if \(false\)/.test(body), 'no branch on this path may be disabled');
+});
+
+test('the runtime flag actually stops the lane', () => {
+  // Turning it off used to stop nothing: the socket stayed open, the detector
+  // kept accumulating and the entry injection kept firing, while
+  // /api/smart-money reported enabled:false.
+  const src = engineSrc();
+  const feedStart = src.indexOf('onLog: (ev) => {');
+  assert.ok(feedStart > 0, 'the watch feed must exist');
+  const feed = src.slice(feedStart, src.indexOf('[SmartMoney]', feedStart));
+  assert.ok(/if \(!featureFlags\.get\('smartMoneySniper'\)\) return;/.test(feed),
+    'the feed must check the flag at the point of action, not only where it was started');
+  const entry = src.slice(src.indexOf('private async onSmartMoneySignal('), src.indexOf('private async onSmartMoneySignal(') + 600);
+  assert.ok(/featureFlags\.get\('smartMoneySniper'\)/.test(entry),
+    'and so must the entry point, for a signal already in flight');
+});
+
+test('research yields to the COPY trader too, not just the sniper', () => {
+  // Both engines share one Helius key. Yielding only for the sniper's entries
+  // meant a research walk could burn the shared budget in the middle of a copy
+  // buy — the shape of the incident that got local tx building demoted.
+  const src = engineSrc();
+  const idx = src.indexOf('isBusy: () =>');
+  assert.ok(idx > 0);
+  const body = src.slice(idx, idx + 400);
+  assert.ok(/this\.copyBusyProvider\(\)/.test(body), 'the copy trader must be consulted');
+  assert.ok(/inFlightBuyCount > 0/.test(body), 'and any in-flight buy from either engine');
+  const server = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+  assert.ok(/setCopyBusyProvider\(\(\) => copyTrader\.isBusyTrading\(\)\)/.test(server),
+    'and the provider must actually be wired');
 });
 
 console.log('\n-- The design promise: no addresses are shipped --');

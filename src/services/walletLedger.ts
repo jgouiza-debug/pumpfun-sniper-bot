@@ -261,10 +261,10 @@ export class WalletLedger {
     let conviction: number | null = null;
     const parts: Array<{ value: number; weight: number }> = [];
     if (winRate !== null) {
-      parts.push({ value: winRate, weight: Math.min(1, w.closedTrades / 20) });
+      parts.push({ value: pessimisticRate(w.wins, w.closedTrades), weight: Math.min(1, w.closedTrades / 20) });
     }
     if (earlyHitRate !== null) {
-      parts.push({ value: earlyHitRate, weight: Math.min(1, earlyTotal / 10) });
+      parts.push({ value: pessimisticRate(w.earlyOnWinners, earlyTotal), weight: Math.min(1, earlyTotal / 10) });
     }
     if (parts.length) {
       const totalWeight = parts.reduce((s, p) => s + p.weight, 0);
@@ -481,7 +481,14 @@ export class WalletLedger {
       if (!w || typeof w.address !== 'string' || !w.address) continue;
       this.wallets.set(w.address, {
         address: w.address,
-        state: isState(w.state) ? w.state : 'candidate',
+        // NEVER TRUSTED FROM DISK. The counters below are evidence and are
+        // restored as written, but `state` is a CONCLUSION and this file sits
+        // in the install directory as plain JSON. A hand-edited or
+        // malware-written `"state": "promoted"` would put an arbitrary wallet
+        // straight into the followable set and defeat the entire "earned, never
+        // pasted in" property. Everything comes back as a candidate and has to
+        // re-derive its state from its own numbers in reevaluate() below.
+        state: 'candidate',
         firstSeenAt: num(w.firstSeenAt),
         lastSeenAt: num(w.lastSeenAt),
         buysSeen: num(w.buysSeen),
@@ -493,13 +500,23 @@ export class WalletLedger {
         earlyOnWinners: num(w.earlyOnWinners),
         earlyOnLosers: num(w.earlyOnLosers),
         stateChangedAt: num(w.stateChangedAt),
-        stateReason: typeof w.stateReason === 'string' ? w.stateReason : 'restored',
-        ...(w.pinned === 'always' || w.pinned === 'never' ? { pinned: w.pinned } : {}),
+        stateReason: 'restored — re-deriving state from the evidence',
+        // A pin is an operator decision, and `never` is the safe direction, so
+        // it is honoured. `always` is not: it forces promotion with no evidence
+        // at all, which is precisely the capability an attacker with write
+        // access to this file would want. Re-pin it from the UI, which is
+        // token-gated.
+        ...(w.pinned === 'never' ? { pinned: 'never' as const } : {}),
         recent: Array.isArray(w.recent) ? w.recent.slice(-RECENT_TRADE_CAP) : [],
       });
       loaded++;
     }
     if (raw.thresholds) this.setThresholds(raw.thresholds);
+    // Re-derive every state from the restored evidence. Without this the whole
+    // ledger comes back as candidates and the roster is empty until the next
+    // timer tick — and more importantly, this is what makes ignoring the
+    // on-disk `state` safe rather than merely paranoid.
+    this.reevaluate();
     return loaded;
   }
 
@@ -519,6 +536,28 @@ function num(v: any): number {
 function round6(n: number): number {
   return Math.round(n * 1e6) / 1e6;
 }
+/**
+ * A success rate that a small sample cannot inflate.
+ *
+ * THE DEFECT THIS REPLACES. Conviction blended raw rates, shrunk toward 0.5 by
+ * sample size. A wallet with four early calls and four winners scored 0.70,
+ * while an honest wallet with thirty calls at a realistic 60% scored 0.60 — so
+ * the manufactured record OUTRANKED the real one and, because the promoted set
+ * is capped and ranked by conviction, took its slot. Producing four such
+ * records costs an attacker a few tenths of a SOL.
+ *
+ * `wins / (total + PRIOR_TRIALS)` is a Laplace-style correction: it charges
+ * every wallet a fixed number of imaginary losses, which a large sample
+ * absorbs and a small one cannot. Four-for-four becomes 0.33; thirty at 60%
+ * becomes 0.47. Perfection stops being free.
+ */
+const PRIOR_TRIALS = 8;
+
+export function pessimisticRate(wins: number, total: number): number {
+  if (!Number.isFinite(wins) || !Number.isFinite(total) || total <= 0) return 0;
+  return clamp01(wins / (total + PRIOR_TRIALS));
+}
+
 function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
