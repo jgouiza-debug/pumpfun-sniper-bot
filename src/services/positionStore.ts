@@ -34,6 +34,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { installPath } from './installPaths';
 
 export const STORE_VERSION = 1;
 const STORE_FILE = '.open-positions.json';
@@ -76,11 +77,21 @@ interface StoreFile {
 }
 
 export function positionStorePath(): string {
-  // Same base-directory rule as keyStore/apiAuth/loadEnv: beside the executable
-  // when packaged, so a per-install file follows the install.
-  const isPackaged = Boolean((process as any).pkg);
-  const baseDir = isPackaged ? path.dirname(process.execPath) : process.cwd();
-  return path.join(baseDir, STORE_FILE);
+  // Use the SHARED resolver rather than re-deriving the rule.
+  //
+  // This function used to compute its own base directory, and its copy was
+  // missing the SNIPER_DATA_DIR branch that installBaseDir() honours — the
+  // per-user app-data path electron/main.js sets from app.getPath('userData').
+  // So under the packaged desktop app (which is not `process.pkg`) it fell
+  // through to process.cwd(): '/' when launched from Finder on macOS, or
+  // C:\Windows\System32 from a shortcut with a different "Start in".
+  //
+  // Both are unwritable, so writeAtomic threw, save() returned false, and the
+  // crash-recovery store was a silent no-op for the entire session — for the
+  // exact users who run the packaged app, i.e. almost everyone. The
+  // installPaths docstring lists the files that must resolve from here and says
+  // it exists "so the remaining files stop drifting from it"; this one had.
+  return installPath(STORE_FILE);
 }
 
 /** Atomic replace. A crash mid-write leaves the previous good file intact. */

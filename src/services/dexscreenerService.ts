@@ -319,17 +319,43 @@ export class DexScreenerService {
 
       const pairs = response.data?.pairs;
       if (Array.isArray(pairs) && pairs.length > 0) {
+        // Stablecoin-quoted pairs only. The fallback used to be `: pairs` —
+        // ANY pair in the response, sorted by liquidity — and a WSOL pair's
+        // `priceUsd` denominates the pair's BASE token. On a response where the
+        // deep USDC/USDT pairs are missing their `liquidity` block (a partial
+        // response, a schema change, a rate-limited edge), the filter emptied,
+        // the fallback took an arbitrary WSOL/<memecoin> pair, and `priceUsd`
+        // came back as the price of that memecoin — cents, or fractions of a
+        // cent, presented as the price of SOL.
+        //
+        // That scalar sits under EVERY usd-denominated guard: the liquidity
+        // floor, the kill switch's hourly and daily limits, position sizing,
+        // breakeven economics. Getting it wrong by three orders of magnitude
+        // does not shift those guards, it disables them.
         const stablePairs = pairs.filter((p: any) =>
-          ['USDC', 'USDT'].includes(p.quoteToken?.symbol) && Number(p.liquidity?.usd || 0) > 100000
+          ['USDC', 'USDT', 'USDS'].includes(p.quoteToken?.symbol)
+          && String(p.baseToken?.address || '') === WSOL_MINT
         );
-        const pool = stablePairs.length > 0 ? stablePairs : pairs;
-        pool.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+        if (!stablePairs.length) {
+          // No usable quote. The LAST KNOWN price is a far better answer than a
+          // confident wrong one, and returning it is what the catch below does.
+          return this.solPriceUsd;
+        }
+        stablePairs.sort((a: any, b: any) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
 
-        const price = Number(pool[0].priceUsd || 0);
-        if (price > 0) {
+        const price = Number(stablePairs[0].priceUsd || 0);
+        // PLAUSIBILITY BAND. Nothing downstream can tell a wrong scalar from a
+        // right one, so the sanity check has to live here. The band is wide
+        // enough to never bind on a real move and narrow enough to reject a
+        // price that is obviously some other token's.
+        if (Number.isFinite(price) && price >= 5 && price <= 5000) {
           this.solPriceUsd = price;
           this.solPriceFetchedAt = Date.now();
           return price;
+        }
+        if (price > 0) {
+          console.warn(`[DexScreener] Ignoring an implausible SOL price of $${price} — keeping $${this.solPriceUsd}. `
+            + 'This usually means the response carried a pair whose priceUsd is not SOL.');
         }
       }
     } catch (error: any) {
