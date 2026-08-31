@@ -801,8 +801,31 @@ export class SniperEngine {
    */
   public async adoptRestoredPositions(): Promise<void> {
     const pending = this.pendingRestore;
-    this.pendingRestore = [];
     if (!pending.length) return;
+
+    // NOT DRAINED UNTIL IT SUCCEEDS. This used to empty pendingRestore before
+    // its first await, so a run at a moment when the wallet was not linked yet
+    // or the RPC was down discarded the very positions it exists to rescue —
+    // silently, and with no second chance.
+    const owner = this.wallet.getKeypair()?.publicKey?.toBase58() ?? null;
+    if (!owner) {
+      this.log('warn', '⏳ Deferring position recovery — no wallet is linked yet. The restored positions are still queued.');
+      setTimeout(() => { void this.adoptRestoredPositions(); }, 15_000).unref?.();
+      return;
+    }
+
+    // And never against the WRONG wallet: reading wallet B's balances to decide
+    // whether wallet A's positions still exist answers zero for all of them and
+    // would drop every one as closed.
+    const storedOwner = this.positionStore.load().walletAddress;
+    if (storedOwner && storedOwner !== owner) {
+      this.pendingRestore = [];
+      this.log('error', `⚠️ The stored open positions belong to wallet ${storedOwner.slice(0, 6)}… but ${owner.slice(0, 6)}… is linked — NOT adopting them. `
+        + 'Relink the original key to recover them; checking them against this wallet would read every one as gone.');
+      return;
+    }
+
+    this.pendingRestore = [];
 
     let adopted = 0;
     let gone = 0;
@@ -1103,23 +1126,36 @@ export class SniperEngine {
    * there is nothing left to push. Fire-and-forget — it must never add latency
    * to the order or hold the trade queue.
    */
-  private rebroadcastUntilSettled(rawTx: Uint8Array, txid: string, mint: string): void {
+  private rebroadcastUntilSettled(rawTx: Uint8Array, txid: string, mint: string): () => void {
     const blockhash = (() => {
       try { return VersionedTransaction.deserialize(rawTx).message.recentBlockhash; } catch { return undefined; }
     })();
     const startedAt = Date.now();
-    // A blockhash lives ~60-90s, so a 45s window left the last and most
-    // valuable stretch uncovered — precisely the window in which a transaction
-    // dropped by a busy leader still could have landed. Bounded by TIME rather
-    // than by a resend count, and it exits the moment expiry is proven.
-    const WINDOW_MS = 95_000;
-    let sends = 0;
+    // MUST NOT OUTLIVE THE VERDICT. This ran for 95s while the confirmation
+    // loop that owns the decision gave up at 75s — so for twenty seconds the
+    // engine had already logged "did NOT land, only the fee was spent",
+    // recorded no position and stopped tracking the mint, while a loop it had
+    // started was still pushing that buy onto the chain. It reproduced the
+    // reported incident from inside the fix: a transaction lands that nothing
+    // is tracking. Bounded below the confirm window, and cancelled outright the
+    // moment the verdict is in.
+    const WINDOW_MS = 70_000;
+    let cancelled = false;
+
     const tick = async (): Promise<void> => {
-      while (Date.now() - startedAt < WINDOW_MS) {
+      while (!cancelled && Date.now() - startedAt < WINDOW_MS) {
         await new Promise(res => setTimeout(res, 4_500));
-        sends++;
+        if (cancelled) return;
+
+        // The checks and the RESEND are separated on purpose. They used to
+        // share one try, so a rate-limited getSignatureStatuses — the exact
+        // condition this loop exists for — skipped the resend as collateral
+        // damage. A status we cannot read is a reason to resend, not to stop.
+        // History search is off here: the signature is seconds old, so the
+        // node's recent cache covers it and the expensive path is the
+        // settlement loop's job, not this one's.
         try {
-          const st = await this.solanaConnection.getSignatureStatuses([txid], { searchTransactionHistory: true });
+          const st = await this.solanaConnection.getSignatureStatuses([txid], { searchTransactionHistory: false });
           const v = st?.value?.[0];
           if (v && (v.err || v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized')) return;
           if (blockhash) {
@@ -1127,14 +1163,16 @@ export class SniperEngine {
             const stillValid = typeof valid === 'boolean' ? valid : valid?.value;
             if (stillValid === false) return; // it can no longer land
           }
+        } catch { /* unreadable — fall through and resend */ }
+
+        if (cancelled) return;
+        try {
           await this.solanaConnection.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 });
-        } catch {
-          // A failed resend is not a failed trade — the confirmation loop owns
-          // the verdict. Stay quiet and try again.
-        }
+        } catch { /* a failed resend is not a failed trade */ }
       }
     };
     void tick();
+    return () => { cancelled = true; };
   }
 
   /** Queue only when nothing already tracks this mint — see the call sites. */
@@ -1151,7 +1189,25 @@ export class SniperEngine {
     if (typeof this.unresolvedBuyTimer.unref === 'function') this.unresolvedBuyTimer.unref();
   }
 
+  private reconcileInFlight = false;
+
   private async reconcileUnresolvedBuys(): Promise<void> {
+    // NO STACKING. A pass awaits a balance read per queued mint, and under the
+    // 429 storm this exists for, one read can take tens of seconds — longer
+    // than the 15s interval. Passes then overlapped, each incrementing the same
+    // attempt counters, so the twenty-attempt budget was spent in a fraction of
+    // the time it was meant to cover and the reconcile gave up on a mint that
+    // was only ever slow.
+    if (this.reconcileInFlight) return;
+    this.reconcileInFlight = true;
+    try {
+      await this.reconcileUnresolvedBuysInner();
+    } finally {
+      this.reconcileInFlight = false;
+    }
+  }
+
+  private async reconcileUnresolvedBuysInner(): Promise<void> {
     for (const [mint, rec] of [...this.unresolvedBuys]) {
       rec.attempts++;
       const owned = await this.readOwnedTokenAmount(mint);
@@ -1921,6 +1977,8 @@ export class SniperEngine {
   ): Promise<TradeResult | null> {
     /** True once THIS call has claimed a concurrency slot. See the finally. */
     let inFlightCounted = false;
+    /** Stops the paced resend. Called the instant the verdict is in. */
+    let stopRebroadcast: (() => void) | null = null;
     /** Undoes the governor claim if this order never reaches the chain. */
     let releaseReservation: (() => void) | null = null;
     /**
@@ -2264,7 +2322,7 @@ export class SniperEngine {
         const txid = await this.solanaConnection.sendRawTransaction(rawTx, {
           skipPreflight: true,
         });
-        this.rebroadcastUntilSettled(rawTx, txid, mint);
+        stopRebroadcast = this.rebroadcastUntilSettled(rawTx, txid, mint);
         latencyTimeline.stamp(mint, 't6SubmittedMs');
 
         // (The claim was made permanent at signing, above.)
@@ -2295,6 +2353,9 @@ export class SniperEngine {
         // blockhash lifetime for the common case while expiry detection ends it
         // sooner whenever isBlockhashValid can be read at all.
         const confirmed = await this.confirmTransaction(txid, 75_000, tx.message.recentBlockhash);
+        // The verdict is in: nothing may keep pushing this transaction.
+        stopRebroadcast?.();
+        stopRebroadcast = null;
         if (confirmed === 'slippage_failed' || (confirmed === 'failed' && action === 'sell')) {
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain due to Slippage (6004). Inspect: https://solscan.io/tx/${txid}`, mint);
 
@@ -2470,6 +2531,10 @@ export class SniperEngine {
         void this.resolveOrphanedSubmission(action, mint, orphan, orphanHash);
       }
     } finally {
+      // Belt and braces: a throw anywhere after submit must not leave a resend
+      // loop alive past this function.
+      stopRebroadcast?.();
+      stopRebroadcast = null;
       // Released on EVERY exit path — return, throw, or fall-through. A leaked
       // in-flight count would ratchet the concurrency ceiling down until it
       // refused every buy, turning a safety limit into an outage.

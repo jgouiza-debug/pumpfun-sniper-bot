@@ -742,8 +742,38 @@ export function loadGovernorState(): void {
   }
 }
 
-/** Persist the latch. Called on every state change that matters. */
+/**
+ * Persist the latch, off the hot path.
+ *
+ * The write is coalesced behind a short timer because it fires from
+ * `tryReserveBuy`, which sits between the governor's claim and the trade-local
+ * HTTP call — the most latency-sensitive moment in the whole system. A
+ * synchronous write + rename there costs 50-200ms whenever the install
+ * directory is on a network share or under an antivirus scan, which is a
+ * self-inflicted delay on every order.
+ *
+ * A HALT is written immediately regardless: that one must survive a crash in
+ * the next tick, and it is rare enough that its cost never matters.
+ */
+let pendingSave: NodeJS.Timeout | null = null;
 export function saveGovernorState(): void {
+  if (tradeGovernor.isHalted()) {
+    if (pendingSave) { clearTimeout(pendingSave); pendingSave = null; }
+    writeGovernorStateNow();
+    return;
+  }
+  if (pendingSave) return;
+  pendingSave = setTimeout(() => { pendingSave = null; writeGovernorStateNow(); }, 750);
+  if (typeof pendingSave.unref === 'function') pendingSave.unref();
+}
+
+/** Flush any pending write synchronously — used on the way out. */
+export function flushGovernorState(): void {
+  if (pendingSave) { clearTimeout(pendingSave); pendingSave = null; }
+  writeGovernorStateNow();
+}
+
+function writeGovernorStateNow(): void {
   try {
     const state: PersistedGovernorState = {
       haltedReason: tradeGovernor.haltReason(),

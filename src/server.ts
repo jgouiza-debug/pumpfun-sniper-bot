@@ -27,7 +27,7 @@ import { entryGateV2 } from './services/entryGateV2';
 import { localTxBuilder } from './services/localTxBuilder';
 import { autoUpdateEnabled, updaterService } from './services/updaterService';
 import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
-import { loadGovernorState, setGovernorWalletProvider } from './services/tradeGovernor';
+import { flushGovernorState, loadGovernorState, setGovernorWalletProvider } from './services/tradeGovernor';
 // Reinstate a spend-governor halt from a previous session BEFORE anything can
 // trade. A restart is the natural response to a runaway, and it must not be the
 // thing that clears the breaker that stopped it.
@@ -1027,10 +1027,15 @@ function gracefulShutdown(reason: string, server?: http.Server): void {
     // STOP THE COPY TRADER TOO. Shutdown disarmed the sniper and flushed the
     // copy trader's state, but never actually stopped it: its signal feeds
     // stayed live right up to process.exit, so a leader signal arriving in the
-    // last moments started a buy that got signed and sent while the process was
-    // on its way out. The transaction lands; the state file was flushed BEFORE
-    // it existed; nothing records the position. That is a bag in the wallet
-    // that no restart ever learns about.
+    // last moments started a NEW buy that got signed and sent while the process
+    // was on its way out.
+    //
+    // HONEST LIMIT: this stops new signals from starting anything. It does NOT
+    // stop a buy already inside its settlement poll — that transaction is
+    // already signed and on the wire, and this process is about to be gone. The
+    // in-flight count is reported below for exactly that reason, and the buy is
+    // recoverable afterwards through the on-chain balance check rather than
+    // through anything shutdown can do.
     try { copyTrader.setEnabled(false); } catch { /* already stopped */ }
     const inFlight = copyTrader.getInFlightBuyCount();
     if (inFlight > 0) {
@@ -1040,6 +1045,9 @@ function gracefulShutdown(reason: string, server?: http.Server): void {
     // Flushed LAST, after both engines have stopped, so the file on disk is the
     // final state rather than a snapshot taken before the last mutation.
     try { copyTrader.flushStateSync(); } catch { /* best effort */ }
+    // The governor's write is debounced off the order hot path; flush whatever
+    // is pending so a halt or a spend total is never lost on the way out.
+    try { flushGovernorState(); } catch { /* best effort */ }
     sniperEngine.markCleanShutdown();
   } catch { /* best effort on the way out */ }
   const done = () => process.exit(0);

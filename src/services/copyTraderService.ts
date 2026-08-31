@@ -108,6 +108,8 @@ const POSITION_SYNC_INTERVAL_MS = 90_000;
  * acting on it would delete real positions seconds after opening them.
  */
 const POSITION_SYNC_MIN_AGE_MS = 60_000;
+/** How often the resolved RPC endpoint is re-checked for drift. */
+const ENDPOINT_DRIFT_CHECK_MS = 20_000;
 /**
  * Concurrent fast-lane verifications allowed at once.
  *
@@ -3010,9 +3012,18 @@ export class CopyTraderService {
       // settings event fires. Without this check the connection stayed pinned
       // to the dead endpoint for the rest of the run while the sniper, which
       // rebinds on the resolved URL, quietly recovered on its own.
-      if (this.config.enabled && this.heliusEndpointInUse) {
+      // Throttled. startHeliusWatcher can legitimately decline to rebuild — no
+      // enabled leaders, no key — in which case heliusEndpointInUse keeps its
+      // old value and an unthrottled check would call it again every 250ms
+      // forever, four restart attempts a second for the life of the process.
+      if (this.config.enabled && this.heliusEndpointInUse
+        && Date.now() - this.lastEndpointDriftCheckAt > ENDPOINT_DRIFT_CHECK_MS) {
+        this.lastEndpointDriftCheckAt = Date.now();
         const currentEndpoint = rpcEndpoint(sniperEngine.getConfig().heliusApiKey || process.env.HELIUS_API_KEY || '');
-        if (currentEndpoint !== this.heliusEndpointInUse) this.startHeliusWatcher();
+        if (currentEndpoint !== this.heliusEndpointInUse) {
+          console.warn(`[CopyTrader] RPC endpoint drifted (${hostOf(this.heliusEndpointInUse)} → ${hostOf(currentEndpoint)}) — rebuilding the watcher.`);
+          this.startHeliusWatcher();
+        }
       }
 
       // PERIODIC TRUTH CHECK — the book, against the chain.
@@ -3034,9 +3045,18 @@ export class CopyTraderService {
         && !this.positionSyncInFlight) {
         this.lastPositionSyncAt = Date.now();
         this.positionSyncInFlight = true;
+        // The flag is released by a DEADLINE as well as by the promise. A
+        // keep-alive socket whose route silently disappears leaves the balance
+        // read pending forever — no FIN, no reset — and a plain `finally` then
+        // never runs, so this in-flight flag became a permanent latch that
+        // disabled the automatic on-chain truth check for the life of the
+        // process. The check that exists to catch a phantom position must not
+        // be switchable off by the same network fault that creates one.
+        const syncGuard = setTimeout(() => { this.positionSyncInFlight = false; }, POSITION_SYNC_INTERVAL_MS);
+        if (typeof syncGuard.unref === 'function') syncGuard.unref();
         void this.syncPositionsWithOnChainBalances()
           .catch(() => { /* unreadable now; the next pass retries */ })
-          .finally(() => { this.positionSyncInFlight = false; });
+          .finally(() => { clearTimeout(syncGuard); this.positionSyncInFlight = false; });
       }
 
       // No price-based exits here. closePosition is reached from onLeaderSell
@@ -3045,6 +3065,7 @@ export class CopyTraderService {
     }, MONITOR_INTERVAL_MS);
   }
 
+  private lastEndpointDriftCheckAt = 0;
   private lastPositionSyncAt = 0;
   private positionSyncInFlight = false;
   /**
