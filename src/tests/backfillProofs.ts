@@ -218,23 +218,40 @@ atest('A FAILED TRANSACTION IS NOT SOMEBODY AHEAD OF YOU', async () => {
   assert.strictEqual(m!.ageSeconds, 900, 'and a failed tx must not be mistaken for the birth either');
 });
 
-atest('SAME-SECOND PREDECESSORS COUNT — block time is only second-granular', async () => {
-  // A hot launch puts dozens of buys inside one second. A strict `<` drops
-  // every one of them, understating the rank most severely exactly where the
-  // rank carries the most information — and making an ordinary buyer on a
-  // contested launch look like they were at the front, which is the input to
-  // the insider check.
+atest('AN ANCHOR RESOLVES SAME-SECOND ORDERING EXACTLY', async () => {
+  // With an anchor there is no block-time comparison at all: "returned by a
+  // `before:` query" IS "earlier in this account's history", which settles
+  // same-second and same-slot ordering that a timestamp cannot. A hot launch
+  // puts dozens of buys inside one second, and this is where the rank carries
+  // the most information.
+  const sigs = new Map([[curveOf(MINT_A), [
+    { signature: 'after1', blockTime: T },
+    { signature: 'mine', blockTime: T },
+    { signature: 'same3', blockTime: T },
+    { signature: 'same2', blockTime: T },
+    { signature: 'same1', blockTime: T },
+    { signature: 'birth', blockTime: T - 600 },
+  ]]]);
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), {
+    anchorSignature: 'mine',
+  });
+  assert.strictEqual(m!.curveTxRank, 4, 'three same-second predecessors plus the birth');
+  assert.strictEqual(m!.ageSeconds, 600);
+});
+
+atest('UNANCHORED, same-second trades still count — block time is second-granular', async () => {
+  // A caller with no particular transaction can only compare timestamps, and a
+  // strict `<` would drop every same-second trade. `<=` over-counts by
+  // whatever landed later in that second, which is the safe direction for a
+  // figure documented as an upper bound.
   const sigs = new Map([[curveOf(MINT_A), [
     { signature: 'same3', blockTime: T },
     { signature: 'same2', blockTime: T },
     { signature: 'same1', blockTime: T },
-    { signature: 'mine', blockTime: T },
     { signature: 'birth', blockTime: T - 600 },
   ]]]);
-  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), {
-    excludeSignature: 'mine',
-  });
-  assert.strictEqual(m!.curveTxRank, 4, 'three same-second trades plus the birth are all ahead');
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())));
+  assert.strictEqual(m!.curveTxRank, 4, 'all three same-second trades plus the birth');
 });
 
 atest('and a buyer is never counted as ahead of themselves', async () => {
@@ -242,11 +259,12 @@ atest('and a buyer is never counted as ahead of themselves', async () => {
     { signature: 'mine', blockTime: T },
     { signature: 'birth', blockTime: T - 600 },
   ]]]);
-  const withOut = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), { excludeSignature: 'mine' });
-  assert.strictEqual(withOut!.curveTxRank, 1, 'only the birth is ahead of them');
-  // And a caller with no particular transaction still gets a defensible count.
+  const anchored = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), { anchorSignature: 'mine' });
+  assert.strictEqual(anchored!.curveTxRank, 1, 'only the birth is ahead of them');
+  // A control moment is not any particular trade, so nothing is excluded and
+  // both visible transactions count.
   const plain = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())));
-  assert.strictEqual(plain!.curveTxRank, 2, 'a control moment is not any of the trades, so nothing is excluded');
+  assert.strictEqual(plain!.curveTxRank, 2);
 });
 
 atest('curve position is on the canonical scale, not a local formula', async () => {
@@ -334,6 +352,65 @@ atest('the read budget is a hard ceiling and says so', async () => {
   assert.ok(m!.stoppedEarly?.includes('budget'), `expected a budget refusal, got ${m!.stoppedEarly}`);
 });
 
+atest('THE WINDOW IS WITHHELD WHEN THE WALK NEVER REACHED IT', async () => {
+  // The worst bug this file has had, and the reason the walk is anchored now.
+  //
+  // Unanchored, the walk starts at the token's NEWEST activity. For a buy made
+  // weeks ago on a token that has traded heavily since, every signature we can
+  // afford to read is from AFTER the moment — so the window comes back empty
+  // and the old code wrote four zeros, asserting the token was quiet.
+  //
+  // The direction is what makes it lethal rather than merely wrong. Long
+  // histories belong to the tokens a proven trader BOUGHT; the matched
+  // controls are duds with short histories and get real readings. Fabricated
+  // zeros on one side against measurements on the other teaches the profile,
+  // with high confidence, that good traders buy tokens nobody is trading.
+  const busy = Array.from({ length: 3000 }, (_, i) => ({ signature: `late${i}`, blockTime: T + 5000 - i }));
+  const sigs = new Map([[curveOf(MINT_A), busy]]);
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), { readWindow: true });
+  assert.strictEqual(m!.windowBuySol, undefined, 'an unreached window must not be reported as an empty one');
+  assert.strictEqual(m!.windowBuyers, undefined);
+  assert.strictEqual(m!.windowTradesPerMin, undefined);
+  assert.ok(/never reached/.test(m!.stoppedEarly ?? ''), m!.stoppedEarly);
+});
+
+atest('a zero window IS asserted once the walk has spanned it', async () => {
+  // The negative case, and it matters: a token nobody is trading is a real
+  // observation and exactly the kind a good trader passes on. Withholding it
+  // too would throw away the signal along with the fabrication.
+  const sigs = new Map([[curveOf(MINT_A), [
+    { signature: 'old2', blockTime: T - Math.floor(WINDOW_MS / 1000) - 500 },
+    { signature: 'old1', blockTime: T - Math.floor(WINDOW_MS / 1000) - 900 },
+  ]]]);
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, new Map())), { readWindow: true });
+  assert.strictEqual(m!.windowBuySol, 0);
+  assert.strictEqual(m!.windowBuyers, 0);
+  assert.strictEqual(m!.windowBuyPressurePct, undefined, 'no flow means no ratio');
+});
+
+atest('A WINDOW WITH MORE TRADES THAN WE MAY READ IS WITHHELD, NOT CLIPPED', async () => {
+  // The same fabrication, quieter. Slicing to the read cap and reporting the
+  // partial sums clipped every busy token's flow toward the control
+  // distribution — and pinned windowTradesPerMin at MAX_WINDOW_READS/5, making
+  // the top of that feature's range a property of a constant in this file
+  // rather than of any token that ever existed.
+  const many = Array.from({ length: MAX_WINDOW_READS * 3 }, (_, i) => ({
+    signature: `hot${i}`, blockTime: T - 10 - i,
+  }));
+  const txs = new Map<string, FakeTx>();
+  for (const s2 of many) {
+    txs.set(s2.signature, { logs: logsFor([{ mint: MINT_A, user: pk(`h${s2.signature}`), isBuy: true, sol: 1, ts: s2.blockTime, vSol: 60 }]) });
+  }
+  const sigs = new Map([[curveOf(MINT_A), [...many, { signature: 'birth', blockTime: T - 9000 }]]]);
+  const m = await readCurveMoment(MINT_A, T * 1000, deps(new FakeConn(sigs, txs)), { readWindow: true });
+  assert.strictEqual(m!.windowBuySol, undefined, 'a clipped sum must not pass as the whole window');
+  assert.strictEqual(m!.windowTradesPerMin, undefined,
+    'otherwise the busiest token on the chain reports the same trades-per-minute as a mildly active one');
+  assert.ok(/over the .* read cap/.test(m!.stoppedEarly ?? ''), m!.stoppedEarly);
+  // The rank does not depend on the window, so it still stands.
+  assert.strictEqual(m!.curveTxRank, MAX_WINDOW_READS * 3 + 1);
+});
+
 console.log('\n-- Rebuilding a wallet\'s entries --');
 
 /** A wallet with buys on A and B, a dust buy on C, and a sell on A. */
@@ -354,12 +431,24 @@ function walletFixture() {
 
   const sigs = new Map<string, Array<{ signature: string; blockTime: number }>>();
   sigs.set(W1, walletSigs);
-  for (const m of [MINT_A, MINT_B, MINT_C]) {
-    sigs.set(curveOf(m), [
-      { signature: `${m}_t2`, blockTime: T - 50 },
-      { signature: `${m}_t1`, blockTime: T - 2000 },
-    ]);
-  }
+  // A mint's curve history CONTAINS the wallet's own trades on it — that is
+  // what makes the buy usable as an anchor, and it is true on chain by
+  // construction. The fakes used not to include them, which made every
+  // anchored walk come back empty.
+  sigs.set(curveOf(MINT_A), [
+    { signature: 'wA_late', blockTime: T - 100 },
+    { signature: 'wA_sell', blockTime: T - 300 },
+    { signature: 'wA_first', blockTime: T - 900 },
+    { signature: 'A_older', blockTime: T - 2000 },
+  ]);
+  sigs.set(curveOf(MINT_B), [
+    { signature: 'wB', blockTime: T - 500 },
+    { signature: 'B_older', blockTime: T - 2000 },
+  ]);
+  sigs.set(curveOf(MINT_C), [
+    { signature: 'wC_dust', blockTime: T - 700 },
+    { signature: 'C_older', blockTime: T - 2000 },
+  ]);
   sigs.set(PUMP_PROGRAM_ID, []);            // no controls by default
   return { sigs, txs };
 }
@@ -410,7 +499,14 @@ atest('THE BUYER IS THE PROGRAM\'S `user`, NOT THE TRANSACTION SIGNER', async ()
   });
   const sigs = new Map<string, Array<{ signature: string; blockTime: number }>>();
   sigs.set(W1, [{ signature: 'bundle', blockTime: T - 100 }]);
-  for (const m of [MINT_A, MINT_B]) sigs.set(curveOf(m), [{ signature: `${m}_t1`, blockTime: T - 3000 }]);
+  // The bundled transaction touches both curves, so it is in both histories —
+  // and it is the anchor for whichever of the two we credit.
+  for (const m of [MINT_A, MINT_B]) {
+    sigs.set(curveOf(m), [
+      { signature: 'bundle', blockTime: T - 100 },
+      { signature: `${m}_t1`, blockTime: T - 3000 },
+    ]);
+  }
   sigs.set(PUMP_PROGRAM_ID, []);
   await backfillFromWallets([W1], deps(new FakeConn(sigs, txs)), { controlsPerEntry: 0, readWindow: false });
   const s = entryProfile.serialize();
@@ -459,13 +555,21 @@ atest('A CAPPED RANK IS A FLOOR AND IS NOT RECORDED AS A COUNT', async () => {
   // Deep history, so the walk never reaches the beginning and the rank is a
   // floor — with the newest few readable as real trades, so the window fills
   // and the snapshot clears the recovered-features floor on its own merits.
-  const curveSigs: Array<{ signature: string; blockTime: number }> = [];
+  const curveSigs: Array<{ signature: string; blockTime: number }> = [
+    { signature: 'one', blockTime: T },        // the anchor: the wallet's own buy
+  ];
   for (let i = 0; i < 5; i++) {
     const sig = `win${i}`;
     curveSigs.push({ signature: sig, blockTime: T - 10 - i });
     txs.set(sig, { logs: logsFor([{ mint: MINT_A, user: pk(`b${i}`), isBuy: true, sol: 1, ts: T - 10 - i, vSol: 60 }]) });
   }
-  for (let i = 0; i < 3000; i++) curveSigs.push({ signature: `p${i}`, blockTime: T - 100 - i });
+  // Deep enough that the walk never reaches the beginning, so the rank is only
+  // a floor — while the newest few are readable trades inside the window, so
+  // the snapshot survives on window evidence rather than on a rank.
+  // Placed OUTSIDE the five-minute window, so the window itself holds only the
+  // five readable trades and stays under the read cap — otherwise the window
+  // is withheld too and the snapshot has nothing left to survive on.
+  for (let i = 0; i < 3000; i++) curveSigs.push({ signature: `p${i}`, blockTime: T - 400 - i });
   sigs.set(curveOf(MINT_A), curveSigs);
   sigs.set(PUMP_PROGRAM_ID, []);
   await backfillFromWallets([W1], deps(new FakeConn(sigs, txs)), { controlsPerEntry: 0, readWindow: true });
@@ -494,12 +598,14 @@ function controlFixture() {
   f.txs.set('ctl1', { logs: logsFor([{ mint: MINT_B, user: pk('rando1'), isBuy: true, sol: 1, ts: T - 900, vSol: 61 }]) });
   f.txs.set('ctl2', { logs: logsFor([{ mint: pk('ctlMintX'), user: pk('rando2'), isBuy: true, sol: 1, ts: T - 901, vSol: 44 }]) });
   f.txs.set('ctl3', { logs: logsFor([{ mint: pk('ctlMintY'), user: pk('rando3'), isBuy: true, sol: 1, ts: T - 902, vSol: 77 }]) });
-  for (const m of [pk('ctlMintX'), pk('ctlMintY')]) {
-    f.sigs.set(curveOf(m), [
-      { signature: `${m}_t2`, blockTime: T - 800 },
-      { signature: `${m}_t1`, blockTime: T - 5000 },
-    ]);
-  }
+  f.sigs.set(curveOf(pk('ctlMintX')), [
+    { signature: 'ctl2', blockTime: T - 901 },
+    { signature: 'ctlX_older', blockTime: T - 5000 },
+  ]);
+  f.sigs.set(curveOf(pk('ctlMintY')), [
+    { signature: 'ctl3', blockTime: T - 902 },
+    { signature: 'ctlY_older', blockTime: T - 5000 },
+  ]);
   return f;
 }
 

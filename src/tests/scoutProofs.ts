@@ -148,7 +148,11 @@ function fixture(trades: TradeSpec[], opts: { curveDepth?: number } = {}) {
       [Buffer.from('bonding-curve'), new PublicKey(t.mint).toBuffer()],
       new PublicKey(PUMP_PROGRAM_ID),
     )[0].toBase58();
+    // The wallet's own buy is IN the mint's curve history — that is what lets it
+    // anchor the walk, and it is true on chain by construction. Without it the
+    // anchored read comes back empty and the queue sample silently never runs.
     sigs.set(curve, [
+      { signature: bSig, blockTime: buyAt },
       ...Array.from({ length: depth }, (_, k) => ({ signature: `${t.mint}c${k}`, blockTime: buyAt - 1 - k })),
       { signature: `${t.mint}birth`, blockTime: buyAt - depth - 100 },
     ]);

@@ -173,7 +173,7 @@ export async function backfillFromWallets(
       const moment = await readCurveMoment(buy.ev.mint, atMs, curveDeps, {
         vSolAtMoment: vSol,
         readWindow,
-        excludeSignature: buy.signature,
+        anchorSignature: buy.signature,
       });
       if (!moment) { reject('curve unreadable'); continue; }
       result.reads += moment.reads;
@@ -195,6 +195,11 @@ export async function backfillFromWallets(
           const cm = await readCurveMoment(c.mint, atMs, curveDeps, {
             vSolAtMoment: c.vSol,
             readWindow,
+            // The trade that revealed this mint is a transaction on its curve
+            // at the same instant, so it anchors the control's walk exactly as
+            // the entry's own buy anchors the entry's — which is what keeps
+            // the two sides of the comparison measured the same way.
+            anchorSignature: c.signature,
           });
           if (!cm) { reject('control curve unreadable'); continue; }
           result.reads += cm.reads;
@@ -302,7 +307,7 @@ async function collectWalletBuys(
   return [...firstByMint.values()];
 }
 
-interface ControlMint { mint: string; vSol: number; }
+interface ControlMint { mint: string; vSol: number; /** The trade that revealed it — anchors the control's own walk. */ signature: string; }
 
 /**
  * Tokens being traded in the same second as `signature`, that these wallets
@@ -357,7 +362,7 @@ async function sampleControlMints(
       if (out.some(c => c.mint === ev.mint)) continue;
       const vSol = Number(ev.virtualSolReserves) / 1e9;
       if (!Number.isFinite(vSol) || vSol <= 0) continue;
-      out.push({ mint: ev.mint, vSol });
+      out.push({ mint: ev.mint, vSol, signature: b.signature });
     }
     await sleep(READ_SPACING_MS);
   }

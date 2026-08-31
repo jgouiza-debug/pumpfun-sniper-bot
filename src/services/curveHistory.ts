@@ -131,12 +131,25 @@ export interface ReadMomentOptions {
   /** Signature pages to walk. Each is one RPC call and up to 1000 signatures. */
   maxPages?: number;
   /**
-   * The transaction this moment IS, when the caller has one.
+   * A transaction of this mint at (or immediately at) the moment being read.
    *
-   * Excluded from the rank so a buyer is not counted as being ahead of
-   * themselves. Omit when the moment is not a particular trade.
+   * THIS IS THE DIFFERENCE BETWEEN A CORRECT READING AND A FABRICATED ONE, not
+   * a convenience. Without it the walk starts at the token's NEWEST activity
+   * and pages backwards, so for a buy made three weeks ago on a token that has
+   * traded ten thousand times since, every signature we can afford to read is
+   * from AFTER the moment — and the code below concludes, with no way to tell,
+   * that nothing had happened yet.
+   *
+   * With an anchor the walk starts at the moment and pages backwards into real
+   * history. It also makes the rank exact rather than second-granular, because
+   * "returned by a `before:` query" is precisely "earlier in this account's
+   * history" — no block-time comparison, no same-second ambiguity, and the
+   * anchor itself is never included.
+   *
+   * The backfiller has one (the buy). The scout has one (the wallet's first
+   * buy). The control sampler has one (the trade that revealed the mint).
    */
-  excludeSignature?: string;
+  anchorSignature?: string;
 }
 
 /**
@@ -179,7 +192,11 @@ export async function readCurveMoment(
   // the page cap (a floor, and therefore no age at all).
   type Sig = { signature: string; blockTime: number };
   const sigs: Sig[] = [];
-  let before: string | undefined;
+  // Anchored walks begin AT the moment. Unanchored ones begin at the token's
+  // newest activity and fall back to filtering by block time, which is all a
+  // caller with no particular transaction can do.
+  let before: string | undefined = opts.anchorSignature;
+  const anchored = Boolean(opts.anchorSignature);
   for (let page = 0; page < maxPages; page++) {
     if (deps.isBusy?.()) { out.stoppedEarly = 'trading path busy'; break; }
     if (!spend(1)) { out.stoppedEarly = 'read budget exhausted'; break; }
@@ -217,25 +234,18 @@ export async function readCurveMoment(
   }
 
   const atSec = Math.floor(atMs / 1000);
-  // BLOCK TIME HAS ONE-SECOND GRANULARITY, and a hot launch puts dozens of
-  // buys inside one second. A strict `<` therefore drops every same-second
-  // predecessor — understating the rank most severely exactly where the rank
-  // carries the most information, and making an ordinary buyer on a contested
-  // launch look like they were at the front.
+  // ANCHORED: everything the walk returned is, by construction, earlier in
+  // this account's history than the anchor. That is exact — it resolves
+  // same-second and same-slot ordering that a block-time comparison cannot,
+  // and it cannot include the anchor itself.
   //
-  // `<=` counts the moment's own second as ahead of us. That over-counts by
-  // however many trades landed in the same second AFTER the one being
-  // described, which is the safe direction: the rank is documented as an upper
-  // bound, and a buyer wrongly placed further back is not mistaken for an
-  // insider. Exact intra-slot ordering needs getBlock and is not worth an RPC
-  // call per predecessor here.
-  //
-  // The moment's OWN transaction is excluded by signature rather than by
-  // subtracting one, because whether it is in this list at all depends on the
-  // caller: a backfilled entry is one of the mint's trades, a sampled control
-  // is an instant at which nobody in particular bought. Blanket-subtracting
-  // would have been right for the first and wrong for the second.
-  const before_ = sigs.filter(s => s.blockTime <= atSec && s.signature !== opts.excludeSignature);
+  // UNANCHORED: fall back to block time, with `<=` rather than `<`. Block time
+  // is only second-granular and a hot launch puts dozens of buys inside one
+  // second; a strict `<` drops all of them, understating the rank exactly
+  // where it carries the most information. `<=` over-counts by whatever landed
+  // later in the same second, which is the safe direction for a figure
+  // documented as an upper bound.
+  const before_ = anchored ? sigs : sigs.filter(s => s.blockTime <= atSec);
   out.curveTxRank = before_.length;
   if (out.rankCapped) {
     // The rank is a floor. Reported anyway — "at least 3000 trades ahead of
@@ -260,15 +270,37 @@ export async function readCurveMoment(
   // still a coherent "the run-up immediately before", which is the thing being
   // measured.
   const windowStart = atSec - Math.floor(WINDOW_MS / 1000);
-  const inWindow = before_
+  const inWindowAll = before_
     .filter(s => s.blockTime >= windowStart)
-    .sort((a, b) => b.blockTime - a.blockTime)
-    .slice(0, MAX_WINDOW_READS);
+    .sort((a, b) => b.blockTime - a.blockTime);
 
-  if (!inWindow.length) {
-    // Genuinely quiet, not unread. Zero flow is a real observation about a
-    // token nobody is trading, and it is exactly the kind of token a good
-    // trader passes on — so it is recorded as zero, not as unknown.
+  // DID THE WALK ACTUALLY COVER THE WINDOW? Only two things prove it: reaching
+  // the token's first transaction, or seeing a trade older than the window's
+  // left edge. Without one of them an empty result means "we never got back
+  // this far", not "nothing happened" — and writing zeros for it is the single
+  // most damaging thing this file could do.
+  //
+  // The damage is directional, which is why it would not have looked like a
+  // bug. Tokens with long histories are the ones a proven trader bought; the
+  // matched controls are mostly duds with short histories and therefore get
+  // real readings. Fabricated zeros on one side and measurements on the other
+  // teaches the profile, with high confidence, that good traders buy tokens
+  // nobody is trading.
+  const spannedWindow = out.sawBeginning || sigs.some(s => s.blockTime < windowStart);
+  if (!spannedWindow) {
+    // APPENDED, not substituted. The paging loop's own reason ("page cap
+    // reached") is true and useful, but it does not say that the window fields
+    // are missing because of it — and that is the fact a reader of this
+    // snapshot needs. Both survive.
+    const why = 'window never reached — the walk did not page back past it';
+    out.stoppedEarly = out.stoppedEarly ? `${out.stoppedEarly}; ${why}` : why;
+    return out;
+  }
+
+  if (!inWindowAll.length) {
+    // NOW this is assertable: the walk spanned the window and found nothing in
+    // it. Zero flow is a real observation about a token nobody is trading, and
+    // it is exactly the kind of token a good trader passes on.
     out.windowBuySol = 0;
     out.windowSellSol = 0;
     out.windowBuyers = 0;
@@ -276,6 +308,18 @@ export async function readCurveMoment(
     out.windowBuyPressurePct = undefined;   // no flow means no ratio, not 0%
     return out;
   }
+
+  // MORE TRADES THAN WE MAY READ IS NOT A SMALL WINDOW EITHER. Slicing to the
+  // read cap and reporting the partial sums was the same fabrication in a
+  // quieter form: it clipped every busy token's flow toward the control
+  // distribution, and pinned windowTradesPerMin at MAX_WINDOW_READS/5 — making
+  // the top of that feature's range a property of this constant rather than of
+  // any token.
+  if (inWindowAll.length > MAX_WINDOW_READS) {
+    out.stoppedEarly = `window holds ${inWindowAll.length} trades, over the ${MAX_WINDOW_READS} read cap`;
+    return out;
+  }
+  const inWindow = inWindowAll;
 
   let buySol = 0;
   let sellSol = 0;

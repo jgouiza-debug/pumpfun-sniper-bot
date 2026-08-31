@@ -580,7 +580,7 @@ export async function verifyTrader(
         now: deps.now,
         sleep: deps.sleep,
         spend,
-      }, { vSolAtMoment: p.firstBuyVSol, maxPages: 2, excludeSignature: p.firstBuySig });
+      }, { vSolAtMoment: p.firstBuyVSol, maxPages: 2, anchorSignature: p.firstBuySig });
       if (!m) continue;
       stats.reads += m.reads;
       // A capped rank is a floor, and a floor above the threshold still proves
