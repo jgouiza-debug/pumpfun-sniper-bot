@@ -348,11 +348,21 @@ test('the pre-sign guard is called with the CEILINGS, not with its permissive de
   const engineSrc = readFileSync(join(__dirname, '../services/sniperEngine.ts'), 'utf8');
   const at = engineSrc.indexOf('assertOutboundTradeTx(');
   assert.ok(at > 0, 'the guard must be called before signing');
-  const call = engineSrc.slice(at, at + 600);
+  const call = engineSrc.slice(at, at + 1400);
   assert.ok(/maxLamportsOut/.test(call),
     'the guard must be told what this trade was sized for, or the naming bypass has no total to be measured against');
   assert.ok(/maxPriorityFeeLamports/.test(call),
     'the guard must be given a priority-fee ceiling, or ComputeBudget is unbounded');
+  // A SELL deliberately declares no size ceiling — its vendor fee scales with
+  // proceeds nobody can see before signing, and refusing an exit is the worst
+  // outcome this guard can produce. It must still declare a bounded allowance
+  // rather than simply omitting one, because an omitted ceiling now falls back
+  // to the module's strict default and would block the exit anyway.
+  assert.ok(/unrelatedLamportsAllowance/.test(call),
+    'a sell must declare its own bounded allowance, not rely on an omission');
+  const sizing = engineSrc.slice(engineSrc.indexOf('const maxLamportsOut ='), engineSrc.indexOf('const maxLamportsOut =') + 700);
+  assert.ok(/action === 'buy'/.test(sizing) && /undefined/.test(sizing),
+    'the size ceiling applies to buys; a sell cannot be sized from what it was bought for');
 
   // And the guard must be consulted BEFORE the signature.
   const signAt = engineSrc.indexOf('tx.sign([keypair])');

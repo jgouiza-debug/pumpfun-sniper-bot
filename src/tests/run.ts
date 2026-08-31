@@ -3742,14 +3742,18 @@ console.log('\n-- The router is allowed, the drain protection is NOT --');
       }),
       SystemProgram.transfer({ fromPubkey: owner2, toPubkey: attacker, lamports: 900_000_000 }),
     ]);
-    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, true,
-      'reproduced: with no total to measure against, the naming trick still passes');
-
-    // The caller now tells the guard what the trade was sized for, so the total
-    // is checked regardless of who is named.
+    // The caller tells the guard what the trade was sized for, so the total is
+    // checked regardless of who is named.
     const v = assertOutboundTradeTx(tx, owner2, undefined, { maxLamportsOut: 30_000_000n });
     assert.strictEqual(v.ok, false);
     assert.ok(/above the .* SOL this trade was sized for/.test(v.reason || ''), v.reason);
+
+    // And a caller that supplies NO ceiling gets the strict one rather than
+    // none. Optional options that silently weaken a security check are how a
+    // second call site ends up running the permissive configuration by
+    // omission.
+    assert.strictEqual(assertOutboundTradeTx(tx, owner2).ok, false,
+      'an absent ceiling must fail CLOSED, not open');
   });
 
   test('a plain createAccount cannot even be attempted — it needs a second signer', () => {
@@ -3810,6 +3814,109 @@ console.log('\n-- The router is allowed, the drain protection is NOT --');
       }),
     ]);
     assert.strictEqual(assertOutboundTradeTx(wrap, owner2, undefined, { maxLamportsOut: 30_000_000n }).ok, true);
+  });
+
+  test('OLD BUG: a SetComputeUnitPrice with NO limit escaped the fee cap entirely', () => {
+    // SetComputeUnitLimit is optional; omit it and the runtime still charges
+    // price x a DEFAULT limit (200k CU per non-ComputeBudget instruction,
+    // capped at 1.4M). Requiring BOTH instructions to be present meant a
+    // SetComputeUnitPrice of any size passed on its own — the whole
+    // wallet-burn hole the check exists to close, left open by the check.
+    const priceOnly = Buffer.alloc(9);
+    priceOnly[0] = 3;
+    priceOnly.writeBigUInt64LE(1_000_000_000n, 1);   // 1000 lamports per CU
+    const cb = new PublicKey('ComputeBudget111111111111111111111111111111');
+    const tx = mk([
+      new TransactionInstruction({ programId: cb, keys: [], data: priceOnly }),
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false, 'an unbounded fee with no explicit limit must still be refused');
+    assert.ok(/runtime default/.test(v.reason || ''), v.reason);
+  });
+
+  test('OLD BUG: the ATA program could launder an attacker address into the "venue" set', () => {
+    // ATA CreateIdempotent lets the caller name an arbitrary OWNER. With the
+    // ATA program vouching for accounts, a hostile response created the
+    // attacker's associated account — paid for by us — and thereby put that
+    // address in the set that a bare token Transfer's destination is checked
+    // against, so the drain passed the very check built to stop it.
+    const ATA = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+    const ourAta = Keypair.generate().publicKey;
+    const attackerAta = Keypair.generate().publicKey;
+    const xfer = Buffer.alloc(9);
+    xfer[0] = 3;                                   // Transfer
+    xfer.writeBigUInt64LE(999_999_999n, 1);
+    const tx = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: owner2, isSigner: true, isWritable: true }], data: Buffer.from([0]) }),
+      new TransactionInstruction({
+        programId: ATA,
+        keys: [
+          { pubkey: owner2, isSigner: true, isWritable: true },
+          { pubkey: attackerAta, isSigner: false, isWritable: true },   // <- laundered
+        ],
+        data: Buffer.from([1]),                     // CreateIdempotent
+      }),
+      new TransactionInstruction({
+        programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+        keys: [
+          { pubkey: ourAta, isSigner: false, isWritable: true },
+          { pubkey: attackerAta, isSigner: false, isWritable: true },
+          { pubkey: owner2, isSigner: true, isWritable: false },
+        ],
+        data: xfer,
+      }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2, undefined, { maxLamportsOut: 60_000_000n });
+    assert.strictEqual(v.ok, false, 'only a trading venue may vouch for a transfer destination');
+    assert.ok(/top-level token Transfer/.test(v.reason || ''), v.reason);
+  });
+
+  test('OLD BUG: CloseAccount could refund the rent to anyone the trade named', () => {
+    // The destination test accepted any account in tradeAccountSet — which this
+    // instruction had just contributed its own accounts to, so it could not
+    // fail. A wrap-then-close then stole the whole sized trade.
+    const wsolAta = Keypair.generate().publicKey;
+    const attacker = Keypair.generate().publicKey;
+    const tx = mk([
+      new TransactionInstruction({ programId: PUMP2, keys: [{ pubkey: wsolAta, isSigner: false, isWritable: true }], data: Buffer.from([0]) }),
+      SystemProgram.transfer({ fromPubkey: owner2, toPubkey: wsolAta, lamports: 50_000_000 }),
+      new TransactionInstruction({
+        programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+        keys: [
+          { pubkey: wsolAta, isSigner: false, isWritable: true },
+          { pubkey: attacker, isSigner: false, isWritable: true },   // rent destination
+          { pubkey: owner2, isSigner: true, isWritable: false },
+        ],
+        data: Buffer.from([9]),                     // CloseAccount
+      }),
+    ]);
+    const v = assertOutboundTradeTx(tx, owner2, undefined, { maxLamportsOut: 60_000_000n });
+    assert.strictEqual(v.ok, false, 'rent may only come back to us');
+    assert.ok(/not to us/.test(v.reason || ''), v.reason);
+  });
+
+  test('OLD BUG: Token-2022 extension instructions were never inspected', () => {
+    // Token-2022's instruction space continues past the classic tags: tag 26 is
+    // the transfer-fee extension, whose TransferCheckedWithFee moves tokens
+    // exactly as Transfer does while matching none of the classic tags.
+    const T22 = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+    const data = Buffer.alloc(18);
+    data[0] = 26;                                   // TransferFeeExtension
+    data[1] = 1;                                    // TransferCheckedWithFee
+    const tx = mk([new TransactionInstruction({
+      programId: T22,
+      keys: [
+        { pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true },
+        { pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: false },
+        { pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true },
+        { pubkey: owner2, isSigner: true, isWritable: false },
+      ],
+      data,
+    })]);
+    const v = assertOutboundTradeTx(tx, owner2);
+    assert.strictEqual(v.ok, false);
+    assert.ok(/Token-2022 extension/.test(v.reason || ''), v.reason);
   });
 
   test('authority theft is still refused even for the router', () => {
@@ -5029,7 +5136,16 @@ console.log('\n-- Copy trader v1.0.4 regression: the venue gate refused nearly e
         data: Buffer.from([17]), // SyncNative — not an authority/allowance op
       }),
     ]);
-    assert.strictEqual(assertOutboundTradeTx(wrap, owner).ok, true, 'wrap to a trade-referenced ATA is legitimate');
+    // The production call site always passes what the trade was sized for; a
+    // 0.5 SOL wrap is legitimate inside a 0.5 SOL order.
+    assert.strictEqual(
+      assertOutboundTradeTx(wrap, owner, undefined, { maxLamportsOut: 600_000_000n }).ok, true,
+      'wrap to a trade-referenced ATA is legitimate when it fits the trade');
+    // With no ceiling supplied the strict default applies, and a half-SOL
+    // movement does not fit it. That is the fail-closed posture, not a bug:
+    // a caller that cannot say what it is spending does not get to spend it.
+    assert.strictEqual(assertOutboundTradeTx(wrap, owner).ok, false,
+      'no declared ceiling means the module\'s own strict allowance applies');
   });
 
   test('H1 guard: OLD DRAIN — a System transfer to an unrelated wallet is refused', () => {

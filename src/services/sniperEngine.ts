@@ -2175,12 +2175,39 @@ export class SniperEngine {
         //
         // A SELL moves no SOL out of the wallet beyond fees, so its allowance is
         // just the fee headroom.
-        const maxLamportsOut = BigInt(Math.ceil(
-          ((action === 'buy' ? solAmount * (1 + effectiveSlippage / 100 + 0.015) : 0)
-            + priorityFeeSol + ATA_RENT_SOL + 0.01) * 1e9
-        ));
+        // BUYS get a ceiling derived from what was ordered. SELLS do not, and
+        // that asymmetry is deliberate.
+        //
+        // A sell's vendor fee is a slice of the PROCEEDS, which are unknown
+        // before signing: a position bought for 0.05 SOL that runs to 3 pays a
+        // ~0.015 SOL routing fee, and a ceiling computed from the entry size
+        // would refuse the exit — pre-sign, so the sniper counts it a failure,
+        // backs off, and eventually hits the attempt cap. Refusing an EXIT is
+        // the worst outcome this guard can produce; a bag that cannot be sold
+        // has no upper bound on cost, and the operator sees the bot holding
+        // through a dump.
+        //
+        // A sell is protected structurally instead, which does not depend on
+        // knowing the size: our wallet is the sole signer and fee payer, no
+        // Assign, no bare token Transfer to a stranger, no Burn, no
+        // SetAuthority/Approve, CloseAccount only back to us, no Token-2022
+        // extension instruction, and the ComputeBudget fee capped. What a
+        // hostile response can extract from a sell is the vendor-fee line, and
+        // the unrelated-lamports allowance still bounds that.
+        const maxLamportsOut = action === 'buy'
+          ? BigInt(Math.ceil(
+              (solAmount * (1 + effectiveSlippage / 100 + 0.015)
+                + priorityFeeSol + ATA_RENT_SOL + 0.01) * 1e9
+            ))
+          : undefined;
         const intent = assertOutboundTradeTx(tx, keypair.publicKey, lookupAccounts, {
-          maxLamportsOut,
+          ...(maxLamportsOut === undefined ? {} : { maxLamportsOut }),
+          // Sells get a larger allowance for the same reason they get no size
+          // ceiling: their vendor fee scales with proceeds we cannot see yet.
+          // 0.05 SOL is a bounded, deliberate number — a hostile response can
+          // take that much from an exit and no more, which is a far better
+          // trade than an exit that cannot be signed.
+          ...(action === 'sell' ? { unrelatedLamportsAllowance: 50_000_000n } : {}),
           maxPriorityFeeLamports: BigInt(Math.ceil(
             Math.max(priorityFeeSol, this.config.maxPriorityFeeSol ?? 0.005) * 1e9
           )),

@@ -79,6 +79,18 @@ const ALLOWED_PROGRAMS = new Set<string>([
 
 const TOKEN_PROGRAMS = new Set<string>([TOKEN_PROGRAM, TOKEN_2022_PROGRAM]);
 
+/**
+ * Programs whose account lists may vouch for a token-transfer destination.
+ *
+ * The trading venues only. The ATA program is deliberately absent — see the
+ * loop that builds venueAccountSet.
+ */
+const VENUE_VOUCHING_PROGRAMS = new Set<string>([
+  PUMP_PROGRAM,
+  PUMP_AMM_PROGRAM,
+  PUMPPORTAL_ROUTER,
+]);
+
 // SPL Token instruction tags (data[0]) that hand our funds or authority to
 // someone else. None of these appears in a normal pump/PumpSwap buy or sell,
 // where token movement happens inside the program's own CPI.
@@ -87,6 +99,13 @@ const TOKEN_REVOKE = 5;
 const TOKEN_SET_AUTHORITY = 6;
 const TOKEN_CLOSE_ACCOUNT = 9;
 const TOKEN_APPROVE_CHECKED = 13;
+/**
+ * Highest classic SPL Token instruction tag (SyncNative is 17, InitializeMint2
+ * 20, GetAccountDataSize 21, AmountToUiAmount 23, InitializeImmutableOwner 22).
+ * Token-2022's EXTENSION instructions start above this, and they include
+ * token-moving ones — see the check that uses it.
+ */
+const TOKEN_MAX_CLASSIC_TAG = 24;
 
 // SPL Token instructions that MOVE tokens at the top level. A pump/PumpSwap
 // trade moves tokens inside the program's own CPI, never as a bare top-level
@@ -177,6 +196,19 @@ export function assertOutboundTradeTx(
     maxLamportsOut?: bigint;
     /** Ceiling on the priority fee the ComputeBudget instructions may set, in lamports. */
     maxPriorityFeeLamports?: bigint;
+    /**
+     * Lamports allowed to reach addresses OUTSIDE the trade, and the fallback
+     * total ceiling when `maxLamportsOut` is not supplied.
+     *
+     * Exists for SELLS. A sell's vendor fee is a slice of the PROCEEDS, which
+     * are unknown before signing — a position bought for 0.05 SOL that runs to
+     * 3 pays a routing fee several times the module's default allowance, and
+     * refusing it would block the EXIT. A blocked exit is the worst outcome
+     * this guard can produce: a bag that cannot be sold has no upper bound on
+     * cost. Raising it deliberately, with a number, is better than the
+     * alternative of turning the ceiling off.
+     */
+    unrelatedLamportsAllowance?: bigint;
   } = {},
 ): TxIntentVerdict {
   try {
@@ -240,6 +272,7 @@ export function assertOutboundTradeTx(
     }
 
     const ownerB58 = owner.toBase58();
+    const unrelatedAllowance = opts.unrelatedLamportsAllowance ?? BigInt(MAX_UNRELATED_LAMPORTS);
 
     // Accounts touched by the actual trade instructions (pump / pump-amm / token /
     // ATA). A legitimate SOL wrap or rent payment goes to one of these; a siphon
@@ -272,7 +305,13 @@ export function assertOutboundTradeTx(
         // and then passed the "is this destination part of the trade?" test it
         // had just satisfied. An instruction may not vouch for itself, so a
         // token transfer's destination must be named by the VENUE.
-        if (!TOKEN_PROGRAMS.has(program)) {
+        // ONLY the trading venues. Not the token programs (an instruction must
+        // not vouch for itself) and NOT the ATA program: `CreateIdempotent` lets
+        // anyone name an arbitrary owner, so a hostile response could create the
+        // ATTACKER's associated account — paid for by us — and thereby launder
+        // that address into the "venue" set, after which a bare token Transfer
+        // to it passed the very check that set was built for.
+        if (VENUE_VOUCHING_PROGRAMS.has(program)) {
           for (const idx of ix.accountKeyIndexes) {
             const k = keys[idx];
             if (k) venueAccountSet.add(k.toBase58());
@@ -358,10 +397,10 @@ export function assertOutboundTradeTx(
             // instead: a fee is a slice, a drain is the balance. Amounts are
             // SUMMED so many small transfers cannot add up to a drain.
             unrelatedLamports += lamportsOut;
-            if (unrelatedLamports > BigInt(MAX_UNRELATED_LAMPORTS)) {
+            if (unrelatedLamports > unrelatedAllowance) {
               return {
                 ok: false,
-                reason: `SystemProgram transfer(s) of ${Number(unrelatedLamports) / 1e9} SOL from our wallet to account(s) outside the trade (${to}) — above the ${MAX_UNRELATED_LAMPORTS / 1e9} SOL fee allowance`,
+                reason: `SystemProgram transfer(s) of ${Number(unrelatedLamports) / 1e9} SOL from our wallet to account(s) outside the trade (${to}) — above the ${Number(unrelatedAllowance) / 1e9} SOL fee allowance`,
               };
             }
           }
@@ -393,12 +432,30 @@ export function assertOutboundTradeTx(
         if (tag === TOKEN_BURN || tag === TOKEN_BURN_CHECKED) {
           return { ok: false, reason: 'token Burn instruction present — a trade never burns our tokens' };
         }
+        // TOKEN-2022 EXTENSIONS. Its instruction space continues past the
+        // classic tags: tag 26 is the transfer-fee extension, whose
+        // TransferCheckedWithFee moves tokens exactly as Transfer does while
+        // matching none of the tags checked above. Allow-listing the program
+        // and then inspecting only the classic set left that wide open. Any tag
+        // outside the classic range is refused — a trade does not need one, and
+        // failing closed here costs nothing but a clear error message.
+        if (program === TOKEN_2022_PROGRAM && tag > TOKEN_MAX_CLASSIC_TAG) {
+          return { ok: false, reason: `Token-2022 extension instruction (tag ${tag}) present — not part of a trade` };
+        }
         if (tag === TOKEN_CLOSE_ACCOUNT) {
           // CloseAccount accounts: [account, destination, owner, ...]. The rent
-          // refund destination must be us.
+          // refund destination must be US, full stop.
+          //
+          // It used to also accept any destination in tradeAccountSet — which
+          // this very instruction had just contributed its own accounts to, so
+          // the test could not fail. That made a wrap-then-close steal the
+          // whole sized trade: transfer SOL into our own WSOL ATA (permitted,
+          // the destination is part of the trade and the amount is inside the
+          // ceiling), then close that ATA to the attacker and the lamports go
+          // with it. Nothing but our own address is a legitimate refund target.
           const dest = keys[ix.accountKeyIndexes[1]]?.toBase58();
-          if (dest && dest !== ownerB58 && !tradeAccountSet.has(dest)) {
-            return { ok: false, reason: `token CloseAccount refunds to unrelated account ${dest}` };
+          if (dest !== ownerB58) {
+            return { ok: false, reason: `token CloseAccount refunds to ${dest ?? 'an unreadable account'}, not to us` };
           }
         }
       }
@@ -407,23 +464,42 @@ export function assertOutboundTradeTx(
     // ---- WHOLE-TRANSACTION CEILINGS -------------------------------------
     // Checked after every instruction, because both are about the TOTAL a
     // transaction can cost, and any single instruction can look reasonable.
-    if (opts.maxLamportsOut !== undefined && totalLamportsOut > opts.maxLamportsOut) {
+    // A CALLER THAT SUPPLIES NO CEILING GETS THE STRICT ONE. Optional options
+    // that silently weaken a security check are how a second call site — a new
+    // sell path, a rescue helper, a harness copied into production — ends up
+    // running the permissive configuration by omission. With no figure from the
+    // caller, the module's own unrelated-lamports allowance applies to the
+    // TOTAL, which refuses a venue-named full-balance transfer instead of
+    // waving it through.
+    const outflowCeiling = opts.maxLamportsOut ?? unrelatedAllowance;
+    if (totalLamportsOut > outflowCeiling) {
       return {
         ok: false,
         reason: `transaction moves ${Number(totalLamportsOut) / 1e9} SOL out of our wallet, above the `
-          + `${Number(opts.maxLamportsOut) / 1e9} SOL this trade was sized for`,
+          + `${Number(outflowCeiling) / 1e9} SOL this trade was sized for`,
       };
     }
 
-    if (cbUnitPrice > 0n && cbUnitLimit > 0n) {
+    if (cbUnitPrice > 0n) {
+      // SetComputeUnitLimit is OPTIONAL. Omit it and the runtime still charges
+      // price x a DEFAULT limit — 200k CU per non-ComputeBudget instruction,
+      // capped at 1.4M — so requiring both instructions to be present meant a
+      // SetComputeUnitPrice of any size passed on its own. That is the entire
+      // wallet-burn hole this check exists to close, left open by the check.
+      const nonBudgetIxs = BigInt(instructions.filter(
+        ix => keys[ix.programIdIndex]?.toBase58() !== COMPUTE_BUDGET).length);
+      const assumedLimit = cbUnitLimit > 0n
+        ? cbUnitLimit
+        : (nonBudgetIxs * 200_000n > 1_400_000n ? 1_400_000n : nonBudgetIxs * 200_000n);
       // microLamports/CU x CU / 1e6 = lamports.
-      const feeLamports = (cbUnitPrice * cbUnitLimit) / 1_000_000n;
+      const feeLamports = (cbUnitPrice * assumedLimit) / 1_000_000n;
       const cap = opts.maxPriorityFeeLamports ?? BigInt(MAX_PRIORITY_FEE_LAMPORTS);
       if (feeLamports > cap) {
         return {
           ok: false,
           reason: `ComputeBudget sets a priority fee of ${Number(feeLamports) / 1e9} SOL `
-            + `(${cbUnitPrice} microLamports/CU x ${cbUnitLimit} CU), above the ${Number(cap) / 1e9} SOL ceiling`,
+            + `(${cbUnitPrice} microLamports/CU x ${assumedLimit} CU${cbUnitLimit > 0n ? '' : ', the runtime default'}), `
+            + `above the ${Number(cap) / 1e9} SOL ceiling`,
         };
       }
     }
