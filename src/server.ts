@@ -301,6 +301,25 @@ app.post('/api/governor/reset', (req, res) => {
   res.json({ success: true, governor: sniperEngine.getGovernorSnapshot() });
 });
 
+// POST adjust the ceilings.
+//
+// A limit the operator cannot raise is not a safety feature, it is an outage
+// waiting to happen: the shipped defaults are chosen for a small wallet, and
+// someone trading a larger one would otherwise watch the bot stop for no reason
+// they can act on — which is the same "it broke again" experience this whole
+// change exists to end. Every refusal names the ceiling that bound and its
+// value, and this is where they change it.
+//
+// Non-finite and negative values are rejected inside setLimits, which keeps the
+// previous ceiling rather than letting a blank field mean "unlimited".
+app.post('/api/governor/limits', (req, res) => {
+  const before = sniperEngine.getGovernorSnapshot().limits;
+  sniperEngine.setGovernorLimits(req.body || {});
+  const after = sniperEngine.getGovernorSnapshot().limits;
+  const changed = Object.keys(after).filter(k => (after as any)[k] !== (before as any)[k]);
+  res.json({ success: true, changed, governor: sniperEngine.getGovernorSnapshot() });
+});
+
 // POST Update Bot Strategy Config
 app.post('/api/bot/config', (req, res) => {
   const before = sniperEngine.getConfig();

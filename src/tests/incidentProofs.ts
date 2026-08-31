@@ -520,6 +520,21 @@ test('a non-finite LIMIT is rejected and the previous ceiling kept', () => {
   assert.strictEqual(g.getLimits().maxBuysPerHour, 9, 'a real value still applies');
 });
 
+test('a ceiling the operator raises is kept, and a typo cannot invent one', () => {
+  // A limit nobody can raise is not a safety feature, it is an outage waiting to
+  // happen — the shipped defaults suit a small wallet, and someone trading a
+  // larger one would otherwise watch the bot stop for no reason they can act on.
+  const g = new TradeGovernor();
+  g.setLimits({ maxSolPerHour: 12 });
+  assert.strictEqual(g.getLimits().maxSolPerHour, 12);
+
+  // A key that does not exist must not be silently accepted: the operator would
+  // believe they had raised a ceiling that nothing reads.
+  g.setLimits({ maxSolPerHourr: 999 } as any);
+  assert.strictEqual((g.getLimits() as any).maxSolPerHourr, undefined);
+  assert.strictEqual(g.getLimits().maxSolPerHour, 12, 'the real ceiling is untouched by the typo');
+});
+
 test('rolling history survives a settings change — moving a slider must not reset the window', () => {
   const g = new TradeGovernor({ maxBuysPerHour: 2 });
   g.recordBuy(1_000_000, 'MintA', 0.01);

@@ -219,9 +219,17 @@ export class TradeGovernor {
    * posts "" must not silently become "unlimited".
    */
   public setLimits(partial: Partial<GovernorLimits>): void {
+    let changed = false;
     for (const [k, v] of Object.entries(partial)) {
-      if (usable(v) && v >= 0) (this.limits as any)[k] = v;
+      // Only keys that exist: a typo must not silently add a field nothing
+      // reads and leave the operator believing they raised a ceiling.
+      if (!(k in this.limits)) continue;
+      if (usable(v) && v >= 0 && (this.limits as any)[k] !== v) {
+        (this.limits as any)[k] = v;
+        changed = true;
+      }
     }
+    if (changed) this.notifyChanged();
   }
 
   public getLimits(): GovernorLimits {
@@ -579,6 +587,13 @@ interface PersistedGovernorState {
   sessionSol: number;
   sessionRealizedSol: number;
   consecutiveFailures: number;
+  /**
+   * The operator's ceilings. Persisted for the same reason the latch is: a
+   * ceiling someone deliberately raised, silently reverting to the shipped
+   * default on the next restart, hits them with the same refusal again and
+   * reads as the bot ignoring them.
+   */
+  limits?: Partial<GovernorLimits>;
   savedAt: number;
 }
 
@@ -602,6 +617,9 @@ export function loadGovernorState(): void {
       sessionRealizedSol: usable(raw.sessionRealizedSol) ? raw.sessionRealizedSol : 0,
       consecutiveFailures: usable(raw.consecutiveFailures) ? raw.consecutiveFailures : 0,
     });
+    // setLimits validates each value and keeps the shipped default for anything
+    // unusable, so a corrupt or hand-edited file cannot widen a ceiling.
+    if (raw.limits && typeof raw.limits === 'object') tradeGovernor.setLimits(raw.limits);
     if (tradeGovernor.isHalted()) {
       console.error(`[Governor] 🛑 TRADING IS STILL HALTED from a previous session: ${tradeGovernor.haltReason()}`);
       console.error('[Governor]    A restart does not clear this. Clear it in the UI once you know what happened.');
@@ -619,6 +637,7 @@ export function saveGovernorState(): void {
       sessionSol: tradeGovernor.snapshot(Date.now()).solThisSession,
       sessionRealizedSol: tradeGovernor.sessionRealizedPnlSol(),
       consecutiveFailures: tradeGovernor.consecutiveFailureCount(),
+      limits: tradeGovernor.getLimits(),
       savedAt: Date.now(),
     };
     const tmp = `${GOVERNOR_STATE_FILE}.${process.pid}.tmp`;

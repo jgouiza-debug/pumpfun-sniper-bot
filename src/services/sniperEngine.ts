@@ -903,6 +903,22 @@ export class SniperEngine {
     return tradeGovernor.snapshot(Date.now());
   }
 
+  /**
+   * Operator action: move the ceilings.
+   *
+   * Held as state rather than rebuilt per call so the rolling history survives a
+   * settings change — otherwise moving a slider resets the very window that was
+   * about to trip. Rejection of non-finite or negative values happens inside
+   * setLimits: a blank field must never become "unlimited".
+   */
+  public setGovernorLimits(partial: Record<string, unknown>): void {
+    tradeGovernor.setLimits(partial as any);
+    const l = tradeGovernor.getLimits();
+    this.log('info', `🎛️ Spend ceilings updated — ${l.maxSolPerHour} SOL/h, ${l.maxSolPerSession} SOL/session, `
+      + `${l.maxSolPerMint} SOL/mint, ${l.maxBuysPerHour} buys/h, reserve ${l.minWalletReserveSol} SOL, `
+      + `halt after ${l.maxConsecutiveFailures} failed buys or ${l.maxSessionLossSol} SOL of realized loss.`);
+  }
+
   /** Operator action: clear a latched halt and resume trading. */
   public clearGovernorHalt(): void {
     tradeGovernor.clearHalt();
@@ -1955,7 +1971,8 @@ export class SniperEngine {
         engine: opts.external ? 'copy' : 'sniper',
       });
       if (!gov.allowed) {
-        this.log('error', `🛑 BUY REFUSED by the spend governor — ${gov.reason}`, mint);
+        this.log('error', `🛑 BUY REFUSED by the spend governor — ${gov.reason}. `
+          + `These ceilings are adjustable (POST /api/governor/limits) — raise the one that bound if it is too tight for your wallet.`, mint);
         if (gov.halted) {
           // A latched halt is not a per-trade refusal; it means the operator
           // has to look. Say it once per trip rather than on every signal.
