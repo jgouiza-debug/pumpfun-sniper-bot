@@ -1228,6 +1228,25 @@ export class SniperEngine {
       ['maxConsecutiveTxFailures', 1, 100],
       ['maxEntriesPerHour', 1, 1000],
       ['maxFeedStaleSlots', 10, 1500],
+      // RUG-SCREENING THRESHOLDS. The docstring above claims to clamp the
+      // risk-bearing fields; these were simply absent from the table, so a POST
+      // setting maxRugcheckScore to a huge value with minLpBurnedOrLockedPct
+      // and minTotalHolders at zero passed through untouched, syncDerivedConfig
+      // pushed it into the RiskFilter, and every concentration and LP check
+      // became a formality. The settings modal posts a WHOLE-CONFIG snapshot, so this is
+      // reachable from a stale client build, not only from a hand-rolled call.
+      ['maxRugcheckScore', 0, 10_000],
+      ['minLpBurnedOrLockedPct', 0, 100],
+      ['minTotalHolders', 0, 1_000_000],
+      // (maxTop10Pct / maxSingleHolderPct / minLiquidityUsd live on FilterConfig,
+      // not BotConfig, and reach the filter through applyRiskTier rather than
+      // through this endpoint.)
+      // SOL/USD is the scalar under EVERY usd-denominated guard — the liquidity
+      // floor, the kill switch's hourly and daily limits, breakeven economics.
+      // It was unvalidated, and a NaN makes every one of those comparisons
+      // silently FALSE (NaN > x and NaN < x are both false), i.e. it does not
+      // loosen the guards, it removes them. A zero divides P&L into Infinity.
+      ['solPriceUsd', 1, 100_000],
     ];
     for (const [key, lo, hi] of bands) {
       const raw = out[key];
@@ -2456,8 +2475,21 @@ export class SniperEngine {
           }
 
           await this.processIncomingToken(payload, arrivalMs);
-        } catch (e) {
-          // ignore
+        } catch (e: any) {
+          // THE FEED HANDLER MUST NOT SWALLOW AN EXIT.
+          //
+          // This was `catch (e) { // ignore }` around the whole websocket
+          // message handler — which is not only the screening path. It is also
+          // where devSellMonitor's alerts are raised and where
+          // handleStructuralAlert awaits executeSell for an OPEN position. So a
+          // throw anywhere in here silently cancelled a creator-dump exit on a
+          // live bag, and did it again on every subsequent message, with
+          // nothing in the log to say the stop had not run.
+          //
+          // Still caught — one malformed payload from a third-party socket must
+          // not kill the feed — but never silent.
+          this.log('error', `❌ Feed handler error: ${e?.message ?? e}. If an exit was being evaluated it did NOT complete.`);
+          if (e?.stack) console.error(e.stack);
         }
       });
 

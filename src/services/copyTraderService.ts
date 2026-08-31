@@ -1134,7 +1134,21 @@ export class CopyTraderService {
             'Leader tx matches a trade already copied from the PumpPortal lane — not copied twice.');
           continue;
         }
-        await this.handleLeaderSignal(wallet, sig);
+        // PER-LEG, because this whole block used to be one uncaught async IIFE.
+        // A leader transaction can carry several legs (a token→token rotation
+        // decodes to two), and markSigProcessed has ALREADY claimed the
+        // signature — so a throw on leg 1 silently dropped every remaining leg
+        // and the slow lane could never re-read it. On a rotation that means
+        // the SELL is mirrored and the BUY is lost, or worse the reverse: we
+        // buy and never learn they were leaving.
+        try {
+          await this.handleLeaderSignal(wallet, sig);
+        } catch (err: any) {
+          this.pushFeed(wallet, sig, 'failed',
+            `Error handling the leader's ${sig.side} of $${this.symbolFor(sig)}: ${err?.message ?? err}. `
+            + 'The other legs of this transaction were still processed.');
+          console.error(`[CopyTrader] handleLeaderSignal threw for ${sig.mint}:`, err);
+        }
       }
     })();
     return true;
