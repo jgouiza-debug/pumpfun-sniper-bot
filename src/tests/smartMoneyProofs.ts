@@ -873,6 +873,50 @@ test('the pin endpoint is token-gated — it decides whose trades we follow', ()
     'nor to lower the promotion bar');
 });
 
+console.log('\n-- The panel says what the lane is actually doing --');
+
+test('the panel is HIDDEN when the lane is off, not shown empty', () => {
+  // An empty table on a feature nobody turned on reads as a broken feature.
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  const idx = app.indexOf('function SmartMoneyPanel()');
+  assert.ok(idx > 0, 'the roster panel must exist');
+  const body = app.slice(idx, app.indexOf('function DiagnosticsPanel()', idx));
+  assert.ok(/if \(!sm \|\| !sm\.enabled\) return null;/.test(body),
+    'the panel must render nothing at all when the lane is disabled');
+});
+
+test('AN EMPTY ROSTER IS EXPLAINED, not left looking broken', () => {
+  // A fresh install has no promoted wallets by construction. Without a
+  // sentence saying so, the operator concludes the feature does not work — and
+  // the natural next step is to go looking for a list to paste in, which is
+  // the exact thing this design exists to avoid.
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  const idx = app.indexOf('function SmartMoneyPanel()');
+  const body = app.slice(idx, app.indexOf('function DiagnosticsPanel()', idx));
+  assert.ok(/sm\.roster\.length === 0/.test(body), 'the empty case must be handled');
+  assert.ok(/is not a fault/.test(body) || /expected on a new install/.test(body),
+    'and it must say plainly that an empty roster is expected, not broken');
+});
+
+test('the panel shows the EVIDENCE behind a promotion, not just the address', () => {
+  // "Trust me, this wallet is good" is what a pasted list says. The point of
+  // earning the roster is that the reasoning can be audited.
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  const idx = app.indexOf('function SmartMoneyPanel()');
+  const body = app.slice(idx, app.indexOf('function DiagnosticsPanel()', idx));
+  for (const field of ['winRate', 'realizedPnlSol', 'closedTrades', 'stateReason', 'conviction']) {
+    assert.ok(body.includes(field), `the panel must surface ${field} so a promotion can be audited`);
+  }
+});
+
+test('the operator can drop a wallet from the panel', () => {
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  const idx = app.indexOf('function SmartMoneyPanel()');
+  const body = app.slice(idx, app.indexOf('function DiagnosticsPanel()', idx));
+  assert.ok(/api\/smart-money\/pin/.test(body), 'the panel must be able to overrule the ladder');
+  assert.ok(/'never'/.test(body), 'specifically to stop following a wallet');
+});
+
 console.log('\n-- The design promise: no addresses are shipped --');
 
 test('NO WALLET ADDRESS IS HARDCODED ANYWHERE IN THE SMART-MONEY PATH', () => {

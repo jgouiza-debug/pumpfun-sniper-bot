@@ -90,6 +90,150 @@ function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean })
  * a healthy-looking screen and a bot that did nothing. This polls
  * /api/diagnostics and puts the reason where they are already looking.
  */
+/**
+ * THE ROSTER THE BOT CHOSE FOR ITSELF.
+ *
+ * Every other setting in this app is something the operator typed. This one is
+ * not: the smart-money lane earns its wallet list from chain evidence, which
+ * makes it the only part of the bot whose behaviour cannot be understood by
+ * reading your own configuration. So it gets a panel — who is promoted, on what
+ * record, and what the research is doing — and a way to overrule it.
+ *
+ * Hidden entirely when the lane is off, rather than showing an empty table that
+ * reads like a broken feature.
+ */
+interface SmartMoneyWallet {
+  address: string;
+  winRate: number | null;
+  realizedPnlSol: number;
+  closedTrades: number;
+  earlyHitRate: number | null;
+  earlyOnWinners: number;
+  conviction: number | null;
+  state: string;
+  stateReason: string;
+  pinned: 'always' | 'never' | null;
+}
+interface SmartMoneyStatus {
+  enabled: boolean;
+  roster: SmartMoneyWallet[];
+  walletsSeen: number;
+  confluence: { minWallets: number; windowMs: number; minBuySol: number };
+  pendingSignals: Array<{ mint: string; wallets: number; needed: number }>;
+  research: { queued: number; dudCandidates: number; readBudgetRemaining: number };
+}
+
+function SmartMoneyPanel() {
+  const [sm, setSm] = useState<SmartMoneyStatus | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await apiFetch('/api/smart-money');
+        if (r.ok && alive) setSm(await r.json());
+      } catch { /* backend unreachable — the RPC pill already says so */ }
+    };
+    pull();
+    const iv = setInterval(pull, 15_000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  const pin = async (address: string, mode: 'always' | 'never' | null) => {
+    try {
+      const r = await apiFetch('/api/smart-money/pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address, mode }),
+      });
+      if (r.ok) setSm((await r.json()).smartMoney);
+    } catch { /* the next poll will show whether it took */ }
+  };
+
+  if (!sm || !sm.enabled) return null;
+
+  const pct = (v: number | null) => (v === null ? '—' : `${Math.round(v * 100)}%`);
+
+  return (
+    <div style={{ marginTop: '12px', padding: '10px', background: 'rgba(124,77,255,0.05)', border: '1px solid rgba(124,77,255,0.25)', borderRadius: '4px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+        <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#b388ff' }}>
+          🧠 Smart Money — wallets the bot proved, not a pasted list
+        </div>
+        <div style={{ fontSize: '9px', color: '#8a8a8a' }}>
+          {sm.roster.length} promoted / {sm.walletsSeen} seen · research queue {sm.research.queued} · reads left {sm.research.readBudgetRemaining}
+        </div>
+      </div>
+
+      {sm.roster.length === 0 ? (
+        <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6 }}>
+          No wallet has earned promotion yet. This is expected on a new install and is not a fault:
+          the roster is built from chain history the bot gathers itself, so it needs days of
+          graduations and duds before anyone clears the bar. Until then this lane produces nothing.
+          {sm.research.dudCandidates > 0 && <> Currently tracking {sm.research.dudCandidates} token(s) to see how they turn out.</>}
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', fontSize: '10px', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: '#8a8a8a', textAlign: 'left' }}>
+                <th style={{ padding: '3px 6px' }}>Wallet</th>
+                <th style={{ padding: '3px 6px' }}>Conviction</th>
+                <th style={{ padding: '3px 6px' }}>Win rate</th>
+                <th style={{ padding: '3px 6px' }}>Trades</th>
+                <th style={{ padding: '3px 6px' }}>Realized SOL</th>
+                <th style={{ padding: '3px 6px' }}>Early hits</th>
+                <th style={{ padding: '3px 6px' }}>Why</th>
+                <th style={{ padding: '3px 6px' }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {sm.roster.map(w => (
+                <tr key={w.address} style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                  <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>
+                    <a href={`https://solscan.io/account/${w.address}`} target="_blank" rel="noreferrer" style={{ color: '#b388ff' }}>
+                      {w.address.slice(0, 4)}…{w.address.slice(-4)}
+                    </a>
+                    {w.pinned === 'always' && <span title="pinned on by you" style={{ marginLeft: 4 }}>📌</span>}
+                  </td>
+                  <td style={{ padding: '3px 6px' }}>{pct(w.conviction)}</td>
+                  <td style={{ padding: '3px 6px' }}>{pct(w.winRate)}</td>
+                  <td style={{ padding: '3px 6px' }}>{w.closedTrades}</td>
+                  <td style={{ padding: '3px 6px', color: w.realizedPnlSol >= 0 ? '#00e676' : '#ff5252' }}>
+                    {w.realizedPnlSol >= 0 ? '+' : ''}{w.realizedPnlSol.toFixed(3)}
+                  </td>
+                  <td style={{ padding: '3px 6px' }}>{w.earlyOnWinners} ({pct(w.earlyHitRate)})</td>
+                  <td style={{ padding: '3px 6px', color: '#8a8a8a' }}>{w.stateReason}</td>
+                  <td style={{ padding: '3px 6px' }}>
+                    <button
+                      onClick={() => pin(w.address, w.pinned === 'never' ? null : 'never')}
+                      title="Stop following this wallet"
+                      style={{ fontSize: '9px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(255,82,82,0.4)', color: '#ff5252', borderRadius: 3 }}
+                    >
+                      {w.pinned === 'never' ? 'unblock' : 'drop'}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div style={{ fontSize: '9px', color: '#8a8a8a', marginTop: '8px', lineHeight: 1.5 }}>
+        An entry needs <strong>{sm.confluence.minWallets}</strong> of these wallets to buy the same token
+        within <strong>{sm.confluence.windowMs / 1000}s</strong>, each risking at least {sm.confluence.minBuySol} SOL.
+        {sm.pendingSignals.length > 0 && (
+          <> Currently watching {sm.pendingSignals.length} token(s) part-way to a quorum
+            (best: {sm.pendingSignals[0].wallets}/{sm.pendingSignals[0].needed}).</>
+        )}
+        <br />
+        Every entry from this lane still passes the same rug, honeypot and spend-governor checks as any other.
+      </div>
+    </div>
+  );
+}
+
 function DiagnosticsPanel() {
   const [diag, setDiag] = useState<{ level: string; findings: Array<{ level: string; title: string; detail: string; fix: string }> } | null>(null);
   const [open, setOpen] = useState(false);
@@ -1237,6 +1381,8 @@ export function App() {
               </tbody>
             </table>
           </div>
+
+          <SmartMoneyPanel />
 
           {/* Positions Matrix Table */}
           <div className="section-header">
