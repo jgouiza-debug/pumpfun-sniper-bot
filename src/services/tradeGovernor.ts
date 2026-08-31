@@ -75,11 +75,34 @@ const ALLOW: GovernorDecision = { allowed: true };
 export interface GovernorLimits {
   /** Buy ATTEMPTS per rolling hour, across both engines. */
   maxBuysPerHour: number;
-  /** SOL committed to buys per rolling hour, across both engines. */
+  /**
+   * FRACTION OF THE WALLET, per rolling hour / per session / per mint.
+   *
+   * Fractions rather than SOL amounts because a SOL amount cannot be right for
+   * both a 0.1 SOL wallet and a 10 SOL one, and getting it wrong in the TIGHT
+   * direction is the worst outcome available here: a bot that refuses every
+   * trade is indistinguishable, to its operator, from a bot that is broken —
+   * which is the trust problem this module exists to end.
+   *
+   * Measured against exactly that: an absolute 0.25 SOL per-mint ceiling sat
+   * BELOW this repo's own shipped stake for a 1.2 SOL wallet, so the very first
+   * sniper entry would have been refused.
+   *
+   * Taken against the session's HIGH-WATER wallet balance, so a ceiling does
+   * not tighten underneath the operator as the balance is spent.
+   */
+  maxWalletFractionPerHour: number;
+  maxWalletFractionPerSession: number;
+  maxWalletFractionPerMint: number;
+  /** Realized loss as a fraction of the session's high-water balance. */
+  maxWalletFractionSessionLoss: number;
+  /**
+   * ABSOLUTE SOL ceilings, applied ON TOP of the fractions (the tighter wins).
+   * 0 = off, which is the default: they exist for an operator who wants a hard
+   * number regardless of wallet size, not as the primary control.
+   */
   maxSolPerHour: number;
-  /** SOL committed to buys since the governor was last reset (the session). */
   maxSolPerSession: number;
-  /** Total SOL committed to any ONE mint. Bounds unlimited DCA into a loser. */
   maxSolPerMint: number;
   /** Buy attempts against any ONE mint. Bounds a repeat-buy loop. */
   maxBuysPerMint: number;
@@ -135,9 +158,17 @@ export interface GovernorLimits {
  */
 export const DEFAULT_GOVERNOR_LIMITS: GovernorLimits = {
   maxBuysPerHour: 60,
-  maxSolPerHour: 1.0,
-  maxSolPerSession: 2.0,
-  maxSolPerMint: 0.25,
+  // A third of the wallet into any one token; one full turnover an hour; two
+  // per session; halt after losing half. All generous next to ordinary use, all
+  // decisive against the mechanisms that actually emptied the wallet.
+  maxWalletFractionPerMint: 0.34,
+  maxWalletFractionPerHour: 1.0,
+  maxWalletFractionPerSession: 2.0,
+  maxWalletFractionSessionLoss: 0.5,
+  // Absolute overrides, off by default — see the interface.
+  maxSolPerHour: 0,
+  maxSolPerSession: 0,
+  maxSolPerMint: 0,
   maxBuysPerMint: 6,
   maxConsecutiveFailures: 5,
   minWalletReserveSol: 0.01,
@@ -146,9 +177,9 @@ export const DEFAULT_GOVERNOR_LIMITS: GovernorLimits = {
   // it never fires in healthy operation, and decisively shorter than the window
   // in which a frozen balance can fund several phantom-affordable orders.
   maxBalanceAgeMs: 30_000,
-  // Sits below maxSolPerSession: losing the whole session budget should stop
-  // trading well before the budget itself runs out.
-  maxSessionLossSol: 0.5,
+  // Absolute override, off by default — maxWalletFractionSessionLoss is the
+  // primary control, for the same reason the spend ceilings are fractions.
+  maxSessionLossSol: 0,
 };
 
 /** What the governor needs to know about a proposed buy. */
@@ -200,6 +231,15 @@ function usable(n: unknown): n is number {
 
 export class TradeGovernor {
   private buys: BuyRecord[] = [];
+  /**
+   * The largest wallet balance seen this session.
+   *
+   * The fraction-based ceilings are taken against THIS rather than the live
+   * balance, so a cap cannot tighten underneath the operator as the balance is
+   * spent: a 34%-per-mint ceiling computed off a balance that has already paid
+   * for two positions would be a third of a third.
+   */
+  private walletHighWaterSol = 0;
   private sessionSol = 0;
   private sessionRealizedSol = 0;
   private consecutiveFailures = 0;
@@ -272,6 +312,21 @@ export class TradeGovernor {
     const L = this.limits;
     this.prune(req.now);
 
+    // Fractions are taken against the session high-water balance. Seeded from
+    // the first reading, so a bot armed on a funded wallet gets ceilings that
+    // match it.
+    if (req.walletSol > this.walletHighWaterSol) this.walletHighWaterSol = req.walletSol;
+    const base = Math.max(this.walletHighWaterSol, req.walletSol);
+    /** The tighter of the fraction ceiling and the absolute one; 0 means "off". */
+    const ceiling = (fraction: number, absolute: number): number => {
+      const fromFraction = fraction > 0 ? fraction * base : 0;
+      if (fromFraction > 0 && absolute > 0) return Math.min(fromFraction, absolute);
+      return fromFraction > 0 ? fromFraction : absolute;
+    };
+    const solPerMint = ceiling(L.maxWalletFractionPerMint, L.maxSolPerMint);
+    const solPerHour = ceiling(L.maxWalletFractionPerHour, L.maxSolPerHour);
+    const solPerSession = ceiling(L.maxWalletFractionPerSession, L.maxSolPerSession);
+
     // 0. Is the number we are about to size against still true? Checked before
     //    every ceiling that consults it, because a stale balance makes all of
     //    them wrong in the same direction — permissive.
@@ -318,11 +373,11 @@ export class TradeGovernor {
       };
     }
     const mintSol = mintBuys.reduce((a, b) => a + b.sol, 0);
-    if (L.maxSolPerMint > 0 && mintSol + req.solAmount > L.maxSolPerMint) {
+    if (solPerMint > 0 && mintSol + req.solAmount > solPerMint) {
       return {
         allowed: false,
         reason: `${(mintSol + req.solAmount).toFixed(4)} SOL would be committed to ${req.mint.slice(0, 8)}… `
-          + `(max ${L.maxSolPerMint} SOL per mint)`,
+          + `(max ${solPerMint.toFixed(4)} SOL per mint — ${(L.maxWalletFractionPerMint * 100).toFixed(0)}% of a ${base.toFixed(3)} SOL wallet)`,
       };
     }
 
@@ -336,22 +391,30 @@ export class TradeGovernor {
       };
     }
     const hourSol = this.buys.reduce((a, b) => a + b.sol, 0);
-    if (L.maxSolPerHour > 0 && hourSol + req.solAmount > L.maxSolPerHour) {
+    if (solPerHour > 0 && hourSol + req.solAmount > solPerHour) {
       return {
         allowed: false,
         reason: `${(hourSol + req.solAmount).toFixed(4)} SOL would be committed this hour `
-          + `(max ${L.maxSolPerHour} SOL/h)`,
+          + `(max ${solPerHour.toFixed(4)} SOL/h — ${(L.maxWalletFractionPerHour * 100).toFixed(0)}% of a ${base.toFixed(3)} SOL wallet)`,
       };
     }
 
     // 5. Session ceiling. The backstop that does not roll off: a bot left
     //    running for a week cannot spend an hourly cap 168 times over.
-    if (L.maxSolPerSession > 0 && this.sessionSol + req.solAmount > L.maxSolPerSession) {
-      return {
-        allowed: false,
-        reason: `${(this.sessionSol + req.solAmount).toFixed(4)} SOL would be committed this session `
-          + `(max ${L.maxSolPerSession} SOL) — reset the governor to continue`,
-      };
+    //
+    //    It LATCHES rather than merely refusing, and that pairing is
+    //    deliberate. The session totals do NOT survive a restart (see
+    //    loadGovernorState) — persisting them made this a lifetime cap that
+    //    only ever grew, so an operator who traded normally for an hour found
+    //    the bot permanently refusing and a restart, the obvious remedy,
+    //    restored the same number from disk. But the LATCH does survive. So a
+    //    genuine runaway cannot be escaped by restarting, while an operator who
+    //    has simply traded their budget gets a clear, one-action reset.
+    if (solPerSession > 0 && this.sessionSol + req.solAmount > solPerSession) {
+      this.halt(`${(this.sessionSol + req.solAmount).toFixed(4)} SOL would be committed this session, `
+        + `above the ${solPerSession.toFixed(4)} SOL session budget. Nothing is wrong — this is the budget doing its job. `
+        + `Reset the governor to start a new session, or raise maxSolPerSession if it is too small for your wallet.`);
+      return { allowed: false, halted: true, reason: this.haltedReason ?? 'session budget reached' };
     }
 
     return ALLOW;
@@ -454,10 +517,15 @@ export class TradeGovernor {
     if (!usable(pnlSol)) return false;
     this.sessionRealizedSol += pnlSol;
     this.notifyChanged();
-    const limit = this.limits.maxSessionLossSol;
+    const fromFraction = this.limits.maxWalletFractionSessionLoss > 0 && this.walletHighWaterSol > 0
+      ? this.limits.maxWalletFractionSessionLoss * this.walletHighWaterSol
+      : 0;
+    const absolute = this.limits.maxSessionLossSol;
+    const limit = fromFraction > 0 && absolute > 0 ? Math.min(fromFraction, absolute)
+      : (fromFraction > 0 ? fromFraction : absolute);
     if (limit > 0 && this.sessionRealizedSol <= -limit) {
       this.halt(`realized losses this session are ${this.sessionRealizedSol.toFixed(4)} SOL `
-        + `(limit ${limit} SOL). New entries are stopped; exits still work. `
+        + `(limit ${limit.toFixed(4)} SOL). New entries are stopped; exits still work. `
         + `Review what the leaders are doing before resetting the governor.`);
       return true;
     }
@@ -474,8 +542,13 @@ export class TradeGovernor {
    * consequences.
    */
   public halt(reason: string): void {
+    // A halt with no reason is a halt nobody can act on, and worse: `isHalted()`
+    // tested `!== null` while the gate tested truthiness, so an empty string
+    // reported "halted" everywhere while gating nothing. One representation,
+    // and it is always non-empty.
+    const text = (reason || '').trim() || 'halted (no reason recorded)';
     if (!this.haltedReason) {
-      this.haltedReason = reason;
+      this.haltedReason = text;
       this.notifyChanged();
     }
   }
@@ -584,9 +657,9 @@ const GOVERNOR_STATE_FILE = installPath('.trade-governor.json');
 
 interface PersistedGovernorState {
   haltedReason: string | null;
-  sessionSol: number;
-  sessionRealizedSol: number;
   consecutiveFailures: number;
+  /** Which wallet this latch is about. A different one starts clean. */
+  walletAddress?: string | null;
   /**
    * The operator's ceilings. Persisted for the same reason the latch is: a
    * ceiling someone deliberately raised, silently reverting to the shipped
@@ -606,16 +679,56 @@ interface PersistedGovernorState {
  */
 export const tradeGovernor = new TradeGovernor();
 
+/**
+ * Which wallet the governor's state belongs to.
+ *
+ * A callback rather than an import: this module deliberately holds no engine
+ * reference (design rule 1 — pure, no I/O beyond the two functions below), and
+ * importing sniperEngine here would be a cycle.
+ */
+let walletAddressProvider: () => string | null = () => null;
+export function setGovernorWalletProvider(fn: () => string | null): void {
+  walletAddressProvider = fn;
+}
+function currentWalletAddress(): string | null {
+  try { return walletAddressProvider(); } catch { return null; }
+}
+
 /** Load a persisted latch at startup. Best-effort; a missing file is a clean session. */
 export function loadGovernorState(): void {
+  const currentWallet = currentWalletAddress();
   try {
     if (!fs.existsSync(GOVERNOR_STATE_FILE)) return;
     const raw = JSON.parse(fs.readFileSync(GOVERNOR_STATE_FILE, 'utf8')) as PersistedGovernorState;
+    // WHOSE WALLET IS THIS? A latch is about a specific wallet's behaviour. The
+    // operator whose wallet was emptied funds a NEW one and links it — carrying
+    // the old wallet's halt across would refuse every buy on a healthy wallet
+    // for reasons that no longer apply, and the reason text would name failures
+    // they cannot even look up any more.
+    const savedWallet = typeof raw.walletAddress === 'string' ? raw.walletAddress : null;
+    const sameWallet = !savedWallet || !currentWallet || savedWallet === currentWallet;
+    if (!sameWallet) {
+      console.warn(`[Governor] The saved state belongs to wallet ${savedWallet} but ${currentWallet} is linked now — `
+        + 'starting clean rather than applying the old wallet\'s halt to this one.');
+    }
+
     tradeGovernor.restore({
-      haltedReason: typeof raw.haltedReason === 'string' ? raw.haltedReason : null,
-      sessionSol: usable(raw.sessionSol) ? raw.sessionSol : 0,
-      sessionRealizedSol: usable(raw.sessionRealizedSol) ? raw.sessionRealizedSol : 0,
-      consecutiveFailures: usable(raw.consecutiveFailures) ? raw.consecutiveFailures : 0,
+      // The LATCH and the failure streak survive a restart: a restart is the
+      // natural reaction to a runaway and must not be the thing that clears the
+      // breaker that stopped it.
+      haltedReason: sameWallet && typeof raw.haltedReason === 'string' && raw.haltedReason.trim()
+        ? raw.haltedReason
+        : null,
+      consecutiveFailures: sameWallet && usable(raw.consecutiveFailures) ? raw.consecutiveFailures : 0,
+      // The rolling TOTALS do not. Persisting them turned the session budget
+      // into a lifetime cap that only ever grew: an operator who traded
+      // normally for an hour found every buy refused, and a restart — the
+      // obvious remedy — restored the same number from disk. The session
+      // ceiling latches instead (see checkBuy), which is what actually stops a
+      // runaway from being restarted around, and it does so with a reason the
+      // operator can read and one action to clear.
+      sessionSol: 0,
+      sessionRealizedSol: 0,
     });
     // setLimits validates each value and keeps the shipped default for anything
     // unusable, so a corrupt or hand-edited file cannot widen a ceiling.
@@ -634,10 +747,9 @@ export function saveGovernorState(): void {
   try {
     const state: PersistedGovernorState = {
       haltedReason: tradeGovernor.haltReason(),
-      sessionSol: tradeGovernor.snapshot(Date.now()).solThisSession,
-      sessionRealizedSol: tradeGovernor.sessionRealizedPnlSol(),
       consecutiveFailures: tradeGovernor.consecutiveFailureCount(),
       limits: tradeGovernor.getLimits(),
+      walletAddress: currentWalletAddress(),
       savedAt: Date.now(),
     };
     const tmp = `${GOVERNOR_STATE_FILE}.${process.pid}.tmp`;

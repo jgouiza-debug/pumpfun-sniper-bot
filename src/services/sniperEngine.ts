@@ -2175,6 +2175,23 @@ export class SniperEngine {
         signedTxid = bs58.encode(tx.signatures[0]);
         signedBlockhash = tx.message.recentBlockhash;
 
+        // THE CLAIM BECOMES PERMANENT HERE, at signing — not after
+        // sendRawTransaction returns.
+        //
+        // It used to be dropped on the line after the send, which looks
+        // equivalent and is not: sendRawTransaction can THROW after the node has
+        // already accepted and forwarded the transaction (a connection reset, a
+        // lost response, an exhausted 429 retry). On that path the release
+        // handle was still set, so the `finally` refunded the budget for a
+        // transaction that may be on chain right now — the very case
+        // resolveOrphanedSubmission exists to chase. Under a degraded endpoint
+        // that un-charges a whole run of real spends and the ceiling stops
+        // counting the money that is actually leaving.
+        //
+        // Once these bytes exist and are about to go on the wire, they are
+        // charged. A refund from here would be a ceiling that forgets.
+        if (action === 'buy') releaseReservation = null;
+
         // maxRetries is the RPC NODE's own rebroadcast count. Pinned at 3, the
         // node stopped resending within a second or two while the blockhash
         // stayed valid for another minute — so a transaction dropped by a busy
@@ -2192,11 +2209,7 @@ export class SniperEngine {
         this.rebroadcastUntilSettled(rawTx, txid, mint);
         latencyTimeline.stamp(mint, 't6SubmittedMs');
 
-        // The order is on the wire, so its claim on the budget is now
-        // permanent: the fee is spent whatever the chain decides. Dropping the
-        // release handle is what makes it permanent — a ceiling that refunded
-        // failed attempts would never stop a fee-burn loop.
-        if (action === 'buy') releaseReservation = null;
+        // (The claim was made permanent at signing, above.)
         if (buildSource === 'local') {
           this.log('info', `🛠️ Submitted locally built tx (no trade-local hop).`, mint);
         }
@@ -2353,10 +2366,20 @@ export class SniperEngine {
       }
     } catch (err: any) {
       this.log('error', `❌ Mainnet ${action} failed for ${mint.slice(0, 6)}...: ${err.message}`);
-      // A throw between submit and resolution is still an unlanded buy as far
-      // as the breaker is concerned: a fee may have been spent and no position
-      // exists. Counting it is what stops a crashing path from looping.
-      if (action === 'buy') tradeGovernor.recordBuyOutcome(false, err?.message ?? 'threw during execution');
+      // ONLY IF WE ACTUALLY SENT SOMETHING.
+      //
+      // The failure breaker exists to notice fees being burned on transactions
+      // that never land. A throw BEFORE the transaction was signed burned no
+      // fee at all — a PumpPortal 502, a DNS blip, an axios timeout on
+      // trade-local. Counting those latched the governor on a vendor outage
+      // and told the operator their wallet was being drained when nothing had
+      // left it, which is its own kind of false alarm and needs a manual reset
+      // to clear.
+      if (action === 'buy' && signedTxid) {
+        tradeGovernor.recordBuyOutcome(false, err?.message ?? 'threw after signing');
+      } else if (action === 'buy') {
+        this.log('warn', `⚠️ ${action.toUpperCase()} for ${mint.slice(0, 6)}… failed BEFORE signing (${err?.message ?? err}) — no fee was spent, so it does not count toward the failure breaker.`, mint);
+      }
 
       // The transaction was signed, so it may be ON CHAIN even though the call
       // that sent it threw. Do not walk away from it. Resolving it in the

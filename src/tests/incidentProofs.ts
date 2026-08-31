@@ -543,12 +543,55 @@ test('rolling history survives a settings change — moving a slider must not re
   assert.strictEqual(g.checkBuy(req({ mint: 'MintC' })).allowed, false);
 });
 
-test('the shipped ceilings are all ON — a default of 0 would ship the hole again', () => {
+test('every SHIPPED ceiling is armed, and each spend bound has one active form', () => {
   const L = DEFAULT_GOVERNOR_LIMITS;
   for (const [k, v] of Object.entries(L)) {
     assert.ok(Number.isFinite(v), `${k} must be a finite number`);
-    assert.ok((v as number) > 0, `${k} ships DISABLED (${v}) — every ceiling must be armed by default`);
+    assert.ok((v as number) >= 0, `${k} must not be negative`);
   }
+  // The three spend bounds and the loss bound each come in two forms — a
+  // fraction of the wallet and an absolute SOL figure — and the FRACTION is the
+  // shipped one. An absolute ceiling cannot be right for both a 0.1 SOL wallet
+  // and a 10 SOL wallet, and the tight direction is the dangerous one: a bot
+  // that refuses every trade reads, to its operator, exactly like a broken bot.
+  for (const k of ['maxWalletFractionPerMint', 'maxWalletFractionPerHour',
+                   'maxWalletFractionPerSession', 'maxWalletFractionSessionLoss'] as const) {
+    assert.ok(L[k] > 0, `${k} ships DISABLED — the primary spend bound must be armed`);
+  }
+  // Everything that is NOT a wallet-scaled bound must be armed absolutely.
+  for (const k of ['maxBuysPerHour', 'maxBuysPerMint', 'maxConsecutiveFailures',
+                   'minWalletReserveSol', 'maxConcurrentBuys', 'maxBalanceAgeMs'] as const) {
+    assert.ok(L[k] > 0, `${k} ships DISABLED (${L[k]}) — this one does not scale and must be armed`);
+  }
+});
+
+test('the ceilings scale with the wallet — the same defaults fit 0.1 SOL and 10 SOL', () => {
+  // The regression this replaces: an absolute 0.25 SOL per-mint ceiling sat
+  // BELOW this repo's own shipped stake for a 1.2 SOL wallet, so the very first
+  // sniper entry would have been refused and the operator would have read it as
+  // the bot breaking again.
+  for (const [wallet, stake] of [[0.1, 0.02], [1.2, 0.3], [10, 2.5]] as const) {
+    const g = new TradeGovernor();
+    const d = g.checkBuy(req({ walletSol: wallet, solAmount: stake }));
+    assert.strictEqual(d.allowed, true,
+      `a ${stake} SOL stake on a ${wallet} SOL wallet must pass: ${d.reason}`);
+  }
+  // And a stake that IS most of the wallet is still refused.
+  const g = new TradeGovernor();
+  const d = g.checkBuy(req({ walletSol: 1.2, solAmount: 0.9 }));
+  assert.strictEqual(d.allowed, false);
+  assert.ok(/per mint/.test(d.reason!), d.reason);
+});
+
+test('a fraction ceiling does not tighten as the balance is spent', () => {
+  // Taken against the session HIGH-WATER balance: computed off a balance that
+  // has already paid for two positions, a 34% ceiling would be a third of a
+  // third, and the book would strangle itself as it filled.
+  const g = new TradeGovernor();
+  assert.strictEqual(g.checkBuy(req({ walletSol: 1.0, solAmount: 0.3 })).allowed, true);
+  g.recordBuy(1_000_000, 'MintA', 0.3);
+  // The wallet has shrunk, but the ceiling for a DIFFERENT mint has not.
+  assert.strictEqual(g.checkBuy(req({ mint: 'MintB', walletSol: 0.7, solAmount: 0.3 })).allowed, true);
 });
 
 test('the operator can always see where they stand before a ceiling bites', () => {
@@ -641,7 +684,12 @@ test('the WORST-CASE outflow is what gets charged, not the nominal stake', () =>
 
   // The wallet floor is the ceiling this matters most for: sized on the stake,
   // a buy "leaving the reserve behind" actually leaves far less than it.
-  const g = new TradeGovernor({ minWalletReserveSol: 0.01, maxSolPerHour: 0, maxBuysPerHour: 0, maxSolPerSession: 0, maxSolPerMint: 0, maxBuysPerMint: 0 });
+  const bare = {
+    minWalletReserveSol: 0.01,
+    maxSolPerHour: 0, maxBuysPerHour: 0, maxSolPerSession: 0, maxSolPerMint: 0, maxBuysPerMint: 0,
+    maxWalletFractionPerHour: 0, maxWalletFractionPerSession: 0, maxWalletFractionPerMint: 0,
+  };
+  const g = new TradeGovernor(bare);
   assert.strictEqual(g.checkBuy(req({ walletSol: 0.0355, solAmount: stake })).allowed, true,
     'charging the nominal stake would have allowed this');
   assert.strictEqual(g.checkBuy(req({ walletSol: 0.0355, solAmount: worstCase })).allowed, false,

@@ -27,10 +27,14 @@ import { entryGateV2 } from './services/entryGateV2';
 import { localTxBuilder } from './services/localTxBuilder';
 import { autoUpdateEnabled, updaterService } from './services/updaterService';
 import { apiToken, isLoopbackOrigin, originGuard, requireApiToken } from './services/apiAuth';
-import { loadGovernorState } from './services/tradeGovernor';
+import { loadGovernorState, setGovernorWalletProvider } from './services/tradeGovernor';
 // Reinstate a spend-governor halt from a previous session BEFORE anything can
 // trade. A restart is the natural response to a runaway, and it must not be the
 // thing that clears the breaker that stopped it.
+//
+// The latch is bound to a wallet: someone who funds a NEW wallet after an
+// incident must not inherit the old one's halt.
+setGovernorWalletProvider(() => sniperEngine.getWalletStatus().address ?? null);
 loadGovernorState();
 // ─── Hardened crash guards ──────────────────────────────────────────────────
 // @solana/web3.js retries 429 / timeout errors internally then re-throws.
