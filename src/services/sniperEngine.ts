@@ -26,6 +26,7 @@ import { RunReport } from '../types';
 import { featureFlags } from './featureFlags';
 import { latencyTimeline } from './latencyTimeline';
 import { slotDelta, SlotDeltaTracker } from './slotDelta';
+import { broadcast, buildRoutes } from './txBroadcaster';
 import { entryGateV2 } from './entryGateV2';
 import { PriorityFeeService } from './priorityFeeService';
 import { localTxBuilder } from './localTxBuilder';
@@ -47,7 +48,7 @@ import { PositionStore, describeRestoration, type PersistedPosition } from './po
 import {
   rpcEndpoint, rpcWsEndpoint, connectionConfig, resetRpcHealth, rpcHealth,
   probeHeliusKey, markHeliusKeyRejected,
-  resolveRpcEndpoint, normalizeHeliusKey,
+  resolveRpcEndpoint, normalizeHeliusKey, noteRpcOutcome,
 } from './rpcHealth';
 import { resolveKey, storeKey, clearStoredKey, keyStorePath, StorableKeyField } from './keyStore';
 
@@ -605,6 +606,9 @@ export class SniperEngine {
     }
 
     this.solanaConnection = new Connection(startupEndpoint.url, connectionConfig());
+    // Opened here as well as on every rebind, so the very first order of a
+    // session already has two routes rather than one.
+    this.rebuildSecondaryConnection(startupEndpoint.url);
     this.wallet = new WalletService(this.solanaConnection);
     this.priorityFeeService = new PriorityFeeService(() => this.solanaConnection);
     this.curveWatcher = new CurveWatcher(
@@ -1549,6 +1553,7 @@ export class SniperEngine {
         this.heliusKeySource = this.config.heliusApiKey ? 'env' : 'none';
         const endpoint = resolveRpcEndpoint(this.config.heliusApiKey);
         this.solanaConnection = new Connection(endpoint.url, connectionConfig());
+        this.rebuildSecondaryConnection(endpoint.url);
         this.wallet.setConnection(this.solanaConnection);
         resetRpcHealth();
         this.log('info', `🌐 RPC endpoint now ${endpoint.host} (source: ${endpoint.source}).`);
@@ -2477,9 +2482,36 @@ export class SniperEngine {
         // SAME signed bytes is idempotent — the network dedupes by signature, so
         // it can only help it land, never execute twice.
         const rawTx = tx.serialize();
-        const txid = await this.solanaConnection.sendRawTransaction(rawTx, {
-          skipPreflight: true,
+
+        // FAN OUT. The same signed bytes go to every endpoint we have, at once,
+        // and the first to answer wins. This cannot execute twice: a
+        // transaction's identity IS its signature, and every node dedupes on
+        // it — the same property the paced rebroadcast below already relies on
+        // to resend a percentage sell without selling twice.
+        //
+        // One `sendRawTransaction` was a bet that a single endpoint is healthy,
+        // unthrottled and well-connected to the current leader at that instant.
+        // When that bet lost, the transaction was not slow, it was ABSENT, and
+        // the operator saw 'expired' with nothing explaining why.
+        const routes = buildRoutes({
+          primary: this.solanaConnection,
+          primaryName: 'primary',
+          fallback: this.secondaryConnection,
+          fallbackName: this.secondaryHost || 'secondary',
         });
+        const sent = await broadcast(rawTx, signedTxid, routes, {
+          onResult: (r) => {
+            // Only the primary's outcome drives failover — a public fallback
+            // being rate-limited says nothing about the endpoint we depend on.
+            if (r.name === 'primary') noteRpcOutcome(r.ok, r.error);
+          },
+        });
+        const txid = sent.txid;
+        if (routes.length > 1) {
+          const losers = sent.results.filter(r => r.name !== sent.winner);
+          this.log('info', `📤 Submitted via ${routes.length} routes — ${sent.winner} answered first`
+            + (losers.length ? ` (${losers.map(r => `${r.name}: ${r.ok ? `${r.ms}ms` : 'failed'}`).join(', ')})` : ''), mint);
+        }
         stopRebroadcast = this.rebroadcastUntilSettled(rawTx, txid, mint);
         latencyTimeline.stamp(mint, 't6SubmittedMs');
 
@@ -4393,9 +4425,36 @@ export class SniperEngine {
     return results.filter((v): v is AddressLookupTableAccount => v !== null);
   }
 
+  /**
+   * A SECOND endpoint, kept open purely so a submission can go down two routes
+   * at once. Not the failover connection — that one REPLACES the primary when
+   * it is judged down; this one runs beside it on every send.
+   *
+   * Rebuilt whenever the primary is rebound so the pair never collapses to the
+   * same URL, which would make the fan-out two identical bets.
+   */
+  private secondaryConnection: Connection | null = null;
+  private secondaryHost = '';
+
+  private rebuildSecondaryConnection(primaryUrl: string): void {
+    this.secondaryConnection = null;
+    this.secondaryHost = '';
+    const configured = (process.env.SOLANA_RPC_FALLBACK_URL || '').trim();
+    const url = configured || 'https://api.mainnet-beta.solana.com';
+    // Two routes to the same node is not a fan-out; it is one bet placed twice.
+    if (!url || url === primaryUrl) return;
+    try {
+      this.secondaryConnection = new Connection(url, connectionConfig());
+      this.secondaryHost = new URL(url).host;
+    } catch {
+      this.secondaryConnection = null;
+    }
+  }
+
   private rebindConnection(url: string): void {
     this.solanaConnection = new Connection(url, connectionConfig());
     this.wallet.setConnection(this.solanaConnection);
+    this.rebuildSecondaryConnection(url);
     // priorityFeeService reads this.solanaConnection through a closure, so it
     // needs no rebind; localTxBuilder holds its own reference.
     if (featureFlags.get('localTxBuild') || featureFlags.get('localTxShadowCompare')) {

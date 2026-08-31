@@ -329,12 +329,25 @@ test('the ceiling is enforced INSIDE executeRealMainnetTrade, before anything is
   // Anchored on the actual CALL, not the bare word: the comments in this area
   // name sendRawTransaction while explaining why the ceiling sits here, and a
   // test that matches prose instead of code proves nothing.
-  const SEND_CALL = 'this.solanaConnection.sendRawTransaction(';
+  //
+  // THE SEND MOVED. It is now `broadcast(...)`, which fans the same signed
+  // bytes out across every configured endpoint at once (txBroadcaster.ts). The
+  // property this test exists for is untouched — the ceiling must be claimed
+  // before anything leaves the process — so the anchor follows the code rather
+  // than the property being dropped because a line was refactored.
+  const SEND_CALL = 'await broadcast(';
   const reserveAt = fnSrc.indexOf('tradeGovernor.tryReserveBuy(');
   const sendAt = fnSrc.indexOf(SEND_CALL);
   assert.ok(reserveAt > 0, 'the governor must be consulted inside executeRealMainnetTrade, not in a caller');
   assert.ok(sendAt > 0, 'the send must be in this function');
   assert.ok(reserveAt < sendAt, 'the ceiling must be checked BEFORE the transaction is sent');
+
+  // AND the raw send must not be reachable from here directly any more: a
+  // `this.solanaConnection.sendRawTransaction(` reappearing inside this
+  // function would be a second door out, unmeasured and possibly unordered
+  // with respect to the reservation above.
+  assert.ok(!/this\.solanaConnection\.sendRawTransaction\(/.test(fnSrc),
+    'every submission from this function must go through the broadcaster, so there is one ordered exit');
 
   // checkBuy alone is check-then-act; only tryReserveBuy claims atomically.
   assert.ok(!/tradeGovernor\.checkBuy\(/.test(fnSrc),
@@ -349,13 +362,14 @@ test('the ceiling is enforced INSIDE executeRealMainnetTrade, before anything is
   // which resends bytes that were already governed and already signed, and is
   // idempotent because the cluster dedupes by signature. Anything else placing
   // an order would be a new spend the ceiling never saw.
-  const otherSends = engineSrc.split(SEND_CALL).length - 1 - 1;
+  const RAW_SEND = 'this.solanaConnection.sendRawTransaction(';
+  const otherSends = engineSrc.split(RAW_SEND).length - 1;
   if (otherSends > 0) {
     const rebroadcastAt = engineSrc.indexOf('private rebroadcastUntilSettled');
     assert.ok(rebroadcastAt > 0, 'the only other send must be the rebroadcast helper');
     const rebroadcastSrc = engineSrc.slice(rebroadcastAt, engineSrc.indexOf('\n  private ', rebroadcastAt + 10));
-    assert.strictEqual(otherSends, rebroadcastSrc.split(SEND_CALL).length - 1,
-      'every send outside executeRealMainnetTrade must be inside rebroadcastUntilSettled');
+    assert.strictEqual(otherSends, rebroadcastSrc.split(RAW_SEND).length - 1,
+      'every raw send in the engine must be inside rebroadcastUntilSettled');
     assert.ok(!/tradeGovernor/.test(rebroadcastSrc),
       'the rebroadcast must not claim budget again — it resends bytes already charged');
   }

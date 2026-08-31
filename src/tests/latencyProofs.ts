@@ -28,6 +28,7 @@ import { join } from 'path';
 import { SlotDeltaTracker } from '../services/slotDelta';
 import { LatencyTimelineLogger } from '../services/latencyTimeline';
 import { clampPriorityFeeSol } from '../services/pipelineUtils';
+import { broadcast, buildRoutes, type BroadcastRoute } from '../services/txBroadcaster';
 
 let passed = 0;
 let failed = 0;
@@ -469,5 +470,119 @@ test('the same bytes are not simulated twice on the buy path', () => {
     'and must still simulate a build that does NOT claim to have been — fail closed');
 });
 
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+console.log('\n-- One send was a bet on one endpoint being healthy right now --');
+
+const asyncTests: Array<{ name: string; fn: () => Promise<void> }> = [];
+function atest(name: string, fn: () => Promise<void>): void { asyncTests.push({ name, fn }); }
+
+const TXID = 'SigAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const route = (name: string, behaviour: { ms?: number; fail?: string }): BroadcastRoute => ({
+  name,
+  send: async () => {
+    await new Promise(r => setTimeout(r, behaviour.ms ?? 0));
+    if (behaviour.fail) throw new Error(behaviour.fail);
+    return TXID;
+  },
+});
+
+atest('the first route to answer wins, and the signature is the one we signed', async () => {
+  const out = await broadcast(new Uint8Array([1]), TXID, [
+    route('slow', { ms: 60 }),
+    route('fast', { ms: 1 }),
+  ]);
+  assert.strictEqual(out.winner, 'fast');
+  // The signature comes from the SIGNED BYTES, never from a route's reply. A
+  // node can accept a transaction and then lose the response; taking the id
+  // from the reply is how an order lands with nothing tracking it.
+  assert.strictEqual(out.txid, TXID);
+  assert.strictEqual(out.attempted, 2);
+});
+
+atest('ONE FAILING ROUTE DOES NOT FAIL THE SEND', async () => {
+  // The whole point. Previously a single throw from a single endpoint meant the
+  // transaction was never submitted at all.
+  const out = await broadcast(new Uint8Array([1]), TXID, [
+    route('rate-limited', { ms: 1, fail: '429 Too Many Requests' }),
+    route('healthy', { ms: 20 }),
+  ]);
+  assert.strictEqual(out.winner, 'healthy');
+});
+
+atest('only when EVERY route fails does the send fail', async () => {
+  await assert.rejects(
+    () => broadcast(new Uint8Array([1]), TXID, [
+      route('a', { ms: 1, fail: 'boom a' }),
+      route('b', { ms: 5, fail: 'boom b' }),
+    ]),
+    /boom/,
+  );
+});
+
+atest('a slow failure does not delay a fast success', async () => {
+  // If the fan-out waited for every route, its latency would be the worst
+  // member's rather than the best's — worse than the single send it replaced.
+  const startedAt = Date.now();
+  const out = await broadcast(new Uint8Array([1]), TXID, [
+    route('sluggish', { ms: 200, fail: 'timeout' }),
+    route('quick', { ms: 1 }),
+  ]);
+  assert.strictEqual(out.winner, 'quick');
+  assert.ok(Date.now() - startedAt < 150, 'the winner must resolve without waiting on the losers');
+});
+
+atest('every route reports its outcome, for the log and the health counters', async () => {
+  const seen: string[] = [];
+  await broadcast(new Uint8Array([1]), TXID, [
+    route('primary', { ms: 1 }),
+    route('secondary', { ms: 2, fail: 'nope' }),
+  ], { onResult: r => seen.push(`${r.name}:${r.ok}`) });
+  await new Promise(r => setTimeout(r, 30));
+  assert.ok(seen.includes('primary:true'), 'the winner must be reported');
+  assert.ok(seen.includes('secondary:false'),
+    'a loser must be reported too — Promise.any would discard exactly the failures worth counting');
+});
+
+atest('no routes at all is an error, never a silent no-op', async () => {
+  await assert.rejects(() => broadcast(new Uint8Array([1]), TXID, []), /no routes/);
+});
+
+test('two routes to the same endpoint is one bet placed twice, not a fan-out', () => {
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('private rebuildSecondaryConnection(');
+  assert.ok(idx > 0, 'the secondary connection must be built somewhere');
+  const body = engine.slice(idx, idx + 900);
+  assert.ok(/url === primaryUrl/.test(body),
+    'the secondary must refuse to duplicate the primary endpoint');
+});
+
+test('the secondary is rebuilt every time the primary changes', () => {
+  // A failover that swaps the primary to the fallback URL, leaving the
+  // secondary pointed at that same fallback, silently collapses the fan-out.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const rebuilds = engine.split('this.rebuildSecondaryConnection(').length - 1;
+  const primaryAssignments = engine.split('this.solanaConnection = new Connection(').length - 1;
+  assert.ok(rebuilds >= primaryAssignments,
+    `every place that sets the primary connection (${primaryAssignments}) must also rebuild the secondary (${rebuilds} found)`);
+});
+
+test('only the primary route drives RPC failover', () => {
+  // A public fallback being rate-limited says nothing about the endpoint the
+  // session depends on. Counting its failures would fail the session over on
+  // the health of a route it only uses as a spare.
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const idx = engine.indexOf('onResult: (r) => {');
+  assert.ok(idx > 0, 'the broadcast must report per-route outcomes');
+  const body = engine.slice(idx, idx + 300);
+  assert.ok(/r\.name === 'primary'/.test(body),
+    'only the primary route may feed noteRpcOutcome');
+});
+
+void (async () => {
+  if (asyncTests.length) console.log(`\n-- Async broadcast proofs (${asyncTests.length}) --`);
+  for (const t of asyncTests) {
+    try { await t.fn(); passed++; console.log(`  ok    ${t.name}`); }
+    catch (err: any) { failed++; console.error(`  FAIL  ${t.name}\n        ${err?.message ?? err}`); }
+  }
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed > 0 ? 1 : 0);
+})();
