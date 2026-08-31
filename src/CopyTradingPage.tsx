@@ -47,7 +47,7 @@ function ExecBadge({ txid, fillVerified }: { txid?: string; fillVerified?: boole
       target="_blank"
       rel="noopener noreferrer"
       className="status-badge"
-      style={{ color: fillVerified ? '#00e676' : '#fbbf24', borderColor: fillVerified ? '#00e676' : '#fbbf24', textDecoration: 'none' }}
+      style={{ color: fillVerified ? 'var(--ok)' : 'var(--warn)', borderColor: fillVerified ? 'var(--ok)' : 'var(--warn)', textDecoration: 'none' }}
       title={fillVerified
         ? 'Landed on-chain — quantity AND cost read back from the transaction itself. Click for Solscan.'
         : 'Landed on-chain — the quantity is the wallet\'s real balance, but the transaction could not be parsed, so the cost basis is the size that was ordered rather than the amount actually taken. P&L on this leg is approximate. Click for Solscan.'}
@@ -342,18 +342,18 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
     <>
       {/* Stat strip — mirrors the sniper page's 5-card anatomy */}
       <section className="stats-grid">
-        <div className="stat-card" style={{ border: enabled ? '1px solid rgba(0,230,118,0.4)' : undefined }}>
+        <div className="stat-card" style={{ border: enabled ? '1px solid var(--ok-bg)' : undefined }}>
           <div className="stat-label">
             Copy Engine
-            <span style={{ float: 'right', fontSize: '9px', color: streamLive ? '#00e676' : '#fbbf24' }}>
+            <span style={{ float: 'right', fontSize: '11px', color: streamLive ? 'var(--ok)' : 'var(--warn)' }}>
               {streamLive ? '● LIVE' : '○ POLLING'}
             </span>
           </div>
-          <div className="stat-value-mono" style={{ color: enabled ? '#00e676' : undefined }}>
+          <div className="stat-value-mono" style={{ color: enabled ? 'var(--ok)' : undefined }}>
             {enabled ? 'ACTIVE' : 'STOPPED'}
           </div>
           <div
-            style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}
+            style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}
             title="ON-CHAIN is the Helius wallet watcher — it sees every buy and sell on any venue. PUMP.FUN is the PumpPortal fast lane for pump.fun trades. SELLS is the copy-sells setting — OFF means leader sells are shown but the position is held."
           >
             {mode.toUpperCase()} · ON-CHAIN {status?.heliusConnected ? 'OK' : '—'} · PUMP.FUN {status?.streamConnected ? 'OK' : '—'} · SELLS {sellsLabel}
@@ -365,7 +365,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           <div className="stat-value-mono">
             {wallets.filter(w => w.enabled).length} / {wallets.length}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {stats ? `${stats.signalsSeen} SIGNALS SEEN` : 'ENABLED / TOTAL'}
           </div>
         </div>
@@ -378,7 +378,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           <div className={`hero-fraunces-number ${(stats?.realizedPnlUsd ?? 0) >= 0 ? 'delta-positive' : 'delta-negative'}`}>
             {(stats?.realizedPnlUsd ?? 0) >= 0 ? '+' : ''}${(stats?.realizedPnlUsd ?? 0).toFixed(2)}
           </div>
-          <div style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', color: 'var(--ink-secondary)', marginTop: '2px' }}>
+          <div style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: 'var(--ink-secondary)', marginTop: '2px' }}>
             {(stats?.unrealizedPnlUsd ?? 0) >= 0 ? '+' : ''}${(stats?.unrealizedPnlUsd ?? 0).toFixed(2)} UNREALIZED
           </div>
         </div>
@@ -388,17 +388,17 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           <div className="stat-value-mono">
             {(stats?.copiedBuys ?? 0)}B / {(stats?.copiedSells ?? 0)}S
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {stats ? `${stats.skippedSignals} SKIPPED · WIN ${stats.winRatePct}%` : '—'}
           </div>
         </div>
 
-        <div className="stat-card" style={{ border: engineWallet?.linked ? '1px solid rgba(0,230,118,0.4)' : undefined }}>
+        <div className="stat-card" style={{ border: engineWallet?.linked ? '1px solid var(--ok-bg)' : undefined }}>
           <div className="stat-label">Photon Wallet</div>
-          <div className="stat-value-mono" style={{ color: engineWallet?.linked ? '#00e676' : undefined }}>
+          <div className="stat-value-mono" style={{ color: engineWallet?.linked ? 'var(--ok)' : undefined }}>
             {engineWallet?.linked ? `${engineWallet.solBalance} SOL` : 'NOT LINKED'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {engineWallet?.linked
               ? `${engineWallet.shortAddress} · $${engineWallet.usdBalance} · SOL $${status?.solPriceUsd ?? '—'}`
               : 'PAPER COPIES ONLY — LINK IN SNIPER SETTINGS'}
@@ -438,7 +438,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
             </button>
           </form>
           {addError && (
-            <div style={{ fontSize: '9.5px', color: '#ff1744', fontFamily: 'var(--font-mono)', marginBottom: '6px', flexShrink: 0 }}>
+            <div style={{ fontSize: '11px', color: 'var(--bad)', fontFamily: 'var(--font-mono)', marginBottom: '6px', flexShrink: 0 }}>
               ⛔ {addError}
             </div>
           )}
@@ -474,7 +474,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                       <td className={`num-col ${w.realizedPnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
                         {w.realizedPnlUsd >= 0 ? '+' : ''}${w.realizedPnlUsd.toFixed(2)}
                       </td>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '9.5px', color: 'var(--ink-secondary)' }}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--ink-secondary)' }}>
                         {fmtAgo(w.lastSeenAt)}
                       </td>
                       <td>
@@ -489,13 +489,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                             target="_blank"
                             rel="noopener noreferrer"
                             className="btn-terminal-outline"
-                            style={{ padding: '2px 6px', fontSize: '9px', textDecoration: 'none' }}
+                            style={{ padding: '2px 6px', fontSize: '11px', textDecoration: 'none' }}
                           >
                             SOLSCAN
                           </a>
                           <button
                             className="btn-terminal-outline"
-                            style={{ padding: '2px 6px', fontSize: '9px' }}
+                            style={{ padding: '2px 6px', fontSize: '11px' }}
                             onClick={() => toggleWallet(w)}
                           >
                             {w.enabled ? 'PAUSE' : 'RESUME'}
@@ -521,7 +521,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                   onClick={syncBalances}
                   disabled={syncing}
                   title="Re-read the wallet's real on-chain balances: closes bags already sold elsewhere and corrects drifted quantities."
-                  style={{ fontSize: '10px', padding: '2px 8px' }}
+                  style={{ fontSize: '11px', padding: '2px 8px' }}
                 >
                   {syncing ? 'SYNCING…' : '⟳ SYNC BALANCES'}
                 </button>
@@ -557,20 +557,20 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                         <span className="cell-symbol">${pos.tokenSymbol}</span>
                         <span className="cell-name">{pos.tokenName}</span>
                       </td>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '9.5px' }} title={pos.leaderWallet}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }} title={pos.leaderWallet}>
                         {pos.leaderNickname}
                       </td>
                       <td className="num-col">{pos.investedSol} SOL (${pos.investedUsd})</td>
                       <td className="num-col">{qty(pos.tokensHeld)}</td>
                       <td className={`num-col ${pos.pnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
                         <div>{pos.pnlUsd >= 0 ? '+' : ''}${pos.pnlUsd.toFixed(2)} ({pos.pnlPct >= 0 ? '+' : ''}{pos.pnlPct}%)</div>
-                        <div style={{ fontSize: '9px', opacity: 0.8, fontFamily: 'var(--font-mono)' }}>
+                        <div style={{ fontSize: '11px', opacity: 0.8, fontFamily: 'var(--font-mono)' }}>
                           {pos.pnlSol >= 0 ? '+' : ''}{pos.pnlSol.toFixed(4)} SOL
                         </div>
                       </td>
                       <td>
                         <div style={{ display: 'inline-flex', flexDirection: 'column', gap: '3px' }}>
-                          {pos.status === 'PARTIAL' && <span className="status-badge" style={{ color: '#fbbf24', borderColor: '#fbbf24' }}>PARTIAL</span>}
+                          {pos.status === 'PARTIAL' && <span className="status-badge" style={{ color: 'var(--warn)', borderColor: 'var(--warn)' }}>PARTIAL</span>}
                           <ExecBadge txid={pos.buyTxid} fillVerified={pos.fillVerified} />
                         </div>
                       </td>
@@ -581,7 +581,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                             target="_blank"
                             rel="noopener noreferrer"
                             className="btn-terminal-outline"
-                            style={{ padding: '2px 6px', fontSize: '9px', textDecoration: 'none' }}
+                            style={{ padding: '2px 6px', fontSize: '11px', textDecoration: 'none' }}
                           >
                             PHOTON
                           </a>
@@ -590,7 +590,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                           </button>
                           <button
                             className="btn-terminal-outline"
-                            style={{ padding: '2px 6px', fontSize: '9px', color: 'var(--ink-muted)' }}
+                            style={{ padding: '2px 6px', fontSize: '11px', color: 'var(--ink-muted)' }}
                             title="Remove/dismiss from open positions if already liquidated on Photon"
                             onClick={() => dismissPosition(pos.id, pos.tokenSymbol)}
                           >
@@ -616,7 +616,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               <button
                 className="btn-terminal-outline"
                 onClick={clearHistory}
-                style={{ fontSize: '10px', padding: '2px 8px', color: '#ff1744', borderColor: '#ff1744' }}
+                style={{ fontSize: '11px', padding: '2px 8px', color: 'var(--bad)', borderColor: 'var(--bad)' }}
               >
                 🗑️ CLEAR
               </button>
@@ -643,7 +643,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                 <tbody>
                   {history.slice(0, 14).map(h => (
                     <tr key={h.id}>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
                         {new Date(h.timestamp).toLocaleTimeString()}
                       </td>
                       <td><span className="cell-symbol">${h.tokenSymbol}</span></td>
@@ -659,7 +659,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                         {h.side === 'buy' ? '—' : `${h.pnlUsd >= 0 ? '+' : ''}$${h.pnlUsd.toFixed(2)} (${h.pnlPct >= 0 ? '+' : ''}${h.pnlPct}%)`}
                       </td>
                       <td><ExecBadge txid={h.txid} fillVerified={h.fillVerified} /></td>
-                      <td style={{ fontSize: '10px', color: 'var(--ink-muted)', maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.exitReason}>
+                      <td style={{ fontSize: '11px', color: 'var(--ink-muted)', maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.exitReason}>
                         {h.side === 'buy' ? `from ${h.leaderNickname}` : h.exitReason}
                       </td>
                     </tr>
@@ -805,8 +805,8 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               </div>
 
               {/* Sells */}
-              <div className="form-group" style={{ border: '1px solid rgba(148,163,184,0.35)', padding: '8px' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+              <div className="form-group" style={{ border: '1px solid var(--line)', padding: '8px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: 'var(--fg)' }}>
                   <input
                     type="checkbox"
                     checked={configForm.copySells === true}
@@ -837,13 +837,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               <button
                 type="button"
                 onClick={() => setShowAdvanced(a => !a)}
-                style={{ all: 'unset', cursor: 'pointer', display: 'block', margin: '12px 0 6px', fontSize: '0.75rem', color: '#94a3b8', fontWeight: 700 }}
+                style={{ all: 'unset', cursor: 'pointer', display: 'block', margin: '12px 0 6px', fontSize: '0.75rem', color: 'var(--fg-dim)', fontWeight: 700 }}
               >
                 {showAdvanced ? '▾' : '▸'} Advanced settings
               </button>
 
               {showAdvanced && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid rgba(148,163,184,0.25)', paddingTop: '10px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid var(--line)', paddingTop: '10px' }}>
                   <div className="form-group">
                     <label className="form-label">Sizing method</label>
                     <select
@@ -915,7 +915,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                   </div>
 
                   <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: 'var(--fg)' }}>
                       <input type="checkbox"
                         checked={configForm.blockRepeatBuys !== true}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, blockRepeatBuys: !e.target.checked })} />
@@ -926,7 +926,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
 
                   {configForm.copySells === true && (
                     <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#e2e8f0' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: 'var(--fg)' }}>
                         <input type="checkbox"
                           checked={configForm.mirrorLeaderTokenMoves !== false}
                           onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, mirrorLeaderTokenMoves: e.target.checked })} />
@@ -938,7 +938,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               )}
 
               {settingsError && (
-                <div style={{ fontSize: '9.5px', marginTop: '8px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(239,68,68,0.08)' }}>
+                <div style={{ fontSize: '11px', marginTop: '8px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--bad)', border: '1px solid var(--bad)', background: 'var(--bad-bg)' }}>
                   ⛔ {settingsError}
                 </div>
               )}
@@ -988,7 +988,7 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, 
     <div style={{ position: 'fixed', top: '8px', right: '18px', display: 'flex', gap: '8px', alignItems: 'center', zIndex: 500 }}>
       {error && (
         <div
-          style={{ fontSize: '9.5px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(14,16,19,0.95)', cursor: 'pointer' }}
+          style={{ fontSize: '11px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--bad)', border: '1px solid var(--bad)', background: 'rgba(4, 6, 10, 0.92)', cursor: 'pointer' }}
           title="Click to dismiss"
           onClick={onDismissError}
         >
@@ -998,7 +998,7 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, 
       <span
         className="status-badge"
         style={mode === 'real'
-          ? { color: '#ff1744', borderColor: '#ff1744', background: 'rgba(255,23,68,0.12)' }
+          ? { color: 'var(--bad)', borderColor: 'var(--bad)', background: 'var(--bad-bg)' }
           : { color: 'var(--accent-olive)', borderColor: 'var(--accent-olive)' }}
         title={mode === 'real' ? 'Copies execute with real SOL from the linked Photon wallet' : 'Copies are simulated — no SOL moves'}
       >
@@ -1014,9 +1014,9 @@ function CopyHeaderControls({ enabled, mode, onToggle, onSettings, onTestAlert, 
         className="btn-terminal"
         onClick={onToggle}
         style={{
-          background: enabled ? '#d32f2f' : 'var(--accent-olive)',
-          borderColor: enabled ? '#d32f2f' : 'var(--accent-olive)',
-          color: '#ffffff',
+          background: enabled ? 'var(--bad)' : 'var(--accent-olive)',
+          borderColor: enabled ? 'var(--bad)' : 'var(--accent-olive)',
+          color: 'var(--fg)',
           fontWeight: 700,
         }}
       >

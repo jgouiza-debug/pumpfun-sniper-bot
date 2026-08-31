@@ -30,19 +30,19 @@ const qty = (n?: number): string => {
 function ExitFillBadge({ trade }: { trade: TradeHistoryRecord }) {
   const fraction = trade.fractionSold;
   if (fraction === undefined) {
-    return <span style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>{qty(trade.tokensSold)}</span>;
+    return <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>{qty(trade.tokensSold)}</span>;
   }
   const pct = fraction * 100;
   const partial = fraction < FULL_EXIT_THRESHOLD;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
         {qty(trade.tokensSold)} ({pct < 10 ? pct.toFixed(1) : Math.round(pct)}%)
       </span>
       {partial && (
         <span
           className="status-badge"
-          style={{ color: '#fbbf24', borderColor: '#fbbf24' }}
+          style={{ color: 'var(--warn)', borderColor: 'var(--warn)' }}
           title={`Only ${pct.toFixed(1)}% of the position was sold. The rest was still held after this order.`}
         >
           PARTIAL FILL
@@ -66,7 +66,7 @@ function TxProofBadge({ txid, verified }: { txid?: string; verified?: boolean })
       target="_blank"
       rel="noopener noreferrer"
       className="status-badge"
-      style={{ color: verified ? '#00e676' : '#fbbf24', borderColor: verified ? '#00e676' : '#fbbf24', textDecoration: 'none' }}
+      style={{ color: verified ? 'var(--ok)' : 'var(--warn)', borderColor: verified ? 'var(--ok)' : 'var(--warn)', textDecoration: 'none' }}
       title={verified
         ? 'Landed on-chain — quantity AND cost read back from the transaction itself. Click to view on Solscan.'
         : 'Landed on-chain — the quantity is the wallet\'s real balance, but the transaction could not be parsed, so the cost basis is the size that was ordered rather than the amount actually taken. P&L on this leg is approximate. Click to view on Solscan.'}
@@ -155,18 +155,18 @@ function SmartMoneyPanel() {
   const pct = (v: number | null) => (v === null ? '—' : `${Math.round(v * 100)}%`);
 
   return (
-    <div style={{ marginTop: '12px', padding: '10px', background: 'rgba(124,77,255,0.05)', border: '1px solid rgba(124,77,255,0.25)', borderRadius: '4px' }}>
+    <div style={{ marginTop: '12px', padding: '10px', background: 'var(--learn-bg)', border: '1px solid var(--learn-bg)', borderRadius: '4px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#b388ff' }}>
+        <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--learn)' }}>
           🧠 Smart Money — wallets the bot proved, not a pasted list
         </div>
-        <div style={{ fontSize: '9px', color: '#8a8a8a' }}>
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>
           {sm.roster.length} promoted / {sm.walletsSeen} seen · research queue {sm.research.queued} · reads left {sm.research.readBudgetRemaining}
         </div>
       </div>
 
       {sm.roster.length === 0 ? (
-        <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6 }}>
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
           No wallet has earned promotion yet. This is expected on a new install and is not a fault:
           the roster is built from chain history the bot gathers itself, so it needs days of
           graduations and duds before anyone clears the bar. Until then this lane produces nothing.
@@ -174,9 +174,9 @@ function SmartMoneyPanel() {
         </div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', fontSize: '10px', borderCollapse: 'collapse' }}>
+          <table style={{ width: '100%', fontSize: '11px', borderCollapse: 'collapse' }}>
             <thead>
-              <tr style={{ color: '#8a8a8a', textAlign: 'left' }}>
+              <tr style={{ color: 'var(--fg-dim)', textAlign: 'left' }}>
                 <th style={{ padding: '3px 6px' }}>Wallet</th>
                 <th style={{ padding: '3px 6px' }}>Conviction</th>
                 <th style={{ padding: '3px 6px' }}>Win rate</th>
@@ -189,9 +189,9 @@ function SmartMoneyPanel() {
             </thead>
             <tbody>
               {sm.roster.map(w => (
-                <tr key={w.address} style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                <tr key={w.address} style={{ borderTop: '1px solid var(--line)' }}>
                   <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>
-                    <a href={`https://solscan.io/account/${w.address}`} target="_blank" rel="noreferrer" style={{ color: '#b388ff' }}>
+                    <a href={`https://solscan.io/account/${w.address}`} target="_blank" rel="noreferrer" style={{ color: 'var(--learn)' }}>
                       {w.address.slice(0, 4)}…{w.address.slice(-4)}
                     </a>
                     {w.pinned === 'always' && <span title="pinned on by you" style={{ marginLeft: 4 }}>📌</span>}
@@ -199,16 +199,16 @@ function SmartMoneyPanel() {
                   <td style={{ padding: '3px 6px' }}>{pct(w.conviction)}</td>
                   <td style={{ padding: '3px 6px' }}>{pct(w.winRate)}</td>
                   <td style={{ padding: '3px 6px' }}>{w.closedTrades}</td>
-                  <td style={{ padding: '3px 6px', color: w.realizedPnlSol >= 0 ? '#00e676' : '#ff5252' }}>
+                  <td style={{ padding: '3px 6px', color: w.realizedPnlSol >= 0 ? 'var(--ok)' : 'var(--bad)' }}>
                     {w.realizedPnlSol >= 0 ? '+' : ''}{w.realizedPnlSol.toFixed(3)}
                   </td>
                   <td style={{ padding: '3px 6px' }}>{w.earlyOnWinners} ({pct(w.earlyHitRate)})</td>
-                  <td style={{ padding: '3px 6px', color: '#8a8a8a' }}>{w.stateReason}</td>
+                  <td style={{ padding: '3px 6px', color: 'var(--fg-dim)' }}>{w.stateReason}</td>
                   <td style={{ padding: '3px 6px' }}>
                     <button
                       onClick={() => pin(w.address, w.pinned === 'never' ? null : 'never')}
                       title="Stop following this wallet"
-                      style={{ fontSize: '9px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(255,82,82,0.4)', color: '#ff5252', borderRadius: 3 }}
+                      style={{ fontSize: '11px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--bad-bg)', color: 'var(--bad)', borderRadius: 3 }}
                     >
                       {w.pinned === 'never' ? 'unblock' : 'drop'}
                     </button>
@@ -220,7 +220,7 @@ function SmartMoneyPanel() {
         </div>
       )}
 
-      <div style={{ fontSize: '9px', color: '#8a8a8a', marginTop: '8px', lineHeight: 1.5 }}>
+      <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '8px', lineHeight: 1.5 }}>
         An entry needs <strong>{sm.confluence.minWallets}</strong> of these wallets to buy the same token
         within <strong>{sm.confluence.windowMs / 1000}s</strong>, each risking at least {sm.confluence.minBuySol} SOL.
         {sm.pendingSignals.length > 0 && (
@@ -326,22 +326,22 @@ function TraderScoutPanel() {
   const hold = (s: number) => (s >= 3600 ? `${Math.round(s / 360) / 10}h` : s >= 60 ? `${Math.round(s / 60)}m` : `${Math.round(s)}s`);
 
   return (
-    <div style={{ marginTop: '12px', padding: '10px', background: 'rgba(0,229,255,0.05)', border: '1px solid rgba(0,229,255,0.25)', borderRadius: '4px' }}>
+    <div style={{ marginTop: '12px', padding: '10px', background: 'var(--info-bg)', border: '1px solid var(--info-bg)', borderRadius: '4px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#18ffff' }}>
+        <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--info)' }}>
           🔎 Who to copy — found, then checked against the chain
         </div>
         <button
           onClick={() => post('/api/scout/run', {}, 'Scout run')}
           disabled={busy !== null}
-          style={{ fontSize: '9px', padding: '2px 8px', cursor: busy ? 'wait' : 'pointer', background: 'transparent', border: '1px solid rgba(0,229,255,0.4)', color: '#18ffff', borderRadius: 3 }}
+          style={{ fontSize: '11px', padding: '2px 8px', cursor: busy ? 'wait' : 'pointer', background: 'transparent', border: '1px solid var(--info-bg)', color: 'var(--info)', borderRadius: 3 }}
         >
           {busy === 'Scout run' ? 'scanning…' : 'scan now'}
         </button>
       </div>
 
       {!sc?.keysSet.solanaTracker && (
-        <div style={{ fontSize: '10px', color: '#ffab40', lineHeight: 1.6, marginBottom: '8px' }}>
+        <div style={{ fontSize: '11px', color: 'var(--warn)', lineHeight: 1.6, marginBottom: '8px' }}>
           No Solana Tracker key set. That is the only free source that ranks Solana wallets by
           realized profit over a plain API call — the boards people usually quote (GMGN, Kolscan)
           sit behind Cloudflare and cannot be read from a server at all. Without it the scout still
@@ -351,32 +351,32 @@ function TraderScoutPanel() {
       )}
 
       {!rep ? (
-        <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6 }}>
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
           No scan yet. The first one runs a few minutes after startup, then hourly.
         </div>
       ) : (
         <>
           {rep.best ? (
-            <div style={{ padding: '8px', background: 'rgba(0,230,118,0.07)', border: '1px solid rgba(0,230,118,0.3)', borderRadius: 3, marginBottom: '8px' }}>
-              <div style={{ fontSize: '10px', color: '#00e676', fontWeight: 700, marginBottom: 4 }}>
+            <div style={{ padding: '8px', background: 'var(--ok-bg)', border: '1px solid var(--ok-bg)', borderRadius: 3, marginBottom: '8px' }}>
+              <div style={{ fontSize: '11px', color: 'var(--ok)', fontWeight: 700, marginBottom: 4 }}>
                 BEST RIGHT NOW — {rep.best.label ? `${rep.best.label} · ` : ''}
-                <a href={`https://solscan.io/account/${rep.best.wallet}`} target="_blank" rel="noreferrer" style={{ color: '#00e676', fontFamily: 'monospace' }}>
+                <a href={`https://solscan.io/account/${rep.best.wallet}`} target="_blank" rel="noreferrer" style={{ color: 'var(--ok)', fontFamily: 'monospace' }}>
                   {short(rep.best.wallet)}
                 </a>
               </div>
-              <div style={{ fontSize: '10px', color: '#ccc', lineHeight: 1.6 }}>
+              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
                 +{rep.best.realizedSol} SOL realized over {rep.best.closedTrades} closed trades ·
                 {' '}{Math.round(rep.best.winRate * 100)}% win rate ·
                 {' '}typical entry {rep.best.medianBuySol} SOL ·
                 {' '}typical hold {hold(rep.best.medianHoldSeconds)} ·
                 {' '}{rep.best.tradesLast6h} trades in 6h
               </div>
-              <div style={{ fontSize: '9px', color: '#8a8a8a', lineHeight: 1.6, marginTop: 3 }}>
+              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginTop: 3 }}>
                 Copying it should cost about{' '}
                 <strong>{rep.best.expectedFillDragPct?.toFixed(1) ?? '?'}%</strong> in worse fills
                 (their {rep.best.medianBuySol} SOL entries land in a {rep.best.medianEntryVSol} SOL curve, and ours lands after).
                 {' '}Take away their best token and they are still at{' '}
-                <strong style={{ color: rep.best.realizedExBestSol > 0 ? '#00e676' : '#ff5252' }}>
+                <strong style={{ color: rep.best.realizedExBestSol > 0 ? 'var(--ok)' : 'var(--bad)' }}>
                   {rep.best.realizedExBestSol > 0 ? '+' : ''}{rep.best.realizedExBestSol} SOL
                 </strong>.
                 {rep.best.stalePositions > 0 && <> {rep.best.stalePositions} bag(s) held over {sc!.bars.staleBagHours}h are unresolved and were not scored either way.</>}
@@ -384,7 +384,7 @@ function TraderScoutPanel() {
               <button
                 onClick={() => post('/api/scout/follow', { address: rep.best!.wallet }, 'Follow')}
                 disabled={busy !== null}
-                style={{ marginTop: 6, fontSize: '9px', padding: '3px 10px', cursor: 'pointer', background: 'rgba(0,230,118,0.15)', border: '1px solid rgba(0,230,118,0.5)', color: '#00e676', borderRadius: 3 }}
+                style={{ marginTop: 6, fontSize: '11px', padding: '3px 10px', cursor: 'pointer', background: 'var(--ok-bg)', border: '1px solid var(--ok-bg)', color: 'var(--ok)', borderRadius: 3 }}
               >
                 {busy === 'Follow' ? 'adding…' : 'copy this wallet'}
               </button>
@@ -392,13 +392,13 @@ function TraderScoutPanel() {
                 onClick={() => post('/api/scout/backfill', {}, 'Backfill')}
                 disabled={busy !== null}
                 title="Rebuild the entry profile from these wallets' own trade history, instead of waiting weeks to watch 40 live entries"
-                style={{ marginTop: 6, marginLeft: 6, fontSize: '9px', padding: '3px 10px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(124,77,255,0.5)', color: '#b388ff', borderRadius: 3 }}
+                style={{ marginTop: 6, marginLeft: 6, fontSize: '11px', padding: '3px 10px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--learn-bg)', color: 'var(--learn)', borderRadius: 3 }}
               >
                 {busy === 'Backfill' ? 'learning…' : 'learn their strategy from history'}
               </button>
             </div>
           ) : (
-            <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6, marginBottom: '8px' }}>
+            <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginBottom: '8px' }}>
               {rep.considered} wallet(s) checked, none copyable. That is a normal result, not a
               fault — most profitable-looking wallets fail one of the bars below.
             </div>
@@ -406,9 +406,9 @@ function TraderScoutPanel() {
 
           {rep.top.length > 1 && (
             <div style={{ overflowX: 'auto', marginBottom: '8px' }}>
-              <table style={{ width: '100%', fontSize: '10px', borderCollapse: 'collapse' }}>
+              <table style={{ width: '100%', fontSize: '11px', borderCollapse: 'collapse' }}>
                 <thead>
-                  <tr style={{ color: '#8a8a8a', textAlign: 'left' }}>
+                  <tr style={{ color: 'var(--fg-dim)', textAlign: 'left' }}>
                     <th style={{ padding: '3px 6px' }}>#</th>
                     <th style={{ padding: '3px 6px' }}>Wallet</th>
                     <th style={{ padding: '3px 6px' }}>Realized</th>
@@ -421,13 +421,13 @@ function TraderScoutPanel() {
                 </thead>
                 <tbody>
                   {rep.top.map((t, i) => (
-                    <tr key={t.wallet} style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                    <tr key={t.wallet} style={{ borderTop: '1px solid var(--line)' }}>
                       <td style={{ padding: '3px 6px' }}>{i + 1}</td>
                       <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>
-                        <a href={`https://solscan.io/account/${t.wallet}`} target="_blank" rel="noreferrer" style={{ color: '#18ffff' }}>{short(t.wallet)}</a>
-                        {t.label && <span style={{ color: '#8a8a8a' }}> {t.label}</span>}
+                        <a href={`https://solscan.io/account/${t.wallet}`} target="_blank" rel="noreferrer" style={{ color: 'var(--info)' }}>{short(t.wallet)}</a>
+                        {t.label && <span style={{ color: 'var(--fg-dim)' }}> {t.label}</span>}
                       </td>
-                      <td style={{ padding: '3px 6px', color: '#00e676' }}>+{t.realizedSol}</td>
+                      <td style={{ padding: '3px 6px', color: 'var(--ok)' }}>+{t.realizedSol}</td>
                       <td style={{ padding: '3px 6px' }}>{Math.round(t.winRate * 100)}%</td>
                       <td style={{ padding: '3px 6px' }}>{t.medianBuySol}</td>
                       <td style={{ padding: '3px 6px' }}>{hold(t.medianHoldSeconds)}</td>
@@ -436,7 +436,7 @@ function TraderScoutPanel() {
                         <button
                           onClick={() => post('/api/scout/follow', { address: t.wallet }, 'Follow')}
                           disabled={busy !== null}
-                          style={{ fontSize: '9px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(0,229,255,0.4)', color: '#18ffff', borderRadius: 3 }}
+                          style={{ fontSize: '11px', padding: '1px 5px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--info-bg)', color: 'var(--info)', borderRadius: 3 }}
                         >follow</button>
                       </td>
                     </tr>
@@ -447,16 +447,16 @@ function TraderScoutPanel() {
           )}
 
           {rep.rejected.length > 0 && (
-            <details style={{ fontSize: '10px', color: '#8a8a8a', marginBottom: '6px' }}>
+            <details style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: '6px' }}>
               <summary style={{ cursor: 'pointer' }}>
                 {rep.rejected.length} checked and rejected — why
               </summary>
               <div style={{ marginTop: 4, lineHeight: 1.6 }}>
                 {rep.rejected.slice(0, 10).map(t => (
                   <div key={t.wallet} style={{ marginBottom: 3 }}>
-                    <span style={{ fontFamily: 'monospace', color: '#aaa' }}>{short(t.wallet)}</span>
+                    <span style={{ fontFamily: 'monospace', color: 'var(--fg-dim)' }}>{short(t.wallet)}</span>
                     {t.claimedRealizedSol !== undefined && (
-                      <span style={{ color: '#666' }}> (board claimed {Math.round(t.claimedRealizedSol)})</span>
+                      <span style={{ color: 'var(--fg-faint)' }}> (board claimed {Math.round(t.claimedRealizedSol)})</span>
                     )}
                     {' — '}{t.disqualifiers[0]}
                   </div>
@@ -465,7 +465,7 @@ function TraderScoutPanel() {
             </details>
           )}
 
-          <div style={{ fontSize: '9px', color: '#8a8a8a', lineHeight: 1.5 }}>
+          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.5 }}>
             {rep.notes.map((n, i) => <div key={i}>· {n}</div>)}
             <div>
               · Bars: trading now (not just seen inside {sc!.bars.maxIdleHours}h),
@@ -482,7 +482,7 @@ function TraderScoutPanel() {
         </>
       )}
 
-      {msg && <div style={{ fontSize: '10px', color: msg.includes('failed') ? '#ff5252' : '#00e676', marginTop: 6 }}>{msg}</div>}
+      {msg && <div style={{ fontSize: '11px', color: msg.includes('failed') ? 'var(--bad)' : 'var(--ok)', marginTop: 6 }}>{msg}</div>}
     </div>
   );
 }
@@ -555,13 +555,13 @@ function EntryProfileSection() {
   };
 
   return (
-    <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(124,77,255,0.2)' }}>
-      <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#b388ff', marginBottom: '6px' }}>
+    <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid var(--learn-bg)' }}>
+      <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--learn)', marginBottom: '6px' }}>
         🔬 What they look for — learned, then applied to every launch
       </div>
 
       {!ep.usable ? (
-        <div style={{ fontSize: '10px', color: '#8a8a8a', lineHeight: 1.6 }}>
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}>
           Not driving entries yet: {ep.notReady}.
           <br />
           Evidence so far: <strong>{ep.enteredSamples}</strong>/{ep.needEntered} tokens they bought,
@@ -571,9 +571,9 @@ function EntryProfileSection() {
       ) : (
         <>
           <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', fontSize: '10px', borderCollapse: 'collapse' }}>
+            <table style={{ width: '100%', fontSize: '11px', borderCollapse: 'collapse' }}>
               <thead>
-                <tr style={{ color: '#8a8a8a', textAlign: 'left' }}>
+                <tr style={{ color: 'var(--fg-dim)', textAlign: 'left' }}>
                   <th style={{ padding: '3px 6px' }}>They buy when</th>
                   <th style={{ padding: '3px 6px' }}>Their band</th>
                   <th style={{ padding: '3px 6px' }}>Their median</th>
@@ -583,12 +583,12 @@ function EntryProfileSection() {
               </thead>
               <tbody>
                 {ep.rules.map(r => (
-                  <tr key={r.feature} style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                  <tr key={r.feature} style={{ borderTop: '1px solid var(--line)' }}>
                     <td style={{ padding: '3px 6px' }}>{r.label}</td>
                     <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{num(r.low)} – {num(r.high)}</td>
                     <td style={{ padding: '3px 6px' }}>{num(r.median)}</td>
-                    <td style={{ padding: '3px 6px', color: '#8a8a8a' }}>{num(r.skippedMedian)}</td>
-                    <td style={{ padding: '3px 6px', color: r.separation >= 0.6 ? '#00e676' : '#ffab40' }}>
+                    <td style={{ padding: '3px 6px', color: 'var(--fg-dim)' }}>{num(r.skippedMedian)}</td>
+                    <td style={{ padding: '3px 6px', color: r.separation >= 0.6 ? 'var(--ok)' : 'var(--warn)' }}>
                       {Math.round(r.separation * 100)}%
                     </td>
                   </tr>
@@ -596,7 +596,7 @@ function EntryProfileSection() {
               </tbody>
             </table>
           </div>
-          <div style={{ fontSize: '9px', color: '#8a8a8a', marginTop: '6px', lineHeight: 1.5 }}>
+          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}>
             Built from {ep.enteredSamples} of their entries against {ep.skippedSamples} launches they passed on.
             A fresh token is bought on this profile alone when it matches at least{' '}
             <strong>{Math.round(ep.minScore * 100)}%</strong> of these rules by weight, on{' '}
@@ -627,12 +627,12 @@ function DiagnosticsPanel() {
   }, []);
 
   if (!diag || diag.level === 'ok' || !diag.findings.length) return null;
-  const color = diag.level === 'critical' ? '#ff1744' : diag.level === 'warning' ? '#ffb300' : '#64b5f6';
+  const color = diag.level === 'critical' ? 'var(--bad)' : diag.level === 'warning' ? 'var(--warn)' : 'var(--info)';
   const icon = diag.level === 'critical' ? '\u26d4' : diag.level === 'warning' ? '\u26a0\ufe0f' : '\u2139\ufe0f';
   const worst = diag.findings.filter((f) => f.level === diag.level);
 
   return (
-    <div style={{ borderBottom: `1px solid ${color}55`, background: `${color}14`, fontSize: '12px' }}>
+    <div style={{ borderBottom: `1px solid ${color}55`, background: `${color}14`, fontSize: '13px' }}>
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -649,10 +649,10 @@ function DiagnosticsPanel() {
       {open && (
         <div style={{ padding: '0 20px 10px' }}>
           {diag.findings.map((f, i) => (
-            <div key={i} style={{ padding: '6px 0', borderTop: i ? '1px solid rgba(255,255,255,0.06)' : 'none' }}>
-              <div style={{ color: f.level === 'critical' ? '#ff1744' : f.level === 'warning' ? '#ffb300' : '#64b5f6', fontWeight: 700 }}>{f.title}</div>
-              <div style={{ color: '#cfd8dc' }}>{f.detail}</div>
-              {f.fix && <div style={{ color: '#80cbc4' }}>&rarr; {f.fix}</div>}
+            <div key={i} style={{ padding: '6px 0', borderTop: i ? '1px solid var(--line)' : 'none' }}>
+              <div style={{ color: f.level === 'critical' ? 'var(--bad)' : f.level === 'warning' ? 'var(--warn)' : 'var(--info)', fontWeight: 700 }}>{f.title}</div>
+              <div style={{ color: 'var(--fg)' }}>{f.detail}</div>
+              {f.fix && <div style={{ color: 'var(--info)' }}>&rarr; {f.fix}</div>}
             </div>
           ))}
         </div>
@@ -1301,7 +1301,9 @@ export function App() {
 
   if (activePage === 'copy') {
     return (
-      <div>
+      /* Same viewport shell as the sniper view — without it this page's grid
+         has no height to fill and the panels sit in the top third. */
+      <div className="app-shell">
         <DiagnosticsPanel />
         <header className="header">
           <div>
@@ -1319,16 +1321,21 @@ export function App() {
   }
 
   return (
-    <div>
+    /* THE VIEWPORT SHELL. This was a bare <div>, which is why the whole layout
+       sat in the top three-quarters of the screen with dead space beneath it:
+       #root is a 100vh flex column, this div was its only child, and a flex
+       child defaults to content height — so the 100vh grid inside it never
+       received a height to fill. */
+    <div className="app-shell">
       {/* Auto-Update banner. A packaged exe installs in place; a dev checkout
           is told to git pull instead of being offered a swap it cannot do. */}
       {updateInfo?.hasUpdate && (
-        <div style={{ background: '#16a34a', color: '#ffffff', padding: '10px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', fontSize: '13px', fontWeight: 600, borderBottom: '1px solid #15803d' }}>
+        <div style={{ background: 'var(--ok)', color: 'var(--fg)', padding: '10px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', fontSize: '15px', fontWeight: 600, borderBottom: '1px solid var(--ok)' }}>
           <span style={{ minWidth: 0 }}>
             🚀 UPDATE AVAILABLE: {updateInfo.latestVersion} (you have {updateInfo.currentVersion})
-            {updateError && <span style={{ display: 'block', fontWeight: 400, fontSize: '11px', color: '#fecaca' }}>⚠️ {updateError}</span>}
+            {updateError && <span style={{ display: 'block', fontWeight: 400, fontSize: '12px', color: 'var(--bad)' }}>⚠️ {updateError}</span>}
             {applyingUpdate && updateProgress && (
-              <span style={{ display: 'block', fontWeight: 400, fontSize: '11px' }}>
+              <span style={{ display: 'block', fontWeight: 400, fontSize: '12px' }}>
                 {updateProgress.message}
                 {updateProgress.stage === 'downloading' && updateProgress.totalBytes > 0 && ` — ${updateProgress.pct}%`}
               </span>
@@ -1340,7 +1347,7 @@ export function App() {
               <button
                 onClick={handleApplyUpdate}
                 disabled={applyingUpdate}
-                style={{ background: '#ffffff', color: '#16a34a', padding: '6px 14px', border: 'none', borderRadius: '4px', fontWeight: 700, cursor: applyingUpdate ? 'wait' : 'pointer', opacity: applyingUpdate ? 0.7 : 1 }}
+                style={{ background: 'var(--fg)', color: 'var(--ok)', padding: '6px 14px', border: 'none', borderRadius: '4px', fontWeight: 700, cursor: applyingUpdate ? 'wait' : 'pointer', opacity: applyingUpdate ? 0.7 : 1 }}
               >
                 {applyingUpdate ? '⏳ UPDATING…' : '⬇ UPDATE NOW'}
               </button>
@@ -1351,14 +1358,14 @@ export function App() {
                 href={updateInfo.releaseUrl}
                 target="_blank"
                 rel="noreferrer"
-                style={{ background: '#ffffff', color: '#16a34a', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}
+                style={{ background: 'var(--fg)', color: 'var(--ok)', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}
               >
                 ⬇ GET THE INSTALLER
               </a>
             ) : (
-              <span style={{ fontSize: '11px', fontWeight: 400 }}>Dev checkout — run <code>git pull</code></span>
+              <span style={{ fontSize: '12px', fontWeight: 400 }}>Dev checkout — run <code>git pull</code></span>
             )}
-            <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer" style={{ background: 'rgba(255,255,255,0.15)', color: '#ffffff', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}>
+            <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer" style={{ background: 'var(--line)', color: 'var(--fg)', padding: '6px 14px', textDecoration: 'none', borderRadius: '4px', fontWeight: 700 }}>
               NOTES
             </a>
           </div>
@@ -1375,7 +1382,7 @@ export function App() {
 
         {/* Multi-Instance Switcher Bar */}
         <div className="instance-bar">
-          <span style={{ fontSize: '9px', textTransform: 'uppercase', color: 'var(--ink-secondary)', fontWeight: 700, marginRight: '4px' }}>
+          <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--ink-secondary)', fontWeight: 700, marginRight: '4px' }}>
             BOT INSTANCES:
           </span>
           {instances.map(inst => (
@@ -1404,10 +1411,10 @@ export function App() {
               gap: '6px',
               padding: '6px 12px',
               borderRadius: '4px',
-              border: `1px solid ${wallet?.rpcHealthy !== false ? 'rgba(0, 230, 118, 0.4)' : 'rgba(255, 23, 68, 0.4)'}`,
-              background: wallet?.rpcHealthy !== false ? 'rgba(0, 230, 118, 0.12)' : 'rgba(255, 23, 68, 0.12)',
-              color: wallet?.rpcHealthy !== false ? '#00e676' : '#ff1744',
-              fontSize: '11px',
+              border: `1px solid ${wallet?.rpcHealthy !== false ? 'var(--ok-bg)' : 'var(--bad-bg)'}`,
+              background: wallet?.rpcHealthy !== false ? 'var(--ok-bg)' : 'var(--bad-bg)',
+              color: wallet?.rpcHealthy !== false ? 'var(--ok)' : 'var(--bad)',
+              fontSize: '12px',
               fontWeight: 700,
               fontFamily: 'var(--font-mono)'
             }}
@@ -1424,8 +1431,8 @@ export function App() {
               width: '7px',
               height: '7px',
               borderRadius: '50%',
-              background: wallet?.rpcHealthy !== false ? '#00e676' : '#ff1744',
-              boxShadow: wallet?.rpcHealthy !== false ? '0 0 6px #00e676' : '0 0 6px #ff1744'
+              background: wallet?.rpcHealthy !== false ? 'var(--ok)' : 'var(--bad)',
+              boxShadow: wallet?.rpcHealthy !== false ? '0 0 6px var(--ok)' : '0 0 6px var(--bad)'
             }} />
             RPC {wallet?.rpcHealthy !== false ? 'OK' : 'DOWN'}
             {rpcEndpointLabel && (
@@ -1441,10 +1448,10 @@ export function App() {
                 alignItems: 'center',
                 padding: '6px 12px',
                 borderRadius: '4px',
-                border: '1px solid rgba(255, 171, 0, 0.5)',
-                background: 'rgba(255, 171, 0, 0.12)',
-                color: '#ffab00',
-                fontSize: '11px',
+                border: '1px solid var(--warn-bg)',
+                background: 'var(--warn-bg)',
+                color: 'var(--warn)',
+                fontSize: '12px',
                 fontWeight: 700,
                 fontFamily: 'var(--font-mono)'
               }}
@@ -1461,10 +1468,10 @@ export function App() {
                 alignItems: 'center',
                 padding: '6px 12px',
                 borderRadius: '4px',
-                border: '1px solid rgba(255, 23, 68, 0.5)',
-                background: 'rgba(255, 23, 68, 0.12)',
-                color: '#ff1744',
-                fontSize: '11px',
+                border: '1px solid var(--bad-bg)',
+                background: 'var(--bad-bg)',
+                color: 'var(--bad)',
+                fontSize: '12px',
                 fontWeight: 700,
                 fontFamily: 'var(--font-mono)'
               }}
@@ -1478,10 +1485,10 @@ export function App() {
             className="btn-terminal-outline"
             onClick={() => handleToggleFlag('allInSizing', !featureFlags.allInSizing)}
             style={{
-              borderColor: featureFlags.allInSizing ? '#00e676' : 'var(--ink-secondary)',
-              color: featureFlags.allInSizing ? '#00e676' : 'var(--ink-secondary)',
+              borderColor: featureFlags.allInSizing ? 'var(--ok)' : 'var(--ink-secondary)',
+              color: featureFlags.allInSizing ? 'var(--ok)' : 'var(--ink-secondary)',
               fontWeight: 700,
-              background: featureFlags.allInSizing ? 'rgba(0, 230, 118, 0.12)' : 'transparent',
+              background: featureFlags.allInSizing ? 'var(--ok-bg)' : 'transparent',
             }}
             title="When active, every trade spends 100% of your available Photon wallet SOL balance"
           >
@@ -1500,9 +1507,9 @@ export function App() {
             className="btn-terminal" 
             onClick={isBotActive ? handleEmergencyStop : toggleBotPower}
             style={{
-              background: isBotActive ? '#d32f2f' : 'var(--accent-olive)',
-              borderColor: isBotActive ? '#d32f2f' : 'var(--accent-olive)',
-              color: '#ffffff',
+              background: isBotActive ? 'var(--bad)' : 'var(--accent-olive)',
+              borderColor: isBotActive ? 'var(--bad)' : 'var(--accent-olive)',
+              color: 'var(--fg)',
               fontWeight: 700
             }}
           >
@@ -1513,9 +1520,9 @@ export function App() {
             className="btn-terminal" 
             onClick={handleShutdownServer}
             style={{
-              background: '#8b0000',
-              borderColor: '#ff1744',
-              color: '#ffffff',
+              background: 'var(--bad)',
+              borderColor: 'var(--bad)',
+              color: 'var(--fg)',
               fontWeight: 700
             }}
           >
@@ -1531,7 +1538,7 @@ export function App() {
           <div className="stat-value-mono">
             {botStatus?.marketRegime || 'RISK_ON'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', textTransform: 'uppercase', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', textTransform: 'uppercase', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}>
             {botStatus?.tradingMode.toUpperCase() || 'PAPER'} ({currentLeniency.toUpperCase()})
           </div>
         </div>
@@ -1541,7 +1548,7 @@ export function App() {
           <div className="stat-value-mono">
             ${botStatus?.bankrollUsd.toFixed(2) || '100.00'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             PORT {selectedPort} EQUALITY
           </div>
         </div>
@@ -1554,7 +1561,7 @@ export function App() {
           <div className={`hero-fraunces-number ${stats.totalNetPnlUsd >= 0 ? 'delta-positive' : 'delta-negative'}`}>
             {stats.totalNetPnlUsd >= 0 ? '+' : ''}${stats.totalNetPnlUsd.toFixed(2)}
           </div>
-          <div style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', color: 'var(--ink-secondary)', marginTop: '2px' }}>
+          <div style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: 'var(--ink-secondary)', marginTop: '2px' }}>
             {stats.totalNetPnlSol >= 0 ? '+' : ''}{stats.totalNetPnlSol} SOL REALIZED
           </div>
         </div>
@@ -1564,7 +1571,7 @@ export function App() {
           <div className="stat-value-mono">
             {stats.winRatePct}%
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {stats.winCount}W / {stats.lossCount}L ({stats.totalTrades} TOTAL)
           </div>
         </div>
@@ -1574,22 +1581,22 @@ export function App() {
           <div className="stat-value-mono">
             {activePositions.length} / {botStatus?.config.maxActivePositions ?? '—'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-sans)', letterSpacing: '0.06em' }}>
             CONCURRENT LIMIT
           </div>
         </div>
 
         {/* Runtime clock — ticks every second while a run is live */}
-        <div className="stat-card" style={{ border: runElapsedSec !== null ? '1px solid rgba(0,230,118,0.4)' : undefined }}>
+        <div className="stat-card" style={{ border: runElapsedSec !== null ? '1px solid var(--ok-bg)' : undefined }}>
           <div className="stat-label">Runtime</div>
-          <div className="stat-value-mono" style={{ color: runElapsedSec !== null ? '#00e676' : undefined }}>
+          <div className="stat-value-mono" style={{ color: runElapsedSec !== null ? 'var(--ok)' : undefined }}>
             {runElapsedSec !== null
               ? fmtClock(runElapsedSec)
               : lastReport
                 ? fmtClock(lastReport.durationSeconds)
                 : '00:00:00'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {runElapsedSec !== null && run?.startedAt
               ? `RUNNING · STARTED ${new Date(run.startedAt).toLocaleTimeString()}`
               : lastReport
@@ -1608,7 +1615,7 @@ export function App() {
                 ? `${lastReport.tokensSeen} → ${lastReport.positionsOpened}`
                 : '—'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {run
               ? 'SEEN → BOUGHT THIS RUN'
               : lastReport
@@ -1618,17 +1625,17 @@ export function App() {
         </div>
 
         {/* Wallet state — the difference between paper and real money */}
-        <div className="stat-card" style={{ border: wallet?.linked ? '1px solid rgba(0,230,118,0.4)' : undefined }}>
+        <div className="stat-card" style={{ border: wallet?.linked ? '1px solid var(--ok-bg)' : undefined }}>
           <div className="stat-label">
             Photon Wallet
-            <span style={{ float: 'right', fontSize: '9px', color: streamLive ? '#00e676' : '#fbbf24' }}>
+            <span style={{ float: 'right', fontSize: '11px', color: streamLive ? 'var(--ok)' : 'var(--warn)' }}>
               {streamLive ? '● LIVE' : '○ POLLING'}
             </span>
           </div>
-          <div className="stat-value-mono" style={{ color: wallet?.linked ? '#00e676' : undefined }}>
+          <div className="stat-value-mono" style={{ color: wallet?.linked ? 'var(--ok)' : undefined }}>
             {wallet?.linked ? `${wallet.solBalance} SOL` : 'NOT LINKED'}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {wallet?.linked
               ? `${wallet.shortAddress} · $${wallet.usdBalance} · ${wallet.rpcHealthy ? 'RPC OK' : 'RPC DOWN'} · SOL $${botStatus?.config?.solPriceUsd ?? '—'}`
               : 'PAPER MODE ONLY'}
@@ -1637,7 +1644,7 @@ export function App() {
 
         {/* Next order size — recomputed from the live balance every frame, by
             the same maths the buy path uses. */}
-        <div className="stat-card" style={{ border: featureFlags.allInSizing ? '1px solid rgba(0,230,118,0.5)' : undefined }}>
+        <div className="stat-card" style={{ border: featureFlags.allInSizing ? '1px solid var(--ok-bg)' : undefined }}>
           <div className="stat-label">
             {featureFlags.allInSizing
               ? '⚡ ALL-IN WALLET BUDGET'
@@ -1645,12 +1652,12 @@ export function App() {
                 ? `Slot Size (1 of ${botStatus?.config?.maxActivePositions ?? 3})`
                 : 'Next Entry Size'}
           </div>
-          <div className="stat-value-mono" style={{ color: featureFlags.allInSizing ? '#00e676' : undefined }}>
+          <div className="stat-value-mono" style={{ color: featureFlags.allInSizing ? 'var(--ok)' : undefined }}>
             {featureFlags.allInSizing
               ? (wallet?.linked ? `${wallet.deployableSol} SOL` : '100% WALLET')
               : sizing ? `${sizing.nextBuySol} SOL` : '—'}
           </div>
-          <div style={{ fontSize: '10px', color: featureFlags.allInSizing ? '#00e676' : 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
+          <div style={{ fontSize: '11px', color: featureFlags.allInSizing ? 'var(--ok)' : 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {featureFlags.allInSizing
               ? 'EVERY ENTRY SPENDS 100% WALLET SOL'
               : sizing
@@ -1660,7 +1667,7 @@ export function App() {
           {/* The whole point of splitting: name what one dead slot actually
               costs, in the currency the owner thinks in. */}
           {sizing && botStatus?.config?.walletSplitSizing && sizing.nextBuySol > 0 && (
-            <div style={{ fontSize: '10px', marginTop: '3px', fontFamily: 'var(--font-mono)', color: 'var(--ink-muted)' }}>
+            <div style={{ fontSize: '11px', marginTop: '3px', fontFamily: 'var(--font-mono)', color: 'var(--ink-muted)' }}>
               MAX LOSS PER SLOT ≈ ${sizing.nextBuyUsd} ({Math.round(100 / (sizing.slots || botStatus?.config?.maxActivePositions || 3))}% OF RUN)
             </div>
           )}
@@ -1668,17 +1675,17 @@ export function App() {
               an order. Bad economics no longer block — every amount trades —
               so they get an advisory line, not a stop sign. */}
           {sizing && sizing.blockedReason && (
-            <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#ef4444', border: '1px solid #ef4444', background: 'rgba(239,68,68,0.08)' }}>
+            <div style={{ fontSize: '11px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--bad)', border: '1px solid var(--bad)', background: 'var(--bad-bg)' }}>
               ⛔ NO TRADES POSSIBLE — {sizing.blockedReason}
             </div>
           )}
           {sizing && !sizing.blockedReason && sizing.economicsOk === false && (
-            <div style={{ fontSize: '9.5px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: '#fbbf24', border: '1px solid #fbbf24', background: 'rgba(251,191,36,0.08)' }}>
+            <div style={{ fontSize: '11px', marginTop: '4px', padding: '4px 6px', fontFamily: 'var(--font-mono)', color: 'var(--warn)', border: '1px solid var(--warn)', background: 'var(--warn-bg)' }}>
               ⚠️ ROUND-TRIP COST {sizing.breakevenPct}% — EVERY ENTRY STARTS THAT FAR UNDERWATER. TRADING ANYWAY.
             </div>
           )}
           {sizing && sizing.slotsReducedForEconomics && (
-            <div style={{ fontSize: '9.5px', marginTop: '4px', fontFamily: 'var(--font-mono)', color: '#fbbf24' }}>
+            <div style={{ fontSize: '11px', marginTop: '4px', fontFamily: 'var(--font-mono)', color: 'var(--warn)' }}>
               ⚠️ {sizing.requestedSlots} SLOTS REQUESTED → {sizing.slots} FUNDABLE. ONE DEAD POSITION NOW COSTS {Math.round(100 / (sizing.slots || 1))}% OF THE RUN.
             </div>
           )}
@@ -1686,10 +1693,10 @@ export function App() {
               at all — show it next to the stake, not buried in a report. */}
           {sizing && sizing.breakevenPct > 0 && (
             <div style={{
-              fontSize: '10px',
+              fontSize: '11px',
               marginTop: '3px',
               fontFamily: 'var(--font-mono)',
-              color: sizing.breakevenPct > 10 ? '#ef4444' : sizing.breakevenPct > 6 ? '#fbbf24' : '#00e676',
+              color: sizing.breakevenPct > 10 ? 'var(--bad)' : sizing.breakevenPct > 6 ? 'var(--warn)' : 'var(--ok)',
             }}>
               NEEDS +{sizing.breakevenPct}% TO BREAK EVEN
             </div>
@@ -1709,7 +1716,7 @@ export function App() {
                 className="btn-terminal-outline"
                 style={{
                   padding: '2px 8px',
-                  fontSize: '9px',
+                  fontSize: '11px',
                   background: 'var(--ink-primary)',
                   color: 'var(--bg-dark)',
                   cursor: 'default',
@@ -1836,7 +1843,7 @@ export function App() {
                               target="_blank"
                               rel="noopener noreferrer"
                               className="btn-terminal-outline"
-                              style={{ padding: '2px 6px', fontSize: '9px' }}
+                              style={{ padding: '2px 6px', fontSize: '11px' }}
                             >
                               SOLSCAN
                             </a>
@@ -1846,7 +1853,7 @@ export function App() {
                             target="_blank"
                             rel="noopener noreferrer"
                             className="btn-terminal-outline"
-                            style={{ padding: '2px 6px', fontSize: '9px' }}
+                            style={{ padding: '2px 6px', fontSize: '11px' }}
                           >
                             PHOTON
                           </a>
@@ -1865,7 +1872,7 @@ export function App() {
           {/* Execution receipts — permanent record of every closed leg. The
               Execution column is the ground truth the 10-second log feed can't
               give: a real fill links to its Solscan tx, a paper fill says so. */}
-          <div className="section-header" style={{ marginTop: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div className="section-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <div className="section-title">Execution Receipts — Closed Trades</div>
               <div className="section-count">
@@ -1876,7 +1883,7 @@ export function App() {
               <button 
                 className="btn-terminal-outline" 
                 onClick={handleClearHistory}
-                style={{ fontSize: '10px', padding: '2px 8px', color: '#ff1744', borderColor: '#ff1744' }}
+                style={{ fontSize: '11px', padding: '2px 8px', color: 'var(--bad)', borderColor: 'var(--bad)' }}
               >
                 🗑️ CLEAR RECEIPTS
               </button>
@@ -1903,7 +1910,7 @@ export function App() {
                 <tbody>
                   {tradeHistory.slice(0, 12).map((t, i) => (
                     <tr key={`${t.id}_${t.exitTime}_${i}`}>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '10px' }}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
                         {new Date(t.exitTime).toLocaleTimeString()}
                       </td>
                       <td>
@@ -1918,7 +1925,7 @@ export function App() {
                       <td>
                         <TxProofBadge txid={t.sellTxid} verified={t.fillVerified} />
                       </td>
-                      <td style={{ fontSize: '10px', color: 'var(--ink-muted)', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.exitReason}>
+                      <td style={{ fontSize: '11px', color: 'var(--ink-muted)', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.exitReason}>
                         {t.exitReason}
                       </td>
                     </tr>
@@ -2055,10 +2062,10 @@ export function App() {
               <div className="form-group" style={{ marginTop: '4px', padding: '10px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', borderRadius: '4px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                   <div>
-                    <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                       ⬇ Software Update
                     </div>
-                    <div style={{ fontSize: '8.5px', color: 'var(--ink-muted)', marginTop: '3px', fontFamily: 'var(--font-mono)' }}>
+                    <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '3px', fontFamily: 'var(--font-mono)' }}>
                       Installed: <strong>v{updateInfo?.currentVersion ?? '—'}</strong>
                       {updateInfo?.latestVersion && updateInfo.latestVersion !== updateInfo.currentVersion && (
                         <> · Available: <strong>{updateInfo.latestVersion}</strong></>
@@ -2079,7 +2086,7 @@ export function App() {
                       <button
                         type="button"
                         className="btn-instance"
-                        style={{ borderColor: '#00e676', color: '#00e676' }}
+                        style={{ borderColor: 'var(--ok)', color: 'var(--ok)' }}
                         onClick={handleApplyUpdate}
                         disabled={applyingUpdate}
                       >
@@ -2089,18 +2096,18 @@ export function App() {
                   </div>
                 </div>
 
-                <div style={{ fontSize: '8px', marginTop: '6px', lineHeight: 1.55, color: 'var(--ink-muted)' }}>
-                  {updateError && <div style={{ color: '#ff1744' }}>⚠️ {updateError}</div>}
+                <div style={{ fontSize: '10px', marginTop: '6px', lineHeight: 1.55, color: 'var(--ink-muted)' }}>
+                  {updateError && <div style={{ color: 'var(--bad)' }}>⚠️ {updateError}</div>}
 
                   {applyingUpdate && updateProgress && (
-                    <div style={{ color: '#00e676' }}>
+                    <div style={{ color: 'var(--ok)' }}>
                       {updateProgress.message}
                       {updateProgress.stage === 'downloading' && updateProgress.totalBytes > 0 && ` — ${updateProgress.pct}%`}
                     </div>
                   )}
 
                   {!applyingUpdate && updateInfo?.hasUpdate && (
-                    <div style={{ color: '#00e676' }}>
+                    <div style={{ color: 'var(--ok)' }}>
                       A newer release is published.
                       {!updateInfo.canSelfUpdate && (updateInfo.installKind === 'electron'
                         ? ' This is the installed desktop app — download the new installer from the release page and run it. Your settings and positions are kept (they live in the app-data folder, not next to the app).'
@@ -2116,7 +2123,7 @@ export function App() {
                       there is nothing on the other end to install yet. Say that
                       plainly rather than showing an empty panel. */}
                   {!applyingUpdate && updateInfo?.error && (
-                    <div style={{ color: '#ffab00' }}>
+                    <div style={{ color: 'var(--warn)' }}>
                       {updateInfo.error}
                       {/No published release/.test(String(updateInfo.error)) && (
                         <> Tag a release (<code>git tag v1.1.0 &amp;&amp; git push --tags</code>) — the workflow builds the exe
@@ -2141,8 +2148,8 @@ export function App() {
                 <label className="form-label">
                   Helius RPC Key{' '}
                   {botStatus?.config?.heliusApiKeySet
-                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.heliusApiKeyHint}</span>
-                    : <span style={{ color: '#ff1744' }}>— NOT SET (the bot cannot reach the chain)</span>}
+                    ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.heliusApiKeyHint}</span>
+                    : <span style={{ color: 'var(--bad)' }}>— NOT SET (the bot cannot reach the chain)</span>}
                 </label>
                 <input
                   type="password"
@@ -2151,7 +2158,7 @@ export function App() {
                   value={configForm.heliusApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, heliusApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px' }}>
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px' }}>
                   Free tier at helius.dev. Used for every RPC call, position pricing and transaction submission.
                   There is no built-in key — each user supplies their own.
                   {' '}Keys entered here are saved to <code>.api-keys.json</code> beside the app and reused on the next start.
@@ -2159,14 +2166,14 @@ export function App() {
                 {/* Which source won matters: a saved key outranks .env, so
                     editing .env and seeing no change needs an explanation. */}
                 {botStatus?.config?.heliusApiKeySet && (
-                  <div style={{ fontSize: '8px', marginTop: '3px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <div style={{ fontSize: '10px', marginTop: '3px', display: 'flex', alignItems: 'center', gap: '6px' }}>
                     <span style={{ color: 'var(--ink-muted)' }}>
                       source: {botStatus.config.heliusApiKeySource === 'stored'
                         ? 'saved in Settings (takes precedence over .env)'
                         : 'environment / .env'}
                     </span>
                     {botStatus.config.heliusApiKeySource === 'stored' && (
-                      <button type="button" className="btn-ghost" style={{ fontSize: '8px', padding: '1px 5px' }}
+                      <button type="button" className="btn-ghost" style={{ fontSize: '10px', padding: '1px 5px' }}
                         onClick={() => void handleForgetKey('heliusApiKey')}>
                         Forget saved key
                       </button>
@@ -2174,7 +2181,7 @@ export function App() {
                   </div>
                 )}
                 {!botStatus?.config?.heliusApiKeySet && (
-                  <div style={{ fontSize: '8px', marginTop: '3px', color: '#ff9100' }}>
+                  <div style={{ fontSize: '10px', marginTop: '3px', color: 'var(--warn)' }}>
                     Running on the public RPC endpoint — heavily rate limited. Positions can still be priced and sold, but snipes will lose races.
                   </div>
                 )}
@@ -2184,8 +2191,8 @@ export function App() {
                 <label className="form-label">
                   PumpPortal Data Key{' '}
                   {botStatus?.config?.pumpPortalApiKeySet
-                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.pumpPortalApiKeyHint}</span>
-                    : <span style={{ color: '#ffab00' }}>— not set (free tier)</span>}
+                    ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.pumpPortalApiKeyHint}</span>
+                    : <span style={{ color: 'var(--warn)' }}>— not set (free tier)</span>}
                 </label>
                 <input
                   type="password"
@@ -2194,7 +2201,7 @@ export function App() {
                   value={configForm.pumpPortalApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, pumpPortalApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
                   <strong>Not needed to trade</strong> — buys and sells go through the free trade-local endpoint.
                   What it unlocks is PER-TRADE DATA, which requires a key funded with at least 0.02 SOL (~$1.50).
                   Without it <code>subscribeTokenTrade</code> returns nothing, so unique-buyer counts read 0,
@@ -2212,8 +2219,8 @@ export function App() {
                 <label className="form-label">
                   Solana Tracker Key{' '}
                   {botStatus?.config?.solanaTrackerApiKeySet
-                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.solanaTrackerApiKeyHint}</span>
-                    : <span style={{ color: '#ffab00' }}>— not set (the scout falls back to on-chain discovery)</span>}
+                    ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.solanaTrackerApiKeyHint}</span>
+                    : <span style={{ color: 'var(--warn)' }}>— not set (the scout falls back to on-chain discovery)</span>}
                 </label>
                 <input
                   type="password"
@@ -2222,7 +2229,7 @@ export function App() {
                   value={configForm.solanaTrackerApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, solanaTrackerApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
                   Free tier at solanatracker.io. Feeds the <strong>Who to copy</strong> scout with candidate
                   wallets — both the profit leaderboard and the named-KOL board. It is the only free source
                   that ranks Solana wallets by realized profit over a plain API call: GMGN and Kolscan are
@@ -2236,7 +2243,7 @@ export function App() {
                 <label className="form-label">
                   Birdeye Key{' '}
                   {botStatus?.config?.birdeyeApiKeySet
-                    ? <span style={{ color: '#00e676' }}>— set {botStatus.config.birdeyeApiKeyHint}</span>
+                    ? <span style={{ color: 'var(--ok)' }}>— set {botStatus.config.birdeyeApiKeyHint}</span>
                     : <span style={{ color: 'var(--ink-muted)' }}>— not set (optional)</span>}
                 </label>
                 <input
@@ -2246,7 +2253,7 @@ export function App() {
                   value={configForm.birdeyeApiKey || ''}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, birdeyeApiKey: e.target.value })}
                 />
-                <div className="form-help" style={{ fontSize: '8px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
+                <div className="form-help" style={{ fontSize: '10px', color: 'var(--ink-muted)', marginTop: '2px', lineHeight: 1.5 }}>
                   Free tier at birdeye.so. A second opinion for the scout's candidate list — a wallet two
                   independent boards both name is worth checking first. Purely additive: the scout works
                   without it.
@@ -2254,21 +2261,21 @@ export function App() {
               </div>
 
               {/* Photon Wallet Link — real on-chain execution */}
-              <div className="form-group" style={{ border: '1px solid rgba(255,255,255,0.14)', padding: 12, marginTop: '6px' }}>
+              <div className="form-group" style={{ border: '1px solid var(--line)', padding: 12, marginTop: '6px' }}>
                 <label className="form-label">
                   Photon Wallet {wallet?.linked ? '— LINKED' : '— not linked'}
                 </label>
 
                 {wallet?.linked ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    <div style={{ fontFamily: 'monospace', fontSize: '0.8rem', wordBreak: 'break-all', color: '#00e676' }}>
+                    <div style={{ fontFamily: 'monospace', fontSize: '0.8rem', wordBreak: 'break-all', color: 'var(--ok)' }}>
                       {wallet.address}
                     </div>
                     <div style={{ display: 'flex', gap: 14, fontSize: '0.85rem', flexWrap: 'wrap' }}>
                       <span><strong>{wallet.solBalance}</strong> SOL</span>
-                      <span style={{ color: '#94a3b8' }}>${wallet.usdBalance}</span>
-                      <span style={{ color: '#00e676' }}>{wallet.deployableSol} deployable</span>
-                      <span style={{ color: wallet.rpcHealthy ? '#00e676' : '#ff1744' }}>
+                      <span style={{ color: 'var(--fg-dim)' }}>${wallet.usdBalance}</span>
+                      <span style={{ color: 'var(--ok)' }}>{wallet.deployableSol} deployable</span>
+                      <span style={{ color: wallet.rpcHealthy ? 'var(--ok)' : 'var(--bad)' }}>
                         RPC {wallet.rpcHealthy ? 'OK' : 'DOWN'}
                       </span>
                     </div>
@@ -2291,7 +2298,7 @@ export function App() {
                       value={walletKeyInput}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => setWalletKeyInput(e.target.value)}
                     />
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: '#94a3b8' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem', color: 'var(--fg-dim)' }}>
                       <input
                         type="checkbox"
                         checked={walletPersist}
@@ -2308,7 +2315,7 @@ export function App() {
 
               {/* Strategy Parameters Grid */}
               <div style={{ marginTop: '10px' }}>
-                <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
                   Strategy Parameters
                 </div>
 
@@ -2340,8 +2347,8 @@ export function App() {
                     setting here that costs SOL on every trade whether the trade
                     wins or loses. It was previously pinned (floor == ceiling)
                     with no way to change it outside a config file. */}
-                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(255,193,7,0.05)', border: '1px solid rgba(255,193,7,0.2)', borderRadius: '4px' }}>
-                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#ffc107', marginBottom: '6px' }}>
+                <div style={{ marginTop: '10px', padding: '10px', background: 'var(--warn-bg)', border: '1px solid var(--warn-bg)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--warn)', marginBottom: '6px' }}>
                     ⚡ Priority Fee — what you pay to land
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
@@ -2366,7 +2373,7 @@ export function App() {
                       />
                     </div>
                   </div>
-                  <div style={{ fontSize: '9px', color: '#8a8a8a', marginTop: '6px', lineHeight: 1.5 }}>
+                  <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}>
                     Paid on <strong>every</strong> transaction, win or lose. The floor is what you always pay;
                     with dynamic fees on, a congested slot can bid up to the ceiling.
                     A fee too low simply does not land — and a send that does not land still burns its base fee.
@@ -2380,8 +2387,8 @@ export function App() {
 
                 {/* Take-profit Automation Controls (positive P&L only). The
                     loss side lives in its own Exit Policy block below. */}
-                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(0,230,118,0.05)', border: '1px solid rgba(0,230,118,0.2)', borderRadius: '4px' }}>
-                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#00e676', marginBottom: '6px' }}>
+                <div style={{ marginTop: '10px', padding: '10px', background: 'var(--ok-bg)', border: '1px solid var(--ok-bg)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ok)', marginBottom: '6px' }}>
                     💰 Take-Profit Automation (Positive P&L Only)
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
@@ -2431,11 +2438,11 @@ export function App() {
                 {/* Exit Policy. Every automatic sell on the loss side is a
                     switch, not a hardcoded rule. All off = the bot never sells
                     on its own; dangers are still detected and logged. */}
-                <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(255,171,0,0.05)', border: '1px solid rgba(255,171,0,0.25)', borderRadius: '4px' }}>
-                  <div style={{ fontSize: '9px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#ffab00', marginBottom: '4px' }}>
+                <div style={{ marginTop: '10px', padding: '10px', background: 'var(--warn-bg)', border: '1px solid var(--warn-bg)', borderRadius: '4px' }}>
+                  <div style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--warn)', marginBottom: '4px' }}>
                     🛡️ Exit Policy — which automatic sells may fire
                   </div>
-                  <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginBottom: '8px', lineHeight: 1.5 }}>
+                  <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '8px', lineHeight: 1.5 }}>
                     Turn every switch off and the bot never sells on its own — dangers are still detected and
                     logged, and LIQUIDATE stays the only exit. Take-profit rungs above are unaffected.
                   </div>
@@ -2461,8 +2468,8 @@ export function App() {
                       style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', padding: '5px 0', borderTop: '1px solid var(--border-hairline)' }}
                     >
                       <div>
-                        <div style={{ fontSize: '8.5px', fontWeight: 700 }}>{title}</div>
-                        <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', lineHeight: 1.45 }}>{detail}</div>
+                        <div style={{ fontSize: '10px', fontWeight: 700 }}>{title}</div>
+                        <div style={{ fontSize: '10px', color: 'var(--ink-muted)', lineHeight: 1.45 }}>{detail}</div>
                       </div>
                       <input
                         type="checkbox"
@@ -2532,8 +2539,8 @@ export function App() {
                     slots at START, so one dead trade costs 1/N of the run. */}
                 <div style={{ marginTop: '8px', padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
                   <div>
-                    <div style={{ fontSize: '8.5px', fontWeight: 700 }}>💰 Split Wallet Across Slots</div>
-                    <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>
+                    <div style={{ fontSize: '10px', fontWeight: 700 }}>💰 Split Wallet Across Slots</div>
+                    <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>
                       At START, divide the deployable balance into {configForm.maxActivePositions ?? 3} equal
                       slots and stake one per trade. Fixed for the run, so a position going to zero costs
                       1/{configForm.maxActivePositions ?? 3} and never shrinks the others. Overrides Position Size.
@@ -2549,10 +2556,10 @@ export function App() {
                 {/* Launch snipe (Play 1): enabled by the 🚀 Launch Snipe flag
                     below; these tune WHEN it pulls the trigger. */}
                 <div style={{ marginTop: '10px' }}>
-                  <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                  <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
                     🚀 Launch Snipe (Play 1)
                   </div>
-                  <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)', marginBottom: '6px' }}>
+                  <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '6px' }}>
                     Buys fresh launches in their first candle, next to the other snipers, skipping the
                     slow screening entirely. Inflow 0 = buy the instant the create event arrives; otherwise
                     wait until that much SOL from other buyers hits the curve inside the window.
@@ -2606,62 +2613,62 @@ export function App() {
 
               {/* Feature Flags Matrix */}
               <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid var(--border-hairline)' }}>
-                <div style={{ fontSize: '8.5px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
+                <div style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--ink-secondary)', marginBottom: '6px' }}>
                   Engine Feature Flags &amp; Guards
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🚀 Launch Snipe</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Play 1: first-candle entry, screens skipped</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🚀 Launch Snipe</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Play 1: first-candle entry, screens skipped</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.launchSnipe} onChange={e => handleToggleFlag('launchSnipe', e.target.checked)} />
                   </div>
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🛑 Dev Sell Stop</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Exit on creator / cluster sells</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🛑 Dev Sell Stop</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Exit on creator / cluster sells</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.devSellStop} onChange={e => handleToggleFlag('devSellStop', e.target.checked)} />
                   </div>
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🧪 Honest Paper</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Real curve fills &amp; fee drag</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🧪 Honest Paper</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Real curve fills &amp; fee drag</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.honestPaper} onChange={e => handleToggleFlag('honestPaper', e.target.checked)} />
                   </div>
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🎯 Playbook Router</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Measured curve routing</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🎯 Playbook Router</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Measured curve routing</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.playbookRouting} onChange={e => handleToggleFlag('playbookRouting', e.target.checked)} />
                   </div>
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>⚡ Kill Switch</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Auto-pause on hourly loss</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>⚡ Kill Switch</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Auto-pause on hourly loss</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.killSwitch} onChange={e => handleToggleFlag('killSwitch', e.target.checked)} />
                   </div>
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>⛽ Dynamic Priority Fee</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>P75 network fee scaling</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>⛽ Dynamic Priority Fee</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>P75 network fee scaling</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.dynamicPriorityFee} onChange={e => handleToggleFlag('dynamicPriorityFee', e.target.checked)} />
                   </div>
 
                   <div style={{ padding: '6px 8px', background: 'var(--bg-subtle)', border: '1px solid var(--border-hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <div style={{ fontSize: '8.5px', fontWeight: 700 }}>🔒 Honeypot Audit</div>
-                      <div style={{ fontSize: '7.5px', color: 'var(--ink-muted)' }}>Freeze &amp; transfer hook check</div>
+                      <div style={{ fontSize: '10px', fontWeight: 700 }}>🔒 Honeypot Audit</div>
+                      <div style={{ fontSize: '10px', color: 'var(--ink-muted)' }}>Freeze &amp; transfer hook check</div>
                     </div>
                     <input type="checkbox" checked={!!featureFlags.honeypotChecks} onChange={e => handleToggleFlag('honeypotChecks', e.target.checked)} />
                   </div>

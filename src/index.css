@@ -1,216 +1,368 @@
+/* ===========================================================================
+   TERMINAL — the design system for the whole app.
+   ---------------------------------------------------------------------------
+   WHY THIS EXISTS. The UI had three typefaces (a serif used in italic for hero
+   numbers, a sans for labels, a mono for values), a body size of 8-9.5px, and
+   twenty-seven hardcoded hex colours doing the work of about six semantic
+   roles. Panels added at different times each brought their own accent — a
+   cyan scout beside an olive stat strip beside a violet roster — so the screen
+   read as several tools sharing a window rather than one instrument.
+
+   THE RULES, in the order they matter:
+
+   1. ONE TYPEFACE. IBM Plex Mono, everywhere. This is a trading terminal: the
+      numbers must align in columns, and a proportional font makes a table of
+      prices unreadable no matter how it is spaced. It also means a label and
+      the value under it share a grid, which is most of what makes a dense
+      screen feel engineered rather than crowded.
+
+   2. COLOUR IS A STATEMENT, NOT DECORATION. Five accents, each with exactly
+      one meaning: green is money made, red is money lost or a hard stop, amber
+      is attention-needed, blue is a fact or a link, violet is something the
+      bot LEARNED rather than was told. If a thing has no state, it is grey.
+      A screen where everything is coloured is a screen where colour says
+      nothing.
+
+   3. READABLE FIRST. 8px type is not a design decision, it is a defect. The
+      base is 11px and labels are 10px, which is genuinely small but legible on
+      a laptop panel; nothing goes below that. Density is bought with spacing
+      and hairlines, never with type size.
+
+   4. THE ACCENTS ARE PICKED FOR DARK BACKGROUNDS. These are GitHub's dark
+      palette values. They are not chosen for taste — they are chosen because
+      they hold their hue and contrast on a near-black ground, which most
+      "terminal green" and "terminal red" do not: saturated primaries vibrate
+      against dark backgrounds and go muddy when dimmed.
+   =========================================================================== */
+
 :root {
-  --bg-dark: #0e1013;
-  --bg-surface: #15181d;
-  --bg-subtle: #1c1f26;
-  --border-hairline: #2a2e38;
-  --border-dark: #e6e2d8;
-  --ink-primary: #e6e2d8;
-  --ink-secondary: #8e8a80;
-  --ink-muted: #626058;
-  --accent-oxblood: #b8433d;
-  --accent-olive: #438a4e;
-  --accent-bronze: #c49352;
-  
-  --font-serif: 'Fraunces', Georgia, serif;
-  --font-sans: 'Switzer', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --font-mono: 'IBM Plex Mono', monospace;
+  /* --- ground ---------------------------------------------------------- */
+  --bg:          #0a0c10;   /* the desk */
+  --bg-panel:    #10131a;   /* a card sitting on it */
+  --bg-raised:   #161a23;   /* a header or hovered row inside a card */
+  --bg-input:    #070910;   /* a hole in the surface — inputs, the console */
+
+  /* --- structure ------------------------------------------------------- */
+  --line:        #222835;   /* the default hairline */
+  --line-bright: #333c4e;   /* a border that is doing work */
+  --line-focus:  #4b566b;
+
+  /* --- text ------------------------------------------------------------ */
+  --fg:          #d6dbe4;   /* values, primary reading */
+  --fg-dim:      #8b95a7;   /* labels, secondary */
+  --fg-faint:    #59637a;   /* timestamps, units, disabled */
+
+  /* --- the five meanings ----------------------------------------------- */
+  --ok:          #3fb950;   /* realised gain, healthy, passed */
+  --bad:         #f85149;   /* loss, refused, stopped */
+  --warn:        #d29922;   /* needs attention, degraded, not configured */
+  --info:        #58a6ff;   /* a fact, a link, a measurement */
+  --learn:       #a371f7;   /* something the bot worked out for itself */
+
+  /* Tinted grounds. Always 10-14% — enough to read as a region, never enough
+     to compete with the text sitting on it. */
+  --ok-bg:       rgba(63, 185, 80, 0.10);
+  --bad-bg:      rgba(248, 81, 73, 0.10);
+  --warn-bg:     rgba(210, 153, 34, 0.10);
+  --info-bg:     rgba(88, 166, 255, 0.10);
+  --learn-bg:    rgba(163, 113, 247, 0.10);
+
+  /* --- type ------------------------------------------------------------ */
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --fs-xs: 10px;    /* labels, badges, help */
+  --fs-sm: 11px;    /* body, table cells — the default */
+  --fs-md: 12px;    /* emphasis inside body */
+  --fs-lg: 15px;    /* stat values */
+  --fs-xl: 21px;    /* the one number you look at first */
+
+  /* --- rhythm ---------------------------------------------------------- */
+  --sp-1: 3px;
+  --sp-2: 6px;
+  --sp-3: 9px;
+  --sp-4: 13px;
+
+  /* Legacy aliases. The TSX carries hundreds of inline styles referencing the
+     old names; mapping them here means the whole app moves to this palette
+     without touching every one of them, and a missed call site inherits the
+     new system instead of a dangling variable. */
+  --bg-dark: var(--bg);
+  --bg-surface: var(--bg-panel);
+  --bg-subtle: var(--bg-raised);
+  --border-hairline: var(--line);
+  --border-dark: var(--line-bright);
+  --ink-primary: var(--fg);
+  --ink-secondary: var(--fg-dim);
+  --ink-muted: var(--fg-faint);
+  --accent-oxblood: var(--bad);
+  --accent-olive: var(--ok);
+  --accent-bronze: var(--warn);
+  --font-mono: var(--mono);
+  --font-sans: var(--mono);
+  --font-serif: var(--mono);
 }
 
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-  border-radius: 0 !important;
-}
+* { box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; }
 
 html, body {
   height: 100vh !important;
   width: 100vw !important;
   max-height: 100vh !important;
-  overflow: hidden !important; /* ABSOLUTE STRICT ZERO PAGE SCROLL GUARANTEE */
-  background-color: var(--bg-dark);
-  color: var(--ink-primary);
-  font-family: var(--font-sans);
-  font-size: 11px;
-  line-height: 1.2;
+  overflow: hidden !important;      /* the layout is a fixed viewport, by design */
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.45;                /* was 1.2 — the single biggest legibility win */
+  font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #root {
-  max-width: 1600px;
+  max-width: 1760px;
   height: 100vh !important;
   max-height: 100vh !important;
   margin: 0 auto;
-  padding: 8px 14px;
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
   display: flex;
   flex-direction: column;
   overflow: hidden !important;
 }
 
-/* Header Architecture & Instance Switcher Bar */
+/* The single child of #root. Carries the height down to the layout grid; see
+   the note at its declaration in App.tsx. */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+::selection { background: var(--info); color: var(--bg); }
+
+/* Scrollbars, so a scrolling region reads as part of the instrument rather
+   than as the operating system showing through. */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: var(--bg-input); }
+::-webkit-scrollbar-thumb { background: var(--line-bright); border: 2px solid var(--bg-input); }
+::-webkit-scrollbar-thumb:hover { background: var(--line-focus); }
+
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ===========================================================================
+   HEADER
+   =========================================================================== */
+
+/* TWO ROWS, DECLARED RATHER THAN NEGOTIATED.
+   The three blocks (brand, instance switcher, controls) were competing for one
+   line, so the switcher spilled "+ NEW INSTANCE" onto a second row and the
+   controls spilled "KILL DEV SERVER" onto a third — a ragged header that moved
+   whenever a button's label changed. Now row one is identity and controls, row
+   two is the instance switcher, which is what it actually is: a tab bar. */
 .header {
   display: flex;
-  justify-content: space-between;
+  flex-wrap: wrap;
   align-items: center;
-  margin-bottom: 6px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid var(--border-hairline);
+  row-gap: var(--sp-2);
+  column-gap: var(--sp-4);
+  margin-bottom: var(--sp-3);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--line);
   flex-shrink: 0;
 }
 
+.header > :first-child { flex: 1 1 auto; min-width: 0; }
+/* The controls block sits beside the brand and never wraps internally. */
+.header > :last-child { flex: 0 0 auto; margin-left: auto; }
+.header > .instance-bar {
+  order: 3;
+  flex: 1 0 100%;
+  margin-left: 0;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line);
+}
+
+/* The product mark. A shell prompt rather than a logo — it says what this is
+   in the same glance as the port it is bound to. */
 .brand-title {
-  font-family: var(--font-sans);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--ink-primary);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.brand-title::before {
+  content: '$ ';
+  color: var(--ok);
+  font-weight: 400;
 }
 
 .brand-subtitle {
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  color: var(--ink-secondary);
+  font-size: var(--fs-xs);
+  color: var(--fg-faint);
+  letter-spacing: 0.02em;
 }
 
-.instance-bar {
-  display: flex;
+.instance-bar { display: flex; align-items: center; gap: var(--sp-1); flex-wrap: wrap; }
+
+/* ===========================================================================
+   CONTROLS
+   Three weights, and only three: primary (filled), default (outlined), ghost.
+   Every button in the app resolves to one of them.
+   =========================================================================== */
+
+.btn-terminal,
+.btn-terminal-outline,
+.btn-instance,
+.btn-ghost,
+.btn-cell-action {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  white-space: nowrap;
+  display: inline-flex;
   align-items: center;
   gap: 4px;
 }
 
-.btn-instance {
-  font-family: var(--font-mono);
-  font-size: 8.5px;
-  padding: 2px 5px;
-  background: var(--bg-surface);
-  color: var(--ink-secondary);
-  border: 1px solid var(--border-hairline);
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.btn-instance.active {
-  background: var(--ink-primary);
-  color: var(--bg-dark);
-  border-color: var(--ink-primary);
-  font-weight: 700;
-}
-
 .btn-terminal {
-  font-family: var(--font-sans);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  padding: 4px 8px;
-  background: var(--ink-primary);
-  color: var(--bg-dark);
-  border: 1px solid var(--ink-primary);
-  cursor: pointer;
-  transition: all 0.15s ease;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
+  padding: 5px 11px;
+  background: var(--ok-bg);
+  color: var(--ok);
+  border: 1px solid var(--ok);
+  font-weight: 600;
 }
-
-.btn-terminal:hover {
-  background: var(--accent-bronze);
-  border-color: var(--accent-bronze);
-  color: #0e1013;
-}
+.btn-terminal:hover { background: var(--ok); color: var(--bg); }
 
 .btn-terminal-outline {
-  font-family: var(--font-sans);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  padding: 4px 8px;
+  padding: 5px 11px;
   background: transparent;
-  color: var(--ink-primary);
-  border: 1px solid var(--border-hairline);
-  cursor: pointer;
-  transition: all 0.15s ease;
+  color: var(--fg-dim);
+  border: 1px solid var(--line-bright);
 }
-
 .btn-terminal-outline:hover {
-  border-color: var(--ink-primary);
-  background: var(--bg-subtle);
+  color: var(--fg);
+  border-color: var(--line-focus);
+  background: var(--bg-raised);
 }
 
-/* Top 5-Card Strip - Ultra Compact Height (~52px) */
+.btn-instance {
+  padding: 4px 9px;
+  background: var(--bg-panel);
+  color: var(--fg-dim);
+  border: 1px solid var(--line);
+}
+.btn-instance:hover { color: var(--fg); border-color: var(--line-bright); }
+.btn-instance.active {
+  background: var(--info-bg);
+  color: var(--info);
+  border-color: var(--info);
+  font-weight: 600;
+}
+
+.btn-ghost {
+  padding: 3px 7px;
+  background: transparent;
+  color: var(--fg-faint);
+  border: 1px solid transparent;
+}
+.btn-ghost:hover { color: var(--fg-dim); border-color: var(--line); }
+
+.btn-cell-action {
+  padding: 2px 7px;
+  background: transparent;
+  color: var(--bad);
+  border: 1px solid var(--bad);
+  font-size: var(--fs-xs);
+}
+.btn-cell-action:hover { background: var(--bad); color: var(--bg); }
+
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled:hover { background: inherit; color: inherit; }
+
+/* ===========================================================================
+   STAT STRIP
+   =========================================================================== */
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 0;
-  border: 1px solid var(--border-hairline);
-  background: var(--bg-surface);
-  margin-bottom: 8px;
+  gap: 1px;                      /* the gap IS the rule — one hairline, not two */
+  background: var(--line);
+  border: 1px solid var(--line);
+  margin-bottom: var(--sp-3);
   flex-shrink: 0;
 }
 
 .stat-card {
-  padding: 5px 8px;
-  border-right: 1px solid var(--border-hairline);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-panel);
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
-  min-height: 50px;
+  gap: 2px;
+  justify-content: center;
+  min-height: 58px;
 }
 
-.stat-card:last-child {
-  border-right: none;
-}
+/* Nine cards in five columns leaves a tenth slot empty, and with the gap
+   painting the rules that slot read as a hole where a panel should be. The
+   last card takes the room instead. Written as "the ninth, if it is also the
+   last" so the copy page's five-card strip is untouched — the two strips have
+   different card counts and neither should have to know about the other. */
+.stat-card:nth-last-child(1):nth-child(9) { grid-column: span 2; }
 
+/* The anchor is the number you look at first, and it earns that with a rule
+   under it rather than with a different typeface. */
 .stat-card.hero-anchor {
-  background: var(--bg-subtle);
-  border-bottom: 2px solid var(--ink-primary);
+  background: var(--bg-raised);
+  box-shadow: inset 0 -2px 0 var(--info);
 }
 
 .stat-label {
-  font-family: var(--font-sans);
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: var(--ink-secondary);
+  color: var(--fg-faint);
 }
 
 .stat-value-mono {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   font-weight: 500;
-  color: var(--ink-primary);
+  color: var(--fg);
+  letter-spacing: -0.01em;
 }
 
+/* Was Fraunces italic — an editorial serif in a trading terminal. Same job,
+   done by size and weight in the one typeface everything else uses. */
 .hero-fraunces-number {
-  font-family: var(--font-serif);
-  font-style: italic;
-  font-size: 18px;
-  font-weight: 400;
-  line-height: 1;
-  color: var(--ink-primary);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  font-style: normal;
+  line-height: 1.1;
+  color: var(--fg);
   letter-spacing: -0.02em;
 }
 
-.delta-positive {
-  color: var(--accent-olive);
-}
+.delta-positive { color: var(--ok); }
+.delta-negative { color: var(--bad); }
 
-.delta-negative {
-  color: var(--accent-oxblood);
-}
+/* ===========================================================================
+   LAYOUT
+   =========================================================================== */
 
-/* Main Split Screen Viewport (Strict 100vh Zero Page Scroll) */
 .main-viewport-grid {
   display: grid;
-  grid-template-columns: 1.25fr 0.75fr;
-  gap: 10px;
+  grid-template-columns: 1.35fr 0.65fr;
+  gap: var(--sp-3);
   flex: 1;
   min-height: 0;
-  height: 100%;
   overflow: hidden !important;
 }
 
@@ -218,41 +370,63 @@ html, body {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  height: 100%;
+  gap: var(--sp-3);
   overflow: hidden !important;
 }
 
-/* Section Titles */
+/* Section headers read as a shell heading: a marker, the name, then a rule
+   running to the count on the right. Cheap to render, and it gives a dense
+   screen the horizontal structure it was missing. */
 .section-header {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 4px;
-  padding-bottom: 2px;
-  border-bottom: 1px solid var(--ink-primary);
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
   flex-shrink: 0;
 }
+.section-header::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+/* Keep the count on the far right of the rule rather than beside the title. */
+.section-header > .section-count { order: 3; }
+.section-header > .section-count + * { order: 2; }
+
+/* Inside a gapped column the header's own margin is a SECOND gap, and the two
+   together were quietly eating the space the tables should have grown into —
+   the panels stopped short of the viewport with dark ground beneath them. The
+   column's `gap` is the single source of vertical rhythm here; the margin
+   survives for the places that are not a gapped column. */
+.viewport-column > .section-header { margin-bottom: 0; margin-top: 0 !important; }
 
 .section-title {
-  font-family: var(--font-sans);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
-  color: var(--ink-primary);
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.section-title::before {
+  content: '▚ ';
+  color: var(--line-focus);
 }
 
 .section-count {
-  font-family: var(--font-mono);
-  font-size: 8.5px;
-  color: var(--ink-secondary);
+  font-size: var(--fs-xs);
+  color: var(--fg-faint);
+  white-space: nowrap;
 }
 
-/* Matrices Tables & Compressed Positions Matrix */
+/* ===========================================================================
+   TABLES
+   =========================================================================== */
+
 .matrix-container {
-  border: 1px solid var(--border-hairline);
-  background: var(--bg-surface);
-  margin-bottom: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg-panel);
   overflow: auto;
   flex-shrink: 0;
 }
@@ -260,242 +434,218 @@ html, body {
 .matrix-container.flex-matrix {
   flex: 1;
   min-height: 0;
-  margin-bottom: 0;
   overflow-y: auto !important;
 }
 
-.matrix-table {
-  width: 100%;
-  border-collapse: collapse;
-  text-align: left;
-}
+.matrix-table { width: 100%; border-collapse: collapse; text-align: left; }
 
 .matrix-table th {
-  font-family: var(--font-sans);
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--ink-secondary);
-  padding: 3px 6px;
-  border-bottom: 1px solid var(--border-hairline);
-  background: var(--bg-subtle);
+  color: var(--fg-faint);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-bright);
+  background: var(--bg-raised);
   position: sticky;
   top: 0;
   z-index: 10;
+  white-space: nowrap;
 }
 
 .matrix-table td {
-  padding: 3px 6px;
-  border-bottom: 1px solid var(--border-hairline);
-  font-size: 9.5px;
+  padding: 5px var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-sm);
+  color: var(--fg-dim);
 }
 
-.matrix-table tr:last-child td {
-  border-bottom: none;
-}
+.matrix-table tbody tr:hover td { background: var(--bg-raised); }
+.matrix-table tr:last-child td { border-bottom: none; }
 
-.num-col {
-  text-align: right;
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
+.num-col { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
+.cell-symbol { font-weight: 600; color: var(--fg); }
+.cell-name { color: var(--fg-faint); font-size: var(--fs-xs); margin-left: 5px; }
 
-.cell-symbol {
-  font-family: var(--font-mono);
-  font-weight: 600;
-  color: var(--ink-primary);
-}
-
-.cell-name {
-  color: var(--ink-secondary);
-  font-size: 9px;
-  margin-left: 4px;
-}
-
+/* Bracketed, because that is how a terminal says "this is a state". */
 .status-badge {
-  font-family: var(--font-sans);
-  font-size: 7.5px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
-  padding: 1px 3px;
-  border: 1px solid var(--border-hairline);
+  padding: 1px 6px;
+  border: 1px solid var(--line-bright);
+  color: var(--fg-dim);
   display: inline-block;
+  white-space: nowrap;
 }
+.status-badge::before { content: '['; opacity: 0.5; margin-right: 3px; }
+.status-badge::after  { content: ']'; opacity: 0.5; margin-left: 3px; }
 
-.status-badge.positive {
-  border-color: var(--accent-olive);
-  color: var(--accent-olive);
-  background: rgba(67, 138, 78, 0.12);
-}
+.status-badge.positive { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
+.status-badge.negative { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
+.status-badge.warning  { border-color: var(--warn); color: var(--warn); background: var(--warn-bg); }
 
-.btn-cell-action {
-  font-family: var(--font-sans);
-  font-size: 7.5px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 1px 4px;
-  background: transparent;
-  color: var(--accent-oxblood);
-  border: 1px solid var(--accent-oxblood);
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
+/* ===========================================================================
+   CONSOLE
+   The one surface that should look unmistakably like a terminal, because it
+   is one: an append-only event stream with a gutter.
+   =========================================================================== */
 
-.btn-cell-action:hover {
-  background: var(--accent-oxblood);
-  color: var(--ink-primary);
-}
-
-/* System Logs Console Feed - Compressed Font & Full Height Auto Scroll */
 .console-container {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-hairline);
-  padding: 6px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  padding: var(--sp-2) 0;
   flex: 1;
   min-height: 0;
-  max-height: 100%;
   overflow-y: auto !important;
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  font-size: 9px;
-  line-height: 1.3;
-  color: var(--ink-primary);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  color: var(--fg-dim);
 }
 
 .log-line {
   display: flex;
-  gap: 6px;
-  padding: 1px 0;
-  border-bottom: 1px solid rgba(42, 46, 56, 0.25);
+  gap: var(--sp-2);
+  padding: 1px var(--sp-3) 1px 0;
+  border-left: 2px solid transparent;
+  padding-left: var(--sp-3);
 }
+.log-line:hover { background: var(--bg-panel); }
 
-.log-time {
-  color: var(--ink-muted);
-  flex-shrink: 0;
-}
+.log-time { color: var(--fg-faint); flex-shrink: 0; font-variant-numeric: tabular-nums; }
 
-.log-level-snipe {
-  color: var(--accent-olive);
-  font-weight: 600;
-}
-
-.log-level-sell {
-  color: var(--accent-bronze);
-  font-weight: 600;
-}
-
-.log-level-error {
-  color: var(--accent-oxblood);
-  font-weight: 600;
-}
-
-.log-level-warn {
-  color: #d99a4e;
-}
-
-.log-level-info {
-  color: var(--ink-secondary);
-}
+.log-level-snipe { color: var(--ok); font-weight: 500; }
+.log-level-sell  { color: var(--warn); font-weight: 500; }
+.log-level-error { color: var(--bad); font-weight: 500; }
+.log-level-warn  { color: var(--warn); }
+.log-level-info  { color: var(--fg-dim); }
 
 /* Routine screening chatter: deliberately dim. It is the highest-volume line
    in the feed, so it must recede and let snipe/sell/error lines carry colour. */
-.log-level-gate0 {
-  color: var(--ink-muted);
-  opacity: 0.75;
+.log-level-gate0 { color: var(--fg-faint); opacity: 0.7; }
+
+/* The severity stripe. A red line in a scrolling feed is findable at a glance
+   in a way that red text alone is not. */
+.log-line:has(.log-level-error) { border-left-color: var(--bad); background: var(--bad-bg); }
+.log-line:has(.log-level-snipe) { border-left-color: var(--ok); }
+.log-line:has(.log-level-sell)  { border-left-color: var(--warn); }
+
+/* ===========================================================================
+   FORMS
+   =========================================================================== */
+
+.form-group { margin-bottom: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-1); }
+
+.form-label {
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
 }
 
-/* Modal Overlay & Form */
+.form-input, .form-select {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  padding: 6px 9px;
+  background: var(--bg-input);
+  color: var(--fg);
+  border: 1px solid var(--line-bright);
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+.form-input:focus, .form-select:focus { border-color: var(--info); }
+.form-input::placeholder { color: var(--fg-faint); }
+
+.form-help { font-size: var(--fs-xs); color: var(--fg-faint); line-height: 1.5; }
+
+/* ===========================================================================
+   MODAL
+   =========================================================================== */
+
 .modal-overlay {
   position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(10, 11, 13, 0.85);
+  inset: 0;
+  background: rgba(4, 6, 10, 0.86);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 1000;
+  padding: var(--sp-4);
 }
 
 .modal-card {
-  background: var(--bg-surface);
-  border: 1px solid var(--ink-primary);
-  padding: 16px;
-  max-width: 460px;
-  width: 90%;
-  max-height: 85vh;
+  background: var(--bg-panel);
+  border: 1px solid var(--line-bright);
+  padding: var(--sp-4);
+  max-width: 640px;
+  width: 100%;
+  max-height: 88vh;
   overflow-y: auto;
 }
 
 .modal-title {
-  font-family: var(--font-sans);
-  font-size: 9.5px;
-  font-weight: 700;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--fg);
+  margin-bottom: var(--sp-3);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--line);
+}
+.modal-title::before { content: '▚ '; color: var(--line-focus); }
+
+/* ===========================================================================
+   PANELS
+   Feature panels (smart money, entry profile, trader scout) previously each
+   carried their own accent inline. These give them one shape, and let the
+   accent say WHICH KIND of thing the panel is rather than which week it was
+   written in.
+   =========================================================================== */
+
+.panel {
+  border: 1px solid var(--line);
+  background: var(--bg-panel);
+  padding: var(--sp-3);
+}
+.panel-learn { border-color: rgba(163, 113, 247, 0.3); background: var(--learn-bg); }
+.panel-info  { border-color: rgba(88, 166, 255, 0.3);  background: var(--info-bg); }
+.panel-ok    { border-color: rgba(63, 185, 80, 0.3);   background: var(--ok-bg); }
+.panel-warn  { border-color: rgba(210, 153, 34, 0.3);  background: var(--warn-bg); }
+
+.panel-title {
+  font-size: var(--fs-xs);
+  font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--ink-primary);
-  margin-bottom: 10px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--border-hairline);
+  margin-bottom: var(--sp-2);
 }
 
-.form-group {
-  margin-bottom: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.form-label {
-  font-family: var(--font-sans);
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--ink-secondary);
-}
-
-.form-input, .form-select {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  padding: 5px 7px;
-  background: var(--bg-dark);
-  color: var(--ink-primary);
-  border: 1px solid var(--border-hairline);
-  outline: none;
-}
-
-.form-input:focus, .form-select:focus {
-  border-color: var(--ink-primary);
-}
-
-.form-help {
-  font-family: var(--font-mono);
-  font-size: 8.5px;
-  color: var(--ink-muted);
-}
-
-/* Empty State */
 .empty-state {
-  padding: 16px 8px;
+  padding: var(--sp-4);
   text-align: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-hairline);
-  color: var(--ink-secondary);
-  font-family: var(--font-mono);
-  font-size: 9.5px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  color: var(--fg-faint);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
 }
 
-@media (max-width: 1024px) {
-  html, body {
-    overflow: auto !important;
-  }
-  .main-viewport-grid {
-    grid-template-columns: 1fr;
-    overflow: visible !important;
-  }
-  .console-container {
-    height: 220px;
-  }
+/* ===========================================================================
+   RESPONSIVE
+   Below 1100px the fixed viewport stops being a feature and starts being a
+   cage, so the page is allowed to scroll.
+   =========================================================================== */
+
+@media (max-width: 1100px) {
+  html, body { overflow: auto !important; height: auto !important; max-height: none !important; }
+  #root { height: auto !important; max-height: none !important; overflow: visible !important; }
+  .main-viewport-grid { grid-template-columns: 1fr; overflow: visible !important; }
+  .viewport-column { overflow: visible !important; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .console-container { height: 280px; flex: none; }
+  .header { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
 }
