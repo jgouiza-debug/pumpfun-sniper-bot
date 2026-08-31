@@ -93,6 +93,13 @@ export interface TradeResult {
    * invented token quantity and a position labelled "ON-CHAIN".
    */
   balanceDerived?: boolean;
+  /**
+   * The transaction's own recent blockhash. Carried on the unresolved-sell path
+   * so resolveTimedOutSell can PROVE expiry instead of only ever timing out —
+   * without it that method can never return 'expired', and every unresolved
+   * sell falls into the five-minute hold meant for the genuinely unknown case.
+   */
+  blockhash?: string;
 }
 
 export interface PriceTick {
@@ -999,7 +1006,7 @@ export class SniperEngine {
   public async readOwnedTokenAmount(mint: string): Promise<number | null> {
     const owner = this.wallet.getKeypair()?.publicKey;
     if (!owner) return null;
-    let sawAnswer = false;
+    let answered = 0;
     let total = 0;
     for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
       try {
@@ -1007,7 +1014,7 @@ export class SniperEngine {
           mint: new PublicKey(mint),
           programId,
         });
-        sawAnswer = true;
+        answered++;
         for (const acc of res.value) {
           const amt = acc.account.data?.parsed?.info?.tokenAmount?.uiAmount;
           if (typeof amt === 'number' && Number.isFinite(amt)) total += amt;
@@ -1016,7 +1023,14 @@ export class SniperEngine {
         // One program failing is not an answer; the other may still respond.
       }
     }
-    return sawAnswer ? total : null;
+    // A POSITIVE total is definitive whichever program produced it.
+    if (total > 0) return total;
+    // A ZERO is only definitive when BOTH programs answered. Previously one
+    // success was enough, so for a Token-2022 mint the classic query returning
+    // an empty list while the 2022 query threw produced a confident "you hold
+    // none" — which tells a caller a buy did not land, or that a bag is gone,
+    // on the strength of having asked the wrong program.
+    return answered === 2 ? 0 : null;
   }
 
   /**
@@ -1057,15 +1071,21 @@ export class SniperEngine {
     if (res.outcome === 'landed') {
       this.log('error', `🚨 ${action.toUpperCase()} ${txid.slice(0, 8)}… DID LAND despite the send error. `
         + (action === 'buy'
-          ? 'The wallet now holds tokens with no position tracking them — reconciling.'
-          : 'The bag was sold; the position record may be stale — reconciling.'), mint);
-      this.queueUnresolvedBuy(mint, txid);
+          ? 'The wallet may now hold tokens with no position tracking them — reconciling.'
+          : 'The bag was sold; the position record may be stale.'), mint);
+      // Only a BUY can leave an UNTRACKED bag, and only when nothing is
+      // tracking the mint already. Queuing a sell here produced a "🚨 UNTRACKED
+      // BAG — sell it manually" alarm for a bag the operator had just sold, and
+      // queuing a mint with a live position produced one for a position sitting
+      // in front of them on screen. A false alarm on this line is expensive:
+      // it is the line that is supposed to mean something.
+      if (action === 'buy') this.maybeQueueUnresolvedBuy(mint, txid);
       void this.syncLiveWalletBalance();
       return;
     }
     if (res.outcome === 'unknown') {
       this.log('error', `❓ ${action.toUpperCase()} ${txid.slice(0, 8)}… could not be resolved after the send error — checking the wallet instead. https://solscan.io/tx/${txid}`, mint);
-      this.queueUnresolvedBuy(mint, txid);
+      if (action === 'buy') this.maybeQueueUnresolvedBuy(mint, txid);
       return;
     }
     this.log('info', `✅ ${action.toUpperCase()} ${txid.slice(0, 8)}… ${res.detail} — nothing landed, nothing to track.`, mint);
@@ -1087,11 +1107,15 @@ export class SniperEngine {
     const blockhash = (() => {
       try { return VersionedTransaction.deserialize(rawTx).message.recentBlockhash; } catch { return undefined; }
     })();
+    const startedAt = Date.now();
+    // A blockhash lives ~60-90s, so a 45s window left the last and most
+    // valuable stretch uncovered — precisely the window in which a transaction
+    // dropped by a busy leader still could have landed. Bounded by TIME rather
+    // than by a resend count, and it exits the moment expiry is proven.
+    const WINDOW_MS = 95_000;
     let sends = 0;
     const tick = async (): Promise<void> => {
-      // Ten resends over ~45s covers a blockhash lifetime at a cadence that
-      // costs the RPC nothing next to the confirmation poll already running.
-      while (sends < 10) {
+      while (Date.now() - startedAt < WINDOW_MS) {
         await new Promise(res => setTimeout(res, 4_500));
         sends++;
         try {
@@ -1111,6 +1135,13 @@ export class SniperEngine {
       }
     };
     void tick();
+  }
+
+  /** Queue only when nothing already tracks this mint — see the call sites. */
+  private maybeQueueUnresolvedBuy(mint: string, txid: string): void {
+    if (this.activePositions.some(p => p.mint === mint)) return;
+    if (this.copyHeldMintsProvider().has(mint)) return;
+    this.queueUnresolvedBuy(mint, txid);
   }
 
   private queueUnresolvedBuy(mint: string, txid: string): void {
@@ -1886,7 +1917,7 @@ export class SniperEngine {
     pool?: string,
     slippageOverride?: number,
     retryCount = 0,
-    opts: { external?: boolean } = {}
+    opts: { external?: boolean; priorTokenBalance?: number } = {}
   ): Promise<TradeResult | null> {
     /** True once THIS call has claimed a concurrency slot. See the finally. */
     let inFlightCounted = false;
@@ -2231,7 +2262,12 @@ export class SniperEngine {
         // dead rather than merely abandoned — see txSettlement. Before this,
         // "we gave up after 30s" and "it never landed" were the same word
         // ('timeout') and a buy that reached it opened a position anyway.
-        const confirmed = await this.confirmTransaction(txid, 95_000, tx.message.recentBlockhash);
+        // 75s, not 95s. The poll holds the per-mint trade queue, so a leader's
+        // flip-sell waits behind it — and under the degraded-RPC conditions
+        // this branch exists for, the poll runs to its ceiling. 75s covers a
+        // blockhash lifetime for the common case while expiry detection ends it
+        // sooner whenever isBlockhashValid can be read at all.
+        const confirmed = await this.confirmTransaction(txid, 75_000, tx.message.recentBlockhash);
         if (confirmed === 'slippage_failed' || (confirmed === 'failed' && action === 'sell')) {
           this.log('error', `❌ ${action.toUpperCase()} tx FAILED on-chain due to Slippage (6004). Inspect: https://solscan.io/tx/${txid}`, mint);
 
@@ -2287,7 +2323,7 @@ export class SniperEngine {
             // twice. Hand the signature back — to external callers (copy exits)
             // AND to the sniper's own executeSell — so the outcome is resolved
             // before any retry (sniper-correctness-5).
-            return { txid, fill: null, timedOut: true };
+            return { txid, fill: null, timedOut: true, blockhash: tx.message.recentBlockhash };
           }
 
           // A BUY WE CANNOT RESOLVE. This is the case that emptied a wallet and
@@ -2300,11 +2336,16 @@ export class SniperEngine {
           // holding none of it, when we held none before, is strong evidence it
           // did not. Either way the number is READ, never invented.
           this.log('warn', `⚠️ Buy ${txid.slice(0, 8)}... could not be confirmed — reading the wallet directly before recording anything.`, mint);
-          tradeGovernor.recordBuyOutcome(false, 'buy could not be confirmed');
+          // The outcome is recorded AFTER the wallet has spoken, not before.
+          // Recording a failure here first could latch the breaker on the fifth
+          // consecutive "unknown" and then discover, one line later, that the
+          // buy had in fact landed — a permanent halt caused by a successful
+          // trade, needing a manual reset to clear.
           const owned = await this.readOwnedTokenAmount(mint);
           void this.syncLiveWalletBalance();
 
           if (owned === null) {
+            tradeGovernor.recordBuyOutcome(false, 'buy could not be confirmed and the wallet was unreadable');
             // Balance unreadable too. We know nothing, so we record nothing —
             // a position invented here is exactly the phantom the operator saw.
             // The mint is queued for reconciliation instead: if the buy did
@@ -2313,18 +2354,28 @@ export class SniperEngine {
             this.queueUnresolvedBuy(mint, txid);
             return null;
           }
-          if (owned <= 0) {
-            this.log('warn', `✅ Buy ${txid.slice(0, 8)}... did NOT land — the wallet holds none of ${mint.slice(0, 8)}…. Nothing opened; only the fee was spent.`, mint);
+          // GROWTH, not presence. `owned > 0` alone proves nothing when the
+          // wallet ALREADY held the mint — which is the normal case for a
+          // repeat (DCA) copy buy, since blockRepeatBuys defaults to false. A
+          // failed DCA buy would read back the pre-existing bag, be recorded as
+          // "confirmed by balance read", clear the fee-burn streak, and add a
+          // second helping of tokens the wallet never received. The caller
+          // tells us what it held before; the difference is the only evidence.
+          const prior = Math.max(0, opts.priorTokenBalance ?? 0);
+          const gained = owned - prior;
+          if (gained <= Math.max(1e-9, prior * 1e-6)) {
+            tradeGovernor.recordBuyOutcome(false, 'buy did not land (wallet holds no more than before)');
+            this.log('warn', `✅ Buy ${txid.slice(0, 8)}... did NOT land — the wallet holds no more of ${mint.slice(0, 8)}… than before (${owned.toLocaleString()} vs ${prior.toLocaleString()}). Nothing opened; only the fee was spent.`, mint);
             return null;
           }
 
-          // It landed after all. Book the REAL quantity the wallet holds.
-          this.log('info', `📗 Buy ${txid.slice(0, 8)}... DID land — the wallet holds ${owned.toLocaleString()} tokens. Recording the real amount, not an estimate.`, mint);
+          // It landed after all. Book the REAL quantity the wallet GAINED.
+          this.log('info', `📗 Buy ${txid.slice(0, 8)}... DID land — the wallet gained ${gained.toLocaleString()} tokens. Recording the real amount, not an estimate.`, mint);
           tradeGovernor.recordBuyOutcome(true, 'confirmed by balance read');
           if (!opts.external) this.failureBreaker.recordSuccess();
           return {
             txid,
-            fill: { txid, solDelta: -solAmount, tokenDelta: owned, feeSol: priorityFeeSol, slot: 0 },
+            fill: { txid, solDelta: -solAmount, tokenDelta: gained, feeSol: priorityFeeSol, slot: 0 },
             balanceDerived: true,
           };
         }
@@ -4326,7 +4377,7 @@ export class SniperEngine {
     if (result && result.timedOut && result.txid) {
       // Hold off any concurrent exit trigger for this position while resolving.
       pos.sellRetryAfterMs = now + 90_000;
-      const outcome = await this.resolveTimedOutSell(result.txid, pos.mint);
+      const outcome = await this.resolveTimedOutSell(result.txid, pos.mint, 75_000, result.blockhash);
       if (outcome === 'unknown') {
         // Neither landed nor provably dead. Retrying now is the blind resubmit
         // this branch exists to prevent, and counting it as a failure would
@@ -5248,9 +5299,18 @@ export class SniperEngine {
     solAmount: number,
     amountPct?: string,
     pool?: string,
-    slippageOverride?: number
+    slippageOverride?: number,
+    /**
+     * What the wallet held of this mint BEFORE the order. Used only on the
+     * unresolved-buy recovery path, where "the wallet holds some" is not
+     * evidence a buy landed if it already held some.
+     */
+    priorTokenBalance?: number
   ): Promise<TradeResult | null> {
-    return this.executeRealMainnetTrade(action, mint, solAmount, amountPct, pool, slippageOverride, 0, { external: true });
+    return this.executeRealMainnetTrade(
+      action, mint, solAmount, amountPct, pool, slippageOverride, 0,
+      { external: true, priorTokenBalance }
+    );
   }
 
   public getSolPriceUsd(): number {

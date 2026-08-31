@@ -2566,8 +2566,16 @@ console.log('\n-- Phase 0/1: fill quality, slippage, and a gate that means somet
     // OWN sells, not only external ones — a return of `null` there let executeSell
     // count it a failure and resubmit while the tx could still land.
     const timeoutBlock = engineSrc.slice(engineSrc.indexOf('Holdings left untouched'), engineSrc.indexOf('Holdings left untouched') + 900);
-    assert.ok(/return \{ txid, fill: null, timedOut: true \}/.test(timeoutBlock),
+    assert.ok(/return \{ txid, fill: null, timedOut: true/.test(timeoutBlock),
       'a sell timeout must return the signature, not null, so the caller can resolve it');
+    // And the BLOCKHASH, or resolveTimedOutSell can never prove expiry: without
+    // it every unresolved sell falls into the long hold meant for the genuinely
+    // unknown case, and the exit is frozen for minutes on a dumping token.
+    assert.ok(/blockhash: tx\.message\.recentBlockhash/.test(timeoutBlock),
+      'the blockhash must travel with the signature so expiry can be proven');
+    const resolveCall = engineSrc.slice(engineSrc.indexOf('await this.resolveTimedOutSell('), engineSrc.indexOf('await this.resolveTimedOutSell(') + 160);
+    assert.ok(/result\.blockhash/.test(resolveCall),
+      'the caller must pass the blockhash through to the resolver');
     assert.ok(!/opts\.external \? \{ txid, fill: null, timedOut: true \} : null/.test(timeoutBlock),
       'the old code only handed the signature to external callers');
     // executeSell must resolve that timedOut result before the failure/retry path.

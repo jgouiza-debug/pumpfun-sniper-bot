@@ -1325,35 +1325,14 @@ export class CopyTraderService {
    * sell left behind is actually gone before closing the position.
    */
   private async getOwnedTokenAmount(mint: string): Promise<number | null> {
-    const address = sniperEngine.getWalletStatus().address;
-    // FALL BACK TO THE ENGINE'S CONNECTION. heliusConn is only built by
-    // startHeliusWatcher, i.e. only while copy trading is ARMED. Every on-chain
-    // balance check therefore returned null the moment the copy trader was
-    // switched off — including the SYNC BALANCES button, which then reported
-    // "checked N, closed 0, corrected 0" and looked like a clean bill of health
-    // while having asked the chain nothing at all. That is exactly the state an
-    // operator is in when they suspect a phantom position and go looking.
-    //
-    // The engine's connection always exists, and its reader also covers
-    // Token-2022, which this one does not.
-    if (!this.heliusConn || !address) {
-      return sniperEngine.readOwnedTokenAmount(mint);
-    }
-    try {
-      const res = await this.heliusConn.getParsedTokenAccountsByOwner(
-        new PublicKey(address),
-        { mint: new PublicKey(mint) },
-        'confirmed',
-      );
-      let total = 0;
-      for (const { account } of res.value) {
-        const amt = (account.data as any)?.parsed?.info?.tokenAmount?.uiAmount;
-        if (typeof amt === 'number' && isFinite(amt)) total += amt;
-      }
-      return total;
-    } catch {
-      return null;
-    }
+    // ONE reader, and it is the engine's — which queries BOTH token programs
+    // and distinguishes "holds none" from "could not ask". This method used to
+    // run its own mint-filtered query through heliusConn, which does not
+    // reliably enumerate a Token-2022 account: the automatic position sync
+    // would then read a real Token-2022 bag as zero and close the position as
+    // "externally exited", deleting a live position on the strength of having
+    // asked the wrong program.
+    return sniperEngine.readOwnedTokenAmount(mint);
   }
 
   /**
@@ -2170,7 +2149,12 @@ export class CopyTraderService {
         try {
           result = await sniperEngine.executeExternalTrade(
             'buy', mint, copySol, undefined, buyPool,
-            Math.min(this.config.maxSlippagePct, COPY_BUY_MAX_SLIPPAGE_PCT)
+            Math.min(this.config.maxSlippagePct, COPY_BUY_MAX_SLIPPAGE_PCT),
+            // What we already hold. On the unresolved-buy recovery path "the
+            // wallet holds some" is not evidence a buy landed if it already
+            // held some — and a repeat buy is the DEFAULT here
+            // (blockRepeatBuys is false), so that case is the common one.
+            existingNow ? existingNow.tokensHeld : 0
           );
         } finally {
           this.inFlightBuySol.delete(mint);
