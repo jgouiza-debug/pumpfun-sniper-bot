@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { CopyFeedEvent, CopyPosition, CopyStatusResponse, CopyTradeRecord, CopyTraderConfig, TrackedWalletPublic } from './types';
 import { stripEmoji } from './App';
 import { apiFetch } from './apiClient';
+import { useBuyAlert } from './useBuyAlert';
 
 const LOG_WIPE_INTERVAL_MS = 5_000;
 
@@ -90,75 +91,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
   const feedEndRef = useRef<HTMLDivElement>(null);
 
   // ── Buy-alert sound ──────────────────────────────────────────────────────
-  // A loud, bass-boosted blast whenever a leader BUY is copied. Played through
-  // WebAudio so it can go past the browser's 1.0 volume ceiling (gain 2.0) and
-  // get a low-shelf bass lift — a plain <audio> caps at 100% and has no EQ.
-  // Browsers block audio until a user gesture, so the context is unlocked on
-  // the first click/keypress. We only fire on feed ids we have not seen, and we
-  // skip the first status frame so restoring history does not blast on load.
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const buyAlertBufRef = useRef<AudioBuffer | null>(null);
+  // A loud blast whenever a leader BUY is copied. The WebAudio plumbing lives
+  // in useBuyAlert (shared with the sniper page); this page only decides WHEN:
+  // feed ids we have not seen, skipping the first status frame so restoring
+  // history does not blast on load. The shipped clip is already bass-boosted,
+  // so no extra low-shelf here.
+  const { playBuyAlert, testBuyAlert } = useBuyAlert({ bassDb: 0 });
   const seenBuyAlertIds = useRef<Set<string>>(new Set());
-  const primedAlertRef = useRef(false);
-
-  useEffect(() => {
-    const prime = () => {
-      if (primedAlertRef.current) return;
-      primedAlertRef.current = true;
-      try {
-        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-        if (!Ctx) return;
-        const ctx: AudioContext = audioCtxRef.current || new Ctx();
-        audioCtxRef.current = ctx;
-        void ctx.resume();
-        fetch(`${location.origin}/buy-alert.mp3`)
-          .then(r => r.arrayBuffer())
-          .then(b => ctx.decodeAudioData(b))
-          .then(buf => { buyAlertBufRef.current = buf; })
-          .catch(() => { /* no alert asset — stay silent */ });
-      } catch { /* WebAudio unavailable */ }
-    };
-    window.addEventListener('pointerdown', prime);
-    window.addEventListener('keydown', prime);
-    return () => {
-      window.removeEventListener('pointerdown', prime);
-      window.removeEventListener('keydown', prime);
-    };
-  }, [apiBase]);
-
-  const playBuyAlert = () => {
-    const ctx = audioCtxRef.current;
-    const buf = buyAlertBufRef.current;
-    if (!ctx || !buf) return;
-    void ctx.resume();
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    const gain = ctx.createGain();
-    gain.gain.value = 2.0; // "200%"
-    const bass = ctx.createBiquadFilter();
-    bass.type = 'lowshelf';
-    bass.frequency.value = 200;
-    bass.gain.value = 12; // +12 dB under 200 Hz
-    src.connect(bass); bass.connect(gain); gain.connect(ctx.destination);
-    try { src.start(); } catch { /* start can throw if ctx suspended */ }
-  };
-
-  // Test button: a click IS a user gesture, so create/resume the context and
-  // load the clip on demand, then play — works even before any other click.
-  const testBuyAlert = async () => {
-    try {
-      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!Ctx) return;
-      const ctx: AudioContext = audioCtxRef.current || new Ctx();
-      audioCtxRef.current = ctx;
-      await ctx.resume();
-      if (!buyAlertBufRef.current) {
-        const b = await fetch(`${location.origin}/buy-alert.mp3`).then(r => r.arrayBuffer());
-        buyAlertBufRef.current = await ctx.decodeAudioData(b);
-      }
-      playBuyAlert();
-    } catch { /* no asset / WebAudio unavailable */ }
-  };
 
   // Same transport strategy as the sniper page: SSE first, tight polling as
   // the degraded path.

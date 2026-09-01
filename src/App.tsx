@@ -25,6 +25,7 @@ export function stripEmoji(text: string): string {
 import { previewWalletAddress } from './services/clientWallet';
 import { apiFetch } from './apiClient';
 import { CopyTradingPage } from './CopyTradingPage';
+import { useBuyAlert } from './useBuyAlert';
 
 // A txid proves execution only when it's a real signature — paper fills carry
 // a sim_ prefix and never touched the chain.
@@ -1142,6 +1143,27 @@ export function App() {
     }
   }, [botStatus?.activePositions, botStatus?.tradeHistory, botStatus?.tradingMode]);
 
+  // Buy-alert sound on every NEW sniper position, paper or real — same clip and
+  // same rule as the copy page. Seed the seen-set from the first frame so
+  // restoring open positions on load stays silent. The clip shipped in
+  // public/buy-alert.mp3 is already bass-boosted, so no extra low-shelf here.
+  const { playBuyAlert, testBuyAlert } = useBuyAlert({ bassDb: 0 });
+  const seenBuyAlertKeys = useRef<Set<string>>(new Set());
+  const buyAlertSeededRef = useRef(false);
+  useEffect(() => {
+    const positions = botStatus?.activePositions;
+    if (!positions) return;
+    const seeding = !buyAlertSeededRef.current;
+    for (const pos of positions) {
+      if (!pos.mint) continue;
+      const key = `${pos.mint}_${pos.buyTxid || 'nobuy'}`;
+      if (seenBuyAlertKeys.current.has(key)) continue;
+      seenBuyAlertKeys.current.add(key);
+      if (!seeding) playBuyAlert();
+    }
+    buyAlertSeededRef.current = true;
+  }, [botStatus?.activePositions]);
+
   // Toggle Bot Power ON / OFF
   const toggleBotPower = async () => {
     const targetState = !botStatus?.isBotActive;
@@ -1482,6 +1504,9 @@ export function App() {
           </button>
 
           <button className="btn-terminal-outline" onClick={() => setShowConfigModal(true)}> SETTINGS &amp; FLAGS
+          </button>
+
+          <button className="btn-terminal-outline" onClick={testBuyAlert} title="Play the buy-alert sound to test it"> TEST SOUND
           </button>
 
           <button className="btn-terminal-outline" onClick={handleClearHistory} style={{ borderColor: 'var(--ink-secondary)' }}> CLEAR RECEIPTS
