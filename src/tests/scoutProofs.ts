@@ -39,6 +39,10 @@ import {
   gatherCandidates, fetchSolanaTrackerTop, fetchSolanaTrackerKols, fetchBirdeyeGainers,
   looksLikeWallet,
 } from '../services/traderSources';
+import {
+  discoverRunningMints, earlyBuyersOf, discoverCandidates,
+  MIN_RUNNING_VSOL, MIN_EARLY_BUY_SOL, MAX_CURVE_PAGES,
+} from '../services/walletDiscovery';
 import { PUMP_PROGRAM_ID } from '../services/pumpEventDecoder';
 
 let passed = 0;
@@ -628,6 +632,201 @@ test('following a wallet is a person\'s decision, not the scout\'s', () => {
   // Nothing may add a copy target on its own.
   assert.ok(!/copyTrader\.addWallet/.test(readFileSync(join(__dirname, '..', 'services', 'traderScout.ts'), 'utf8')),
     'the scout itself must never add a copy target');
+});
+
+// ===========================================================================
+// THE SCOUT COULD NOT FIND ANYBODY AT ALL
+// ===========================================================================
+//
+// Reported 2026-09-01: "the wallet finder isnt actually finding wallets to
+// copy all it does is say scan complete".
+//
+// It was right, and it was structural rather than a bad day. The scout had two
+// candidate sources and on a default install both are empty: the leaderboards
+// need an API key, and the wallet ledger is filled by a harvester that only
+// runs behind a feature flag which ships OFF. So gatherCandidates returned
+// nothing, runScout returned before making a single RPC call, and the panel
+// said "0 wallet(s) checked, none copyable — that is a normal result".
+//
+// It was not a normal result. Nothing had been checked.
+console.log('\n-- Discovery: finding wallets with no key and no flag --');
+
+const PUMP = PUMP_PROGRAM_ID;
+
+/** A curve PDA, the way the real code derives it. */
+function curveOf(mint: string): string {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('bonding-curve'), new PublicKey(mint).toBuffer()],
+    new PublicKey(PUMP),
+  )[0].toBase58();
+}
+
+/**
+ * A chain where `mint` is mid-run and its whole history is reachable.
+ *
+ * `curveTrades` is the number of transactions on the token's curve — under a
+ * page, so the walk reaches the beginning and the first buyers are genuinely
+ * first.
+ */
+function chainWith(opts: {
+  mint: string; vSol: number; firstBuyers: Array<{ user: string; sol: number }>;
+  curveTrades?: number; failFirst?: boolean;
+}) {
+  const sigs = new Map<string, Array<{ signature: string; blockTime: number }>>();
+  const txs = new Map<string, FakeTx>();
+  const curve = curveOf(opts.mint);
+
+  // Recent pump-program activity: one trade on this mint, at vSol.
+  const progSigs: Array<{ signature: string; blockTime: number }> = [];
+  for (let i = 0; i < 12; i++) {
+    const sg = `prog${i}`;
+    progSigs.push({ signature: sg, blockTime: NOW_S - i });
+    txs.set(sg, {
+      logs: logsFor([{ mint: opts.mint, user: pk(`noise${i}`), isBuy: true, sol: 1, tokens: 1000, ts: NOW_S - i, vSol: opts.vSol }]),
+      ...(opts.failFirst ? { err: { InstructionError: [0, 'Custom'] } } : {}),
+    });
+  }
+  sigs.set(PUMP, progSigs);
+
+  // The token's own curve history, oldest last (the RPC returns newest first).
+  const curveSigs: Array<{ signature: string; blockTime: number }> = [];
+  const depth = opts.curveTrades ?? 30;
+  for (let i = 0; i < depth; i++) curveSigs.push({ signature: `c${i}`, blockTime: NOW_S - 100 - i });
+  // The oldest entries ARE the first buyers.
+  opts.firstBuyers.forEach((b, i) => {
+    const sg = `first${i}`;
+    curveSigs.push({ signature: sg, blockTime: NOW_S - 1000 + i });
+    txs.set(sg, {
+      logs: logsFor([{ mint: opts.mint, user: b.user, isBuy: true, sol: b.sol, tokens: 1000, ts: NOW_S - 1000 + i, vSol: 31 }]),
+    });
+  });
+  for (const c of curveSigs) if (!txs.has(c.signature)) txs.set(c.signature, { logs: [] });
+  sigs.set(curve, curveSigs);
+  return new FakeConn(sigs, txs);
+}
+
+const dDeps = (conn: FakeConn) => ({ getConnection: () => conn as any, sleep: async () => {} });
+const budget = (n: number) => { let left = n; return (k: number) => { if (left < k) return false; left -= k; return true; }; };
+
+atest('OLD BUG: with no key and an empty ledger the scout checked nobody', async () => {
+  // The old shape, reproduced exactly: leaderboards only.
+  const { candidates } = await gatherCandidates({}, {
+    fetch: (async () => { throw new Error('no network'); }) as any,
+  });
+  assert.strictEqual(candidates.length, 0,
+    'no key means no leaderboard candidate — this part is unchanged and correct');
+  // And that was the whole list, so the scan ended having examined nothing.
+  // What follows is the source that had to exist for it not to.
+});
+
+atest('THE FIX: a running token yields its first buyers, with no key at all', async () => {
+  const MINT = pk('runningMint');
+  const conn = chainWith({
+    mint: MINT, vSol: 55,
+    firstBuyers: [{ user: pk('early1'), sol: 0.5 }, { user: pk('early2'), sol: 1.2 }],
+  });
+  const out = await discoverCandidates(dDeps(conn), budget(5_000));
+  assert.ok(out.outcome.ok, `discovery should have worked: ${out.outcome.detail}`);
+  const found = out.outcome.candidates.map(c => c.wallet).sort();
+  assert.deepStrictEqual(found, [pk('early1'), pk('early2')].sort(),
+    'the token is running and its first buyers are reachable, so they are the candidates');
+  assert.ok(out.reads > 0, 'and it cost real reads — it actually went to the chain');
+});
+
+atest('a token that has not moved off its launch price is not a lead', async () => {
+  const MINT = pk('flatMint');
+  const conn = chainWith({
+    mint: MINT, vSol: MIN_RUNNING_VSOL - 5,      // still ~launch
+    firstBuyers: [{ user: pk('early1'), sol: 0.5 }],
+  });
+  const { mints } = await discoverRunningMints(dDeps(conn), budget(5_000));
+  assert.strictEqual(mints.length, 0,
+    'every pump.fun mint has buyers; only ones whose curve has actually run are evidence of anything');
+});
+
+atest('a FAILED transaction is not proof a token is running', async () => {
+  const MINT = pk('failMint');
+  const conn = chainWith({
+    mint: MINT, vSol: 70, failFirst: true,        // every sampled tx errored
+    firstBuyers: [{ user: pk('early1'), sol: 0.5 }],
+  });
+  const { mints } = await discoverRunningMints(dDeps(conn), budget(5_000));
+  assert.strictEqual(mints.length, 0,
+    'a failed transaction moved nothing, so its reserves are not evidence of a move');
+});
+
+atest('a token too busy to walk back credits NOBODY, not whoever we reached', async () => {
+  const MINT = pk('busyMint');
+  // More curve transactions than the page cap can reach: the oldest addresses
+  // the walk sees are a mid-life snapshot, and crediting those as "first
+  // buyers" is exactly how a wallet that sprays dust into busy tokens earns a
+  // perfect record.
+  const conn = chainWith({
+    mint: MINT, vSol: 80, curveTrades: MAX_CURVE_PAGES * 1000 + 50,
+    firstBuyers: [{ user: pk('early1'), sol: 0.5 }],
+  });
+  const r = await earlyBuyersOf(MINT, dDeps(conn), budget(50_000));
+  assert.strictEqual(r.reachedBeginning, false, 'the walk cannot have reached the beginning');
+  assert.deepStrictEqual(r.buyers, [], 'and it must credit nobody rather than somebody wrong');
+  assert.ok(r.stoppedEarly, 'and say why, rather than looking like a token with no buyers');
+});
+
+atest('a dust buy is not a call', async () => {
+  const MINT = pk('dustMint');
+  const conn = chainWith({
+    mint: MINT, vSol: 60,
+    firstBuyers: [{ user: pk('duster'), sol: MIN_EARLY_BUY_SOL / 2 }, { user: pk('real1'), sol: 0.4 }],
+  });
+  const r = await earlyBuyersOf(MINT, dDeps(conn), budget(5_000));
+  assert.deepStrictEqual(r.buyers, [pk('real1')], 'the dust sprayer is not an early buyer');
+});
+
+atest('discovery reports WHY it found nothing, rather than going quiet', async () => {
+  const MINT = pk('quietMint');
+  const conn = chainWith({ mint: MINT, vSol: 32, firstBuyers: [] });
+  const out = await discoverCandidates(dDeps(conn), budget(5_000));
+  assert.ok(!out.outcome.ok);
+  assert.ok((out.outcome.detail ?? '').length > 20,
+    'a silent source is indistinguishable from a dead feature — that is the defect being fixed');
+});
+
+atest('the scout merges discovery with the leaderboards and counts it', async () => {
+  const MINT = pk('mergeMint');
+  const conn = chainWith({
+    mint: MINT, vSol: 65,
+    firstBuyers: [{ user: pk('early1'), sol: 0.6 }],
+  });
+  const report = await runScout({}, {
+    getConnection: () => conn as any,
+    fetch: (async () => { throw new Error('no network'); }) as any,
+    now: () => NOW_MS,
+    sleep: async () => {},
+  }, { checkQueuePosition: false });
+  assert.ok(report.considered > 0,
+    'with no key at all the scout must still have candidates to check — this is the reported bug');
+  assert.ok(report.sourceOutcomes.some(o => /on-chain discovery/.test(o.name)),
+    'and discovery must appear in the source line whether it worked or not');
+});
+
+test('an empty scan is never reported as a normal result', () => {
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  const idx = app.indexOf('NO CANDIDATE WALLETS WERE FOUND');
+  assert.ok(idx > 0,
+    'zero candidates must be named as such — "0 wallet(s) checked, none copyable, that is a normal '
+    + 'result" made a structurally dead feature read as a working one having a quiet day');
+  const block = app.slice(idx - 400, idx + 900);
+  assert.ok(/rep\.considered === 0/.test(block), 'and it must branch on there being nothing to check');
+  assert.ok(/sourceOutcomes\.filter\(o => !o\.ok\)/.test(block),
+    'and show which source failed, at the top, not in dim text at the bottom');
+});
+
+test('discovery needs no feature flag and writes no ledger state', () => {
+  const src = readFileSync(join(__dirname, '..', 'services', 'walletDiscovery.ts'), 'utf8');
+  assert.ok(!/featureFlags/.test(src),
+    'gating discovery behind a flag is how the previous on-chain source came to never run');
+  assert.ok(!/walletLedger/.test(src),
+    'a guess from curve position is not the evidence the ledger promotes on, and writing it in '
+    + 'would quietly degrade the thing it imitates');
 });
 
 (async () => {

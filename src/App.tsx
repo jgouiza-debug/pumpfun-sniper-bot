@@ -358,9 +358,11 @@ function TraderScoutPanel() {
       {!sc?.keysSet.solanaTracker && (
         <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginBottom: '8px' }}>No Solana Tracker key set. That is the only free source that ranks Solana wallets by
           realized profit over a plain API call — the boards people usually quote (GMGN, Kolscan)
-          sit behind Cloudflare and cannot be read from a server at all. Without it the scout still
-          runs, but only over wallets this bot discovered on chain by itself, which takes longer to
-          surface someone new. Paste a free key in Settings.
+          sit behind Cloudflare and cannot be read from a server at all. Without it the scout falls
+          back to its own chain research: it finds the pump.fun tokens running right now and reads
+          who bought them first. That works with no key at all, but it only sees wallets that were
+          early to something live in the last few minutes, so it surfaces fewer names. Paste a free
+          key in Settings to widen it.
         </div>
       )}
 
@@ -409,10 +411,28 @@ function TraderScoutPanel() {
               </button>
             </div>
           ) : (
-            <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginBottom: '8px' }}>
-              {rep.considered} wallet(s) checked, none copyable. That is a normal result, not a
-              fault — most profitable-looking wallets fail one of the bars below.
-            </div>
+            /* "0 checked, none copyable" is not a normal result — it means no
+               source produced a lead and nothing was examined at all. Saying
+               the two the same way made a structurally dead feature read as a
+               working one having a quiet day. */
+            rep.considered === 0 ? (
+              <div style={{ fontSize: '11px', color: 'var(--warn)', lineHeight: 1.6, marginBottom: '8px', border: '1px solid var(--warn)', padding: '6px' }}>
+                NO CANDIDATE WALLETS WERE FOUND — nothing was checked. This is not
+                &ldquo;we looked and nobody qualified&rdquo;; no source produced an address to look at.
+                <div style={{ marginTop: 4, color: 'var(--fg-dim)' }}>
+                  {rep.sourceOutcomes.filter(o => !o.ok).map(o => (
+                    <div key={o.name}>· {o.name}: {o.detail ?? 'failed'}
+                      {o.seenKeys?.length ? ` — fields actually returned: ${o.seenKeys.join(', ')}` : ''}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginBottom: '8px' }}>
+                {rep.considered} wallet(s) checked, none copyable. That is a normal result, not a
+                fault — most profitable-looking wallets fail one of the bars below.
+              </div>
+            )
           )}
 
           {rep.top.length > 1 && (

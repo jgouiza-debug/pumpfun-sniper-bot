@@ -8,6 +8,7 @@ import { readCurveMoment } from './curveHistory';
 import {
   gatherCandidates, type ScoutCandidate, type SourceKeys, type SourceDeps, type SourceOutcome,
 } from './traderSources';
+import { discoverCandidates } from './walletDiscovery';
 
 /**
  * WHO TO COPY, RIGHT NOW — verified, ranked, and never taken on trust.
@@ -287,16 +288,44 @@ export async function runScout(
 
   const { candidates, outcomes } = await gatherCandidates(keys, sourceDeps);
   report.sourceOutcomes = outcomes;
-  report.considered = candidates.length;
-  if (!candidates.length) {
-    report.notes.push('No source produced a candidate. Nothing was verified, and nothing is being recommended.');
+
+  // THE SOURCE THAT NEEDS NOBODY'S PERMISSION. The leaderboards above need a
+  // key, and without one they produce nothing — which used to be the entire
+  // story on a default install, so the scout returned before making a single
+  // RPC call and the panel reported a completed scan that had checked nobody.
+  // This one reads the chain the bot is already connected to. It runs whether
+  // or not the keys worked: it is independent evidence, not a fallback, and a
+  // wallet two unrelated sources name is the one worth verifying first.
+  const discovery = await discoverCandidates(deps, spend);
+  report.sourceOutcomes.push(discovery.outcome);
+  report.reads += discovery.reads;
+
+  const merged = new Map<string, ScoutCandidate>();
+  for (const c of [...candidates, ...discovery.outcome.candidates]) {
+    const prev = merged.get(c.wallet);
+    if (!prev) { merged.set(c.wallet, { ...c, sources: [...c.sources] }); continue; }
+    for (const src of c.sources) if (!prev.sources.includes(src)) prev.sources.push(src);
+    prev.claimedRealizedSol ??= c.claimedRealizedSol;
+    prev.claimedWinRate ??= c.claimedWinRate;
+    prev.claimedTrades ??= c.claimedTrades;
+    prev.label ??= c.label;
+  }
+  const allCandidates = [...merged.values()];
+  report.considered = allCandidates.length;
+  if (!allCandidates.length) {
+    // Never "none of them qualified" — nothing was checked at all, and the
+    // difference matters to whoever is reading the panel.
+    report.notes.push(
+      'NO CANDIDATE WALLETS WERE FOUND, so nothing was verified and nothing is being recommended. '
+      + 'This is not the same as checking wallets and rejecting them — see the source line below for '
+      + 'which lead failed and why.');
     return report;
   }
 
   // Sources that name a wallet twice are worth checking first — not because
   // agreement is evidence of skill, but because the verification budget is
   // finite and has to be spent in some order.
-  const ordered = [...candidates].sort((a, b) => b.sources.length - a.sources.length);
+  const ordered = [...allCandidates].sort((a, b) => b.sources.length - a.sources.length);
   const limit = Math.min(ordered.length, opts.maxCandidates ?? MAX_CANDIDATES_VERIFIED);
 
   const verified: TraderStats[] = [];
