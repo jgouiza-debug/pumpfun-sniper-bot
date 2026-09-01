@@ -31,6 +31,7 @@ import { walletLedger, WalletLedger, flushWalletLedger, loadWalletLedger } from 
 import { WalletHarvester, bondingCurveFor } from './walletHarvester';
 import { smartMoneyDetector, type SmartMoneySignal } from './smartMoneySignal';
 import { entryProfile, flushEntryProfile, type TokenSnapshot } from './entryProfile';
+import { LaunchTape, type LaunchTapeRules } from './launchTape';
 import { WalletLogWatcher } from './walletLogWatcher';
 import { tradeEventsFromLogs } from './pumpEventDecoder';
 import { entryGateV2 } from './entryGateV2';
@@ -466,6 +467,13 @@ export class SniperEngine {
     // with a token-only dev buy.
     launchSnipeMaxDevBuySol: 5,
     launchSnipeMinDevBuySol: 0,
+    // The tape rules. Three wallets over two slots with nobody above 60% is
+    // the smallest shape that is not one bundle: a Jito bundle lands in ONE
+    // slot however many wallets it uses, and a single whale is one hand
+    // however many slots it spreads over.
+    launchSnipeMinDistinctBuyers: 3,
+    launchSnipeMinDistinctSlots: 2,
+    launchSnipeMaxSingleBuyerPct: 60,
     privateKey: '',
     // NO BUILT-IN KEY. A literal used to live here and in three other places,
     // in a public repo — so every copy of the exe shipped the builder's Helius
@@ -592,6 +600,16 @@ export class SniperEngine {
    * back to the ordinary Play 2 watchlist path.
    */
   private pendingSnipes = new Map<string, PendingSnipe>();
+  /**
+   * Who is buying each armed launch — see launchTape.ts. Fed by a
+   * logsSubscribe per armed mint on its own socket (the smart-money watcher
+   * owns a different address set with a different lifecycle).
+   */
+  private launchTape = new LaunchTape();
+  private launchTapeWatcher: WalletLogWatcher | null = null;
+  /** Mints already told "inflow is in, holding for attribution" — one line each, not one per curve tick. */
+  private launchTapeHeld = new Set<string>();
+  private launchTapeNoKeyWarned = false;
 
   constructor() {
     this.riskFilter = new RiskFilter();
@@ -1569,6 +1587,11 @@ export class SniperEngine {
       ['launchSnipeWindowSeconds', 3, 600],
       ['launchSnipeMaxDevBuySol', 0, 85],
       ['launchSnipeMinDevBuySol', 0, 85],
+      // Tape rules: a floor of 1 buyer / 1 slot / 1% keeps a POST from turning
+      // the attribution off by zeroing it; 100% on the share cap is "off".
+      ['launchSnipeMinDistinctBuyers', 1, 50],
+      ['launchSnipeMinDistinctSlots', 1, 20],
+      ['launchSnipeMaxSingleBuyerPct', 1, 100],
       // Guardrail caps: a POST could otherwise disable the breaker (0), remove
       // the entry rate limit (huge), or blind the freshness gate (huge) —
       // these ARE risk-bearing fields the docstring claims to clamp (quality-tests-3).
@@ -1907,6 +1930,7 @@ export class SniperEngine {
         if (pending.ownsCurveSub && !tokenWatchlist.has(mint)) this.curveWatcher.unwatch(mint);
       }
       this.pendingSnipes.clear();
+      this.clearLaunchTape();
       // The budget belongs to the run. Clearing it means the next START re-reads
       // the wallet and re-splits, rather than staking slots sized for a balance
       // this run has since spent.
@@ -4292,8 +4316,79 @@ export class SniperEngine {
       creator: payload.traderPublicKey || payload.creator || undefined,
       ownsCurveSub,
     });
-    this.log('gate0', `🚀 $${payload.symbol ?? mint.slice(0, 6)} armed: buying on ${minInflow} SOL inflow within ${this.config.launchSnipeWindowSeconds ?? 60}s (dev bought ${devBuySol.toFixed(2)} SOL)`, mint);
+    // The curve will say how much comes in; the tape says who. Started here,
+    // at arm time, so by the time the inflow bar is met the subscription has
+    // had the whole confirmation window to be acknowledged and to listen.
+    this.armLaunchTape(mint, payload.traderPublicKey || payload.creator || undefined);
+    const rules = this.launchTapeRules();
+    this.log('gate0', `🚀 $${payload.symbol ?? mint.slice(0, 6)} armed: buying on ${minInflow} SOL inflow within ${this.config.launchSnipeWindowSeconds ?? 60}s `
+      + `from ≥${rules.minDistinctBuyers} wallets over ≥${rules.minDistinctSlots} slots (dev bought ${devBuySol.toFixed(2)} SOL)`, mint);
     return true;
+  }
+
+  // ---------------- LAUNCH TAPE (Play 1 attribution) ----------------
+
+  private launchTapeRules(): LaunchTapeRules {
+    return {
+      minDistinctBuyers: this.config.launchSnipeMinDistinctBuyers ?? 3,
+      minDistinctSlots: this.config.launchSnipeMinDistinctSlots ?? 2,
+      maxSingleBuyerPct: this.config.launchSnipeMaxSingleBuyerPct ?? 60,
+    };
+  }
+
+  /** Subscribe to this mint's trades for the life of its armed snipe. */
+  private armLaunchTape(mint: string, creator?: string): void {
+    if (!this.config.heliusApiKey) {
+      // Without the tape no armed snipe can fire (a verdict needs a live
+      // subscription). Say so once — the curve watcher already needs the same
+      // key, so this lane was never going to work without one.
+      if (!this.launchTapeNoKeyWarned) {
+        this.launchTapeNoKeyWarned = true;
+        this.log('warn', '🚀 Launch snipe is armed but there is no Helius key — the trade tape needs one, so no momentum snipe can fire. Set a key, or set the inflow to 0 for unconfirmed block-0 entry.');
+      }
+      return;
+    }
+    if (!this.launchTapeWatcher) {
+      this.launchTapeWatcher = new WalletLogWatcher({
+        getWsUrl: () => rpcWsEndpoint(this.config.heliusApiKey),
+        // 'processed': a buy is worth knowing about the moment a node executed
+        // it. The verdict does not act on any single trade, so a fork-dropped
+        // one costs a slightly optimistic count, never a phantom position.
+        commitment: 'processed',
+        onLog: (ev) => {
+          if (!featureFlags.get('launchSnipe')) return;
+          // `mentions: [mint]` delivers every transaction touching the mint;
+          // the decoder yields only pump.fun TradeEvents, and the mint check
+          // drops a router hop that mentioned ours while trading another.
+          for (const t of tradeEventsFromLogs(ev.logs)) {
+            if (t.mint !== ev.address) continue;
+            this.launchTape.observe({
+              mint: t.mint, user: t.user, isBuy: t.isBuy, solLamports: t.solLamports,
+              slot: ev.slot, signature: ev.signature, err: ev.err,
+            });
+          }
+        },
+        log: (level, msg) => this.log(level === 'warn' ? 'warn' : 'info', `[LaunchTape] ${msg}`),
+      });
+      this.launchTapeWatcher.start();
+    }
+    this.launchTape.arm(mint, { creator, armedAt: Date.now() });
+    // setAddresses hot-diffs: the new mint subscribes, a cap-evicted one
+    // unsubscribes, nothing reconnects.
+    this.launchTapeWatcher.setAddresses(this.launchTape.armedMints());
+  }
+
+  private disarmLaunchTape(mint: string): void {
+    this.launchTapeHeld.delete(mint);
+    if (!this.launchTape.isArmed(mint)) return;
+    this.launchTape.disarm(mint);
+    this.launchTapeWatcher?.setAddresses(this.launchTape.armedMints());
+  }
+
+  private clearLaunchTape(): void {
+    this.launchTape.clear();
+    this.launchTapeHeld.clear();
+    this.launchTapeWatcher?.setAddresses([]);
   }
 
   /**
@@ -4372,6 +4467,7 @@ export class SniperEngine {
   /** Disarms a pending launch snipe, releasing its curve slot when this lane owns it. */
   private releasePendingSnipe(mint: string, pending: PendingSnipe, why: string): void {
     this.pendingSnipes.delete(mint);
+    this.disarmLaunchTape(mint);
     if (pending.ownsCurveSub && !tokenWatchlist.has(mint) && !this.activePositions.some(p => p.mint === mint)) {
       this.curveWatcher.unwatch(mint);
     }
@@ -4473,29 +4569,45 @@ export class SniperEngine {
           // A full book leaves the snipe ARMED (not disarmed): a slot freeing
           // up inside the window can still take the entry.
           if (inflow >= minInflow && committed < this.config.maxActivePositions) {
-            this.pendingSnipes.delete(u.mint);
-            // Stop the Play 2 path double-entering the same token later.
-            tokenWatchlist.markTriggered(u.mint);
-            latencyTimeline.begin(u.mint, {
-              t1ArrivalMs: u.at,
-              mode: this.config.tradingMode,
-              symbol: pending.symbol,
-              txType: 'create',
-              payload: { mint: u.mint, trigger: 'launch-snipe-inflow', inflowSol: inflow },
-            });
-            latencyTimeline.stamp(u.mint, 't2ParsedMs');
-            latencyTimeline.stamp(u.mint, 't3FiltersDoneMs');
-            await this.fireLaunchSnipe({
-              mint: u.mint,
-              name: pending.name,
-              symbol: pending.symbol,
-              creator: pending.creator ?? u.creator ?? undefined,
-              vSol: u.vSolInBondingCurve,
-              vTokens: u.vTokensInBondingCurve,
-              trigger: `${inflow.toFixed(2)} SOL inflow in ${(ageMs / 1000).toFixed(1)}s`,
-            });
-            latencyTimeline.complete(u.mint);
-            return;
+            // THE CURVE SAID HOW MUCH. THE TAPE SAYS WHO. The inflow number
+            // alone is what a bundled launch fakes in its own slot; the entry
+            // needs distinct wallets over distinct slots with no single hand
+            // dominant (launchTape.ts). A refusal leaves the snipe ARMED — a
+            // real launch keeps adding buyers inside the window, a bundle
+            // does not — and the window still bounds it.
+            const tape = this.launchTape.verdict(u.mint, this.launchTapeRules(),
+              this.launchTapeWatcher?.isAddressLive(u.mint) ?? false);
+            if (!tape.ok) {
+              if (!this.launchTapeHeld.has(u.mint)) {
+                this.launchTapeHeld.add(u.mint);
+                this.log('gate0', `🚀… $${pending.symbol ?? u.mint.slice(0, 6)} — ${inflow.toFixed(2)} SOL is in but held: ${tape.reason}`, u.mint);
+              }
+            } else {
+              this.pendingSnipes.delete(u.mint);
+              this.disarmLaunchTape(u.mint);
+              // Stop the Play 2 path double-entering the same token later.
+              tokenWatchlist.markTriggered(u.mint);
+              latencyTimeline.begin(u.mint, {
+                t1ArrivalMs: u.at,
+                mode: this.config.tradingMode,
+                symbol: pending.symbol,
+                txType: 'create',
+                payload: { mint: u.mint, trigger: 'launch-snipe-inflow', inflowSol: inflow, tape },
+              });
+              latencyTimeline.stamp(u.mint, 't2ParsedMs');
+              latencyTimeline.stamp(u.mint, 't3FiltersDoneMs');
+              await this.fireLaunchSnipe({
+                mint: u.mint,
+                name: pending.name,
+                symbol: pending.symbol,
+                creator: pending.creator ?? u.creator ?? undefined,
+                vSol: u.vSolInBondingCurve,
+                vTokens: u.vTokensInBondingCurve,
+                trigger: `${inflow.toFixed(2)} SOL inflow in ${(ageMs / 1000).toFixed(1)}s — ${tape.reason}`,
+              });
+              latencyTimeline.complete(u.mint);
+              return;
+            }
           }
         }
       }

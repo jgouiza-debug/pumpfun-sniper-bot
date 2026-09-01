@@ -344,6 +344,15 @@ export interface BotConfig {
   launchSnipeMaxDevBuySol?: number;
   /** Skip launches whose creator initial buy is below this (zero-commitment spam). 0 disables. */
   launchSnipeMinDevBuySol?: number;
+  // The trade tape (see launchTape.ts): the curve says HOW MUCH came in, the
+  // tape says WHO. These only apply when the inflow confirmation is on
+  // (launchSnipeMinSolInflow > 0); the instant block-0 mode stays unfiltered.
+  /** Distinct non-creator wallets that must have bought since the tape went live. */
+  launchSnipeMinDistinctBuyers?: number;
+  /** Distinct slots those buys must span. One slot is one bundle, whatever the wallet count. */
+  launchSnipeMinDistinctSlots?: number;
+  /** Max share (0-100) of the attributed inflow that a single wallet may account for. */
+  launchSnipeMaxSingleBuyerPct?: number;
   maxActivePositions: number;
   priorityFeeSol: number;
   /** Hard ceiling for the dynamic priority fee (flag dynamicPriorityFee). */

@@ -754,6 +754,9 @@ export function App() {
     launchSnipeWindowSeconds: 60,
     launchSnipeMaxDevBuySol: 5,
     launchSnipeMinDevBuySol: 0,
+    launchSnipeMinDistinctBuyers: 3,
+    launchSnipeMinDistinctSlots: 2,
+    launchSnipeMaxSingleBuyerPct: 60,
     privateKey: '',
     // Both key fields start blank and STAY blank on every status sync: the
     // server never sends a key back, only whether one is stored. Saving with a
@@ -2533,7 +2536,9 @@ export function App() {
                   </div>
                   <div style={{ fontSize: '10px', color: 'var(--ink-muted)', marginBottom: '6px' }}> Buys fresh launches in their first candle, next to the other snipers, skipping the
                     slow screening entirely. Inflow 0 = buy the instant the create event arrives; otherwise
-                    wait until that much SOL from other buyers hits the curve inside the window.
+                    wait until that much SOL from other buyers hits the curve inside the window, AND the
+                    trade tape shows it came from a crowd: at least this many distinct wallets over this
+                    many distinct slots, with no single wallet above the share cap. One slot is one bundle.
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                     <div className="form-group">
@@ -2576,6 +2581,36 @@ export function App() {
                         className="form-input"
                         value={configForm.launchSnipeMinDevBuySol}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinDevBuySol: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Min Distinct Buyers</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.launchSnipeMinDistinctBuyers}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinDistinctBuyers: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Min Distinct Slots</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.launchSnipeMinDistinctSlots}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMinDistinctSlots: Number(e.target.value) })}
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Max Single Buyer Share (%)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={configForm.launchSnipeMaxSingleBuyerPct}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfigForm({ ...configForm, launchSnipeMaxSingleBuyerPct: Number(e.target.value) })}
                       />
                     </div>
                   </div>
