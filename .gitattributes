@@ -1,2 +1,11 @@
+# Check every text file out as LF on every platform, Windows included. Two
+# separate tests have now been broken by a CRLF working tree: the suite asserts
+# against the .ts sources as text on disk, and `.` never matches \r while `$`
+# without /m needs true end-of-string — so a trailing \r silently defeats
+# comment stripping and the assertion then fires on prose it was meant to skip.
+# Normalising at checkout removes the whole class rather than one site at a time.
+* text=auto eol=lf
+
+# Binaries: never munge line endings (-text), and store them in LFS.
 *.exe filter=lfs diff=lfs merge=lfs -text
 pumpfun-sniper-bot-macos-* filter=lfs diff=lfs merge=lfs -text
