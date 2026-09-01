@@ -103,20 +103,15 @@
   --sp-4: 13px;
 
   /* Legacy aliases — see the note at the top of the file. */
-  --bg-dark: var(--bg);
-  --bg-surface: var(--bg-panel);
   --bg-subtle: var(--bg-raised);
   --border-hairline: var(--line);
-  --border-dark: var(--line-bright);
   --ink-primary: var(--fg);
   --ink-secondary: var(--fg-dim);
   --ink-muted: var(--fg-faint);
-  --accent-oxblood: var(--bad);
   --accent-olive: var(--ok);
   --accent-bronze: var(--warn);
   --font-mono: var(--mono);
   --font-sans: var(--mono);
-  --font-serif: var(--mono);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; }

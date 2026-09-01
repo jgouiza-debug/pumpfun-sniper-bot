@@ -109,7 +109,16 @@ export interface TraderStats {
   reads: number;
 }
 
+/**
+ * Bumped whenever a field is added, removed, or changes meaning. `loadScoutReport`
+ * refuses a file at any other version instead of guessing at its shape — a
+ * `.trader-scout.json` from a stale build should read as "no report yet", not
+ * get silently misparsed into a shape this build never wrote.
+ */
+export const SCOUT_REPORT_SCHEMA_VERSION = 1;
+
 export interface ScoutReport {
+  schemaVersion: number;
   ranAt: number;
   /** The one to copy. Null when nothing survived verification. */
   best: TraderStats | null;
@@ -131,13 +140,27 @@ export interface ScoutReport {
 // ---------------------------------------------------------------------------
 
 /**
+ * Env override for a bar below, so an operator can adjust one without a
+ * rebuild. Every bar here carries a reasoned default (math, incident
+ * history, or an explicit policy call) — this is an escape hatch for an
+ * operator who has read the comment and still wants a different number, not
+ * an invitation to casually retune. Unset or unparsable leaves the default.
+ */
+function numFromEnv(envVar: string, fallback: number): number {
+  const raw = process.env[envVar];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
  * "Active at that period of time" — the operator's own words, made numeric.
  *
  * Six hours, not twenty-four. Memecoin traders rotate wallets constantly, often
  * daily; a wallet quiet for a day is as likely to be abandoned as resting, and
  * copying an abandoned wallet is copying nothing while paying to watch it.
  */
-export const MAX_IDLE_HOURS = 6;
+export const MAX_IDLE_HOURS = numFromEnv('SCOUT_MAX_IDLE_HOURS', 6);
 /** Closed positions needed before a win rate means anything. Matches walletLedger. */
 export const MIN_CLOSED_TRADES = 8;
 /** Laplace prior. Eight phantom losses, so a 3-for-3 wallet scores 0.27, not 1.0. */
@@ -156,7 +179,7 @@ export const MAX_TOP_MINT_SHARE = 0.6;
  * Kept because a wallet whose curve position we could not read still needs an
  * answer, and because a 40 SOL entry is uncopyable at any point on any curve.
  */
-export const MAX_COPYABLE_BUY_SOL = 15;
+export const MAX_COPYABLE_BUY_SOL = numFromEnv('SCOUT_MAX_COPYABLE_BUY_SOL', 15);
 /**
  * THE ACTUAL TOO-BIG-TO-COPY TEST: how much worse our fill would be.
  *
@@ -178,7 +201,7 @@ export const MAX_COPYABLE_BUY_SOL = 15;
  */
 export const MAX_FILL_DRAG_PCT = 10;
 /** Our own typical entry, SOL — the `ourSol` term in the drag identity. */
-export const OUR_TYPICAL_ENTRY_SOL = 0.5;
+export const OUR_TYPICAL_ENTRY_SOL = numFromEnv('SCOUT_OUR_TYPICAL_ENTRY_SOL', 0.5);
 /**
  * How long an unsold bag stays "open" before it counts as evidence.
  *
@@ -191,7 +214,7 @@ export const OUR_TYPICAL_ENTRY_SOL = 0.5;
  * Twelve hours because a pump.fun position is a hours-long trade; a bag held
  * overnight was not a plan.
  */
-export const STALE_BAG_HOURS = 12;
+export const STALE_BAG_HOURS = numFromEnv('SCOUT_STALE_BAG_HOURS', 12);
 /**
  * The most of a wallet's history that may be bags with no outcome.
  *
@@ -212,7 +235,7 @@ export const MIN_SERIOUS_BUY_SOL = 0.1;
  * leaves room for that plus the time to notice, decide and confirm. Below it we
  * would be buying what they are already selling.
  */
-export const MIN_HOLD_SECONDS = 30;
+export const MIN_HOLD_SECONDS = numFromEnv('SCOUT_MIN_HOLD_SECONDS', 30);
 /**
  * Share of entries at the very front of the queue that marks an insider.
  *
@@ -222,7 +245,7 @@ export const MIN_HOLD_SECONDS = 30;
  */
 export const MAX_FRONT_OF_QUEUE_SHARE = 0.6;
 /** Buyers ahead of you that still counts as "the front". */
-export const FRONT_OF_QUEUE_RANK = 6;
+export const FRONT_OF_QUEUE_RANK = numFromEnv('SCOUT_FRONT_OF_QUEUE_RANK', 6);
 
 /** Signature pages walked per candidate. */
 export const MAX_PAGES_PER_TRADER = 3;
@@ -272,6 +295,7 @@ export async function runScout(
   const spend = (n: number) => { if (budget < n) return false; budget -= n; return true; };
 
   const report: ScoutReport = {
+    schemaVersion: SCOUT_REPORT_SCHEMA_VERSION,
     ranAt: now(),
     best: null,
     top: [],
@@ -340,22 +364,39 @@ export async function runScout(
     verified.push(stats);
   }
 
-  const clean = verified.filter(v => v.disqualifiers.length === 0);
-  clean.sort((a, b) => b.score - a.score);
-  report.top = clean.slice(0, 3);
-  report.best = report.top[0] ?? null;
-  report.rejected = verified.filter(v => v.disqualifiers.length > 0)
-    .sort((a, b) => b.realizedSol - a.realizedSol);
+  applyVerifiedResults(report, verified);
 
   if (!report.best) {
     report.notes.push(
       `${verified.length} wallet(s) were checked and none passed. That is a normal outcome — `
       + 'the bars exist because most profitable-looking wallets cannot be copied profitably.');
   }
+  const copyable = verified.filter(v => v.disqualifiers.length === 0).length;
   deps.log?.('info',
     `🔎 Scout: ${report.considered} candidate(s), ${verified.length} verified, `
-    + `${clean.length} copyable, ${report.reads} RPC reads`);
+    + `${copyable} copyable, ${report.reads} RPC reads`);
   return report;
+}
+
+/**
+ * Merge a batch of freshly verified wallets into a report's top/rejected
+ * lists, re-ranking and re-truncating as one operation.
+ *
+ * Both `runScout` (the initial pass) and `runScoutOnce` (folding in the
+ * bot's own ledger candidates afterwards) used to each hand-roll this
+ * sort/truncate/pick-best step, and had quietly drifted apart: the ledger
+ * fold-in path pushed straight into `report.rejected` without the
+ * `realizedSol` sort the main path applies, so which rejects sort to the top
+ * of the panel depended on which code path found them. One function means
+ * a future change to the ranking rule can't apply to only one path again.
+ */
+function applyVerifiedResults(report: ScoutReport, verified: TraderStats[]): void {
+  const clean = [...report.top, ...verified.filter(v => v.disqualifiers.length === 0)];
+  clean.sort((a, b) => b.score - a.score);
+  report.top = clean.slice(0, 3);
+  report.best = report.top[0] ?? null;
+  report.rejected = [...report.rejected, ...verified.filter(v => v.disqualifiers.length > 0)]
+    .sort((a, b) => b.realizedSol - a.realizedSol);
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +678,14 @@ export async function verifyTrader(
   }
   if (stats.staleShare > MAX_STALE_SHARE) {
     d.push(`${Math.round(stats.staleShare * 100)}% of its positions are bags held over ${STALE_BAG_HOURS}h and never sold`
-      + ' — too little of this record has resolved to judge the rest');
+      + ' — too little of this record has resolved to judge the rest'
+      // Some of what reads as "never sold" here may in fact be a graduated
+      // token this wallet exited profitably on an AMM — invisible to this
+      // scan (see the module doc). Disqualifying is still the right default
+      // (an unresolved record is not evidence either way), but the operator
+      // reviewing rejects should know a graduation-heavy trader looks
+      // identical here to one holding rugs.
+      + `; note some "unsold" bags may be tokens sold post-graduation on an AMM, which this scan cannot see`);
   }
   if (stats.closedTrades < MIN_CLOSED_TRADES) {
     d.push(`only ${stats.closedTrades} closed position(s) visible; ${MIN_CLOSED_TRADES} needed before a win rate means anything`);
@@ -773,10 +821,15 @@ export function saveScoutReport(r: ScoutReport): void {
 export function loadScoutReport(): ScoutReport | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(REPORT_FILE, 'utf8'));
-    if (parsed && typeof parsed.ranAt === 'number' && Array.isArray(parsed.top)) {
+    if (parsed && typeof parsed.ranAt === 'number' && Array.isArray(parsed.top)
+        && parsed.schemaVersion === SCOUT_REPORT_SCHEMA_VERSION) {
       lastReport = parsed as ScoutReport;
       return lastReport;
     }
+    // Either the file predates versioning or a different build changed the
+    // shape. Both mean "treat it as no report" — misparsing an old shape into
+    // today's ScoutReport type is how a rename silently produces garbage
+    // instead of an honest first-run state.
   } catch { /* no report yet, or unreadable */ }
   return null;
 }
@@ -823,17 +876,16 @@ export async function runScoutOnce(
       const budgetLeft = Math.max(0, (opts.readBudget ?? DEFAULT_SCOUT_READ_BUDGET) - report.reads);
       if (budgetLeft > 200) {
         const spend = makeSpender(budgetLeft);
+        const ledgerVerified: TraderStats[] = [];
         for (const c of extra.slice(0, 8)) {
           if (deps.isBusy?.()) break;
           const s = await verifyTrader(c, deps, spend, { checkQueuePosition: opts.checkQueuePosition !== false });
           if (!s) continue;
           report.reads += s.reads;
-          if (s.disqualifiers.length === 0) report.top.push(s); else report.rejected.push(s);
+          ledgerVerified.push(s);
           report.considered++;
         }
-        report.top.sort((a, b) => b.score - a.score);
-        report.top = report.top.slice(0, 3);
-        report.best = report.top[0] ?? null;
+        applyVerifiedResults(report, ledgerVerified);
       }
     }
     saveScoutReport(report);

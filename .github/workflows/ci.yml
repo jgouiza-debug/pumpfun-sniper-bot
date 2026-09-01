@@ -1,0 +1,51 @@
+name: CI
+
+# Runs the test suite and typecheck on every push and pull request, so a
+# broken build is caught before it reaches a release tag.
+#
+# release.yml already runs the full suite on push to master as a smoke test,
+# but only for the macOS binary job, and neither release.yml nor desktop.yml
+# runs on a pull request at all — a PR can merge with a failing test:all and
+# nothing catches it until someone cuts a release tag. This is exactly how
+# the 4.0.0 CRLF Windows build break shipped (see HANDOFF-v4.1.0-release.md):
+# first caught at tag time, when the workflow also publishes.
+#
+# This workflow is intentionally cheap: one Linux runner, no packaging, no
+# publish step. It exists to gate merges, not to build installers.
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # See release.yml for why npm@11 is pinned and --ignore-scripts is used.
+      - name: Install Dependencies
+        run: |
+          npm i -g npm@11
+          npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Run Tests
+        run: npm run test:all

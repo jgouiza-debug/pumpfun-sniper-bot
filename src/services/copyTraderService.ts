@@ -1308,6 +1308,26 @@ export class CopyTraderService {
    * with the right status instead of a 'pending' nothing will ever resolve.
    */
   private settledLeaderSigs = new Map<string, 'confirmed' | 'dropped' | 'failed'>();
+  /** How many signatures have been dropped at the cap since the queue last had room. */
+  private droppedAtCapSinceLog = 0;
+  /** Consecutive settleLeaderSignatures RPC failures, so a stuck queue is diagnosable instead of silent. */
+  private leaderVerifyRpcFailures = 0;
+
+  /**
+   * A persistently failing RPC still needs to be visible: without a status
+   * call ever succeeding, nothing in pendingLeaderSigs ever ages out
+   * (leaderSignatureVerdict is only reached with a real status), so the
+   * queue can silently sit at MAX_PENDING_LEADER_SIGS. Logged once, then
+   * every 20th failure, not every tick.
+   */
+  private noteLeaderVerifyRpcFailure(): void {
+    this.leaderVerifyRpcFailures++;
+    if (this.leaderVerifyRpcFailures === 1 || this.leaderVerifyRpcFailures % 20 === 0) {
+      appendBotLog(`[copy-feed] leader signature settlement: ${this.leaderVerifyRpcFailures} consecutive `
+        + `RPC failure(s), ${this.pendingLeaderSigs.size} signature(s) still pending — not expiring any of `
+        + `them, only the RPC is down`);
+    }
+  }
 
   private markSettled(signature: string, status: 'confirmed' | 'dropped' | 'failed'): void {
     this.settledLeaderSigs.set(signature, status);
@@ -1334,7 +1354,18 @@ export class CopyTraderService {
     // not turn a diagnostic into unbounded memory. The oldest entries are the
     // ones closest to being settled either way, so drop the NEWEST arrivals
     // rather than evicting a signature we have nearly finished checking.
-    if (this.pendingLeaderSigs.size >= MAX_PENDING_LEADER_SIGS) return;
+    if (this.pendingLeaderSigs.size >= MAX_PENDING_LEADER_SIGS) {
+      // This used to be silent. A cap that fills and stays full (e.g. the RPC
+      // is down and nothing is draining) then drops every new signal with no
+      // trace — logged in batches of 50 so a burst doesn't spam the log.
+      this.droppedAtCapSinceLog++;
+      if (this.droppedAtCapSinceLog === 1 || this.droppedAtCapSinceLog % 50 === 0) {
+        appendBotLog(`[copy-feed] leader signature queue at cap (${MAX_PENDING_LEADER_SIGS}) — `
+          + `${this.droppedAtCapSinceLog} signal(s) dropped since the queue last had room`);
+      }
+      return;
+    }
+    this.droppedAtCapSinceLog = 0;
     this.pendingLeaderSigs.set(sig.signature, { firstSeen: Date.now(), wallet, sig, spent });
     this.startLeaderVerifyTimer();
   }
@@ -1362,10 +1393,12 @@ export class CopyTraderService {
     try {
       const res = await conn.getSignatureStatuses(batch, { searchTransactionHistory: true });
       statuses = (res?.value ?? []) as any;
+      this.leaderVerifyRpcFailures = 0;
     } catch {
       // Transient. Do NOT expire anything on an RPC failure — declaring a
       // leader's trade dropped because our own node would not answer is
       // exactly the false accusation this code exists to prevent.
+      this.noteLeaderVerifyRpcFailure();
       return;
     }
 
