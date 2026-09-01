@@ -684,6 +684,29 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
                     {ev.leaderNickname} {ev.side.toUpperCase()} ${ev.tokenSymbol}
                     {ev.leaderSolAmount > 0 ? ` (${ev.leaderSolAmount} SOL)` : ''} — {stripEmoji(ev.detail)}
                   </span>
+                  {/* The leader's own transaction — the evidence for the line.
+                      A fast-lane line is a claim until the chain settles it, so
+                      it says so rather than reading as fact. */}
+                  {ev.leaderSignature && (
+                    <span style={{ marginLeft: 6 }}>
+                      <a
+                        href={`https://solscan.io/tx/${ev.leaderSignature}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        title="the leader's transaction on Solscan"
+                        style={{ color: 'var(--ink-muted)' }}
+                      >tx</a>
+                      {ev.leaderStatus === 'pending' && (
+                        <span style={{ color: 'var(--warn)' }} title="seen at processed commitment; not yet confirmed on chain"> unconfirmed</span>
+                      )}
+                      {ev.leaderStatus === 'dropped' && (
+                        <span style={{ color: 'var(--bad)' }} title="never reached a confirmed status — this trade did not happen"> DROPPED</span>
+                      )}
+                      {ev.leaderStatus === 'failed' && (
+                        <span style={{ color: 'var(--bad)' }} title="the leader's transaction failed on chain"> LEADER TX FAILED</span>
+                      )}
+                    </span>
+                  )}
                 </div>
               ))
             )}

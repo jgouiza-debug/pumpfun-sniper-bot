@@ -17,6 +17,7 @@ import { affordableStakeSol, sellAmountParam, splitWalletIntoSlots } from './pip
 import { breakevenPct } from './paperSimulator';
 import { installPath } from './installPaths';
 import { appendBotLog } from './fileLogger';
+import { leaderSignatureVerdict } from './txSettlement';
 import { DexScreenerService } from './dexscreenerService';
 import { attachKeepalive, reconnectDelayMs, KeepaliveHandle } from './wsKeepalive';
 import { WalletLogWatcher, type WalletLogEvent } from './walletLogWatcher';
@@ -118,7 +119,21 @@ const ENDPOINT_DRIFT_CHECK_MS = 20_000;
  * second between them. It is anchored to real copy BUYS (bounded by the spend
  * governor) rather than to notifications, and capped here as well.
  */
-const MAX_FAST_VERIFY_IN_FLIGHT = 4;
+/**
+ * Settlement of leader signatures seen at 'processed'.
+ *
+ * 256 is the RPC's own per-call ceiling for getSignatureStatuses; staying well
+ * under it leaves room for the call to be cheap. The window is generous on
+ * purpose — accusing a leader of a phantom trade because a node was slow is
+ * worse than settling it a few seconds later.
+ */
+const LEADER_VERIFY_TICK_MS = 2_500;
+const LEADER_VERIFY_BATCH = 200;
+const LEADER_VERIFY_WINDOW_MS = 25_000;
+/** Outstanding signatures held at once. A ceiling, never a queue. */
+const MAX_PENDING_LEADER_SIGS = 2_000;
+/** Verdicts remembered, so a signature is never re-judged. */
+const MAX_SETTLED_LEADER_SIGS = 5_000;
 
 /** Host of a URL, for log lines. Never throws on a malformed value. */
 function hostOf(url: string): string {
@@ -1246,66 +1261,156 @@ export class CopyTraderService {
   }
 
   /**
-   * Did the leader's transaction — the one we already copied, buy OR sell —
-   * actually land?
+   * Did the leader's transaction actually land?
    *
    * THE TRADE-OFF THIS MANAGES. The fast lane subscribes at commitment
    * 'processed', which is the whole reason it is fast: a node has EXECUTED the
    * transaction but nothing has voted on it yet, so we learn about the trade
    * ~0.5-1.2s before it is readable at 'confirmed'. A processed transaction can
-   * still be dropped or lost on a fork, and when that happens the leader never
-   * traded at all — while we have already sent a real buy against it. That is a
-   * "random buy" with a completely innocent-looking feed line behind it.
+   * still be dropped or lost on a fork, and when that happens THE LEADER NEVER
+   * TRADED AT ALL — while the feed has already told the operator they did, and
+   * we may have sent a real buy against it.
    *
    * Waiting for 'confirmed' before copying would remove the risk and remove the
-   * product with it. So the order still goes at 'processed', and the leader's
-   * signature is checked afterwards: it costs nothing on the hot path, and it
-   * turns a silent bad copy into a named one the operator can act on.
+   * product with it. So the order still goes at 'processed' and the signature is
+   * settled afterwards.
    *
-   * A signature seen at 'processed' that still has NO status after this window
-   * did not land — a real one confirms in a second or two.
+   * WHY THIS COVERS EVERY SIGNAL AND NOT JUST THE COPIED ONES. It used to run
+   * only after a successful real BUY — so a leader trade that was skipped by a
+   * gate, mirrored as a sell, paper-traded, or copied unsuccessfully was
+   * displayed as fact and never checked against anything. That is the same
+   * defect class as the incident this whole release exists to fix: presenting
+   * an unconfirmed event as a settled one. Reported from the field 2026-09-01 —
+   * the panel showed a leader buy that the wallet's own public history did not.
+   *
+   * WHY BATCHED. getSignatureStatuses takes up to 256 signatures per call, so
+   * checking every signal costs the SAME one RPC round trip per tick that
+   * checking one did — and the old shape (an unawaited poll loop per signature,
+   * capped at 4 concurrent) had to drop verifications to stay safe. Cheaper AND
+   * complete; there is no trade being made here.
    */
-  private fastVerifyInFlight = 0;
+  private pendingLeaderSigs = new Map<string, {
+    firstSeen: number;
+    wallet: TrackedWalletInternal;
+    sig: LeaderSignal;
+    /** True when real money already moved on this signal — earns the loud warning. */
+    spent: boolean;
+  }>();
+  private leaderVerifyTimer: NodeJS.Timeout | null = null;
+  /**
+   * Signatures already judged, and how.
+   *
+   * Load-bearing, not an optimisation. `warnFastSignalLost` reports a lost
+   * signal by pushing a feed line, and every feed line registers its signature
+   * for settlement — so without this the warning re-queues the very signature
+   * it is warning about and the pair loops forever, one warning per window.
+   * It also lets a late feed line about an already-settled transaction be born
+   * with the right status instead of a 'pending' nothing will ever resolve.
+   */
+  private settledLeaderSigs = new Map<string, 'confirmed' | 'dropped' | 'failed'>();
 
-  private verifyFastSignal(wallet: TrackedWalletInternal, sig: LeaderSignal): void {
+  private markSettled(signature: string, status: 'confirmed' | 'dropped' | 'failed'): void {
+    this.settledLeaderSigs.set(signature, status);
+    // Insertion-ordered, so the oldest verdicts age out first.
+    while (this.settledLeaderSigs.size > MAX_SETTLED_LEADER_SIGS) {
+      const oldest = this.settledLeaderSigs.keys().next().value;
+      if (oldest === undefined) break;
+      this.settledLeaderSigs.delete(oldest);
+    }
+  }
+
+  /**
+   * Queue a fast-lane signature for settlement.
+   *
+   * `spent` is sticky: one signature can produce a feed line AND a copy, and
+   * the copy is what decides whether losing it is a warning or a footnote.
+   */
+  private trackLeaderSignature(wallet: TrackedWalletInternal, sig: LeaderSignal, spent: boolean): void {
+    if (!sig.fast || !sig.signature) return;          // slow lane read a confirmed tx already
+    if (this.settledLeaderSigs.has(sig.signature)) return;   // judged once, and only once
+    const prev = this.pendingLeaderSigs.get(sig.signature);
+    if (prev) { prev.spent = prev.spent || spent; return; }
+    // A ceiling, not a queue: a leader firing hundreds of trades a minute must
+    // not turn a diagnostic into unbounded memory. The oldest entries are the
+    // ones closest to being settled either way, so drop the NEWEST arrivals
+    // rather than evicting a signature we have nearly finished checking.
+    if (this.pendingLeaderSigs.size >= MAX_PENDING_LEADER_SIGS) return;
+    this.pendingLeaderSigs.set(sig.signature, { firstSeen: Date.now(), wallet, sig, spent });
+    this.startLeaderVerifyTimer();
+  }
+
+  private startLeaderVerifyTimer(): void {
+    if (this.leaderVerifyTimer) return;
+    this.leaderVerifyTimer = setInterval(() => { void this.settleLeaderSignatures(); }, LEADER_VERIFY_TICK_MS);
+    this.leaderVerifyTimer.unref?.();
+  }
+
+  private stopLeaderVerifyTimer(): void {
+    if (!this.leaderVerifyTimer) return;
+    clearInterval(this.leaderVerifyTimer);
+    this.leaderVerifyTimer = null;
+  }
+
+  /** One RPC call, however many signatures are outstanding. */
+  private async settleLeaderSignatures(): Promise<void> {
+    if (!this.pendingLeaderSigs.size) { this.stopLeaderVerifyTimer(); return; }
     const conn = this.heliusConn;
-    const signature = sig.signature;
-    if (!conn || !signature) return;
+    if (!conn) return;                                 // no connection: keep them queued, do not judge
 
-    // HARD BOUND. Called once per real copy BUY, which the governor already
-    // limits — but a ceiling here as well, because an unawaited poll loop per
-    // event is exactly the shape that turns a diagnostic into the 429 storm it
-    // was meant to diagnose. Dropping a verification is a lost warning; running
-    // hundreds of them is a broken bot.
-    if (this.fastVerifyInFlight >= MAX_FAST_VERIFY_IN_FLIGHT) return;
-    this.fastVerifyInFlight++;
+    const batch = [...this.pendingLeaderSigs.keys()].slice(0, LEADER_VERIFY_BATCH);
+    let statuses: Array<{ err: unknown; confirmationStatus?: string } | null> = [];
+    try {
+      const res = await conn.getSignatureStatuses(batch, { searchTransactionHistory: true });
+      statuses = (res?.value ?? []) as any;
+    } catch {
+      // Transient. Do NOT expire anything on an RPC failure — declaring a
+      // leader's trade dropped because our own node would not answer is
+      // exactly the false accusation this code exists to prevent.
+      return;
+    }
 
-    const started = Date.now();
-    const WINDOW_MS = 20_000;
+    const now = Date.now();
+    let changed = false;
+    batch.forEach((signature, i) => {
+      const entry = this.pendingLeaderSigs.get(signature);
+      if (!entry) return;
+      const v = statuses[i];
+      // The rule itself lives in txSettlement, pure and unit-tested. This loop
+      // only applies the verdict, so the rule the suite proves is the rule that
+      // ships.
+      const verdict = leaderSignatureVerdict(v, now - entry.firstSeen, LEADER_VERIFY_WINDOW_MS);
+      if (verdict === 'wait') return;
 
-    const poll = async (): Promise<void> => {
-      try {
-        while (Date.now() - started < WINDOW_MS) {
-          try {
-            const res = await conn.getSignatureStatuses([signature], { searchTransactionHistory: true });
-            const v = res?.value?.[0];
-            if (v) {
-              if (v.err) {
-                this.warnFastSignalLost(wallet, sig, signature, `it FAILED on-chain (${JSON.stringify(v.err)})`);
-                return;
-              }
-              if (v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized') return; // healthy
-            }
-          } catch { /* transient — keep polling inside the window */ }
-          await sleep(2500);
-        }
-        this.warnFastSignalLost(wallet, sig, signature,
-          `it never reached a confirmed status within ${WINDOW_MS / 1000}s — it was most likely dropped`);
-      } finally {
-        this.fastVerifyInFlight--;
+      this.pendingLeaderSigs.delete(signature);
+      this.settleFeedFor(signature, verdict);
+      changed = true;
+      if (verdict === 'confirmed') return;
+
+      const why = verdict === 'failed'
+        ? `it FAILED on-chain (${JSON.stringify(v?.err)})`
+        : `it never reached a confirmed status within ${LEADER_VERIFY_WINDOW_MS / 1000}s — it was most likely dropped`;
+      if (entry.spent) {
+        // Real money moved on this signal, so it earns the loud line.
+        this.warnFastSignalLost(entry.wallet, entry.sig, signature, why);
+      } else {
+        // Nothing was spent, so the feed line flipping to DROPPED is the whole
+        // correction — but it still goes to the durable log, because a session
+        // full of phantom leader trades is the symptom of a bad feed and has to
+        // be diagnosable after the fact.
+        appendBotLog(`[copy-feed] UNCONFIRMED ${entry.sig.side} ${this.symbolFor(entry.sig)} — `
+          + `leader tx ${signature}: ${why}`);
       }
-    };
-    void poll();
+    });
+    if (changed) this.emitChange();
+    if (!this.pendingLeaderSigs.size) this.stopLeaderVerifyTimer();
+  }
+
+  /** Settle every feed line that rests on this leader transaction. */
+  private settleFeedFor(signature: string, status: 'confirmed' | 'dropped' | 'failed'): void {
+    this.markSettled(signature, status);
+    for (const e of this.feed) {
+      if (e.leaderSignature === signature && e.leaderStatus === 'pending') e.leaderStatus = status;
+    }
   }
 
   private warnFastSignalLost(
@@ -2445,12 +2550,10 @@ export class CopyTraderService {
           `REAL BUY ${copySol} SOL of $${symbol}${existingNow ? ' (added to position)' : ''}${clampNote} @ ${fmtPrice(entryPriceSol)} SOL/token`,
           copySol, result.txid);
 
-        // Only NOW, and only for a fast-lane signal: check that the leader
-        // transaction we acted on actually survived. Anchored here rather than
-        // at the notification because we just spent real money on it — and
-        // because the notification rate is the leader's, which can be hundreds
-        // per minute, while this rate is bounded by the governor.
-        if (sig.fast && sig.signature) this.verifyFastSignal(wallet, sig);
+        // Settlement is registered by pushFeed above, for this line and every
+        // other one. Marking it `spent` here is what upgrades a quiet feed
+        // correction into the loud warning: real money moved on this signal.
+        this.trackLeaderSignature(wallet, sig, true);
       } else {
         // Paper: fill at the leader's realized price plus a slippage haircut —
         // we would have landed AFTER them, never at a better price.
@@ -3255,8 +3358,18 @@ export class CopyTraderService {
       detail: sig.fast ? `⚡ ${detail}` : detail,
       copySol,
       txid,
+      // The evidence for the line, and whether it has been settled yet. Only
+      // the fast lane can be provisional: the slow lane read a confirmed
+      // transaction to produce the signal in the first place.
+      ...(sig.signature ? { leaderSignature: sig.signature } : {}),
+      ...(sig.fast && sig.signature
+        ? { leaderStatus: this.settledLeaderSigs.get(sig.signature) ?? ('pending' as const) }
+        : {}),
       via: sig.via,
     });
+    // EVERY line we show gets checked, not just the ones that cost money.
+    // `spent` marks the ones that did, because losing those earns the warning.
+    this.trackLeaderSignature(wallet, sig, action === 'copied');
     if (this.feed.length > FEED_LIMIT) this.feed.length = FEED_LIMIT;
     // The feed is memory-only and auto-clears; the durable copy is what makes
     // a dead session diagnosable (2026-08-23: a stranded position left no

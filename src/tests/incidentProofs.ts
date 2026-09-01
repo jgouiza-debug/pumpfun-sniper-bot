@@ -22,7 +22,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { classifyFlow, TRADE_MIN_SOL_BUY, VENUE_TRADE_MIN_SOL_BUY } from '../services/leaderTxClassifier';
 import { TradeGovernor, DEFAULT_GOVERNOR_LIMITS } from '../services/tradeGovernor';
-import { settleTransaction, didLand, provablyDidNothing } from '../services/txSettlement';
+import { settleTransaction, didLand, provablyDidNothing, leaderSignatureVerdict } from '../services/txSettlement';
 import { splitWalletIntoSlots } from '../services/pipelineUtils';
 
 let passed = 0;
@@ -999,6 +999,107 @@ test('a yield is NOT a timeout — the caller owes it a reconciliation', async (
   const branchBody = engine.slice(yieldBranch, yieldBranch + 900);
   assert.ok(branchBody.includes('maybeQueueUnresolvedBuy'),
     'a yielded buy whose balance has not moved must be QUEUED for reconciliation, not written off');
+});
+
+// ===========================================================================
+// S4 — A LEADER TRADE THAT NEVER HAPPENED
+// ===========================================================================
+//
+// Reported 2026-09-01: "console is saying hes making a buy but photon history
+// isnt". Same family as S2, one wallet over: S2 was OUR transaction presented
+// as settled before the chain agreed. This is the LEADER'S.
+//
+// The fast lane subscribes at commitment 'processed' — a node has executed the
+// transaction, nobody has voted on it. That is deliberate and it is where the
+// speed comes from. But a processed transaction can be dropped on a fork, and
+// then the leader never traded at all, while the feed has already said they
+// did. The public history the operator checks it against shows nothing, and
+// they are right and we are wrong.
+console.log('\n-- S4: a leader trade seen at processed, shown as fact --');
+
+const WINDOW = 25_000;
+
+test('OLD BUG: verification ran only after a successful real BUY', () => {
+  const src = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  // The old shape anchored the check inside the copied-buy branch, so a leader
+  // trade that was skipped by a gate, mirrored as a sell, paper-traded, or
+  // copied unsuccessfully was displayed and never checked against anything.
+  assert.ok(!/verifyFastSignal\(/.test(src),
+    'the per-copied-buy verifier must be gone — every displayed signal is checked now, not just the ones that cost money');
+  assert.ok(/private trackLeaderSignature\(/.test(src),
+    'signals must be registered for settlement');
+  // Registered from pushFeed: the one place EVERY feed line goes through.
+  const feed = src.slice(src.indexOf('private pushFeed('), src.indexOf('private pushFeed(') + 2200);
+  assert.ok(/this\.trackLeaderSignature\(wallet, sig, action === 'copied'\)/.test(feed),
+    'every feed line must register its leader signature, marking the ones that spent money');
+});
+
+test('a confirmed leader transaction settles as confirmed', () => {
+  assert.strictEqual(
+    leaderSignatureVerdict({ err: null, confirmationStatus: 'confirmed' }, 0, WINDOW), 'confirmed');
+  assert.strictEqual(
+    leaderSignatureVerdict({ err: null, confirmationStatus: 'finalized' }, 999_999, WINDOW), 'confirmed',
+    'age is irrelevant once the chain has voted');
+});
+
+test("a leader transaction that failed on-chain is not a trade", () => {
+  assert.strictEqual(
+    leaderSignatureVerdict({ err: { InstructionError: [3, 'Custom'] }, confirmationStatus: 'confirmed' }, 0, WINDOW),
+    'failed',
+    'an error outranks the confirmation — a confirmed failure moved nothing');
+});
+
+test('THE REPORTED SYMPTOM: seen at processed, never confirmed, is dropped', () => {
+  // Inside the window there is no verdict yet — a real transaction confirms in
+  // a second or two, and calling it dead early would be its own false report.
+  assert.strictEqual(leaderSignatureVerdict(null, 0, WINDOW), 'wait');
+  assert.strictEqual(leaderSignatureVerdict(null, WINDOW - 1, WINDOW), 'wait');
+  // Past it, the transaction the feed line rests on does not exist.
+  assert.strictEqual(leaderSignatureVerdict(null, WINDOW, WINDOW), 'dropped');
+});
+
+test('a signature STUCK at processed is settled too, not held forever', () => {
+  const stuck = { err: null, confirmationStatus: 'processed' };
+  assert.strictEqual(leaderSignatureVerdict(stuck, 0, WINDOW), 'wait');
+  // The leak this closes: exempting 'processed' from the window would leave
+  // the signature pending for the life of the process, so the feed line would
+  // read "unconfirmed" forever and never resolve either way.
+  assert.strictEqual(leaderSignatureVerdict(stuck, WINDOW, WINDOW), 'dropped',
+    'still merely processed when the window is spent means it did not land');
+});
+
+test('an RPC failure never convicts a leader', () => {
+  const src = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  const settle = src.slice(src.indexOf('private async settleLeaderSignatures('));
+  const cat = settle.slice(settle.indexOf('} catch {'), settle.indexOf('} catch {') + 400);
+  assert.ok(/return;/.test(cat),
+    'a getSignatureStatuses throw must return without judging anything — declaring a trade dropped '
+    + 'because OUR node would not answer is the same false report in the other direction');
+});
+
+test('the warning cannot loop on its own feed line', () => {
+  const src = readFileSync(join(__dirname, '..', 'services', 'copyTraderService.ts'), 'utf8');
+  // warnFastSignalLost reports by pushing a feed line, and every feed line
+  // registers its signature — so without a settled set the warning re-queues
+  // the signature it is warning about, forever, one warning per window.
+  assert.ok(/private settledLeaderSigs = new Map/.test(src), 'verdicts must be remembered');
+  const track = src.slice(src.indexOf('private trackLeaderSignature('),
+    src.indexOf('private trackLeaderSignature(') + 900);
+  assert.ok(/if \(this\.settledLeaderSigs\.has\(sig\.signature\)\) return;/.test(track),
+    'a signature already judged must never be re-queued');
+});
+
+test('the operator can check the claim: every line carries the leader tx', () => {
+  const types = readFileSync(join(__dirname, '..', 'types.ts'), 'utf8');
+  const ev = types.slice(types.indexOf('export interface CopyFeedEvent'),
+    types.indexOf('export interface CopyFeedEvent') + 2600);
+  assert.ok(/leaderSignature\?: string;/.test(ev),
+    'our txid proves what WE did; the leader signature is the evidence for the claim being doubted');
+  assert.ok(/leaderStatus\?: 'pending' \| 'confirmed' \| 'dropped' \| 'failed';/.test(ev),
+    'and a fast-lane line must say it is provisional until the chain settles it');
+  const page = readFileSync(join(__dirname, '..', 'CopyTradingPage.tsx'), 'utf8');
+  assert.ok(/solscan\.io\/tx\/\$\{ev\.leaderSignature\}/.test(page), 'and it must be one click away');
+  assert.ok(/DROPPED/.test(page), 'a dropped leader trade must be visible as such, not silently corrected');
 });
 
 void (async () => {

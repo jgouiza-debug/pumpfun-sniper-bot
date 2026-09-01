@@ -360,3 +360,53 @@ export function didLand(outcome: SettlementOutcome): boolean {
 export function provablyDidNothing(outcome: SettlementOutcome): boolean {
   return outcome === 'reverted' || outcome === 'slippage' || outcome === 'expired';
 }
+
+// ---------------------------------------------------------------------------
+// A LEADER'S transaction, rather than our own.
+// ---------------------------------------------------------------------------
+
+/**
+ * What a signature status means for a leader trade we have already displayed.
+ *
+ * Separate from the settlement above because the question is different: that
+ * one asks "did OUR transaction land, and may we retry" and owns the sending.
+ * This one asks "did the thing we told the operator happened actually happen",
+ * about a transaction belonging to someone else that we can only observe.
+ *
+ * It is pure so the rule can be tested directly. The rule is small and every
+ * branch of it is a way to be wrong about a stranger's money:
+ *
+ *   - a status with an error   → the leader's transaction FAILED; nothing moved
+ *   - confirmed or finalized   → it happened
+ *   - no status at all, still  → unknown, and 'processed' can be dropped on a
+ *     inside the window          fork, so keep waiting rather than guess
+ *   - no status past the window→ it did not land
+ *
+ * `null` status is the ambiguous one and the reason for the window. A
+ * transaction seen at 'processed' is on SOME node; if it is real, a confirmed
+ * status follows within a second or two. Still nothing after 25 seconds means
+ * the fork it was on lost.
+ */
+export type LeaderSigVerdict = 'confirmed' | 'failed' | 'dropped' | 'wait';
+
+export function leaderSignatureVerdict(
+  status: { err: unknown; confirmationStatus?: string | null } | null | undefined,
+  ageMs: number,
+  windowMs: number,
+): LeaderSigVerdict {
+  if (status) {
+    if (status.err) return 'failed';
+    if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+      return 'confirmed';
+    }
+    // 'processed' only: seen by a node, not yet voted on. No verdict yet —
+    // but the window still applies. A real transaction confirms in a second or
+    // two, so one that is STILL merely processed when the window is spent has
+    // not landed, and saying so is the whole point. Exempting this case would
+    // also leak: a signature that sits at 'processed' would never be settled
+    // and never leave the pending set.
+    return ageMs >= windowMs ? 'dropped' : 'wait';
+  }
+  // No status at all. Unknown until the window is spent, then it did not land.
+  return ageMs >= windowMs ? 'dropped' : 'wait';
+}

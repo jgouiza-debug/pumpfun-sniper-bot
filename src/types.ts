@@ -908,6 +908,29 @@ export interface CopyFeedEvent {
   copySol?: number;
   txid?: string;
   /**
+   * THE LEADER'S OWN TRANSACTION — the evidence for the whole line.
+   *
+   * Without this the operator cannot check the one claim every feed line
+   * makes: that the wallet they are following actually did this. Our `txid`
+   * proves what WE did, which is a different question and the less doubtful
+   * one. Reported 2026-09-01: the feed showed a leader buy that the wallet's
+   * public history did not, and there was no way to settle it from the panel.
+   */
+  leaderSignature?: string;
+  /**
+   * Has the leader's transaction been seen on chain, at 'confirmed' or better?
+   *
+   * The fast lane acts on 'processed' logs, which is the entire reason it is
+   * fast — and a processed transaction can still be dropped on a fork, in
+   * which case the leader never traded at all. So a fast-lane line starts
+   * 'pending' and is settled by the verifier: a line that says a trade
+   * happened is not the same as a trade that happened.
+   *
+   * Undefined on slow-lane and manual entries, which were read from a
+   * confirmed transaction to begin with.
+   */
+  leaderStatus?: 'pending' | 'confirmed' | 'dropped' | 'failed';
+  /**
    * Which feed delivered the signal: 'pumpportal' (pump.fun fast lane),
    * 'helius' (on-chain wallet watcher — catches every venue), or 'manual'
    * (the SELL button on the copy page).
