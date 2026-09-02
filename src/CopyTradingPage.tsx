@@ -295,11 +295,11 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
           <div className="stat-value-mono" style={{ color: enabled ? 'var(--ok)' : undefined }}>
             {enabled ? 'ACTIVE' : 'STOPPED'}
           </div>
-          <div
-            style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}
-            title="ON-CHAIN is the Helius wallet watcher — it sees every buy and sell on any venue. PUMP.FUN is the PumpPortal fast lane for pump.fun trades. SELLS is the copy-sells setting — OFF means leader sells are shown but the position is held."
-          >
+          <div style={{ fontSize: '11px', color: 'var(--ink-muted)', marginTop: '2px', fontFamily: 'var(--font-mono)' }}>
             {mode.toUpperCase()} · ON-CHAIN {status?.heliusConnected ? 'OK' : '—'} · PUMP.FUN {status?.streamConnected ? 'OK' : '—'} · SELLS {sellsLabel}
+            <InfoTip>ON-CHAIN is the Helius wallet watcher — it sees every buy and sell on any venue. PUMP.FUN is
+              the PumpPortal fast lane for pump.fun trades. SELLS is the copy-sells setting — OFF means leader
+              sells are shown but the position is held.</InfoTip>
           </div>
         </div>
 

@@ -188,10 +188,11 @@ function SmartMoneyPanel() {
       </div>
 
       {sm.roster.length === 0 ? (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}> No wallet has earned promotion yet. This is expected on a new install and is not a fault:
-          the roster is built from chain history the bot gathers itself, so it needs days of
-          graduations and duds before anyone clears the bar. Until then this lane produces nothing.
-          {sm.research.dudCandidates > 0 && <> Currently tracking {sm.research.dudCandidates} token(s) to see how they turn out.</>}
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>
+          No wallet promoted yet{sm.research.dudCandidates > 0 ? ` — ${sm.research.dudCandidates} being tracked` : ''}.
+          <InfoTip>This is expected on a new install and is not a fault: the roster is built from chain
+            history the bot gathers itself, so it needs days of graduations and duds before anyone clears
+            the bar. Until then this lane produces nothing.</InfoTip>
         </div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
@@ -241,13 +242,11 @@ function SmartMoneyPanel() {
         </div>
       )}
 
-      <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '8px', lineHeight: 1.5 }}> An entry needs <strong>{sm.confluence.minWallets}</strong> of these wallets to buy the same token
-        within <strong>{sm.confluence.windowMs / 1000}s</strong>, each risking at least {sm.confluence.minBuySol} SOL.
-        {sm.pendingSignals.length > 0 && (
-          <> Currently watching {sm.pendingSignals.length} token(s) part-way to a quorum
-            (best: {sm.pendingSignals[0].wallets}/{sm.pendingSignals[0].needed}).</>
-        )}
-        <br /> Every entry from this lane still passes the same rug, honeypot and spend-governor checks as any other.
+      <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '8px' }}>
+        Needs <strong>{sm.confluence.minWallets}</strong> wallets buying the same token within <strong>{sm.confluence.windowMs / 1000}s</strong>
+        {sm.pendingSignals.length > 0 && ` — watching ${sm.pendingSignals.length} part-way (best ${sm.pendingSignals[0].wallets}/${sm.pendingSignals[0].needed})`}.
+        <InfoTip>Each wallet must risk at least {sm.confluence.minBuySol} SOL. Every entry from this lane still
+          passes the same rug, honeypot and spend-governor checks as any other.</InfoTip>
       </div>
 
       <EntryProfileSection />
@@ -361,18 +360,19 @@ function TraderScoutPanel() {
       </div>
 
       {!sc?.keysSet.solanaTracker && (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginBottom: '8px' }}>No Solana Tracker key set. That is the only free source that ranks Solana wallets by
-          realized profit over a plain API call — the boards people usually quote (GMGN, Kolscan)
-          sit behind Cloudflare and cannot be read from a server at all. Without it the scout falls
-          back to its own chain research: it finds the pump.fun tokens running right now and reads
-          who bought them first. That works with no key at all, but it only sees wallets that were
-          early to something live in the last few minutes, so it surfaces fewer names. Paste a free
-          key in Settings to widen it.
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: '8px' }}>
+          No Solana Tracker key set — using on-chain discovery only.
+          <InfoTip>That key is the only free source that ranks Solana wallets by realized profit over a
+            plain API call — the boards people usually quote (GMGN, Kolscan) sit behind Cloudflare and
+            cannot be read from a server at all. Without it the scout falls back to its own chain
+            research: it finds the pump.fun tokens running right now and reads who bought them first.
+            That works with no key at all, but it only sees wallets that were early to something live in
+            the last few minutes, so it surfaces fewer names. Paste a free key in Settings to widen it.</InfoTip>
         </div>
       )}
 
       {!rep ? (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}> No scan yet. The first one runs a few minutes after startup, then hourly.
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}> No scan yet — the first one runs a few minutes after startup, then hourly.
         </div>
       ) : (
         <>
@@ -390,14 +390,15 @@ function TraderScoutPanel() {
                 {' '}typical hold {hold(rep.best.medianHoldSeconds)} ·
                 {' '}{rep.best.tradesLast6h} trades in 6h
               </div>
-              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6, marginTop: 3 }}> Copying it should cost about{' '}
-                <strong>{rep.best.expectedFillDragPct?.toFixed(1) ?? '?'}%</strong> in worse fills
-                (their {rep.best.medianBuySol} SOL entries land in a {rep.best.medianEntryVSol} SOL curve, and ours lands after).
-                {' '}Take away their best token and they are still at{' '}
+              <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: 3 }}>
+                ~<strong>{rep.best.expectedFillDragPct?.toFixed(1) ?? '?'}%</strong> worse fill copying them · still{' '}
                 <strong style={{ color: rep.best.realizedExBestSol > 0 ? 'var(--ok)' : 'var(--bad)' }}>
                   {rep.best.realizedExBestSol > 0 ? '+' : ''}{rep.best.realizedExBestSol} SOL
-                </strong>.
-                {rep.best.stalePositions > 0 && <> {rep.best.stalePositions} bag(s) held over {sc!.bars.staleBagHours}h are unresolved and were not scored either way.</>}
+                </strong> without their best token
+                <InfoTip>Their {rep.best.medianBuySol} SOL entries land in a {rep.best.medianEntryVSol} SOL curve, and ours
+                  lands after — that's the expected fill drag. The "without their best token" figure removes
+                  their single biggest winner to check it isn't one lucky call carrying the whole record.
+                  {rep.best.stalePositions > 0 && ` ${rep.best.stalePositions} bag(s) held over ${sc!.bars.staleBagHours}h are unresolved and were not scored either way.`}</InfoTip>
               </div>
               <button
                 onClick={() => post('/api/scout/follow', { address: rep.best!.wallet }, 'Follow')}
@@ -409,7 +410,7 @@ function TraderScoutPanel() {
               <button
                 onClick={() => post('/api/scout/backfill', {}, 'Backfill')}
                 disabled={busy !== null}
-                title="Rebuild the entry profile from these wallets' own trade history, instead of waiting weeks to watch 40 live entries"
+                title="Learn from this wallet's trade history instead of waiting weeks"
                 style={{ marginTop: 6, marginLeft: 6, fontSize: '11px', padding: '3px 10px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--line-focus)', color: 'var(--fg-dim)' }}
               >
                 {busy === 'Backfill' ? 'learning…' : 'learn their strategy from history'}
@@ -421,9 +422,9 @@ function TraderScoutPanel() {
                the two the same way made a structurally dead feature read as a
                working one having a quiet day. */
             rep.considered === 0 ? (
-              <div style={{ fontSize: '11px', color: 'var(--warn)', lineHeight: 1.6, marginBottom: '8px', border: '1px solid var(--warn)', padding: '6px' }}>
-                NO CANDIDATE WALLETS WERE FOUND — nothing was checked. This is not
-                &ldquo;we looked and nobody qualified&rdquo;; no source produced an address to look at.
+              <div style={{ fontSize: '11px', color: 'var(--warn)', marginBottom: '8px', border: '1px solid var(--warn)', padding: '6px' }}>
+                NO CANDIDATE WALLETS WERE FOUND — nothing was checked.
+                <InfoTip>This is not &ldquo;we looked and nobody qualified&rdquo;; no source produced an address to look at.</InfoTip>
                 <div style={{ marginTop: 4, color: 'var(--fg-dim)' }}>
                   {rep.sourceOutcomes.filter(o => !o.ok).map(o => (
                     <div key={o.name}>· {o.name}: {o.detail ?? 'failed'}
@@ -509,15 +510,13 @@ function TraderScoutPanel() {
             </details>
           )}
 
-          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.5 }}>
+          <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>
             {rep.notes.map((n, i) => <div key={i}>· {n}</div>)}
             <div>
-              · Bars: trading now (not just seen inside {sc!.bars.maxIdleHours}h),
-              {' '}{sc!.bars.minClosedTrades}+ closed trades,
-              {' '}under {sc!.bars.maxFillDragPct}% expected fill drag from copying them,
-              {' '}hold over {sc!.bars.minHoldSeconds}s (shorter than we can follow),
-              {' '}still profitable with their best token removed,
-              {' '}and under half their positions unresolved bags.
+              · Bars: trading now, {sc!.bars.minClosedTrades}+ closed trades, under {sc!.bars.maxFillDragPct}% fill drag, others
+              <InfoTip>Trading now means not just seen inside {sc!.bars.maxIdleHours}h. Hold time must be over{' '}
+                {sc!.bars.minHoldSeconds}s (shorter than we can follow). Must still be profitable with their
+                best token removed, and have under half their positions as unresolved bags.</InfoTip>
             </div>
             <div style={{ marginTop: 3 }}> Sources: {rep.sourceOutcomes.map(o => `${o.name} ${o.ok ? '✓' : `✗ (${o.detail ?? 'failed'})`}`).join(' · ')}
             </div>
@@ -603,10 +602,10 @@ function EntryProfileSection() {
       </div>
 
       {!ep.usable ? (
-        <div style={{ fontSize: '11px', color: 'var(--fg-dim)', lineHeight: 1.6 }}> Not driving entries yet: {ep.notReady}.
-          <br /> Evidence so far: <strong>{ep.enteredSamples}</strong>/{ep.needEntered} tokens they bought,
-          {' '}<strong>{ep.skippedSamples}</strong>/{ep.needSkipped} they passed on. Both sides are needed —
-          the tokens they skipped are what make the comparison say anything.
+        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}> Not driving entries yet: {ep.notReady}.
+          Evidence so far: <strong>{ep.enteredSamples}</strong>/{ep.needEntered} bought,{' '}
+          <strong>{ep.skippedSamples}</strong>/{ep.needSkipped} passed on.
+          <InfoTip>Both sides are needed — the tokens they skipped are what make the comparison say anything.</InfoTip>
         </div>
       ) : (
         <>
@@ -636,11 +635,11 @@ function EntryProfileSection() {
               </tbody>
             </table>
           </div>
-          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px', lineHeight: 1.5 }}> Built from {ep.enteredSamples} of their entries against {ep.skippedSamples} launches they passed on.
-            A fresh token is bought on this profile alone when it matches at least{' '}
-            <strong>{Math.round(ep.minScore * 100)}%</strong> of these rules by weight, on{' '}
-            <strong>{ep.minRules}</strong> or more of them — no wallet has to buy first.
-            Rules that fail to separate their picks from the rest are dropped rather than shown.
+          <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginTop: '6px' }}>
+            Built from {ep.enteredSamples} entries vs {ep.skippedSamples} skips. Buys alone at{' '}
+            <strong>{Math.round(ep.minScore * 100)}%</strong> match on <strong>{ep.minRules}</strong>+ rules.
+            <InfoTip>No wallet has to buy first — a fresh token is bought on this profile alone once it clears
+              that bar. Rules that fail to separate their picks from the rest are dropped rather than shown.</InfoTip>
           </div>
         </>
       )}
