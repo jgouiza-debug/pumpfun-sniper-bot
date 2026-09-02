@@ -26,6 +26,8 @@ import { previewWalletAddress } from './services/clientWallet';
 import { apiFetch } from './apiClient';
 import { CopyTradingPage } from './CopyTradingPage';
 import { useBuyAlert } from './useBuyAlert';
+import { ResizablePanel, useColumnSplit } from './components/ResizablePanel';
+import { InfoTip } from './components/InfoTip';
 
 // A txid proves execution only when it's a real signature — paper fills carry
 // a sim_ prefix and never touched the chain.
@@ -702,6 +704,10 @@ export function App() {
   // Page routing: the sniper terminal and the copy trading desk share the
   // backend instance but render as separate full-screen pages.
   const [activePage, setActivePage] = useState<'sniper' | 'copy'>('sniper');
+
+  // The left/right column divider. Shared storage key with CopyTradingPage —
+  // one drag position for "how this app is split", not one per page.
+  const columnSplit = useColumnSplit();
 
   // Multi-Instance State
   const [instances, setInstances] = useState<BotInstanceInfo[]>([
@@ -1718,13 +1724,21 @@ export function App() {
       </section>
 
       {/* Main Single-Screen Split Grid (Zero Forced Page Scrolling) */}
-      <div className="main-viewport-grid">
+      <div
+        className="main-viewport-grid"
+        style={{ gridTemplateColumns: `${columnSplit.leftPct}% var(--sp-3) 1fr` }}
+      >
         {/* Left column: what to copy, what is open, what closed. */}
         <div className="viewport-column">
-          <TraderScoutPanel />
-          <SmartMoneyPanel />
+          <ResizablePanel id="sniper-scout" resize="both" minHeight={120}>
+            <TraderScoutPanel />
+          </ResizablePanel>
+          <ResizablePanel id="sniper-smart-money" resize="both" minHeight={90}>
+            <SmartMoneyPanel />
+          </ResizablePanel>
 
           {/* Positions Matrix Table */}
+          <ResizablePanel id="sniper-positions" resize="both" minHeight={160}>
           <div className="section-header">
             <div className="section-title">Positions Matrix — Bot Instance Port {selectedPort}</div>
             <div className="section-count">{activePositions.length} OPEN ENGAGEMENTS</div>
@@ -1819,10 +1833,12 @@ export function App() {
               </table>
             )}
           </div>
+          </ResizablePanel>
 
           {/* Execution receipts — permanent record of every closed leg. The
               Execution column is the ground truth the 10-second log feed can't
               give: a real fill links to its Solscan tx, a paper fill says so. */}
+          <ResizablePanel id="sniper-receipts" resize="both" minHeight={140}>
           <div className="section-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <div className="section-title">Execution Receipts — Closed Trades</div>
@@ -1883,10 +1899,20 @@ export function App() {
               </table>
             )}
           </div>
+          </ResizablePanel>
         </div>
+
+        {/* Drag to resize the left/right split. */}
+        <div
+          className="column-split-handle"
+          onPointerDown={columnSplit.onHandlePointerDown}
+          onDoubleClick={columnSplit.reset}
+          title="Drag to resize — double-click to reset"
+        />
 
         {/* Right Column: System Logs Console Feed (Full Height Auto-Scroll) */}
         <div className="viewport-column">
+          <ResizablePanel id="sniper-logs" resize="both" minHeight={200} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <div className="section-header">
             <div className="section-title">System Logs & Event Stream — Port {selectedPort}</div>
             <div className="section-count">
@@ -1910,6 +1936,7 @@ export function App() {
             )}
             <div ref={terminalEndRef} />
           </div>
+          </ResizablePanel>
         </div>
       </div>
 

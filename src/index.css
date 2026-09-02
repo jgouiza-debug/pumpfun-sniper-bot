@@ -413,6 +413,8 @@ button:disabled:hover { background: inherit; color: inherit; }
 
 .main-viewport-grid {
   display: grid;
+  /* Overridden inline per-render by useColumnSplit (App.tsx / CopyTradingPage.tsx);
+     this is only the pre-hydration fallback. */
   grid-template-columns: 1.35fr 0.65fr;
   gap: var(--sp-3);
   flex: 1;
@@ -425,7 +427,113 @@ button:disabled:hover { background: inherit; color: inherit; }
   flex-direction: column;
   min-height: 0;
   gap: var(--sp-3);
-  overflow: hidden !important;
+  /* A dragged panel height can exceed the viewport — scroll the column
+     rather than clip content silently. Each panel still scrolls its own
+     table/log internally first via .flex-matrix / .console-container. */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* The handle between the two main columns. A thin hit target visually, a
+   generous one to actually grab — the same trick every real pane splitter
+   uses, because a 1px line is unclickable. */
+.column-split-handle {
+  cursor: col-resize;
+  position: relative;
+}
+.column-split-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+  transform: translateX(-50%);
+}
+.column-split-handle:hover::after,
+.column-split-handle.dragging::after {
+  background: var(--line-focus);
+  width: 2px;
+}
+
+.resizable-panel { flex-shrink: 0; }
+.resizable-panel:has(.matrix-container.flex-matrix),
+.resizable-panel:has(.console-container) {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.resizable-panel:has(.matrix-container.flex-matrix) .matrix-container.flex-matrix,
+.resizable-panel:has(.console-container) .console-container {
+  flex: 1;
+  min-height: 0;
+}
+
+.resize-handle { position: absolute; z-index: 5; }
+.resize-handle-e {
+  top: 0; right: -4px; bottom: 0; width: 8px;
+  cursor: ew-resize;
+}
+.resize-handle-s {
+  left: 0; right: 0; bottom: -4px; height: 8px;
+  cursor: ns-resize;
+}
+.resize-handle-e:hover, .resize-handle-s:hover { background: rgba(255, 255, 255, 0.04); }
+
+.resize-reset {
+  /* Bottom-right, not top-right: every panel's header puts real controls
+     (a count, a SCAN NOW / SYNC button) in the top-right corner, and this
+     used to sit right on top of them. The bottom corner is where the two
+     resize handles already meet, so it reads as part of the same affordance. */
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  z-index: 6;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.resize-reset:hover { color: var(--fg); border-color: var(--line-focus); }
+
+/* ===========================================================================
+   INFO TIP — a (?) that opens the long explanation instead of always
+   showing it. See InfoTip.tsx.
+   =========================================================================== */
+
+.info-tip { position: relative; display: inline-block; margin-left: 4px; }
+.info-tip-trigger {
+  width: 14px;
+  height: 14px;
+  line-height: 12px;
+  border-radius: 999px !important;
+  border: 1px solid var(--line-bright);
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  padding: 0;
+}
+.info-tip-trigger:hover { color: var(--fg); border-color: var(--line-focus); }
+.info-tip-popover {
+  position: absolute;
+  z-index: 20;
+  top: 18px;
+  left: 0;
+  width: 320px;
+  max-width: min(320px, 80vw);
+  background: var(--bg-raised);
+  border: 1px solid var(--line-bright);
+  padding: var(--sp-3);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--fg-dim);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 
 /* Section headers read as a shell heading: a marker, the name, then a rule
@@ -751,7 +859,11 @@ button:disabled:hover { background: inherit; color: inherit; }
 @media (max-width: 1100px) {
   html, body { overflow: auto !important; height: auto !important; max-height: none !important; }
   #root { height: auto !important; max-height: none !important; overflow: visible !important; }
-  .main-viewport-grid { grid-template-columns: 1fr; overflow: visible !important; }
+  /* !important: this must win over the inline grid-template-columns the
+     resizable column split sets, or a narrow window keeps the two-column
+     layout the collapse below exists to prevent. */
+  .main-viewport-grid { grid-template-columns: 1fr !important; overflow: visible !important; }
+  .column-split-handle { display: none; }
   .viewport-column { overflow: visible !important; }
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .console-container { height: 280px; flex: none; }

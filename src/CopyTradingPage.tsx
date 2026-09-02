@@ -3,6 +3,8 @@ import { CopyFeedEvent, CopyPosition, CopyStatusResponse, CopyTradeRecord, CopyT
 import { stripEmoji } from './App';
 import { apiFetch } from './apiClient';
 import { useBuyAlert } from './useBuyAlert';
+import { ResizablePanel, useColumnSplit } from './components/ResizablePanel';
+import { InfoTip } from './components/InfoTip';
 
 const LOG_WIPE_INTERVAL_MS = 5_000;
 
@@ -59,6 +61,9 @@ function ExecBadge({ txid, fillVerified }: { txid?: string; fillVerified?: boole
 }
 
 export function CopyTradingPage({ apiBase }: { apiBase: string }) {
+  // Same split, same storage key as the sniper page — one drag position for
+  // how this app is divided, not one per page.
+  const columnSplit = useColumnSplit();
   const [status, setStatus] = useState<CopyStatusResponse | null>(null);
   const [streamLive, setStreamLive] = useState<boolean>(false);
 
@@ -344,9 +349,13 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
       </section>
 
       {/* Main split view */}
-      <div className="main-viewport-grid">
+      <div
+        className="main-viewport-grid"
+        style={{ gridTemplateColumns: `${columnSplit.leftPct}% var(--sp-3) 1fr` }}
+      >
         {/* Left: wallets, positions, receipts */}
         <div className="viewport-column">
+          <ResizablePanel id="copy-wallets" resize="both" minHeight={140}>
           <div className="section-header">
             <div className="section-title">Leader Wallets Under Surveillance</div>
             <div className="section-count">{wallets.length} TRACKED</div>
@@ -445,20 +454,25 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               </table>
             )}
           </div>
+          </ResizablePanel>
 
+          <ResizablePanel id="copy-positions" resize="both" minHeight={160}>
           <div className="section-header" style={{ marginTop: '8px' }}>
             <div className="section-title">Open Copy Positions</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               {positions.length > 0 && (
-                <button
-                  className="btn-terminal-outline"
-                  onClick={syncBalances}
-                  disabled={syncing}
-                  title="Re-read the wallet's real on-chain balances: closes bags already sold elsewhere and corrects drifted quantities."
-                  style={{ fontSize: '11px', padding: '2px 8px' }}
-                >
-                  {syncing ? 'SYNCING…' : '⟳ SYNC BALANCES'}
-                </button>
+                <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                  <button
+                    className="btn-terminal-outline"
+                    onClick={syncBalances}
+                    disabled={syncing}
+                    title="Re-read on-chain balances"
+                    style={{ fontSize: '11px', padding: '2px 8px' }}
+                  >
+                    {syncing ? 'SYNCING…' : '⟳ SYNC BALANCES'}
+                  </button>
+                  <InfoTip>Re-reads the wallet's real on-chain balances: closes bags already sold elsewhere and corrects drifted quantities.</InfoTip>
+                </span>
               )}
               <div className="section-count">{positions.length} OPEN</div>
             </div>
@@ -536,7 +550,9 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               </table>
             )}
           </div>
+          </ResizablePanel>
 
+          <ResizablePanel id="copy-receipts" resize="both" minHeight={140}>
           <div className="section-header" style={{ marginTop: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <div className="section-title">Copy Receipts — Closed Legs</div>
@@ -598,10 +614,20 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
               </table>
             )}
           </div>
+          </ResizablePanel>
         </div>
+
+        {/* Drag to resize the left/right split. */}
+        <div
+          className="column-split-handle"
+          onPointerDown={columnSplit.onHandlePointerDown}
+          onDoubleClick={columnSplit.reset}
+          title="Drag to resize — double-click to reset"
+        />
 
         {/* Right: live signal feed */}
         <div className="viewport-column">
+          <ResizablePanel id="copy-feed" resize="both" minHeight={200} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <div className="section-header">
             <div className="section-title">Leader Signal Feed — Live Copy Decisions</div>
             <div className="section-count">
@@ -651,6 +677,7 @@ export function CopyTradingPage({ apiBase }: { apiBase: string }) {
             )}
             <div ref={feedEndRef} />
           </div>
+          </ResizablePanel>
         </div>
       </div>
 
