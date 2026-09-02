@@ -300,6 +300,8 @@ interface ScoutPayload {
     reads: number;
     notes: string[];
     sourceOutcomes: Array<{ name: string; ok: boolean; detail?: string; seenKeys?: string[] }>;
+    /** Set when the run was cut short (trading path busy, read budget spent) — results are partial. */
+    stoppedEarly?: string;
   } | null;
   bars: { maxIdleHours: number; maxCopyableBuySol: number; minHoldSeconds: number; minClosedTrades: number; maxFillDragPct: number; staleBagHours: number };
   keysSet: { solanaTracker: boolean; birdeye: boolean };
@@ -434,6 +436,14 @@ function TraderScoutPanel() {
                 fault — most profitable-looking wallets fail one of the bars below.
               </div>
             )
+          )}
+
+          {/* A run cut short by a busy trading path or a spent read budget used
+              to look identical to a complete one. Partial is partial. */}
+          {rep.stoppedEarly && (
+            <div style={{ fontSize: '11px', color: 'var(--warn)', lineHeight: 1.6, marginBottom: '8px' }}>
+              RUN STOPPED EARLY — {rep.stoppedEarly}. These results are partial; the next run may find more.
+            </div>
           )}
 
           {rep.top.length > 1 && (

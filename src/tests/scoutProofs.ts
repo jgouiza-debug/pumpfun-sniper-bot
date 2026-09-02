@@ -41,7 +41,7 @@ import {
 } from '../services/traderSources';
 import {
   discoverRunningMints, earlyBuyersOf, discoverCandidates,
-  MIN_RUNNING_VSOL, MIN_EARLY_BUY_SOL, MAX_CURVE_PAGES,
+  MIN_RUNNING_VSOL, MIN_EARLY_BUY_SOL, MAX_CURVE_PAGES, RECENT_MINT_MAX_AGE_MS,
 } from '../services/walletDiscovery';
 import { PUMP_PROGRAM_ID } from '../services/pumpEventDecoder';
 
@@ -827,6 +827,91 @@ test('discovery needs no feature flag and writes no ledger state', () => {
   assert.ok(!/walletLedger/.test(src),
     'a guess from curve position is not the evidence the ledger promotes on, and writing it in '
     + 'would quietly degrade the thing it imitates');
+});
+
+console.log('\n-- Discovery: the tokens the bot already watched get created --');
+
+// THE REPORTED SYMPTOM: "the wallet scanner never pulls anything". The sampled
+// path finds tokens that are running NOW at whatever age, and a token hot
+// enough to pass the bar has usually traded past what earlyBuyersOf can walk
+// back through — so it credited nobody, by design, every run. The engine's
+// own watchlist knows which running tokens are YOUNG.
+
+atest('THE WATCHLIST PATH: a young running mint the bot already saw costs zero reads', async () => {
+  // A connection that can answer nothing: if discovery touches it, the sampled
+  // path ran and this proof is wrong about what it costs.
+  const dead = new FakeConn(new Map(), new Map());
+  const MINT = pk('youngHot');
+  const { mints, reads } = await discoverRunningMints({
+    ...dDeps(dead),
+    recentMints: () => [{ mint: MINT, createdAt: Date.now() - 60_000, vSolInBondingCurve: 55 }],
+  }, budget(5_000));
+  assert.deepStrictEqual(mints.map(m => m.mint), [MINT]);
+  assert.strictEqual(reads, 0, 'the watchlist is in memory — reading it must not spend the RPC budget');
+});
+
+atest('an OLD mint or a FLAT mint on the watchlist is not a lead, and the sample still runs', async () => {
+  const dead = new FakeConn(new Map(), new Map());
+  const out = await discoverRunningMints({
+    ...dDeps(dead),
+    recentMints: () => [
+      { mint: pk('oldHot'), createdAt: Date.now() - RECENT_MINT_MAX_AGE_MS - 1, vSolInBondingCurve: 80 },
+      { mint: pk('youngFlat'), createdAt: Date.now() - 60_000, vSolInBondingCurve: MIN_RUNNING_VSOL - 1 },
+    ],
+  }, budget(5_000));
+  assert.deepStrictEqual(out.mints, [], 'neither qualifies');
+  assert.ok(out.reads > 0, 'so the sampled path must have been tried');
+  assert.ok(/no recent activity/.test(out.detail ?? ''), `and its own reason reported: ${out.detail}`);
+});
+
+atest('hottest first: two young running mints are ranked by curve depth', async () => {
+  const dead = new FakeConn(new Map(), new Map());
+  const { mints } = await discoverRunningMints({
+    ...dDeps(dead),
+    recentMints: () => [
+      { mint: pk('warm'), createdAt: Date.now() - 60_000, vSolInBondingCurve: 45 },
+      { mint: pk('hot'), createdAt: Date.now() - 60_000, vSolInBondingCurve: 70 },
+    ],
+  }, budget(5_000));
+  assert.deepStrictEqual(mints.map(m => m.mint), [pk('hot'), pk('warm')]);
+});
+
+atest('END TO END: a young watchlist mint yields its first buyers with no key at all', async () => {
+  const MINT = pk('youngMint');
+  const conn = chainWith({
+    mint: MINT, vSol: 55,
+    firstBuyers: [{ user: pk('early1'), sol: 0.5 }, { user: pk('early2'), sol: 1.2 }],
+  });
+  const out = await discoverCandidates({
+    ...dDeps(conn),
+    recentMints: () => [{ mint: MINT, createdAt: Date.now() - 120_000, vSolInBondingCurve: 55 }],
+  }, budget(5_000));
+  assert.ok(out.outcome.ok, `discovery should have worked: ${out.outcome.detail}`);
+  assert.deepStrictEqual(out.outcome.candidates.map(c => c.wallet).sort(), [pk('early1'), pk('early2')].sort());
+});
+
+test('the engine hands the scout its live watchlist', () => {
+  const engine = readFileSync(join(__dirname, '..', 'services', 'sniperEngine.ts'), 'utf8');
+  const deps = engine.slice(engine.indexOf('public researchDeps()'), engine.indexOf('public researchDeps()') + 900);
+  assert.ok(/recentMints: \(\) => tokenWatchlist\.all\(\)/.test(deps),
+    'the watchlist is the only zero-cost list of young running mints this process has');
+});
+
+test('OLD BUG: the hourly scout read API keys once, at boot', () => {
+  const server = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8');
+  const bundle = server.slice(server.indexOf('function scoutDeps()'), server.indexOf('function scoutDeps()') + 1200);
+  const keys = bundle.slice(bundle.indexOf('getKeys: () =>'));
+  assert.ok(/getKeys: \(\) => \{[\s\S]{0,120}sniperEngine\.getConfig\(\)/.test(keys),
+    'getConfig() must be called INSIDE getKeys — outside it, the schedule (built once at boot) '
+    + 'froze the keys and a key pasted into Settings was ignored until restart');
+  const before = bundle.slice(0, bundle.indexOf('getKeys: () =>'));
+  assert.ok(!/const cfg = sniperEngine\.getConfig\(\)/.test(before), 'and not captured above the closure');
+});
+
+test('a run cut short says so on the panel', () => {
+  const app = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8');
+  assert.ok(/rep\.stoppedEarly && \(/.test(app),
+    '"trading path busy" and "read budget exhausted" used to render identically to a complete run');
 });
 
 (async () => {

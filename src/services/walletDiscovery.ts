@@ -73,7 +73,7 @@ export const MIN_RUNNING_VSOL = 40;
 /** Mints walked back to their first buyers per run. */
 export const MAX_MINTS_WALKED = 4;
 /** Signature pages walked per mint. 1000 each. */
-export const MAX_CURVE_PAGES = 4;
+export const MAX_CURVE_PAGES = 8;
 /** Transactions read per mint when decoding its first buyers. */
 export const MAX_EARLY_TX_READS = 45;
 /** First buyers taken from one token. */
@@ -89,7 +89,24 @@ export interface DiscoveryDeps {
   isBusy?: () => boolean;
   sleep?: (ms: number) => Promise<void>;
   log?: (level: 'info' | 'warn', msg: string) => void;
+  /**
+   * Mints the bot has ALREADY seen created and is tracking live (the engine's
+   * screening watchlist). Costs nothing to read, and — the point — a mint that
+   * is young AND already running has hundreds of curve transactions, not
+   * thousands, so its first buyers are inside a bounded backward walk. See
+   * discoverRunningMints for why the sampled path alone starved the scout.
+   */
+  recentMints?: () => Array<{ mint: string; createdAt: number; vSolInBondingCurve: number }>;
 }
+
+/**
+ * How young a watchlist mint may be to count as "recent". Older than this and
+ * a running token has usually accumulated more curve history than
+ * MAX_CURVE_PAGES can walk back through, which is the failure this exists to
+ * avoid; a mint that is still running at 45 minutes will be in the sampled
+ * path's page anyway.
+ */
+export const RECENT_MINT_MAX_AGE_MS = 45 * 60_000;
 
 export interface RunningMint {
   mint: string;
@@ -115,6 +132,26 @@ export async function discoverRunningMints(
   deps: DiscoveryDeps,
   spend: (n: number) => boolean,
 ): Promise<{ mints: RunningMint[]; reads: number; detail?: string }> {
+  // THE WATCHLIST FIRST. The sampled path below finds tokens that are running
+  // NOW, at whatever age — and a token hot enough to pass MIN_RUNNING_VSOL has
+  // usually been trading long enough that earlyBuyersOf cannot walk back to its
+  // birth inside MAX_CURVE_PAGES, so it returns nobody, by design. Measured on
+  // a default install: every run ended "every one of them has more than N
+  // trades", and the scout reported no candidates, every hour, forever.
+  //
+  // The bot already watched these tokens get created. A mint that is both
+  // young and running has a SHORT curve history, so its first buyers are
+  // reachable — and reading the watchlist costs no RPC at all.
+  const recent = (deps.recentMints?.() ?? [])
+    .filter(m => Number.isFinite(m.vSolInBondingCurve) && m.vSolInBondingCurve >= MIN_RUNNING_VSOL
+      && Date.now() - m.createdAt <= RECENT_MINT_MAX_AGE_MS)
+    .sort((a, b) => b.vSolInBondingCurve - a.vSolInBondingCurve)
+    .map<RunningMint>(m => ({ mint: m.mint, virtualSolReserves: m.vSolInBondingCurve, sampleHits: 0 }));
+  if (recent.length) {
+    deps.log?.('info', `[Discovery] ${recent.length} young running mint(s) from the live watchlist — no sampling needed.`);
+    return { mints: recent, reads: 0 };
+  }
+
   const conn = deps.getConnection();
   if (!conn) return { mints: [], reads: 0, detail: 'no RPC connection' };
   const sleep = deps.sleep ?? defaultSleep;

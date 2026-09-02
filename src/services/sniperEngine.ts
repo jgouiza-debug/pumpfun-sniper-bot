@@ -3835,10 +3835,21 @@ export class SniperEngine {
    * anything on the trading key. This hands out the two things a bounded,
    * yielding research walk needs and nothing else.
    */
-  public researchDeps(): { getConnection: () => Connection | null; isBusy: () => boolean } {
+  public researchDeps(): {
+    getConnection: () => Connection | null;
+    isBusy: () => boolean;
+    recentMints: () => Array<{ mint: string; createdAt: number; vSolInBondingCurve: number }>;
+  } {
     return {
       getConnection: () => this.solanaConnection,
       isBusy: () => this.tradingPathBusy(),
+      // The screening watchlist: every create this process saw, with the
+      // latest curve reading. The scout's keyless source walks the YOUNG
+      // running ones to their first buyers (walletDiscovery.ts) — the only
+      // shape of token whose beginning a bounded walk can actually reach.
+      recentMints: () => tokenWatchlist.all().map(t => ({
+        mint: t.mint, createdAt: t.createdAt, vSolInBondingCurve: t.vSolInBondingCurve,
+      })),
     };
   }
 

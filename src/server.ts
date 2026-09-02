@@ -464,15 +464,23 @@ app.get('/api/entry-profile', (req, res) => {
  * next restart.
  */
 function scoutDeps() {
-  const cfg = sniperEngine.getConfig();
   return {
     ...sniperEngine.researchDeps(),
     fetch: globalThis.fetch,
     log: (level: 'info' | 'warn', msg: string) => console.log(msg),
-    getKeys: () => ({
-      solanaTracker: (cfg.solanaTrackerApiKey || process.env.SOLANA_TRACKER_API_KEY || '').trim() || undefined,
-      birdeye: (cfg.birdeyeApiKey || process.env.BIRDEYE_API_KEY || '').trim() || undefined,
-    }),
+    // getConfig() INSIDE the closure. It used to be read once, above, when this
+    // bundle was built — and the hourly schedule builds its bundle exactly once,
+    // at boot, so a key pasted into Settings afterwards was ignored by every
+    // scheduled run until a restart, while the manual SCAN NOW (which rebuilds
+    // the bundle per call) worked. The comment above promised call-time reads;
+    // now it is true for both paths.
+    getKeys: () => {
+      const cfg = sniperEngine.getConfig();
+      return {
+        solanaTracker: (cfg.solanaTrackerApiKey || process.env.SOLANA_TRACKER_API_KEY || '').trim() || undefined,
+        birdeye: (cfg.birdeyeApiKey || process.env.BIRDEYE_API_KEY || '').trim() || undefined,
+      };
+    },
   };
 }
 
